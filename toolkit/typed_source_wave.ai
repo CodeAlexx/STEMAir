@@ -1,0 +1,242 @@
+module stemair.typed_source_wave
+import "audio_result.ai" as audio
+import "model_ensemble_config.ai" as config
+import "typed_spectral_residual.ai" as spectral
+import "numeric.ai" as numeric
+
+pub type Wave=struct{target:string,samples:audio.Samples,frames:u64,frequency_reference:array<f32>,frequency_residual:bool=false}
+// Compatibility field retained for existing callers; the source-qualified wide
+// path no longer requires an opt-in. Working-byte checks still apply.
+pub type Limits=struct{max_working_bytes:u64,allow_provisional_spectral:bool=false}
+pub fn reference_bytes(wave:ref<Wave>)->result<u64,string> effects {alloc}{
+ if array.len(wave.frequency_reference)>18446744073709551615/4{return result.err("Frequency reference storage overflows")}
+ result.ok(4*array.len(wave.frequency_reference))
+}
+pub fn copy_reference(wave:ref<Wave>,limits:Limits)->result<array<f32>,string> effects {alloc}{
+ let bytes:u64=try reference_bytes(wave)
+ let samples:u64=try byte_size(struct.borrow(wave,field=samples))
+ if (try checked_add(samples,try checked_add(bytes,bytes)))>limits.max_working_bytes{return result.err("Frequency reference copy exceeds its working-byte limit")}
+ result.ok(numeric.copy(array.view(wave.frequency_reference)))
+}
+pub fn attach_reference(waves:ref<array<Wave>>,reference:view<f32>,limits:Limits)->result<unit,string> effects {alloc}{
+ attach_references(waves,reference,false,limits)
+}
+pub fn attach_references(waves:ref<array<Wave>>,reference:view<f32>,all:bool,limits:Limits)->result<unit,string> effects {alloc}{
+ if view.len(reference)==0{return result.ok(())}
+ if array.len(waves)==0 or view.len(reference)!=2*array.borrow(waves,0).frames or not numeric.finite(reference){return result.err("Frequency reference does not match its primary source")}
+ let copies:u64=if all{array.len(waves)}else{1}
+ if copies>16 or view.len(reference)>18446744073709551615/(4*(copies+1)){return result.err("Frequency reference extent overflows")}
+ var bytes:u64=4*(copies+1)*view.len(reference)
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  bytes=try checked_add(bytes,try byte_size(struct.borrow(array.borrow(waves,i),field=samples)))
+  bytes=try checked_add(bytes,try reference_bytes(array.borrow(waves,i)))
+  i+=1}
+ if bytes>limits.max_working_bytes{return result.err("Frequency reference exceeds its working-byte limit")}
+ i=0
+ loop{if i==copies{break}
+  let primary:ref<Wave>=array.borrow(waves,i)
+  if view.len(reference)!=2*primary.frames{return result.err("Frequency reference source frame extents differ")}
+  primary.frequency_reference=numeric.copy(reference)
+  primary.frequency_residual=all
+  i+=1}
+ result.ok(())
+}
+pub fn frames(source:ref<audio.Samples>)->result<u64,string> effects {alloc} {
+ let _=try audio.validate(source)
+ if audio.count(source)%2!=0{return result.err("A source waveform requires complete planar stereo")}
+ result.ok(audio.count(source)/2)
+}
+fn byte_size(source:ref<audio.Samples>)->result<u64,string> effects {alloc} {
+ let _=try frames(source)
+ let width:u64=if source.precision==audio.Precision.Float32{4}else{8}
+ if audio.count(source)>18446744073709551615/width{return result.err("Typed source byte extent overflows")}
+ result.ok(audio.count(source)*width)
+}
+fn checked_add(a:u64,b:u64)->result<u64,string> effects {alloc} {
+ if a>18446744073709551615-b{return result.err("Typed source byte extent overflows")}
+ result.ok(a+b)
+}
+fn budget(source:ref<audio.Samples>,count:u64,width:u64,limits:Limits)->result<unit,string> effects {alloc} {
+ if count>18446744073709551615/width{return result.err("Typed source allocation overflows")}
+ let bytes:u64=try checked_add(try byte_size(source),count*width)
+ if bytes>limits.max_working_bytes{return result.err("Typed source exceeds its selected working-byte limit")}
+ result.ok(())
+}
+pub fn value(source:ref<audio.Samples>,at:u64)->f64 effects {} {
+ if source.precision==audio.Precision.Float32{cast.float(array.get(source.single,at))}else{array.get(source.wide,at)}
+}
+fn empty(wide:bool,count:u64)->audio.Samples effects {alloc} {
+ var out:audio.Samples=if wide{audio.from_wide([])}else{audio.from_single([])}
+ if wide{array.reserve(out.wide,count)}else{array.reserve(out.single,count)}
+ out
+}
+fn append(out:ref<audio.Samples>,v:f64)->unit effects {alloc} {
+ if out.precision==audio.Precision.Float64{array.push(out.wide,v)}else{array.push(out.single,cast.float(v))}
+ ()
+}
+pub fn copy(source:ref<audio.Samples>,limits:Limits)->result<audio.Samples,string> effects {alloc} {
+ let _=try frames(source)
+ let wide:bool=source.precision==audio.Precision.Float64
+ let count:u64=audio.count(source)
+ let _=try budget(source,count,if wide{8}else{4},limits)
+ var out:audio.Samples=empty(wide,count)
+ var i:u64=0
+ loop{if i==count{break}
+  if wide{array.push(out.wide,array.get(source.wide,i))}else{array.push(out.single,array.get(source.single,i))}
+  i+=1}
+ result.ok(out)
+}
+pub fn fit(source:ref<audio.Samples>,count:u64,limits:Limits)->result<audio.Samples,string> effects {alloc} {
+ let before:u64=try frames(source)
+ if count>18446744073709551615/2{return result.err("Typed source frame extent overflows")}
+ let wide:bool=source.precision==audio.Precision.Float64
+ let _=try budget(source,2*count,if wide{8}else{4},limits)
+ var out:audio.Samples=empty(wide,2*count)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var i:u64=0
+  loop{if i==count{break}
+   if wide{array.push(out.wide,if i<before{array.get(source.wide,channel*before+i)}else{0.0})}else{array.push(out.single,if i<before{array.get(source.single,channel*before+i)}else{0.0})}
+   i+=1}
+  channel+=1}
+ result.ok(out)
+}
+pub fn assign(destination:ref<audio.Samples>,offset:u64,source:ref<audio.Samples>,limits:Limits)->result<unit,string> effects {alloc} {
+ let _=try audio.validate(destination)
+ let _=try audio.validate(source)
+ let count:u64=audio.count(source)
+ if offset>audio.count(destination) or count>audio.count(destination)-offset{return result.err("Typed source assignment exceeds destination extent")}
+ let required:u64=try checked_add(try byte_size(destination),try byte_size(source))
+ if required>limits.max_working_bytes{return result.err("Typed source assignment exceeds its working-byte limit")}
+ var i:u64=0
+ loop{if i==count{break}
+  if destination.precision==audio.Precision.Float64{array.set(destination.wide,offset+i,value(source,i))}else{
+   if source.precision==audio.Precision.Float32{array.set(destination.single,offset+i,array.get(source.single,i))}else{array.set(destination.single,offset+i,cast.float(array.get(source.wide,i)))}}
+  i+=1}
+ result.ok(())
+}
+pub fn find(waves:ref<array<Wave>>,name:str)->option<u64> effects {} {
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  if str.view(array.borrow(waves,i).target)==name{return option.some(i)}
+  i+=1}
+ option.none()
+}
+pub fn provides(waves:ref<array<Wave>>,target:ref<config.Target>)->bool effects {} {
+ if str.len(target.exclude)>0{return array.len(waves)>1 and option.is_some(find(waves,target.exclude))}
+ if option.is_some(find(waves,target.target)){return true}
+ str.view(target.target)=="instrumental" and option.is_some(find(waves,"vocals")) and
+  option.is_some(find(waves,"bass")) and option.is_some(find(waves,"drums")) and option.is_some(find(waves,"other"))
+}
+pub fn validate(waves:ref<array<Wave>>)->result<unit,string> effects {alloc} {
+ if array.len(waves)==0{return result.err("A source selection requires model stems")}
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  let w:ref<Wave>=array.borrow(waves,i)
+  if (try frames(struct.borrow(w,field=samples)))!=w.frames{return result.err("Typed source frame metadata differs")}
+  if array.len(w.frequency_reference)>0 and (array.len(w.frequency_reference)!=2*w.frames or not numeric.finite(array.view(w.frequency_reference))){return result.err("Frequency reference must match the source stereo extent")}
+  let label:string=string.copy(w.target)
+  var j:u64=0
+  loop{if j==i{break}
+   if str.view(array.borrow(waves,j).target)==str.view(label){return result.err("Duplicate typed source name")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn unpack(targets:ref<array<string>>,packed:ref<audio.Samples>,count:u64,limits:Limits)->result<array<Wave>,string> effects {alloc} {
+ let _=try audio.validate(packed)
+ let sources:u64=array.len(targets)
+ if sources==0 or sources>16 or count>18446744073709551615/2/sources or audio.count(packed)!=2*count*sources{return result.err("Wrong packed typed source extent")}
+ let _=try budget(packed,audio.count(packed),if packed.precision==audio.Precision.Float64{8}else{4},limits)
+ var out:array<Wave>=[]
+ var i:u64=0
+ loop{if i==sources{break}
+  var selected:audio.Samples=empty(packed.precision==audio.Precision.Float64,2*count)
+  var at:u64=0
+  loop{if at==2*count{break}
+   if packed.precision==audio.Precision.Float32{array.push(selected.single,array.get(packed.single,i*2*count+at))}else{array.push(selected.wide,array.get(packed.wide,i*2*count+at))}
+   at+=1}
+  array.push(out,Wave{frequency_reference:[],target:string.copy(array.get(targets,i)),samples:selected,frames:count})
+  i+=1}
+ let _=try validate(out)
+ result.ok(out)
+}
+pub fn select(waves:ref<array<Wave>>,target:ref<config.Target>,complement:str,mixture:ref<audio.Samples>,limits:Limits)->result<audio.Samples,string> effects {alloc, env, ffi, fs.read} {
+ let _=try validate(waves)
+ let input_frames:u64=try frames(mixture)
+ if complement!="sum" and complement!="residual" and complement!="spectral"{return result.err("Unknown typed source complement")}
+ if not provides(waves,target){return result.err("A typed requested source is missing")}
+ if str.len(target.exclude)==0 and not (complement=="spectral" and str.view(target.target)=="instrumental" and option.is_some(find(waves,"vocals"))){
+  match find(waves,target.target){none=>{},some(index)=>{return copy(struct.borrow(array.borrow(waves,index),field=samples),limits)}}}
+ let name:string=if str.len(target.exclude)>0{string.copy(target.exclude)}else{"vocals"}
+ let excluded:u64=match find(waves,name){none=>{return result.err("A typed complement source is missing")},some(i)=>i}
+ if array.len(waves)<2{return result.err("A typed complement requires more than one source")}
+ let stem:ref<Wave>=array.borrow(waves,excluded)
+ let reference_size:u64=try reference_bytes(stem)
+ let source:ref<audio.Samples>=struct.borrow(stem,field=samples)
+ if complement=="spectral"{
+  if array.len(stem.frequency_reference)>0{
+   let bytes:u64=4*array.len(stem.frequency_reference)
+   if bytes>limits.max_working_bytes/2{return result.err("Frequency reference exceeds its working-byte limit")}
+   var reference:audio.Samples=audio.from_single(numeric.copy(array.view(stem.frequency_reference)))
+   var output:spectral.Output=try spectral.waveform(reference,source,spectral.Limits{max_working_bytes:limits.max_working_bytes-2*bytes})
+   return result.ok(struct.replace(output,audio.from_single([]),field=samples))}
+  var output:spectral.Output=try spectral.waveform(mixture,source,spectral.Limits{max_working_bytes:limits.max_working_bytes})
+  return result.ok(struct.replace(output,audio.from_single([]),field=samples))}
+ if complement=="residual"{
+  let count:u64=stem.frames
+  let wide:bool=source.precision==audio.Precision.Float64 or mixture.precision==audio.Precision.Float64
+  let base:u64=try checked_add(try checked_add(try byte_size(mixture),try byte_size(source)),reference_size)
+  if count>18446744073709551615/16 or (try checked_add(base,16*count))>limits.max_working_bytes{return result.err("Typed residual exceeds its working-byte limit")}
+  var out:audio.Samples=empty(wide,2*count)
+  var channel:u64=0
+  loop{if channel==2{break}
+   var i:u64=0
+   loop{if i==count{break}
+    let input:f64=if stem.frequency_residual and array.len(stem.frequency_reference)>0{cast.float(array.get(stem.frequency_reference,channel*count+i))}else{if i<input_frames{value(mixture,channel*input_frames+i)}else{0.0}}
+    if wide{append(out,input-value(source,channel*count+i))}else{
+     let a:f32=cast.float(input)
+     let b:f32=array.get(source.single,channel*count+i)
+     array.push(out.single,a-b)}
+    i+=1}
+   channel+=1}
+  return result.ok(out)}
+ var first:u64=0
+ if first==excluded{first=1}
+ let initial:ref<Wave>=array.borrow(waves,first)
+ let count:u64=initial.frames
+ let wide:bool=initial.samples.precision==audio.Precision.Float64
+ var base:u64=0
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  let w:ref<Wave>=array.borrow(waves,i)
+  if i!=excluded and w.frames!=count and w.frames!=1{return result.err("Source sum operands do not broadcast to the first destination")}
+  base=try checked_add(base,try byte_size(struct.borrow(w,field=samples)))
+  i+=1}
+ if count>18446744073709551615/16 or (try checked_add(base,16*count))>limits.max_working_bytes{return result.err("Typed sum exceeds its working-byte limit")}
+ var out:audio.Samples=empty(wide,2*count)
+ i=0
+ loop{if i==2*count{break}
+  append(out,0.0)
+  i+=1}
+ var member:u64=0
+ loop{if member==array.len(waves){break}
+  if member!=excluded{
+   let w:ref<Wave>=array.borrow(waves,member)
+   var channel:u64=0
+   loop{if channel==2{break}
+    i=0
+    loop{if i==count{break}
+     let at:u64=channel*count+i
+     let from:u64=channel*w.frames+if w.frames==1{0}else{i}
+     let right:f64=value(struct.borrow(w,field=samples),from)
+     if wide{array.set(out.wide,at,array.get(out.wide,at)+right)}else{
+      if w.samples.precision==audio.Precision.Float64{let sum:f64=cast.float(array.get(out.single,at))+right
+       array.set(out.single,at,cast.float(sum))}else{let r:f32=cast.float(right)
+       array.set(out.single,at,array.get(out.single,at)+r)}}
+     i+=1}
+    channel+=1}}
+  member+=1}
+ result.ok(out)
+}

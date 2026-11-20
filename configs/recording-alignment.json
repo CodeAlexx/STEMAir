@@ -1,0 +1,7 @@
+{
+  "windows": "0.25",
+  "intros": "default",
+  "gain": "medium",
+  "phase": "unchanged",
+  "save_aligned": true
+}

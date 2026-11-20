@@ -1,0 +1,54 @@
+module stemair.waveform.config
+import std.files as files
+import std.codec as codec
+import std.float as fp
+pub type Config=struct{engine:string="waveform",sample_rate:u32=44100,split:bool=true,
+ shift_offsets:array<u64>,targets:array<string>,generation:u64=1,segment_samples:u64=0,
+ overlap:f64=0.25,transition_power:f64=1.0} derive codec(strict)
+pub fn validate(c:ref<Config>)->result<unit,string> effects {alloc} {
+ if (str.view(c.engine)!="waveform" and str.view(c.engine)!="temporal") or c.sample_rate!=44100 or array.len(c.targets)!=4 or
+  array.len(c.shift_offsets)>32 or c.generation<1 or c.generation>2 or
+  not fp.is_finite(c.overlap) or c.overlap<0.0 or c.overlap>=1.0 or
+  not fp.is_finite(c.transition_power) or c.transition_power<1.0 or
+  (c.generation==1 and (c.overlap!=0.25 or c.transition_power!=1.0)) or
+  (c.generation==1 and c.segment_samples!=0 and c.segment_samples!=441000) or
+  (c.generation==2 and c.segment_samples!=0 and (c.segment_samples<4410 or c.segment_samples>1764000)){
+  return result.err("Invalid waveform profile")}
+ var i:u64=0
+ loop{if i==array.len(c.shift_offsets){break}
+  let offset:u64=array.get(c.shift_offsets,i)
+  if offset>22050 or (c.generation==1 and offset==22050){return result.err("Waveform shift exceeds half-second range")}
+  var j:u64=0
+  loop{if j==i{break}
+   if c.generation==1 and offset==array.get(c.shift_offsets,j){return result.err("Waveform shifts must be distinct")}
+   j+=1}
+  i+=1}
+ i=0
+ loop{if i==array.len(c.targets){break}
+  let name:str=array.get(c.targets,i)
+  if str.len(name)==0 or str.len(name)>64{return result.err("Invalid waveform source name")}
+  var b:u64=0
+  loop{if b==str.len(name){break}
+   let small:u8=cast.bits(view.get(str.bytes(name),b))
+   if not ((small>=97 and small<=122) or (small>=48 and small<=57) or small==45 or small==95){
+    return result.err("Waveform source names must use lowercase letters, digits, dash or underscore")}
+   b+=1}
+  var j:u64=0
+  loop{if j==i{break}
+   let earlier:str=array.get(c.targets,j)
+   if earlier==name{return result.err("Duplicate waveform source name")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn read(path:str)->result<Config,string> effects {alloc,fs.read} {
+ let raw:string=match files.read_text(path){ok(v)=>v,err(_)=>{return result.err("Cannot read waveform profile")},}
+ var c:Config=try Config_decode(raw) map_err codec.describe
+ let _=try validate(c)
+ result.ok(c)
+}
+pub fn segment_length(c:ref<Config>)->u64 effects {} {
+ if c.segment_samples!=0{return c.segment_samples}
+ if c.generation==1{return 441000}
+ if str.view(c.engine)=="temporal"{352800}else{1764000}
+}

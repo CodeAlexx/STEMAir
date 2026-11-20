@@ -1,0 +1,89 @@
+module stemair.spectral_residual
+import "complex_spectral_single.ai" as spectral
+import "ops.ai" as ops
+import "numeric.ai" as num
+import "control.ai" as control
+import std.float as fp
+import std.libm as scalar
+
+pub type Output=struct{values:array<f32>,frames:u64}
+// Preserve the selected stem phase and the larger magnitude, then subtract
+// the mixture-phase projection. The waveform wrapper negates this result.
+pub fn spectrum(mixture:ref<ops.Tensor>,stem:ref<ops.Tensor>)->result<ops.Tensor,string> effects {alloc,ffi,env,fs.read} {
+ if mixture.c!=4 or stem.c!=4 or mixture.h==0 or mixture.h!=stem.h or mixture.w==0 or stem.w==0 or
+    array.len(mixture.data)!=4*mixture.h*mixture.w or array.len(stem.data)!=4*stem.h*stem.w or
+    not num.finite(array.view(mixture.data)) or not num.finite(array.view(stem.data)){
+  return result.err("Spectral residual requires finite stereo spectra with matching bins")}
+ let frames:u64=if mixture.w<stem.w{mixture.w}else{stem.w}
+ let bins:u64=mixture.h
+ let profile:spectral.Profile=try spectral.host_profile()
+ var library:CAbiLibrary=match scalar.open(){ok(v)=>v,err(_)=>{return result.err("Native phase math is unavailable")}}
+ var values:array<f32>=num.zeros(4*bins*frames)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var frequency:u64=0
+  loop{if frequency==bins{break}
+   var time:u64=0
+   loop{if time==frames{break}
+    let real:f32=array.get(mixture.data,(2*channel*bins+frequency)*mixture.w+time)
+    let imaginary:f32=array.get(mixture.data,((2*channel+1)*bins+frequency)*mixture.w+time)
+    let sr:f32=array.get(stem.data,(2*channel*bins+frequency)*stem.w+time)
+    let si:f32=array.get(stem.data,((2*channel+1)*bins+frequency)*stem.w+time)
+    let mix_magnitude:f32=spectral.magnitude_profile(profile,real,imaginary)
+    let stem_magnitude:f32=spectral.magnitude_profile(profile,sr,si)
+    let magnitude:f32=if mix_magnitude>=stem_magnitude{mix_magnitude}else{stem_magnitude}
+    let angle:f32=fp.atan2(imaginary,real)
+    let cosine:f32=match scalar.cosf(library,angle){ok(v)=>v,err(_)=>{return result.err("Native phase cosine failed")}}
+    let sine:f32=match scalar.sinf(library,angle){ok(v)=>v,err(_)=>{return result.err("Native phase sine failed")}}
+    array.set(values,(2*channel*bins+frequency)*frames+time,sr-magnitude*cosine)
+    array.set(values,((2*channel+1)*bins+frequency)*frames+time,si-magnitude*sine)
+    time+=1}
+   frequency+=1}
+  channel+=1}
+ let _=scalar.close(library)
+ if not num.finite(array.view(values)){return result.err("Spectral residual overflow")}
+ result.ok(ops.tensor(4,bins,frames,values))
+}
+pub fn separate(mixture:view<f32>,stem:view<f32>,cancel:str,progress:str)->result<Output,string> effects {alloc,ffi,env,fs.read,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Spectral residual cancelled")}
+ var plan:spectral.Plan=try spectral.plan(2048,1024)
+ var original:ops.Tensor=try spectral.analyze(plan,mixture)
+ control.report(progress,1,3)
+ if control.cancelled(cancel){return result.err("Spectral residual cancelled")}
+ var estimated:ops.Tensor=try spectral.analyze(plan,stem)
+ control.report(progress,2,3)
+ if control.cancelled(cancel){return result.err("Spectral residual cancelled")}
+ var difference:ops.Tensor=try spectrum(original,estimated)
+ let output:Output=try reconstruct(plan,difference)
+ if control.cancelled(cancel){return result.err("Spectral residual cancelled")}
+ control.report(progress,3,3)
+ result.ok(output)
+}
+// Pure composition for model source selection; its caller owns cancellation.
+pub fn waveform(mixture:view<f32>,stem:view<f32>)->result<Output,string> effects {alloc,ffi,env,fs.read} {
+ var plan:spectral.Plan=try spectral.plan(2048,1024)
+ var original:ops.Tensor=try spectral.analyze(plan,mixture)
+ var estimated:ops.Tensor=try spectral.analyze(plan,stem)
+ var difference:ops.Tensor=try spectrum(original,estimated)
+ reconstruct(plan,difference)
+}
+fn reconstruct(plan:ref<spectral.Plan>,difference:ref<ops.Tensor>)->result<Output,string> effects {alloc} {
+ if difference.w<2{return result.err("Spectral residual needs at least 1024 samples in each input")}
+ var real:array<f64>=[]
+ var imaginary:array<f64>=[]
+ var channel:u64=0
+ loop{if channel==2{break}
+  var at:u64=0
+  loop{if at==difference.h*difference.w{break}
+   array.push(real,cast.float(array.get(difference.data,2*channel*difference.h*difference.w+at)))
+   array.push(imaginary,cast.float(array.get(difference.data,(2*channel+1)*difference.h*difference.w+at)))
+   at+=1}
+  channel+=1}
+ let wave:array<f32>=try spectral.synthesize_f32(plan,array.view(real),array.view(imaginary),difference.w)
+ var values:array<f32>=[]
+ var index:u64=0
+ loop{if index==array.len(wave){break}
+  array.push(values,-array.get(wave,index))
+  index+=1}
+ result.ok(Output{values:values,frames:(difference.w-1)*1024})
+}

@@ -1,0 +1,79 @@
+module stemair.model_settings_session
+import "preferences.ai" as preferences
+import "model_defaults.ai" as defaults
+import "model_queue_snapshot.ai" as queue
+import "artifact_cleanup_policy.ai" as cleanup_policy
+import "../toolkit/artifact_cleanup.ai" as cleanup
+import "../toolkit/model_cache.ai" as models
+import "../toolkit/engine.ai" as engine
+import "../toolkit/control.ai" as control
+import std.files as files
+import std.text as text
+import std.codec as codec
+import "cpu_session_close.ai" as cpu_close
+
+fn failure(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+fn current_file(file:str,previous:str)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ if str.len(file)==0{return result.err("Model settings cannot be applied while desktop preferences are unavailable")}
+ let info:fs.meta=match files.symlink_metadata(file){ok(value)=>value,err(e)=>{
+  if e.code==1{return result.ok(())}
+  return result.err(failure(e))}}
+ if not info.is_file or info.is_symlink{return result.err("Saved desktop preferences are not an ordinary file; selection and models are unchanged")}
+ let raw:bytes=match files.read_limited(file,4194304){ok(v)=>v,err(_)=>{return result.err("Cannot read saved desktop preferences; selection and models are unchanged")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("Saved desktop preferences are not UTF-8; selection and models are unchanged")}}
+ var stored:preferences.State=try preferences.decode(source)
+ if (try preferences.encode(stored))!=previous{return result.err("Saved desktop preferences changed; reopen them before applying model defaults")}
+ result.ok(())
+}
+fn pending(candidate:ref<preferences.State>,snapshot:str)->result<unit,string> effects {alloc} {
+ if array.len(candidate.queue_items)==0{candidate.queue_model_snapshot=""
+  candidate.queue_cleanup_snapshot=""
+  return result.ok(())}
+ if str.len(candidate.queue_model_snapshot)>0{let _=try queue.decode(candidate.queue_model_snapshot)
+  return result.ok(())}
+ if str.len(snapshot)==0{return result.err("Capture the pending queue's current model settings before applying a new default")}
+ let _=try queue.decode(snapshot)
+ candidate.queue_model_snapshot=string.copy(snapshot)
+ var selected:cleanup.Settings=try cleanup_policy.current(candidate.cleanup_enabled,candidate.cleanup_threshold)
+ candidate.queue_cleanup_snapshot=try cleanup_policy.encode(selected)
+ result.ok(())
+}
+pub fn save_use(state:ref<preferences.State>,retained:ref<option<models.Cache>>,file:str,temporary:str,previous:str,
+ directory:str,record:ref<defaults.Record>,base_file:str,checkpoint:str,pending_snapshot:str,cancel:str)->result<string,string>
+ effects {alloc, ffi, gpu, fs.meta, fs.read, fs.write} {
+ let _=try current_file(file,previous)
+ var candidate:preferences.State=try preferences.decode(try preferences.encode(state))
+ let _=try pending(candidate,pending_snapshot)
+ if str.len(checkpoint)==0{return result.err("Choose the model checkpoint before applying defaults")}
+ let published:defaults.Published=try defaults.publish(directory,record,base_file,cancel)
+ if control.cancelled(cancel){return result.err(text.concat("Model settings save cancelled; immutable revision remains at ",published.definition))}
+ candidate.model_defaults=try defaults.selected(candidate.model_defaults,record,published)
+ candidate.settings=string.copy(published.configuration)
+ candidate.model_definition=string.copy(published.definition)
+ candidate.checkpoint=string.copy(checkpoint)
+ let saved:string=match preferences.persist_synced(candidate,file,temporary){ok(v)=>v,err(e)=>{
+  return result.err(text.concat(e,text.concat("; immutable model revision remains at ",published.definition)))}}
+ // This is an explicit new-session boundary, only after publication succeeded.
+ match cpu_close.retained_all(retained){ok(_)=>{},err(e)=>{return result.err(text.concat("Model settings were durably saved, but the loaded session could not close. Restart before editing or processing again: ",e))}}
+ ref.swap(state,candidate)
+ result.ok(saved)
+}
+pub fn restore(state:ref<preferences.State>,retained:ref<option<models.Cache>>,file:str,temporary:str,previous:str,
+ profile:str,asset_sha256:str,base_file:str,checkpoint:str,pending_snapshot:str)->result<string,string>
+ effects {alloc, ffi, gpu, fs.meta, fs.read, fs.write} {
+ let _=try current_file(file,previous)
+ var candidate:preferences.State=try preferences.decode(try preferences.encode(state))
+ let _=try pending(candidate,pending_snapshot)
+ let raw:bytes=match files.read_limited(base_file,65536){ok(v)=>v,err(_)=>{return result.err("Cannot read bundled model configuration within 64 KiB")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("Bundled model configuration is not UTF-8")}}
+ let _=try engine.decode(source)
+ if str.len(checkpoint)==0{return result.err("Choose the model checkpoint before restoring defaults")}
+ candidate.model_defaults=try defaults.restored(candidate.model_defaults,profile,asset_sha256)
+ candidate.settings=string.copy(base_file)
+ candidate.model_definition=""
+ candidate.checkpoint=string.copy(checkpoint)
+ let saved:string=try preferences.persist_synced(candidate,file,temporary)
+ match cpu_close.retained_all(retained){ok(_)=>{},err(e)=>{return result.err(text.concat("Bundled settings were durably selected, but the loaded session could not close. Restart before editing or processing again: ",e))}}
+ ref.swap(state,candidate)
+ result.ok(saved)
+}

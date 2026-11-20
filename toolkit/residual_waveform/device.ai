@@ -1,0 +1,139 @@
+module stemair.residual_waveform.device
+import "network.ai" as network
+import "../device_ops.ai" as ops
+import "../ops.ai" as host
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "../hybrid/residual.ai" as residual
+import "../recurrent.ai" as layers
+import "../recurrent_vendor.ai" as vendor
+import "../windowed_sinc.ai" as sinc
+import "../windowed_sinc_source.ai" as source_sinc
+import "../windowed_sinc_device.ai" as sinc_device
+import std.tensor as tensor
+import std.torch_sum as sum
+import std.torch_std as deviation
+import std.mkl_vml as vml
+import std.gpu as agpu
+
+pub type State=struct{execution:ops.ExecutionState,mean:sum.Engine214,stddev:deviation.Engine,
+ up:sinc.Plan,down:sinc.Plan,up_kernel:tensor.Tensor,down_kernel:tensor.Tensor,requests:u64=0}
+pub type Limits=struct{convolution_bytes:u64=2147483648,recurrent_packed_bytes:u64=67108864,recurrent_workspace_bytes:u64=268435456,packed_recurrent_workspace_bytes:u64=1073741824}
+pub fn prepare(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>,runtime:ref<vml.Vml>,limits:Limits)->result<State,string> effects {alloc,ffi,gpu}{
+ let policy:ops.ConvolutionPolicy=ops.ConvolutionPolicy{workspace_bytes:limits.convolution_bytes,deterministic:false,allow_tf32:true}
+ var execution:ops.ExecutionState=try ops.prepare_execution(context,policy,ops.ActivationRecipe.OrderedF32,ops.NormalizationRecipe.OrderedF32)
+ // Original packed constructor uses 112-second segments (about 9,645 local
+ // positions). Keep the legacy workspace limits on all other constructors.
+ if not n.constructor.kwargs.rewrite{
+  execution.local_state_steps=16384
+  execution.local_state_scores=536870912
+ }
+ var recurrent:vendor.State=vendor.empty(if n.constructor.kwargs.rewrite{limits.recurrent_workspace_bytes}else{limits.packed_recurrent_workspace_bytes})
+ var i:u64=0
+ loop{if i==array.len(n.residuals){break}
+  let block:ref<residual.Block>=array.borrow(n.residuals,i)
+  var j:u64=0
+  loop{if j==array.len(block.branches){break}
+   match array.borrow(block.branches,j).recurrence{some(r)=>{
+    let pair:array<layers.Bidirectional>=[r.first,r.second]
+    let _=try vendor.prepare(recurrent,context,stream,struct.borrow(n,field=weights),array.view(pair),limits.recurrent_packed_bytes)
+   },none=>{}}
+   j+=1}
+  i+=1}
+ execution.recurrence=option.some(recurrent)
+ execution.projection=ops.ProjectionPolicy{recipe:ops.ProjectionRecipe.EagerF32,workspace_bytes:1048576}
+ let _=try ops.prepare_attention(context,execution)
+ let up:sinc.Plan=try source_sinc.plan(runtime,1,2)
+ let down:sinc.Plan=try source_sinc.plan(runtime,2,1)
+ let up_kernel:tensor.Tensor=try sinc_device.upload(context,stream,up)
+ let down_kernel:tensor.Tensor=try sinc_device.upload(context,stream,down)
+ let mean:sum.Engine214=try sum.create214(context) map_err ops.error
+ let stddev:deviation.Engine=try deviation.create(context) map_err ops.error
+ result.ok(State{execution:execution,mean:mean,stddev:stddev,up:up,down:down,up_kernel:up_kernel,down_kernel:down_kernel})
+}
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,state:ref<State>,input:ref<tensor.Tensor>,cancel:str)->result<host.Tensor,string> effects {alloc,gpu,fs.meta}{
+ if tensor.rank(input)!=4 or array.get(input.dimensions,0)!=1 or array.get(input.dimensions,1)!=2 or array.get(input.dimensions,2)!=1{
+  return result.err("Residual waveform requires planar stereo input")}
+ let length:u64=array.get(input.dimensions,3)
+ let padded:u64=try network.valid_length(struct.borrow(n.constructor,field=kwargs),length)
+ let values:array<f32>=try tensor.to_f32(stream,input) map_err ops.error
+ if not num.finite(array.view(values)){return result.err("Residual waveform input is not finite")}
+ var mono:array<f32>=[]
+ var i:u64=0
+ loop{if i==length{break}
+  array.push(mono,(array.get(values,i)+array.get(values,length+i))*0.5)
+  i+=1}
+ let mono_shape:array<u64>=[length]
+ var mono_tensor:tensor.Tensor=try tensor.from_f32(context,stream,array.view(mono),array.view(mono_shape),tensor.DType.F32) map_err ops.error
+ var mean:sum.Reduction214=try sum.mean214(struct.borrow(state,field=mean),context,stream,mono_tensor) map_err ops.error
+ var stddev:deviation.Reduction=try deviation.standard_deviation(struct.borrow(state,field=stddev),context,stream,mono_tensor,1.0) map_err ops.error
+ let center_values:array<f32>=try tensor.to_f32(stream,struct.borrow(mean,field=value)) map_err ops.error
+ let scale_values:array<f32>=try tensor.to_f32(stream,struct.borrow(stddev,field=value)) map_err ops.error
+ let center:f32=array.get(center_values,0)
+ let scale:f32=array.get(scale_values,0)
+ let denominator:f32=scale+0.00001
+ var packed:array<f32>=num.zeros(2*padded)
+ let offset:u64=(padded-length)/2
+ var c:u64=0
+ loop{if c==2{break}
+  i=0
+  loop{if i==length{break}
+   array.set(packed,c*padded+offset+i,(array.get(values,c*length+i)-center)/denominator)
+   i+=1}
+  c+=1}
+ let shape:array<u64>=[1,2,1,padded]
+ var x:tensor.Tensor=try tensor.from_f32(context,stream,array.view(packed),array.view(shape),tensor.DType.F32) map_err ops.error
+ x=try sinc_device.apply(context,stream,struct.borrow(state,field=up),struct.borrow(state,field=up_kernel),x)
+ var saved:array<tensor.Tensor>=[]
+ i=0
+ loop{if i==array.len(n.encoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let block:network.Encoder=array.get(n.encoder,i)
+  x=try ops.convolution_with_policy(context,stream,parameters,x,block.conv,state.execution.convolution)
+  match block.norm{some(form)=>{x=try ops.normalize_with_execution(context,stream,parameters,x,form,struct.borrow(state,field=execution))},none=>{}}
+  x=try ops.gelu_with_execution(context,stream,x,struct.borrow(state,field=execution))
+  match block.residual{some(index)=>{x=try residual.forward_with_execution(context,stream,parameters,struct.borrow(n,field=weights),array.borrow(n.residuals,index),x,cancel,struct.borrow(state,field=execution))},none=>{}}
+  match block.rewrite{some(form)=>{
+   x=try ops.convolution_with_policy(context,stream,parameters,x,form,state.execution.convolution)
+   match block.rewrite_norm{some(normalization)=>{x=try ops.normalize_with_execution(context,stream,parameters,x,normalization,struct.borrow(state,field=execution))},none=>{}}
+   x=try ops.glu(context,stream,x)
+  },none=>{}}
+  array.push(saved,try tensor.view(x) map_err ops.error)
+  i+=1}
+ i=0
+ loop{if i==array.len(n.decoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var skip:tensor.Tensor=match array.pop(saved){some(v)=>v,none=>{return result.err("Residual waveform skip state missing")}}
+  let width:u64=array.get(x.dimensions,3)
+  let skip_width:u64=array.get(skip.dimensions,3)
+  if skip_width<width{return result.err("Residual waveform skip extent differs")}
+  skip=try ops.slice(context,stream,skip,3,(skip_width-width)/2,width)
+  x=try ops.add(context,stream,x,skip)
+  let block:network.Decoder=array.get(n.decoder,i)
+  match block.rewrite{some(form)=>{
+   x=try ops.convolution_with_policy(context,stream,parameters,x,form,state.execution.convolution)
+   match block.rewrite_norm{some(normalization)=>{x=try ops.normalize_with_execution(context,stream,parameters,x,normalization,struct.borrow(state,field=execution))},none=>{}}
+   x=try ops.glu(context,stream,x)
+  },none=>{}}
+  x=try ops.convolution_with_policy(context,stream,parameters,x,block.conv,state.execution.convolution)
+  match block.norm{some(form)=>{x=try ops.normalize_with_execution(context,stream,parameters,x,form,struct.borrow(state,field=execution))},none=>{}}
+  if not block.last{x=try ops.gelu_with_execution(context,stream,x,struct.borrow(state,field=execution))}
+  i+=1}
+ x=try sinc_device.apply(context,stream,struct.borrow(state,field=down),struct.borrow(state,field=down_kernel),x)
+ let width:u64=array.get(x.dimensions,3)
+ if width<length{return result.err("Residual waveform output extent is too short")}
+ let raw:array<f32>=try tensor.to_f32(stream,x) map_err ops.error
+ var output:array<f32>=num.zeros(8*length)
+ c=0
+ loop{if c==8{break}
+  i=0
+  loop{if i==length{break}
+   let scaled:f32=array.get(raw,c*width+(width-length)/2+i)*scale
+   array.set(output,c*length+i,scaled+center)
+   i+=1}
+  c+=1}
+ if not num.finite(array.view(output)){return result.err("Residual waveform output is not finite")}
+ let _=try agpu.sync_stream(stream) map_err ops.error
+ state.requests+=1
+ result.ok(host.tensor(8,1,length,output))
+}

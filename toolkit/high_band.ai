@@ -1,0 +1,97 @@
+module stemair.high_band
+import "ops.ai" as ops
+import "numeric.ai" as num
+import "complex_spectral.ai" as spectral
+import std.float as fp
+import std.libm as libm
+import std.cabi as foreign
+import std.vector_math as vector
+
+pub type Norm=enum{Scalar,Vector}
+fn magnitude(real:f32,imaginary:f32,norm:Norm)->f32 effects {} {
+ if norm==Norm.Vector{vector.magnitude_f32(real,imaginary)}else{spectral.magnitude(real,imaginary)}
+}
+
+pub fn valid(mode:str)->bool effects {} {
+ mode=="none" or mode=="mirror-phase" or mode=="mirror-scaled"
+}
+pub fn extent(max_bin:u64,crop_stop:u64,filter_start:u64,filter_stop:u64)->result<u64,string> effects {alloc} {
+ if max_bin==0 or max_bin>16384 or crop_stop>max_bin+1 or filter_stop<filter_start{
+  return result.err("Invalid high-band reconstruction geometry")}
+ let span:u64=filter_stop-filter_start
+ if span>max_bin+1{return result.err("High-band reconstruction filter span is too large")}
+ let total:u64=max_bin+span
+ if total<crop_stop{return result.err("High-band reconstruction extent is negative")}
+ let height:u64=total-crop_stop
+ if height>max_bin or (height>0 and filter_start<height+10){return result.err("High-band mirror exceeds the available spectrum")}
+ result.ok(height)
+}
+pub fn capture(input:ref<ops.Tensor>,height:u64,max_bin:u64)->result<ops.Tensor,string> effects {alloc} {
+ if max_bin==0 or max_bin>16384 or input.c!=4 or input.h!=max_bin+1 or input.w==0 or height==0 or height>max_bin or
+  input.h>134217728/input.w or array.len(input.data)!=4*input.h*input.w{
+  return result.err("Invalid retained high-band spectrum")}
+ var values:array<f32>=num.zeros(4*height*input.w)
+ var component:u64=0
+ loop{if component==4{break}
+  var f:u64=0
+  loop{if f==height{break}
+   var t:u64=0
+   loop{if t==input.w{break}
+    array.set(values,(component*height+f)*input.w+t,array.get(input.data,(component*input.h+max_bin-height+f)*input.w+t))
+    t+=1}
+   f+=1}
+  component+=1}
+ if not num.finite(array.view(values)){return result.err("Nonfinite retained high-band spectrum")}
+ result.ok(ops.tensor(4,height,input.w,values))
+}
+pub fn mirror(mode:str,combined:ref<ops.Tensor>,high:ref<ops.Tensor>,filter_start:u64)->result<ops.Tensor,string> effects {alloc,ffi} {
+ var runtime:libm.Runtime=try libm.open_runtime() map_err foreign.error_message
+ let norm:Norm=if runtime.host==libm.Host.Posix{Norm.Vector}else{Norm.Scalar}
+ let outcome:result<ops.Tensor,string>=mirror_with_math(struct.borrow(runtime,field=library),norm,mode,combined,high,filter_start)
+ libm.close_runtime(runtime)
+ let output:ops.Tensor=try outcome
+ result.ok(output)
+}
+pub fn mirror_with_math(library:ref<CAbiLibrary>,norm:Norm,mode:str,combined:ref<ops.Tensor>,high:ref<ops.Tensor>,filter_start:u64)->result<ops.Tensor,string> effects {alloc,ffi} {
+ if not valid(mode) or mode=="none" or combined.c!=4 or high.c!=4 or high.h==0 or high.w==0 or
+  combined.w!=high.w or high.h>134217728/high.w or filter_start>combined.h or filter_start<high.h+10 or
+  combined.h>134217728/combined.w or array.len(combined.data)!=4*combined.h*combined.w or
+  array.len(high.data)!=4*high.h*high.w or not num.finite(array.view(combined.data)) or not num.finite(array.view(high.data)){
+  return result.err("Invalid high-band mirror inputs")}
+ var output:array<f32>=num.zeros(4*high.h*high.w)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var f:u64=0
+  loop{if f==high.h{break}
+   let source:u64=filter_start-11-f
+   var t:u64=0
+   loop{if t==high.w{break}
+    let re:f32=array.get(combined.data,(2*channel*combined.h+source)*combined.w+t)
+    let im:f32=array.get(combined.data,((2*channel+1)*combined.h+source)*combined.w+t)
+    let amplitude:f32=magnitude(re,im,norm)
+    let a:u64=(2*channel*high.h+f)*high.w+t
+    let b:u64=((2*channel+1)*high.h+f)*high.w+t
+    let original_re:f32=array.get(high.data,a)
+    let original_im:f32=array.get(high.data,b)
+    var candidate_re:f32=0.0
+    var candidate_im:f32=0.0
+    if mode=="mirror-phase"{
+     let phase:f32=try libm.atan2f(library,original_im,original_re) map_err foreign.error_message
+     let cosine:f32=try libm.cosf(library,phase) map_err foreign.error_message
+     let sine:f32=try libm.sinf(library,phase) map_err foreign.error_message
+     candidate_re=amplitude*cosine
+     candidate_im=amplitude*sine
+    }else{
+     let scaled_re:f32=original_re*1.7
+     let scaled_im:f32=original_im*1.7
+     candidate_re=amplitude*scaled_re
+     candidate_im=amplitude*scaled_im}
+    let use_original:bool=magnitude(original_re,original_im,norm)<=magnitude(candidate_re,candidate_im,norm)
+    array.set(output,a,if use_original{original_re}else{candidate_re})
+    array.set(output,b,if use_original{original_im}else{candidate_im})
+    t+=1}
+   f+=1}
+  channel+=1}
+ if not num.finite(array.view(output)){return result.err("High-band reconstruction overflow")}
+ result.ok(ops.tensor(4,high.h,high.w,output))
+}

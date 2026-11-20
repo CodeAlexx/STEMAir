@@ -1,0 +1,38 @@
+module stemair.config
+import std.files as files
+import std.codec as codec
+
+pub type Config=struct{engine:string="spectral",sample_rate:u32,n_fft:u64,hop:u64,frequency_bins:u64,bands:u64,
+ channels:u64,growth:u64,scales:u64,blocks:u64,bottleneck:u64,targets:array<string>,frames:u64,overlap:u64} derive codec(strict)
+pub fn validate(c:ref<Config>)->result<unit,string> effects {alloc} {
+ if str.view(c.engine)!="spectral" or c.sample_rate<8000 or c.sample_rate>192000 or c.n_fft<32 or c.n_fft>32768 or c.n_fft%2!=0 or
+  c.hop==0 or c.hop>c.n_fft/2 or c.frequency_bins==0 or c.frequency_bins>c.n_fft/2+1 or
+  c.bands==0 or c.bands>32 or c.frequency_bins%c.bands!=0 or c.channels==0 or c.channels>1024 or
+  c.growth>256 or c.scales>8 or c.blocks==0 or c.blocks>8 or c.bottleneck==0 or c.bottleneck>64 or
+  c.frames<2 or c.frames>2048 or c.overlap==0 or c.overlap>64 or
+  array.len(c.targets)==0 or array.len(c.targets)>8{return result.err("Invalid spectral model configuration")}
+ var divisor:u64=1
+ var i:u64=0
+ loop{if i>=c.scales{break}
+  divisor*=2
+  i+=1}
+ if c.frames%divisor!=0 or (c.frequency_bins/c.bands)%divisor!=0 or
+  c.frequency_bins/c.bands/divisor<c.bottleneck or (c.hop*(c.frames-1))%c.overlap!=0 or c.hop*(c.frames-1)<=c.n_fft/2{
+  return result.err("Spectral dimensions must survive every scale and exactly tile overlap")}
+ i=0
+ loop{if i>=array.len(c.targets){break}
+  let name:str=array.get(c.targets,i)
+  if str.len(name)==0 or str.len(name)>64{return result.err("Invalid source name")}
+  var j:u64=0
+  loop{if j>=i{break}
+   if name==array.get(c.targets,j){return result.err("Duplicate source name")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn read(path:str)->result<Config,string> effects {alloc,fs.read} {
+ let raw:string=match files.read_text(path){ok(v)=>v,err(_)=>{return result.err("Cannot read model configuration")},}
+ var c:Config=match Config_decode(str.view(raw)){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+ let _=try validate(c)
+ result.ok(c)
+}

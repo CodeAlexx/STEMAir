@@ -1,0 +1,127 @@
+module stemair.attention.host
+import "network.ai" as network
+import "host_layers.ai" as layers
+import "host_transformer.ai" as transformer
+import "host_stack.ai" as stack
+import "../hybrid/device.ai" as normalization
+import "../hybrid/spectral.ai" as spectral
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "../device_ops.ai" as definition
+import std.cpu_neural_f32 as neural
+pub type Backend=struct{layers:layers.Backend,transformer:transformer.Backend,packs:u64,bytes:u64}
+pub fn prepare(n:ref<network.Network>,affine:neural.Affine)->result<Backend,string> effects {alloc} {
+ if array.len(n.weights.parameters.values)!=(if n.projected{533}else{525}) or n.training_length==0 or n.training_length>343980 or array.len(n.encoder)!=4 or array.len(n.tencoder)!=4 or array.len(n.decoder)!=4 or array.len(n.tdecoder)!=4 or array.len(n.transformer.layers)!=5 or array.len(n.transformer.time_layers)!=5{return result.err("CPU attention architecture has not been qualified")}
+ let convolutions:layers.Backend=try layers.prepare(n,affine)
+ let matrices:transformer.Backend=try transformer.prepare(struct.borrow(n,field=weights),affine)
+ let count:u64=convolutions.packs+matrices.packs
+ let bytes:u64=convolutions.bytes+matrices.bytes
+ result.ok(Backend{layers:convolutions,transformer:matrices,packs:count,bytes:bytes})
+}
+fn project(n:ref<network.Network>,backend:ref<Backend>,library:ref<CAbiLibrary>,x:ref<layers.Tensor>,projection:option<definition.Convolution>)->result<layers.Tensor,string> effects {alloc,ffi} {
+ let conv:definition.Convolution=match projection{none=>{return result.ok(layers.copy(x))},some(v)=>v}
+ let flat:layers.Tensor=layers.tensor(x.n,x.c,1,x.h*x.w,num.copy(array.view(x.data)))
+ var out:layers.Tensor=try layers.convolve(n,struct.borrow(backend,field=layers),library,flat,conv)
+ out.h=x.h
+ out.w=x.w
+ result.ok(out)
+}
+fn embedding(n:ref<network.Network>,x:ref<layers.Tensor>)->result<layers.Tensor,string> effects {alloc} {
+ if x.n!=1 or x.c!=48 or x.h!=512{return result.err("CPU attention frequency embedding extent differs")}
+ let parameter:ref<array<f32>>=struct.borrow(array.borrow(n.weights.parameters.values,n.embedding),field=values)
+ var out:layers.Tensor=layers.copy(x)
+ var channel:u64=0
+ loop{if channel==x.c{break}
+  var frequency:u64=0
+  loop{if frequency==x.h{break}
+   let first:f32=array.get(parameter,frequency*x.c+channel)*10.0
+   let value:f32=first*0.2
+   var t:u64=0
+   loop{if t==x.w{break}
+    let at:u64=(channel*x.h+frequency)*x.w+t
+    array.set(out.data,at,array.get(out.data,at)+value)
+    t+=1}
+   frequency+=1}
+  channel+=1}
+ result.ok(out)
+}
+pub fn forward(n:ref<network.Network>,backend:ref<Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ if n.training_length>343980{return result.err("Invalid or oversized CPU attention waveform input")}
+ forward_at_training_length(n,backend,library,input,cancel,n.training_length)
+}
+pub fn forward_at_training_length(n:ref<network.Network>,backend:ref<Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str,length:u64)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ let requested:u64=input.w
+ if input.c!=2 or input.h!=1 or requested==0 or requested>length or length>134217728 or array.len(input.data)!=2*requested or not num.finite(array.view(input.data)){return result.err("Invalid or oversized CPU attention waveform input")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var padded:array<f32>=num.zeros(2*length)
+ var interleaved:array<f32>=num.zeros(2*length)
+ var i:u64=0
+ loop{if i==requested{break}
+  array.set(padded,i,array.get(input.data,i))
+  array.set(padded,length+i,array.get(input.data,requested+i))
+  array.set(interleaved,2*i,array.get(input.data,i))
+  array.set(interleaved,2*i+1,array.get(input.data,requested+i))
+  i+=1}
+ var spectrum:ops.Tensor=try spectral.analyze(struct.borrow(n,field=spectral),array.view(interleaved),2)
+ interleaved=[]
+ var frequency_norm:normalization.Normalized=try normalization.normalized(array.view(spectrum.data))
+ var time_norm:normalization.Normalized=try normalization.normalized(array.view(padded))
+ padded=[]
+ var x:layers.Tensor=layers.tensor(1,4,spectrum.h,spectrum.w,struct.replace(frequency_norm,[],field=values))
+ spectrum.data=[]
+ var xt:layers.Tensor=layers.tensor(1,2,1,length,struct.replace(time_norm,[],field=values))
+ var saved:array<layers.Tensor>=[]
+ var saved_time:array<layers.Tensor>=[]
+ var lengths:array<u64>=[]
+ var time_lengths:array<u64>=[]
+ i=0
+ loop{if i==4{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  array.push(lengths,x.w)
+  array.push(time_lengths,xt.w)
+  xt=try layers.encode(n,struct.borrow(backend,field=layers),library,array.get(n.tencoder,i),xt,cancel)
+  x=try layers.encode(n,struct.borrow(backend,field=layers),library,array.get(n.encoder,i),x,cancel)
+  if i==0{x=try embedding(n,x)}
+  array.push(saved,layers.copy(x))
+  array.push(saved_time,layers.copy(xt))
+  i+=1}
+ x=try project(n,backend,library,x,n.up)
+ xt=try project(n,backend,library,xt,n.time_up)
+ var streams:stack.Streams=try stack.forward(n,struct.borrow(backend,field=transformer),library,x,xt,cancel)
+ x=struct.replace(streams,layers.tensor(0,0,0,0,[]),field=frequency)
+ xt=struct.replace(streams,layers.tensor(0,0,0,0,[]),field=time)
+ x=try project(n,backend,library,x,n.down)
+ xt=try project(n,backend,library,xt,n.time_down)
+ i=4
+ loop{if i==0{break}
+  i-=1
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let skip:layers.Tensor=match array.pop(saved){some(v)=>v,none=>{return result.err("Missing CPU attention frequency skip")}}
+  let time_skip:layers.Tensor=match array.pop(saved_time){some(v)=>v,none=>{return result.err("Missing CPU attention time skip")}}
+  let extent:u64=match array.pop(lengths){some(v)=>v,none=>{return result.err("Missing CPU attention frequency extent")}}
+  let time_extent:u64=match array.pop(time_lengths){some(v)=>v,none=>{return result.err("Missing CPU attention time extent")}}
+  x=try layers.decode(n,struct.borrow(backend,field=layers),library,array.get(n.decoder,i),x,skip,extent,cancel)
+  xt=try layers.decode(n,struct.borrow(backend,field=layers),library,array.get(n.tdecoder,i),xt,time_skip,time_extent,cancel)}
+ let channels:u64=2*n.source_count
+ if x.c!=2*channels or xt.c!=channels or xt.w!=length{return result.err("CPU attention final branch geometry differs")}
+ let frequency_height:u64=x.h
+ let frequency_width:u64=x.w
+ i=0
+ loop{if i==array.len(x.data){break}
+  array.set(x.data,i,array.get(x.data,i)*frequency_norm.deviation+frequency_norm.mean)
+  i+=1}
+ let complex:ops.Tensor=ops.tensor(2*channels,frequency_height,frequency_width,struct.replace(x,[],field=data))
+ let inverse:array<f32>=try spectral.synthesize(struct.borrow(n,field=spectral),complex,length)
+ var output:array<f32>=num.zeros(channels*requested)
+ var channel:u64=0
+ loop{if channel==channels{break}
+  i=0
+  loop{if i==requested{break}
+   let wave:f32=array.get(xt.data,channel*length+i)*time_norm.deviation+time_norm.mean
+   array.set(output,channel*requested+i,wave+array.get(inverse,i*channels+channel))
+   i+=1}
+  channel+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite CPU attention output")}
+ result.ok(ops.tensor(channels,1,requested,output))
+}

@@ -1,0 +1,31 @@
+module stemair.waveform.host_session
+import "network.ai" as network
+import "host.ai" as host
+import "host_audio.ai" as recording
+import "config.ai" as config
+import "../ops.ai" as ops
+
+import "../recording_shifts.ai" as shifts
+pub type Prepared=struct{backend:host.Backend,requests:u64=0,forward_calls:u64=0}
+pub fn prepare(n:ref<network.Network>)->result<Prepared,string> effects {alloc} {result.ok(Prepared{backend:try host.prepare(n)})}
+pub fn prepare_with_blas(n:ref<network.Network>,runtime:str,version:str)->result<Prepared,string> effects {alloc,ffi}{result.ok(Prepared{backend:try host.prepare_with_blas(n,runtime,version)})}
+fn predict(n:ref<network.Network>,prepared:ref<Prepared>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ let output:ops.Tensor=try host.forward(n,struct.borrow(prepared,field=backend),library,input,cancel)
+ prepared.forward_calls+=1
+ result.ok(output)
+}
+fn length_for(n:ref<network.Network>,length:u64)->result<u64,string> effects {alloc} {network.valid_length(n.options,length)}
+pub fn separate(n:ref<network.Network>,prepared:ref<Prepared>,library:ref<CAbiLibrary>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if n.options.generation!=c.generation{return result.err("CPU waveform generation differs from retained network")}
+ let output:array<f32>=try recording.separate(n,prepared,library,c,input,cancel,progress,predict,length_for)
+ prepared.requests+=1
+ result.ok(output)
+}
+
+// Explicit request schedule; legacy fixed-offset separate remains available.
+pub fn separate_scheduled(n:ref<network.Network>,prepared:ref<Prepared>,library:ref<CAbiLibrary>,c:ref<config.Config>,schedule:ref<shifts.Schedule>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if n.options.generation!=c.generation{return result.err("CPU waveform generation differs from retained network")}
+ let output:array<f32>=try recording.separate_scheduled(n,prepared,library,c,schedule,input,cancel,progress,predict,length_for)
+ prepared.requests+=1
+ result.ok(output)
+}

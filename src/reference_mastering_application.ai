@@ -1,0 +1,68 @@
+// MIT orchestration of an explicitly selected, separately deployed GPL helper.
+// No DSP from that helper is linked into the application.
+module stemair.reference_mastering_application
+import "../toolkit/reference_mastering_protocol.ai" as protocol
+import "../toolkit/codec_process.ai" as child
+import "../toolkit/control.ai" as control
+import "container_export.ai" as container
+import "reference_mastering_plan.ai" as planning
+import std.codec as codec
+import std.files as files
+import std.path as path
+import std.text as text
+pub type Outcome=struct{report:option<protocol.Report>,capture:option<child.Capture>,error:string,work_directory:string,temporary_removed:bool,child_close_succeeded:bool=false}
+fn error(e:fs.error)->string effects {alloc}{string.copy(fs.error.message(e))}
+fn failure(message:string own,working:str)->Outcome effects {alloc}{Outcome{report:option.none(),capture:option.none(),error:message,work_directory:string.copy(working),temporary_removed:false}}
+pub fn pairs(targets:ref<array<string>>,references:ref<array<string>>,directory:str,prefix:str,format:ref<container.Plan>)->result<array<protocol.Pair>,string> effects {alloc,fs.meta}{
+ let _=try container.require_directory(directory)
+ if text.contains(prefix,"/") or text.contains(prefix,"\\") or text.contains(prefix,":") or text.contains(prefix,"\x{00}"){return result.err("Mastering testing prefix must be a filename component")}
+ let count:u64=if array.len(targets)<array.len(references){array.len(targets)}else{array.len(references)}
+ if count==0{return result.err("Choose at least one ordered target/reference pair")}
+ var selected:array<protocol.Pair>=[]
+ var i:u64=0
+ loop{if i==count{break}
+  let target:str=array.get(targets,i)
+  let reference:str=array.get(references,i)
+  let stem:string=text.concat(prefix,text.concat(path.stem(target),"_(Matched)"))
+  array.push(selected,protocol.Pair{target:string.copy(target),reference:string.copy(reference),output:container.target(directory,stem,format)})
+  i+=1}
+ result.ok(selected)}
+fn decode_report(file:str)->result<protocol.Report,string> effects {alloc,fs.read}{
+ let raw:bytes=match files.read_limited(file,4194304){ok(value)=>value,err(_)=>{return result.err("Mastering helper did not return a bounded report; workspace retained")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(value)=>value,none=>{return result.err("Mastering helper report is not UTF-8")}}
+ result.ok(try protocol.Report_decode(source) map_err codec.describe)}
+pub fn run(request:ref<protocol.Request>)->Outcome effects {alloc,fs.read,fs.write,fs.meta,process,time}{
+ let working:string=string.copy(request.work_directory)
+ if time.monotonic_ns()>=request.deadline_ns{return failure("Mastering deadline reached",working)}
+ if control.cancelled(request.cancel){return failure("Mastering cancelled",working)}
+ match protocol.validate(request){err(message)=>{return failure(message,working)},ok(_)=>{}}
+ match protocol.verify_tool(struct.borrow(struct.borrow(request,field=runtime),field=helper)){err(message)=>{return failure(message,working)},ok(_)=>{}}
+ var format:container.Plan=match planning.make(request){err(message)=>{return failure(message,working)},ok(value)=>value}
+ var i:u64=0
+ loop{if i==array.len(request.pairs){break}
+  let pair:ref<protocol.Pair>=array.borrow(request.pairs,i)
+  if str.view(pair.target)!=str.view(pair.reference){match container.preflight_file(pair.output,format){err(message)=>{return failure(message,working)},ok(_)=>{}}}
+  i+=1}
+ let raw:string=match protocol.Request_encode(request){ok(value)=>value,err(_)=>{return failure("Cannot encode mastering request",working)}}
+ var selected:protocol.Request=match protocol.Request_decode(raw){ok(value)=>value,err(_)=>{return failure("Cannot copy mastering request",working)}}
+ match files.create_dir(working){err(problem)=>{return failure(text.concat("Cannot create exclusive mastering workspace: ",error(problem)),working)},ok(_)=>{}}
+ selected.work_directory=path.join(working,"helper")
+ let encoded:string=match protocol.Request_encode(selected){ok(value)=>value,err(_)=>{return failure("Cannot encode helper request; workspace retained",working)}}
+ let input:string=path.join(working,"request.json")
+ let output:string=path.join(working,"report.json")
+ match files.write_new_text(input,encoded){err(problem)=>{return failure(error(problem),working)},ok(_)=>{}}
+ var lifetime:child.Lifetime=child.Lifetime{}
+ let argv:array<string>=[string.copy(request.runtime.helper.path),input,string.copy(output)]
+ let executed:result<child.Capture,string>=child.run_observed(argv,working,path.join(working,"helper-log"),output,request.cancel,request.deadline_ns,4194304,lifetime)
+ let capture:child.Capture=match executed{err(message)=>{return Outcome{report:option.none(),capture:option.none(),error:text.concat(message,text.concat("; mastering workspace retained: ",working)),work_directory:string.copy(working),temporary_removed:false,child_close_succeeded:lifetime.quiescent}},ok(value)=>value}
+ var report:protocol.Report=match decode_report(output){err(message)=>{return Outcome{report:option.none(),capture:option.some(capture),error:message,work_directory:string.copy(working),temporary_removed:false}},ok(value)=>value}
+ if capture.code!=0 or report.failed>0{return Outcome{report:option.some(report),capture:option.some(capture),error:text.concat("Mastering failed; completed outputs and diagnostics retained at ",working),work_directory:string.copy(working),temporary_removed:false}}
+ if report.version!=1 or report.completed+report.skipped!=array.len(request.pairs) or array.len(report.rows)!=array.len(request.pairs){return Outcome{report:option.some(report),capture:option.some(capture),error:"Mastering helper report count/version differs from accepted request",work_directory:string.copy(working),temporary_removed:false}}
+ let names:array<string>=["helper","request.json","report.json","helper-log.out","helper-log.err"]
+ i=0
+ loop{if i==array.len(names){break}
+  match files.remove(path.join(working,array.get(names,i))){err(problem)=>{return Outcome{report:option.some(report),capture:option.some(capture),error:text.concat("Mastering cleanup incomplete: ",error(problem)),work_directory:string.copy(working),temporary_removed:false}},ok(_)=>{}}
+  i+=1}
+ match files.remove(working){err(problem)=>{return Outcome{report:option.some(report),capture:option.some(capture),error:text.concat("Mastering cleanup incomplete: ",error(problem)),work_directory:string.copy(working),temporary_removed:false}},ok(_)=>{}}
+ report.temporary_removed=true
+ Outcome{report:option.some(report),capture:option.some(capture),error:"",work_directory:string.copy(working),temporary_removed:true,child_close_succeeded:lifetime.quiescent}}

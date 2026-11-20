@@ -1,0 +1,41 @@
+module stemair.sound_file_runtime
+import "../toolkit/rate_filter.ai" as filter
+import std.sndfile as sound
+import std.files as files
+import std.path as path
+import std.codec as codec
+import std.json as json
+import std.system as system
+
+fn document(root:str,file:str)->result<json.Document,string> effects {alloc,fs.read} {
+ let raw:bytes=match files.read_limited(path.join(root,file),16384){ok(value)=>value,err(_)=>{return result.err("The recording sample runtime identity is unavailable")}}
+ let content:str=match str.from_bytes(bytes.view(raw)){some(value)=>value,none=>{return result.err("The recording sample runtime identity must be UTF-8")}}
+ match json.parse(content){ok(value)=>result.ok(value),err(_)=>result.err("The recording sample runtime identity is invalid")}
+}
+pub fn decoder(root:str,file:str)->result<option<sound.Tool>,string> effects {alloc,env,fs.read} {
+ if str.len(file)==0{return result.ok(option.none())}
+ if not path.is_absolute(file){return result.err("Choose an absolute sound-file decoder library path")}
+ var data:json.Document=try document(root,"licenses/sound-file-source.json")
+ let policy:codec.Policy=codec.Policy{reject_unknown:false,reject_duplicates:true}
+ var reader:codec.Reader=codec.root_reader(policy)
+ if (try codec.u64_field(data,reader,"version") map_err codec.describe)!=1{return result.err("The sound-file decoder identity version is unsupported")}
+ var platform:codec.Reader=try codec.object_field(data,reader,if system.platform()=="windows"{"windows"}else{"linux"},policy) map_err codec.describe
+ let sha:string=try codec.text_field(data,platform,"sha256") map_err codec.describe
+ let version:string=try codec.text_field(data,platform,"version_string") map_err codec.describe
+ let wide:bool=try codec.bool_field(data,platform,"wide_paths") map_err codec.describe
+ let _=try codec.reader_finish(data,platform) map_err codec.describe
+ let _=try codec.reader_finish(data,reader) map_err codec.describe
+ result.ok(option.some(sound.Tool{path:string.copy(file),sha256:sha,version:version,wide_paths:wide}))
+}
+pub fn rate_filter(root:str)->result<filter.Asset,string> effects {alloc,fs.read} {
+ var data:json.Document=try document(root,"licenses/rate-filter-source.json")
+ var reader:codec.Reader=codec.root_reader(codec.Policy{reject_unknown:false,reject_duplicates:true})
+ if (try codec.u64_field(data,reader,"version") map_err codec.describe)!=1{return result.err("The recording rate-filter identity version is unsupported")}
+ let id:string=try codec.text_field(data,reader,"id") map_err codec.describe
+ let file:string=try codec.text_field(data,reader,"file") map_err codec.describe
+ let count:u64=try codec.u64_field(data,reader,"bytes") map_err codec.describe
+ let sha:string=try codec.text_field(data,reader,"sha256") map_err codec.describe
+ let _=try codec.reader_finish(data,reader) map_err codec.describe
+ if id!="rate-filter-v1" or file!="assets/rate-filter-v1.npz" or count==0 or count>4194304 or str.len(sha)!=64{return result.err("The recording rate-filter identity is unsupported")}
+ result.ok(filter.Asset{path:path.join(root,file),sha256:sha,max_archive_bytes:4194304,max_values:500000,max_header_bytes:1024})
+}

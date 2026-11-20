@@ -1,0 +1,412 @@
+module stemair.hybrid.device
+import "network.ai" as network
+import "residual.ai" as residual
+import "spectral.ai" as spectral
+import "frontend.ai" as retained
+import "../device_ops.ai" as ops
+import "../ops.ai" as host
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "../recurrent_vendor.ai" as recurrent_vendor
+import "../recurrent.ai" as recurrent_layers
+import std.tensor as tensor
+import std.compute as compute
+import std.float as fp
+import std.text as text
+import "multi_layout.ai" as multi
+import "multi_device.ai" as bands
+
+// Optional bounded observers receive host copies; absent observers materialize
+// no additional tensors. The callback owns recording policy, not graph math.
+pub type Observer<O>=struct{callback:option<fn(ref<O>,str,view<u64>,view<f32>)->result<unit,string> effects {alloc}>}
+pub type Frontend=struct{retained:option<retained.State>}
+// Startup-only population from already resident host parameters. Every bound
+// recurrent module gets one immutable vendor snapshot, reused by all forwards.
+pub fn prepare_recurrent(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>,state:ref<ops.ExecutionState>,packed_limit:u64,workspace_limit:u64)->result<unit,string> effects {alloc,gpu} {
+ match state.recurrence{some(_)=>{return result.err("Retained recurrence was already prepared")},none=>{}}
+ var bank:recurrent_vendor.State=recurrent_vendor.empty(workspace_limit)
+ var i:u64=0
+ loop{if i==array.len(n.residuals){break}
+  let block:ref<residual.Block>=array.borrow(n.residuals,i)
+  var j:u64=0
+  loop{if j==array.len(block.branches){break}
+   match array.borrow(block.branches,j).recurrence{some(r)=>{
+    let layers:array<recurrent_layers.Bidirectional>=[r.first,r.second]
+    let _=try recurrent_vendor.prepare(bank,context,stream,struct.borrow(n,field=weights),array.view(layers),packed_limit)
+   },none=>{}}
+   j+=1}
+  i+=1}
+ if bank.packs==0{return result.err("No bound recurrent modules to prepare")}
+ state.recurrence=option.some(bank)
+ result.ok(())
+}
+fn observe_host<O>(observer:ref<Observer<O>>,observations:ref<O>,name:str,shape:view<u64>,values:view<f32>)->result<unit,string> effects {alloc} {
+ match observer.callback{none=>result.ok(()),some(invoke)=>invoke(observations,name,shape,values)}
+}
+fn observe_tensor<O>(stream:ref<GpuStream>,observer:ref<Observer<O>>,observations:ref<O>,name:str,value:ref<tensor.Tensor>)->result<unit,string> effects {alloc,gpu} {
+ match observer.callback{none=>result.ok(()),some(invoke)=>{
+  let values:array<f32>=try tensor.to_f32(stream,value) map_err ops.error
+  invoke(observations,name,array.view(value.dimensions),array.view(values))}}
+}
+fn observe_stage<O>(stream:ref<GpuStream>,observer:ref<Observer<O>>,observations:ref<O>,base:str,index:u64,value:ref<tensor.Tensor>)->result<unit,string> effects {alloc,gpu} {
+ match observer.callback{none=>result.ok(()),some(_)=>{
+  let name:string=text.concat(base,string.from_int(index))
+  observe_tensor(stream,observer,observations,name,value)}}
+}
+fn observe_stat<O>(observer:ref<Observer<O>>,observations:ref<O>,name:str,value:f32)->result<unit,string> effects {alloc} {
+ match observer.callback{none=>result.ok(()),some(invoke)=>{
+  let shape:array<u64>=[1]
+  let values:array<f32>=[value]
+  invoke(observations,name,array.view(shape),array.view(values))}}
+}
+
+pub type Normalized=struct{values:array<f32>,mean:f32,deviation:f32}
+pub fn normalized(input:view<f32>)->result<Normalized,string> effects {alloc} {
+ if view.len(input)<2 or not num.finite(input){return result.err("Invalid hybrid normalization input")}
+ var sum:f64=0.0
+ var i:u64=0
+ loop{if i==view.len(input){break}
+  sum+=cast.float(view.get(input,i))
+  i+=1}
+ let mean64:f64=sum/cast.float(view.len(input))
+ let mean:f32=cast.float(mean64)
+ var variance:f64=0.0
+ i=0
+ loop{if i==view.len(input){break}
+  let value:f64=cast.float(view.get(input,i))
+  let delta:f64=value-mean64
+  variance+=delta*delta
+  i+=1}
+ let deviation:f32=cast.float(fp.sqrt(variance/cast.float(view.len(input)-1)))
+ let denominator:f32=deviation+0.00001
+ var output:array<f32>=[]
+ array.reserve(output,view.len(input))
+ i=0
+ loop{if i==view.len(input){break}
+  array.push(output,(view.get(input,i)-mean)/denominator)
+  i+=1}
+ result.ok(Normalized{values:output,mean:mean,deviation:deviation})
+}
+fn right_pad(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,stride:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let length:u64=array.get(x.dimensions,3)
+ if length%stride==0{return result.ok(try tensor.view(x) map_err ops.error)}
+ let target:u64=length+stride-length%stride
+ let rows:u64=array.get(x.dimensions,0)*array.get(x.dimensions,1)
+ let shape:array<u64>=[array.get(x.dimensions,0),array.get(x.dimensions,1),1,target]
+ var output:tensor.Tensor=try tensor.zeros(context,stream,array.view(shape),tensor.DType.F32) map_err ops.error
+ let flat_input:array<u64>=[rows*length]
+ let flat_output:array<u64>=[rows*target]
+ var input_flat:tensor.Tensor=try tensor.reshape(x,array.view(flat_input)) map_err ops.error
+ var output_flat:tensor.Tensor=try tensor.reshape(output,array.view(flat_output)) map_err ops.error
+ var row:u64=0
+ loop{if row==rows{break}
+  var source:tensor.Tensor=try tensor.narrow(input_flat,0,row*length,length) map_err ops.error
+  var destination:tensor.Tensor=try tensor.narrow(output_flat,0,row*target,length) map_err ops.error
+  let _=try tensor.copy_d2d_async(stream,source,destination) map_err ops.error
+  row+=1}
+ result.ok(output)
+}
+fn norm(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,form:option<ops.Normalization>,state:ref<ops.ExecutionState>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ match form{some(n)=>ops.normalize_with_execution(context,stream,parameters,x,n,state),none=>result.ok(try tensor.view(x) map_err ops.error)}
+}
+fn branch_observed<N,O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,x:ref<tensor.Tensor>,index:u64,frequency:bool,cancel:str,state:ref<ops.ExecutionState>,observer:ref<Observer<O>>,observations:ref<O>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ let batch:u64=array.get(x.dimensions,0)
+ let channels:u64=array.get(x.dimensions,1)
+ let frequencies:u64=array.get(x.dimensions,2)
+ let time:u64=array.get(x.dimensions,3)
+ var y:tensor.Tensor=try tensor.view(x) map_err ops.error
+ if frequency{
+  y=try ops.transpose(context,stream,y,[0,2,1,3])
+  let shape:array<u64>=[batch*frequencies,channels,1,time]
+  y=try tensor.reshape(y,array.view(shape)) map_err ops.error}
+ var nested:residual.Observer<O>=residual.Observer<O>{callback:observer.callback}
+ y=try residual.forward_observed(context,stream,parameters,struct.borrow(n,field=weights),array.borrow(n.residuals,index),y,cancel,state,nested,observations)
+ if frequency{
+  let shape:array<u64>=[batch,frequencies,channels,time]
+  y=try tensor.reshape(y,array.view(shape)) map_err ops.error
+  y=try ops.transpose(context,stream,y,[0,2,1,3])}
+ result.ok(y)
+}
+fn branch<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,x:ref<tensor.Tensor>,index:u64,frequency:bool,cancel:str,state:ref<ops.ExecutionState>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ var observations:unit=()
+ branch_observed(context,stream,parameters,n,x,index,frequency,cancel,state,observer,observations)
+}
+pub fn encode_observed<N,O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,block:network.Encoder,input:ref<tensor.Tensor>,inject:option<tensor.Tensor> own,cancel:str,state:ref<ops.ExecutionState>,observer:ref<Observer<O>>,observations:ref<O>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var x:tensor.Tensor=try tensor.view(input) map_err ops.error
+ if not block.frequency{x=try right_pad(context,stream,x,block.stride)}
+ var y:tensor.Tensor=try ops.convolution_with_policy(context,stream,parameters,x,block.conv,state.convolution)
+ let _=try observe_tensor(stream,observer,observations,"conv",y)
+ if block.empty{return result.ok(y)}
+ match inject{some(injection)=>{var held:tensor.Tensor=injection
+  y=try ops.add(context,stream,y,held)},none=>{}}
+ let _=try observe_tensor(stream,observer,observations,"inject",y)
+ y=try norm(context,stream,parameters,y,block.norm1,state)
+ let _=try observe_tensor(stream,observer,observations,"norm1",y)
+ y=try ops.gelu_with_execution(context,stream,y,state)
+ let _=try observe_tensor(stream,observer,observations,"gelu",y)
+ match block.residual{some(index)=>{y=try branch_observed(context,stream,parameters,n,y,index,block.frequency,cancel,state,observer,observations)},none=>{}}
+ let _=try observe_tensor(stream,observer,observations,"dconv",y)
+ y=try ops.convolution_with_policy(context,stream,parameters,y,block.rewrite,state.convolution)
+ let _=try observe_tensor(stream,observer,observations,"rewrite",y)
+ y=try norm(context,stream,parameters,y,block.norm2,state)
+ let _=try observe_tensor(stream,observer,observations,"norm2",y)
+ y=try ops.glu(context,stream,y)
+ let _=try observe_tensor(stream,observer,observations,"glu",y)
+ result.ok(y)
+}
+pub fn encode_with_execution<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,block:network.Encoder,input:ref<tensor.Tensor>,inject:option<tensor.Tensor> own,cancel:str,state:ref<ops.ExecutionState>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ var observations:unit=()
+ encode_observed(context,stream,parameters,n,block,input,inject,cancel,state,observer,observations)
+}
+pub fn encode_with_convolution_policy<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,block:network.Encoder,input:ref<tensor.Tensor>,inject:option<tensor.Tensor> own,cancel:str,policy:ops.ConvolutionPolicy)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var state:ops.ExecutionState=ops.current_execution(policy)
+ encode_with_execution(context,stream,parameters,n,block,input,inject,cancel,state)
+}
+pub fn encode<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,block:network.Encoder,input:ref<tensor.Tensor>,inject:option<tensor.Tensor> own,cancel:str)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ encode_with_convolution_policy(context,stream,parameters,n,block,input,inject,cancel,ops.ConvolutionPolicy{})
+}
+pub type Decoded=struct{output:tensor.Tensor,pre:tensor.Tensor}
+pub fn decode_with_execution<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,block:network.Decoder,input:ref<tensor.Tensor>,skip:ref<tensor.Tensor>,length:u64,cancel:str,state:ref<ops.ExecutionState>)->result<Decoded,string> effects {alloc,gpu,fs.meta} {
+ var y:tensor.Tensor=try tensor.view(input) map_err ops.error
+ if not block.empty{
+  y=try ops.add(context,stream,y,skip)
+  y=try ops.convolution_with_policy(context,stream,parameters,y,block.rewrite,state.convolution)
+  y=try norm(context,stream,parameters,y,block.norm1,state)
+  y=try ops.glu(context,stream,y)
+  match block.residual{some(index)=>{y=try branch(context,stream,parameters,n,y,index,block.frequency,cancel,state)},none=>{}}}
+ var z:tensor.Tensor=try ops.convolution_with_policy(context,stream,parameters,y,block.conv,state.convolution)
+ z=try norm(context,stream,parameters,z,block.norm2,state)
+ if block.frequency{
+  if block.pad!=0{z=try ops.slice(context,stream,z,2,block.pad,array.get(z.dimensions,2)-2*block.pad)}
+ }else{z=try ops.slice(context,stream,z,3,block.pad,length)}
+ if not block.last{z=try ops.gelu_with_execution(context,stream,z,state)}
+ result.ok(Decoded{output:z,pre:y})
+}
+pub fn decode_with_convolution_policy<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,block:network.Decoder,input:ref<tensor.Tensor>,skip:ref<tensor.Tensor>,length:u64,cancel:str,policy:ops.ConvolutionPolicy)->result<Decoded,string> effects {alloc,gpu,fs.meta} {
+ var state:ops.ExecutionState=ops.current_execution(policy)
+ decode_with_execution(context,stream,parameters,n,block,input,skip,length,cancel,state)
+}
+pub fn decode<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,block:network.Decoder,input:ref<tensor.Tensor>,skip:ref<tensor.Tensor>,length:u64,cancel:str)->result<Decoded,string> effects {alloc,gpu,fs.meta} {
+ decode_with_convolution_policy(context,stream,parameters,n,block,input,skip,length,cancel,ops.ConvolutionPolicy{})
+}
+pub fn encode_bands(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,level:u64,input:ref<tensor.Tensor>,inject:option<tensor.Tensor> own,cancel:str,state:ref<ops.ExecutionState>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta}{
+ if array.len(array.borrow(n.encoder_bands,level).layers)==0{return encode_with_execution(context,stream,parameters,n,array.get(n.encoder,level),input,inject,cancel,state)}
+ if option.is_some(inject){return result.err("Frequency band encoder cannot accept an injection")}
+ var geometry:array<multi.Band>=try multi.encoder(array.get(input.dimensions,2),array.view(n.constructor.kwargs.multi_freqs),8,4)
+ if array.len(geometry)!=array.len(array.borrow(n.encoder_bands,level).layers){return result.err("Frequency band encoder inventory differs")}
+ var outputs:array<tensor.Tensor>=[]
+ var i:u64=0
+ loop{if i==array.len(geometry){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let span:multi.Band=array.get(geometry,i)
+  var part:tensor.Tensor=try bands.span(context,stream,input,span.start,span.count,span.left,span.right)
+  array.push(outputs,try encode_with_execution(context,stream,parameters,n,array.get(array.borrow(n.encoder_bands,level).layers,i),part,option.none(),cancel,state))
+  i+=1}
+ bands.join(context,stream,outputs)
+}
+pub fn decode_bands(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,level:u64,input:ref<tensor.Tensor>,skip:ref<tensor.Tensor>,length:u64,cancel:str,state:ref<ops.ExecutionState>)->result<Decoded,string> effects {alloc,gpu,fs.meta}{
+ if array.len(array.borrow(n.decoder_bands,level).layers)==0{return decode_with_execution(context,stream,parameters,n,array.get(n.decoder,level),input,skip,length,cancel,state)}
+ if array.get(input.dimensions,2)!=array.get(skip.dimensions,2){return result.err("Frequency band decoder skip differs")}
+ var geometry:array<multi.Band>=try multi.decoder(array.get(input.dimensions,2),array.view(n.constructor.kwargs.multi_freqs))
+ if array.len(geometry)!=array.len(array.borrow(n.decoder_bands,level).layers){return result.err("Frequency band decoder inventory differs")}
+ var outputs:array<tensor.Tensor>=[]
+ var i:u64=0
+ loop{if i==array.len(geometry){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let span:multi.Band=array.get(geometry,i)
+  var part:tensor.Tensor=try bands.span(context,stream,input,span.start,span.count,0,0)
+  var held:tensor.Tensor=try bands.span(context,stream,skip,span.start,span.count,0,0)
+  var block:network.Decoder=array.get(array.borrow(n.decoder_bands,level).layers,i)
+  block.last=true
+  var decoded:Decoded=try decode_with_execution(context,stream,parameters,n,block,part,held,0,cancel,state)
+  var out:tensor.Tensor=struct.replace(decoded,try tensor.view(part) map_err ops.error,field=output)
+  let stride:u64=block.conv.stride_h
+  if i!=0{
+   let _=try bands.overlap(context,stream,array.borrow(outputs,i-1),out,array.borrow(parameters,block.conv.bias),stride)
+   out=try ops.slice(context,stream,out,2,stride,array.get(out.dimensions,2)-stride)}
+  if i+1==array.len(geometry){out=try ops.slice(context,stream,out,2,0,array.get(out.dimensions,2)-stride/2)}
+  if i==0{out=try ops.slice(context,stream,out,2,stride/2,array.get(out.dimensions,2)-stride/2)}
+  array.push(outputs,out)
+  i+=1}
+ var joined:tensor.Tensor=try bands.join(context,stream,outputs)
+ if not array.get(n.decoder,level).last{joined=try ops.gelu_with_execution(context,stream,joined,state)}
+ result.ok(Decoded{output:joined,pre:try tensor.view(input) map_err ops.error})
+}
+pub fn embedding<N>(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<N>,x:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let time:u64=array.get(x.dimensions,3)
+ let frequencies:u64=array.get(x.dimensions,2)
+ let channels:u64=array.get(x.dimensions,1)
+ let values:ref<array<f32>>=struct.borrow(array.borrow(n.weights.parameters.values,n.embedding),field=values)
+ var columns:array<f32>=[]
+ var channel:u64=0
+ loop{if channel==channels{break}
+  var frequency:u64=0
+  loop{if frequency==frequencies{break}
+   let scaled:f32=array.get(values,frequency*channels+channel)*10.0
+   array.push(columns,scaled*0.2)
+   frequency+=1}
+  channel+=1}
+ let vector_shape:array<u64>=[channels*frequencies]
+ var vector:tensor.Tensor=try tensor.from_f32(context,stream,array.view(columns),array.view(vector_shape),tensor.DType.F32) map_err ops.error
+ let matrix_shape:array<u64>=[time,channels*frequencies]
+ var matrix:tensor.Tensor=try ops.empty(context,array.view(matrix_shape))
+ let _=try compute.broadcast_rows(stream,vector,matrix) map_err ops.error
+ let shape:array<u64>=[1,time,channels,frequencies]
+ var expanded:tensor.Tensor=try tensor.reshape(matrix,array.view(shape)) map_err ops.error
+ var arranged:tensor.Tensor=try ops.transpose(context,stream,expanded,[0,2,3,1])
+ ops.add(context,stream,x,arranged)
+}
+pub fn forward_observed_with_frontend<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,frontend:ref<Frontend>,observer:ref<Observer<O>>,observations:ref<O>)->result<host.Tensor,string> effects {alloc,gpu,fs.meta} {
+ let cac:bool=n.constructor.kwargs.cac
+ let sources:u64=array.len(n.constructor.kwargs.sources)
+ let output_channels:u64=2*sources
+ let complex_channels:u64=4*sources
+ let frequency_channels:u64=if cac{4}else{2}
+ let estimated_channels:u64=frequency_channels*sources
+ if tensor.rank(input)!=4 or input.dtype!=tensor.DType.F32 or array.get(input.dimensions,0)!=1 or array.get(input.dimensions,1)!=2 or array.get(input.dimensions,2)!=1{
+  return result.err("Invalid hybrid waveform tensor")}
+ let length:u64=array.get(input.dimensions,3)
+ if length==0 or length>16711680{return result.err("Invalid hybrid waveform extent")}
+ let original:array<f32>=try tensor.to_f32(stream,input) map_err ops.error
+ let _=try observe_host(observer,observations,"input",array.view(input.dimensions),array.view(original))
+ var interleaved:array<f32>=[]
+ var i:u64=0
+ loop{if i==length{break}
+  array.push(interleaved,array.get(original,i))
+  array.push(interleaved,array.get(original,length+i))
+  i+=1}
+ match frontend.retained{none=>{},some(f)=>{
+  if f.geometry.length!=length or f.geometry.n!=n.spectral.base.n or f.geometry.hop!=n.spectral.base.hop or f.geometry.old!=n.spectral.old{
+   return result.err("Retained frontend does not match current hybrid geometry")}
+  let window_shape:array<u64>=[f.geometry.n]
+  let _=try observe_host(observer,observations,"analysis-window",array.view(window_shape),array.view(f.window))}}
+ var spectrum:host.Tensor=match frontend.retained{
+  none=>try spectral.analyze(struct.borrow(n,field=spectral),array.view(interleaved),2),
+  some(f)=>try retained.analyze(f,context,stream,array.view(original))}
+ var magnitude_state:option<retained.Magnitude>=option.none()
+ var magnitude_values:array<f32>=[]
+ if not cac{match frontend.retained{none=>{return result.err("Magnitude GPU frontend was not prepared")},some(f)=>{
+  var held:retained.Magnitude=try retained.magnitude(f,context,stream,spectrum)
+  magnitude_values=struct.replace(held,[],field=values)
+  magnitude_state=option.some(held)}}}
+ var frequency_norm:Normalized=if cac{match frontend.retained{
+  none=>try normalized(array.view(spectrum.data)),some(f)=>{
+   var value:retained.Normalized=try retained.normalize(f,context,stream,array.view(spectrum.data))
+   Normalized{values:struct.replace(value,[],field=values),mean:value.mean,deviation:value.deviation}}}}else{match frontend.retained{none=>{return result.err("Magnitude GPU frontend was not prepared")},some(f)=>{
+  var value:retained.Normalized=try retained.normalize_transposed(f,context,stream,array.view(magnitude_values),2,spectrum.h,spectrum.w)
+  Normalized{values:struct.replace(value,[],field=values),mean:value.mean,deviation:value.deviation}}}}
+ var time_norm:Normalized=match frontend.retained{
+  none=>try normalized(array.view(original)),some(f)=>{
+   var value:retained.Normalized=try retained.normalize(f,context,stream,array.view(original))
+   Normalized{values:struct.replace(value,[],field=values),mean:value.mean,deviation:value.deviation}}}
+ let frequency_shape:array<u64>=[1,frequency_channels,spectrum.h,spectrum.w]
+ let analysis_shape:array<u64>=[1,4,spectrum.h,spectrum.w]
+ let time_shape:array<u64>=[1,2,1,length]
+ let _=try observe_host(observer,observations,"analysis",array.view(analysis_shape),array.view(spectrum.data))
+ match frontend.retained{none=>{},some(_)=>{
+  let _=try observe_stat(observer,observations,"frequency-mean",frequency_norm.mean)
+  let _=try observe_stat(observer,observations,"frequency-deviation",frequency_norm.deviation)
+  let _=try observe_stat(observer,observations,"time-mean",time_norm.mean)
+  let _=try observe_stat(observer,observations,"time-deviation",time_norm.deviation)}}
+ let _=try observe_host(observer,observations,"frequency-normalized",array.view(frequency_shape),array.view(frequency_norm.values))
+ let _=try observe_host(observer,observations,"time-normalized",array.view(time_shape),array.view(time_norm.values))
+ var x:tensor.Tensor=try tensor.from_f32(context,stream,array.view(frequency_norm.values),array.view(frequency_shape),tensor.DType.F32) map_err ops.error
+ var xt:tensor.Tensor=try tensor.from_f32(context,stream,array.view(time_norm.values),array.view(time_shape),tensor.DType.F32) map_err ops.error
+ var saved:array<tensor.Tensor>=[]
+ var saved_time:array<tensor.Tensor>=[]
+ var lengths:array<u64>=[]
+ var time_lengths:array<u64>=[]
+ i=0
+ loop{if i==6{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  array.push(lengths,array.get(x.dimensions,3))
+  var inject:option<tensor.Tensor>=option.none()
+  if i<5{
+   array.push(time_lengths,array.get(xt.dimensions,3))
+   let block:network.Encoder=array.get(n.tencoder,i)
+   xt=try encode_with_execution(context,stream,parameters,n,block,xt,option.none(),cancel,state)
+   let _=try observe_stage(stream,observer,observations,"time-encoder-",i,xt)
+   if block.empty{inject=option.some(try tensor.view(xt) map_err ops.error)}else{
+    array.push(saved_time,try tensor.view(xt) map_err ops.error)}}
+  x=try encode_bands(context,stream,parameters,n,i,x,inject,cancel,state)
+  let _=try observe_stage(stream,observer,observations,"frequency-encoder-",i,x)
+  if i==0{x=try embedding(context,stream,n,x)
+   let _=try observe_tensor(stream,observer,observations,"embedding",x)}
+  array.push(saved,try tensor.view(x) map_err ops.error)
+  i+=1}
+ x=try tensor.zeros(context,stream,array.view(x.dimensions),tensor.DType.F32) map_err ops.error
+ i=6
+ loop{if i==0{break}
+  i-=1
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var skip:tensor.Tensor=match array.pop(saved){some(v)=>v,none=>{return result.err("Missing hybrid skip")}}
+  let saved_length:u64=match array.pop(lengths){some(v)=>v,none=>{return result.err("Missing hybrid extent")}}
+  var decoded:Decoded=try decode_bands(context,stream,parameters,n,i,x,skip,saved_length,cancel,state)
+  x=struct.replace(decoded,try tensor.view(x) map_err ops.error,field=output)
+  let _=try observe_stage(stream,observer,observations,"frequency-decoder-",i,x)
+  if i<5{
+   let block:network.Decoder=array.get(n.tdecoder,i)
+   let time_length:u64=match array.pop(time_lengths){some(v)=>v,none=>{return result.err("Missing hybrid time extent")}}
+   if block.empty{
+    var pre:tensor.Tensor=struct.replace(decoded,try tensor.view(xt) map_err ops.error,field=pre)
+    var unused_skip:tensor.Tensor=try tensor.view(pre) map_err ops.error
+    var time_decoded:Decoded=try decode_with_execution(context,stream,parameters,n,block,pre,unused_skip,time_length,cancel,state)
+    xt=struct.replace(time_decoded,try tensor.view(xt) map_err ops.error,field=output)
+    let _=try observe_stage(stream,observer,observations,"time-decoder-",i,xt)
+   }else{
+    var time_skip:tensor.Tensor=match array.pop(saved_time){some(v)=>v,none=>{return result.err("Missing hybrid time skip")}}
+    var time_decoded:Decoded=try decode_with_execution(context,stream,parameters,n,block,xt,time_skip,time_length,cancel,state)
+    xt=struct.replace(time_decoded,try tensor.view(xt) map_err ops.error,field=output)
+    let _=try observe_stage(stream,observer,observations,"time-decoder-",i,xt)}}}
+ let frequency_output:array<f32>=try tensor.to_f32(stream,x) map_err ops.error
+ let time_output:array<f32>=try tensor.to_f32(stream,xt) map_err ops.error
+ var estimates:host.Tensor=host.tensor(estimated_channels,spectrum.h,spectrum.w,num.copy(array.view(frequency_output)))
+ i=0
+ loop{if i==array.len(estimates.data){break}
+  array.set(estimates.data,i,array.get(estimates.data,i)*frequency_norm.deviation+frequency_norm.mean)
+  i+=1}
+ var complex:host.Tensor=if cac{estimates}else{match frontend.retained{none=>{return result.err("Magnitude GPU frontend was not prepared")},some(f)=>{match magnitude_state{none=>{return result.err("Magnitude GPU mixture is missing")},some(held)=>{try retained.reconstruct(f,context,stream,held,estimates,sources)}}}}}
+ let complex_shape:array<u64>=[1,complex_channels,spectrum.h,spectrum.w]
+ let _=try observe_host(observer,observations,"restored-spectrum",array.view(complex_shape),array.view(complex.data))
+ let inverse:array<f32>=match frontend.retained{
+  none=>try spectral.synthesize(struct.borrow(n,field=spectral),complex,length),
+  some(f)=>try retained.synthesize(f,context,stream,complex)}
+ let inverse_shape:array<u64>=[length,output_channels]
+ let _=try observe_host(observer,observations,"inverse-interleaved",array.view(inverse_shape),array.view(inverse))
+ var output:array<f32>=num.zeros(output_channels*length)
+ var channel:u64=0
+ loop{if channel==output_channels{break}
+  i=0
+  loop{if i==length{break}
+   let wave:f32=array.get(time_output,channel*length+i)*time_norm.deviation+time_norm.mean
+   array.set(output,channel*length+i,wave+array.get(inverse,i*output_channels+channel))
+   i+=1}
+  channel+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite hybrid output")}
+ let output_shape:array<u64>=[1,output_channels,1,length]
+ let _=try observe_host(observer,observations,"output",array.view(output_shape),array.view(output))
+ result.ok(host.tensor(output_channels,1,length,output))
+}
+pub fn forward_observed<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,observer:ref<Observer<O>>,observations:ref<O>)->result<host.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var frontend:Frontend=Frontend{retained:option.none()}
+ forward_observed_with_frontend(context,stream,parameters,n,input,cancel,state,frontend,observer,observations)
+}
+pub fn forward_with_frontend(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,frontend:ref<Frontend>)->result<host.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observations:unit=()
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ forward_observed_with_frontend(context,stream,parameters,n,input,cancel,state,frontend,observer,observations)
+}
+pub fn forward_with_execution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>)->result<host.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observations:unit=()
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ forward_observed(context,stream,parameters,n,input,cancel,state,observer,observations)
+}
+pub fn forward_with_convolution_policy(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,policy:ops.ConvolutionPolicy)->result<host.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var state:ops.ExecutionState=ops.current_execution(policy)
+ forward_with_execution(context,stream,parameters,n,input,cancel,state)
+}
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<host.Tensor,string> effects {alloc,gpu,fs.meta} {
+ forward_with_convolution_policy(context,stream,parameters,n,input,cancel,ops.ConvolutionPolicy{})
+}

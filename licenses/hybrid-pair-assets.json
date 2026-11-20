@@ -1,0 +1,9 @@
+{
+  "model": "hybrid-pair-v1",
+  "filename": "hybrid-pair-v1.th",
+  "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/ebf34a2db.th",
+  "bytes": 167390507,
+  "sha256": "dbdd521017d706829716055df8a86e7ee5d05a590508488c82ffb551c6edb918",
+  "credit": "Demucs by Alexandre Defossez, Facebook AI Research and Meta Platforms; public model distribution by TRvlvr",
+  "license": "MIT; hybrid-MIT.txt"
+}

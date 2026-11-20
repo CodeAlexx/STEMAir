@@ -1,0 +1,9 @@
+{
+  "model": "hybrid-v1",
+  "filename": "hybrid-v1.th",
+  "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/fa0cb7f9-100d8bf4.th",
+  "bytes": 167405675,
+  "sha256": "100d8bf4dc5e228edfd9bb7a2ec44ad9f44d8f0a845964d38ee8c11ea8ca1399",
+  "credit": "Demucs by Alexandre Defossez, Facebook AI Research and Meta Platforms",
+  "license": "MIT; waveform-MIT.txt and hybrid-MIT.txt"
+}

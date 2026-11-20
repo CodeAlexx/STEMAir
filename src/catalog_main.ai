@@ -1,0 +1,76 @@
+module stemair.catalog_main
+import "model_catalog.ai" as catalog
+import "../toolkit/asset_acquisition.ai" as acquisition
+import std.codec as codec
+import std.files as files
+import std.path as path
+
+fn state_name(value:catalog.Presence)->str effects {} {
+ match value{Missing=>"missing",PresentUnverified=>"present-unverified",Verified=>"verified",Invalid=>"invalid"}
+}
+fn list(entries:ref<array<catalog.Entry>>,directory:str)->result<string,string> effects {alloc,fs.read,fs.meta} {
+ var out:codec.Writer=codec.writer()
+ codec.begin_array(out)
+ var i:u64=0
+ loop{if i==array.len(entries){break}
+  let item:ref<catalog.Entry>=array.borrow(entries,i)
+  let asset:ref<acquisition.Asset>=struct.borrow(item,field=asset)
+  codec.begin_object(out)
+  codec.field_text(out,"profile",item.profile)
+  codec.field_text(out,"configuration",item.configuration)
+  codec.field_text(out,"manifest",item.manifest)
+  codec.field_text(out,"filename",asset.filename)
+  codec.field_text(out,"url",asset.url)
+  codec.field_text(out,"sha256",asset.sha256)
+  codec.field_u64(out,"bytes",asset.bytes)
+  codec.field_text(out,"credit",item.credit)
+  codec.field_text(out,"state",state_name(catalog.presence(item,directory,false)))
+  codec.end_object(out)
+  i+=1}
+ codec.end_array(out)
+ let encoded:string=try codec.finish(out) map_err codec.describe
+ result.ok(encoded)
+}
+fn run(args:view<str>)->result<string,string> effects {alloc,fs.read,fs.write,fs.meta,net,random,time} {
+ let operation:str=view.get(args,1)
+ let root:str=view.get(args,2)
+ if (operation=="list" and view.len(args)>4) or (operation=="verify" and view.len(args)>5){return result.err("Too many arguments for this catalog action")}
+ var entries:array<catalog.Entry>=try catalog.load(root)
+ if operation=="list"{
+  let directory:string=if view.len(args)==4{string.copy(view.get(args,3))}else{path.join(root,"assets")}
+  return list(entries,directory)}
+ if operation!="verify" and operation!="acquire"{return result.err("Unknown catalog action")}
+ if view.len(args)<4{return result.err("Choose an admitted profile")}
+ let selected:u64=match catalog.find(entries,view.get(args,3)){some(v)=>v,none=>{return result.err("Profile is not admitted by this application")}}
+ let item:ref<catalog.Entry>=array.borrow(entries,selected)
+ let directory:string=if view.len(args)>=5{string.copy(view.get(args,4))}else{path.join(root,"assets")}
+ if operation=="verify"{
+  var dependency:u64=0
+  loop{if dependency==array.len(item.dependencies){break}
+   let asset:ref<acquisition.Asset>=array.borrow(item.dependencies,dependency)
+   let _=try acquisition.verify(asset,path.join(directory,asset.filename))
+   dependency+=1}
+  let target:string=path.join(directory,item.asset.filename)
+  let _=try acquisition.verify(struct.borrow(item,field=asset),target)
+  return result.ok("Verified pinned model asset")}
+ let _=match files.mkdirs(directory){ok(_)=>(),err(_)=>{return result.err("Cannot create the selected asset directory")}}
+ let cancel:string=if view.len(args)>=6{string.copy(view.get(args,5))}else{""}
+ let progress:string=if view.len(args)>=7{string.copy(view.get(args,6))}else{""}
+ var settings:acquisition.Options=acquisition.Options{}
+ var dependency:u64=0
+ loop{if dependency==array.len(item.dependencies){break}
+  let _=try acquisition.acquire(array.borrow(item.dependencies,dependency),directory,settings,cancel,progress)
+  dependency+=1}
+ let report:acquisition.Report=try acquisition.acquire(struct.borrow(item,field=asset),directory,settings,cancel,progress)
+ let encoded:string=try acquisition.Report_encode(report) map_err codec.describe
+ result.ok(encoded)
+}
+pub fn main(args:view<str>)->i32 effects {alloc,fs.read,fs.write,fs.meta,net,random,time,io.write} {
+ if view.len(args)<3 or view.len(args)>7{io.ewrite("Usage: stem-catalog list ROOT [ASSET_DIRECTORY] | verify ROOT PROFILE [ASSET_DIRECTORY] | acquire ROOT PROFILE [ASSET_DIRECTORY] [CANCEL_FILE] [PROGRESS_FILE]\n")
+  return 2}
+ match run(args){ok(output)=>{io.write(output)
+  io.write("\n")
+  0},err(problem)=>{io.ewrite(problem)
+  io.ewrite("\n")
+  1}}
+}

@@ -1,0 +1,14 @@
+{
+  "engine": "hybrid",
+  "generation": 1,
+  "sample_rate": 44100,
+  "split": true,
+  "shift_offsets": [],
+  "targets": [
+    "instrumental",
+    "vocals"
+  ],
+  "segment_samples": 0,
+  "overlap": 0.25,
+  "transition_power": 1
+}

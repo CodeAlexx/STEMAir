@@ -1,0 +1,26 @@
+module stemair.audio_result
+
+// Model results retain their actual scalar precision through processing.
+// Only one owned array is active; conversion at a consumer must be explicit.
+pub type Precision=enum{Float32,Float64}
+pub type Samples=struct{precision:Precision,single:array<f32>,wide:array<f64>}
+pub fn from_single(values:array<f32> own)->Samples effects {alloc} {
+ Samples{precision:Precision.Float32,single:values,wide:[]}
+}
+pub fn from_wide(values:array<f64> own)->Samples effects {alloc} {
+ Samples{precision:Precision.Float64,single:[],wide:values}
+}
+pub fn count(samples:ref<Samples>)->u64 effects {} {
+ if samples.precision==Precision.Float32{array.len(samples.single)}else{array.len(samples.wide)}
+}
+pub fn validate(samples:ref<Samples>)->result<unit,string> effects {alloc} {
+ if (samples.precision==Precision.Float32 and array.len(samples.wide)!=0) or
+  (samples.precision==Precision.Float64 and array.len(samples.single)!=0){return result.err("Audio result has inactive sample storage")}
+ result.ok(())
+}
+pub fn take_single(samples:Samples own)->result<array<f32>,string> effects {alloc} {
+ var owned:Samples=samples
+ let _=try validate(owned)
+ if owned.precision!=Precision.Float32{return result.err("Audio result requires Float64 processing")}
+ result.ok(struct.replace(owned,[],field=single))
+}

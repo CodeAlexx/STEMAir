@@ -1,0 +1,129 @@
+module stemair.model_catalog
+import "../toolkit/asset_acquisition.ai" as acquisition
+import std.files as files
+import std.path as path
+import std.codec as codec
+import std.json as json
+import std.text as text
+
+pub type Entry=struct{profile:string,configuration:string,manifest:string,credit:string,asset:acquisition.Asset,dependencies:array<acquisition.Asset>}
+pub type Presence=enum{Missing,PresentUnverified,Verified,Invalid}
+pub fn profiles()->array<string> effects {alloc} {
+ ["spectral-v1","exchange-v1","mask-v1","mask-recurrent-v1","waveform-v1","waveform-v2","temporal-v1","temporal-v2","hybrid-v1","attention-v1","backing-v1","mask-small-v1","attention-six-v1","attention-tuned-v1","spectral-alt-v1","mask-wide-v1","residual-waveform-v1","residual-packed-v1","waveform-wide-v1","waveform-standard-v2","waveform-small-v2","hybrid-pair-v1","recording-attention-v1","recording-attention-six-v1","recording-tuned-v1","recording-repro-v1","recording-time-v1","recording-hybrid-v1","recording-mixed-v1","recording-mixed-packed-v1","recording-extra-v1","recording-extra-packed-v1","recording-mmi-v1","recording-pair-v1"]
+}
+pub fn supported(profile:str)->bool effects {alloc} {
+ let known:array<string>=profiles()
+ var i:u64=0
+ loop{if i==array.len(known){break}
+  if array.get(known,i)==profile{return true}
+  i+=1}
+ false
+}
+// These complete recording recipes apply accepted segment/shift controls to
+// their ordered members. Existing checkpoint-profile labels stay unchanged.
+pub fn label(profile:str)->string effects {alloc}{
+ if profile=="recording-attention-v1"{return "Recording model, configurable segment (4 stems)"}
+ if profile=="recording-attention-six-v1"{return "Recording model, configurable segment (6 stems)"}
+ if profile=="recording-tuned-v1"{return "Recording ensemble, tuned (4 models)"}
+ if profile=="recording-repro-v1"{return "Recording ensemble, mixed (4 models)"}
+ if profile=="recording-time-v1"{return "Recording ensemble, time (4 positions)"}
+ if profile=="recording-hybrid-v1"{return "Recording ensemble, hybrid (4 positions)"}
+ if profile=="recording-mixed-v1"{return "Recording ensemble, weighted"}
+ if profile=="recording-mixed-packed-v1"{return "Recording ensemble, weighted packed"}
+ if profile=="recording-extra-v1"{return "Recording ensemble, extra"}
+ if profile=="recording-extra-packed-v1"{return "Recording ensemble, extra packed"}
+ if profile=="recording-mmi-v1"{return "Recording model, alternate"}
+ if profile=="recording-pair-v1"{return "Recording model, paired stems"}
+ string.copy(profile)
+}
+fn read_manifest(root:str,name:str)->result<option<Entry>,string> effects {alloc,fs.read,fs.meta} {
+ let manifest:string=path.join("licenses",name)
+ let content:bytes=match files.read_limited(path.join(root,manifest),65536){ok(v)=>v,err(_)=>{return result.err("Cannot read a bounded model asset manifest")}}
+ let raw:str=match str.from_bytes(bytes.view(content)){some(v)=>v,none=>{return result.err("Asset manifest is not UTF-8")}}
+ var document:json.Document=match json.parse(raw){ok(v)=>v,err(_)=>{return result.err("Asset manifest is not valid JSON")}}
+ var reader:codec.Reader=codec.root_reader(codec.Policy{reject_unknown:false,reject_duplicates:true})
+ let profile:string=try codec.text_field(document,reader,"model") map_err codec.describe
+ if not supported(profile){return result.ok(option.none())}
+ let filename:string=try codec.text_field(document,reader,"filename") map_err codec.describe
+ let url:string=try codec.text_field(document,reader,"url") map_err codec.describe
+ let size:u64=try codec.u64_field(document,reader,"bytes") map_err codec.describe
+ let sha:string=try codec.text_field(document,reader,"sha256") map_err codec.describe
+ let credit:string=try codec.text_field(document,reader,"credit") map_err codec.describe
+ let expected:string=path.join("configs",text.concat(profile,".json"))
+ let configuration:string=try codec.text_or(document,reader,"configuration",expected) map_err codec.describe
+ var dependencies:array<acquisition.Asset>=[]
+ if try codec.has_field(document,reader,"dependencies") map_err codec.describe{
+  var items:codec.Items=try codec.items_field(document,reader,"dependencies",codec.strict()) map_err codec.describe
+  loop{match try codec.next_object(document,items) map_err codec.describe{none=>{break},some(row)=>{
+   if array.len(dependencies)>=16{return result.err("Model dependency count exceeds its bound")}
+   let encoded:string=option.unwrap(json.raw(document,codec.node_index(row)))
+   let dependency:acquisition.Asset=try acquisition.Asset_decode(encoded) map_err codec.describe
+   let _=try acquisition.validate(dependency)
+   let dependency_name:str=dependency.filename
+   if dependency_name==str.view(filename){return result.err("A model dependency repeats its primary filename")}
+   var at:u64=0
+   loop{if at==array.len(dependencies){break}
+    if dependency_name==str.view(struct.borrow(array.borrow(dependencies,at),field=filename)){return result.err("Duplicate model dependency filename")}
+    at+=1}
+   array.push(dependencies,dependency)}}}
+ }
+ let _=try codec.reader_finish(document,reader) map_err codec.describe
+ if configuration!=expected{return result.err("Asset configuration does not match its admitted profile")}
+ if not match files.is_file(path.join(root,configuration)){ok(v)=>v,err(_)=>false}{return result.err("Model configuration is unavailable")}
+ let asset:acquisition.Asset=acquisition.Asset{filename:filename,url:url,bytes:size,sha256:sha}
+ let _=try acquisition.validate(asset)
+ result.ok(option.some(Entry{profile:profile,configuration:configuration,manifest:manifest,credit:credit,asset:asset,dependencies:dependencies}))
+}
+pub fn find(entries:ref<array<Entry>>,profile:str)->option<u64> effects {} {
+ var i:u64=0
+ loop{if i==array.len(entries){break}
+  if array.borrow(entries,i).profile==profile{return option.some(i)}
+  i+=1}
+ option.none()
+}
+pub fn load(root:str)->result<array<Entry>,string> effects {alloc,fs.read,fs.meta} {
+ let names:array<string>=match files.list_dir(path.join(root,"licenses")){ok(v)=>v,err(_)=>{return result.err("Model asset manifests are unavailable")}}
+ if array.len(names)>256{return result.err("Asset manifest directory exceeds its entry bound")}
+ var out:array<Entry>=[]
+ var i:u64=0
+ loop{if i==array.len(names){break}
+  let name:str=array.get(names,i)
+  if name=="assets.json" or text.ends_with(name,"-assets.json"){
+   match try read_manifest(root,name){none=>{},some(entry)=>{
+    if option.is_some(find(out,entry.profile)){return result.err("Duplicate admitted model profile in asset manifests")}
+    var old:u64=0
+    loop{if old==array.len(out){break}
+     let previous:ref<Entry>=array.borrow(out,old)
+     let old_asset:ref<acquisition.Asset>=struct.borrow(previous,field=asset)
+     let new_asset:ref<acquisition.Asset>=struct.borrow(entry,field=asset)
+     if str.view(struct.borrow(old_asset,field=filename))==str.view(struct.borrow(new_asset,field=filename)){return result.err("Model assets must have distinct destination filenames")}
+     old+=1}
+    array.push(out,entry)}}}
+  i+=1}
+ let known:array<string>=profiles()
+ if array.len(out)!=array.len(known){return result.err("An admitted model asset manifest is missing")}
+ // Present in the authoritative admitted-profile order, independent of filenames.
+ var sorted:array<Entry>=[]
+ i=0
+ loop{if i==array.len(known){break}
+  let selected:u64=match find(out,array.get(known,i)){some(v)=>v,none=>{return result.err("An admitted model asset manifest is missing")}}
+  array.swap(out,selected,array.len(out)-1)
+  array.push(sorted,option.unwrap(array.pop(out)))
+  i+=1}
+ result.ok(sorted)
+}
+pub fn presence(entry:ref<Entry>,directory:str,verify_identity:bool)->Presence effects {alloc,fs.read,fs.meta} {
+ var i:u64=0
+ loop{if i==array.len(entry.dependencies){break}
+  let observed:Presence=asset_presence(array.borrow(entry.dependencies,i),directory,verify_identity)
+  if observed==Presence.Missing or observed==Presence.Invalid{return observed}
+  i+=1}
+ asset_presence(struct.borrow(entry,field=asset),directory,verify_identity)
+}
+fn asset_presence(asset:ref<acquisition.Asset>,directory:str,verify_identity:bool)->Presence effects {alloc,fs.read,fs.meta} {
+ let file:string=path.join(directory,asset.filename)
+ match files.symlink_metadata(file){err(problem)=>{if problem.code==1{return Presence.Missing}
+  return Presence.Invalid},ok(info)=>{if not info.is_file or info.is_symlink or info.size!=asset.bytes{return Presence.Invalid}}}
+ if not verify_identity{return Presence.PresentUnverified}
+ if result.is_ok(acquisition.verify(asset,file)){Presence.Verified}else{Presence.Invalid}
+}

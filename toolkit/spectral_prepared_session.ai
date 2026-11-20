@@ -1,0 +1,54 @@
+module stemair.spectral_prepared_session
+import "session.ai" as legacy
+import "spectral_host_prepared.ai" as host
+import "config.ai" as config
+import "ops.ai" as ops
+import "chunks.ai" as chunks
+import "numeric.ai" as num
+import "control.ai" as control
+
+pub type Session=struct{base:legacy.Session,prepared:host.Backend,preparations:u64=1}
+pub fn open(checkpoint:str,settings:config.Config own)->result<Session,string> effects {alloc,fs.read} {
+ var c:config.Config=settings
+ var loaded:legacy.Session=try legacy.open(checkpoint,c)
+ let prepared:host.Backend=try host.prepare(struct.borrow(loaded,field=network))
+ result.ok(Session{base:loaded,prepared:prepared})
+}
+pub fn chunk(s:ref<Session>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta} {
+ chunk_loaded(struct.borrow(s,field=base),struct.borrow(s,field=prepared),library,input,cancel)
+}
+pub fn chunk_loaded(s:ref<legacy.Session>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta} {
+ let samples:u64=s.config.hop*(s.config.frames-1)
+ if view.len(input)!=2*samples or not num.finite(input){return result.err("Invalid model chunk waveform")}
+ var silent:bool=true
+ var i:u64=0
+ loop{if i==view.len(input){break}
+  if view.get(input,i)!=0.0{silent=false
+   break}
+  i+=1}
+ if silent{return result.ok(num.zeros(2*array.len(s.config.targets)*samples))}
+ let packed:ops.Tensor=try legacy.analyze(struct.borrow(s,field=plan),input,samples,s.config.frequency_bins,s.config.bands)
+ var predicted:ops.Tensor=try host.forward(struct.borrow(s,field=network),prepared,library,packed,cancel)
+ legacy.synthesize(struct.borrow(s,field=plan),predicted,samples,s.config.frequency_bins,s.config.bands,array.len(s.config.targets))
+}
+pub fn separate(s:ref<Session>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ separate_loaded(struct.borrow(s,field=base),struct.borrow(s,field=prepared),library,input,cancel,progress)
+}
+pub fn separate_loaded(s:ref<legacy.Session>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if view.len(input)==0 or view.len(input)%2!=0 or not num.finite(input){return result.err("Expected finite planar stereo audio")}
+ let samples:u64=view.len(input)/2
+ let p:chunks.Plan=try chunks.plan(samples,s.config.hop*(s.config.frames-1),s.config.overlap)
+ var accumulator:chunks.Accumulator=try chunks.accumulator(p,2*array.len(s.config.targets))
+ var i:u64=0
+ loop{if i==p.count{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  control.report(progress,i,p.count)
+  let part:array<f32>=try chunks.extract_finite(p,input,2,i)
+  let output:array<f32>=try chunk_loaded(s,prepared,library,array.view(part),cancel)
+  let _=try chunks.add(p,accumulator,array.view(output))
+  i+=1}
+ let output:array<f32>=try chunks.finish(p,accumulator)
+ control.report(progress,p.count,p.count)
+ s.requests+=1
+ result.ok(output)
+}

@@ -1,0 +1,350 @@
+module stemair.application
+import "wav_export.ai" as wav
+import "container_export.ai" as container
+import "../toolkit/numeric.ai" as num
+import std.audio as audio
+import std.files as files
+import std.path as path
+import std.text as text
+import std.table as table
+import std.ffmpeg as ffmpeg
+import std.codec as codec
+import "../toolkit/audio_result.ai" as audio_result
+import "../toolkit/typed_source_wave.ai" as typed_source
+
+pub fn recording_error(message:string own)->string effects {alloc} {text.concat("Recording: ",message)}
+
+// Native WAV decoding is immediate. Other codecs and rate conversion compose
+// the shared codec helper; model execution remains in this process.
+pub fn read_recording(input:str,rate:u32,output_directory:str)->result<audio.AudioBuffer,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let size:u64=match files.file_size(input){ok(v)=>v,err(_)=>{return result.err("Cannot read input recording")},}
+ if size==0 or size>2147483648{return result.err("Input recording exceeds the current file-size bound")}
+ match audio.read_wav(input){err(_)=>{},ok(value)=>{
+  var source:audio.AudioBuffer=value
+  if source.rate==rate and (source.channels==1 or source.channels==2){return result.ok(source)}
+ },}
+ let temporary:string=path.join(output_directory,text.concat(text.concat(".stemair-decode-",str.view(string.from_int(time.monotonic_ns()))),".wav"))
+ match files.write_new_bytes(str.view(temporary),b""){ok(_)=>{},err(_)=>{return result.err("Cannot prepare audio conversion in the output folder")},}
+ let decoded:result<audio.AudioBuffer,ffmpeg.Error>=ffmpeg.read_audio_float(input,str.view(temporary),rate,2)
+ let removed:bool=result.is_ok(files.remove(str.view(temporary)))
+ if not removed{return result.err("Cannot remove temporary decoded audio")}
+ match decoded{ok(v)=>result.ok(v),err(_)=>result.err("Cannot decode or resample audio; audio codec tools must be installed for compressed files and sample-rate conversion"),}
+}
+
+fn fail(message:str)->i32 effects {alloc,io.write} {io.ewrite(text.concat(message,"\n"))
+ 1}
+pub fn planar(source:ref<audio.AudioBuffer>,rate:u32)->result<array<f32>,string> effects {alloc} {
+ if source.rate!=rate{return result.err("Input sample rate must match the model; resample before separation")}
+ if source.channels!=1 and source.channels!=2{return result.err("Input must be mono or stereo")}
+ if array.len(source.samples)==0 or not num.finite(array.view(source.samples)){return result.err("Input has no finite audio samples")}
+ let samples:u64=audio.num_frames(source)
+ if samples>158760000{return result.err("Input exceeds the current one-hour memory bound")}
+ var out:array<f32>=[]
+ array.reserve(out,2*samples)
+ var c:u64=0
+ loop{if c>=2{break}
+  var i:u64=0
+  loop{if i>=samples{break}
+   array.push(out,array.get(source.samples,i*cast.wrap(source.channels)+if source.channels==1{0}else{c}))
+   i+=1}
+  c+=1}
+ result.ok(out)
+}
+pub fn output_name(root:str,index:u64)->string effects {alloc} {
+ path.join(root,text.concat(text.concat("source-",str.view(string.from_int(index+1))),".wav"))
+}
+pub fn preflight(root:str,count:u64)->result<unit,string> effects {alloc,fs.meta} {
+ let is_dir:bool=match files.is_dir(root){ok(v)=>v,err(_)=>false,}
+ if not is_dir{return result.err("Output directory must already exist")}
+ var i:u64=0
+ loop{if i>=count{break}
+  match files.exists(output_name(root,i)){ok(exists)=>{if exists{return result.err("An output already exists; choose an empty directory")}},err(_)=>{return result.err("Cannot inspect output directory")},}
+  i+=1}
+ match files.exists(path.join(root,"sources.json")){ok(exists)=>{if exists{return result.err("An output manifest already exists")}},err(_)=>{return result.err("Cannot inspect output manifest")},}
+ result.ok(())
+}
+type Sources=struct{sample_rate:u32,frames:u64,names:array<string>,files:array<string>,backend:string,checkpoint_loads:u64} derive codec(strict)
+type RaggedSources=struct{sample_rate:u32,frames:u64,names:array<string>,files:array<string>,frame_counts:array<u64>,backend:string,checkpoint_loads:u64} derive codec(strict)
+pub fn export_ragged(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,frames:ref<array<u64>>,backend:str,loads:u64)->result<unit,string> effects {alloc,fs.write} {
+ if array.len(targets)==0 or array.len(targets)!=array.len(frames) or not num.finite(values){return result.err("Wrong ragged source extent")}
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(frames){break}
+  let count:u64=array.get(frames,i)
+  if count==0 or count>158760000 or count>(view.len(values)-total)/2{return result.err("Wrong ragged source extent")}
+  total+=2*count
+  i+=1}
+ if total!=view.len(values){return result.err("Wrong ragged source extent")}
+ var names:array<string>=[]
+ var paths:array<string>=[]
+ var extents:array<u64>=[]
+ var offset:u64=0
+ i=0
+ loop{if i==array.len(targets){break}
+  let count:u64=array.get(frames,i)
+  let _=try write_planar(output_name(root,i),rate,view.slice(values,offset,offset+2*count))
+  array.push(names,string.copy(array.get(targets,i)))
+  array.push(paths,text.concat("source-",text.concat(string.from_int(i+1),".wav")))
+  array.push(extents,count)
+  offset+=2*count
+  i+=1}
+ var metadata:RaggedSources=RaggedSources{sample_rate:rate,frames:array.get(frames,0),names:names,files:paths,frame_counts:extents,backend:string.copy(backend),checkpoint_loads:loads}
+ let encoded:string=try RaggedSources_encode(metadata) map_err codec.describe
+ match files.write_new_text(path.join(root,"sources.json"),encoded){ok(_)=>result.ok(()),err(_)=>result.err("Cannot create source manifest; source WAVs remain available")}
+}
+pub fn write_planar(file:str,rate:u32,values:view<f32>)->result<unit,string> effects {alloc,fs.write} {
+ if view.len(values)==0 or view.len(values)%2!=0{return result.err("Wrong output waveform extent")}
+ let samples:u64=view.len(values)/2
+ let interleaved:array<f32>=wav.interleave(values,samples,2)
+ var buffer:audio.AudioBuffer=audio.AudioBuffer{samples:interleaved,rate:rate,channels:2}
+ let encoded:bytes=try audio.encode_wav(buffer,32) map_err audio.message
+ match files.write_new_bytes(file,bytes.view(encoded)){ok(_)=>result.ok(()),err(_)=>result.err("Cannot create source WAV; existing files are preserved")}
+}
+pub fn export(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,samples:u64,backend:str)->result<unit,string> effects {alloc,fs.write} {
+ export_with_loads(root,rate,targets,values,samples,backend,1)
+}
+pub fn export_with_loads(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,samples:u64,backend:str,loads:u64)->result<unit,string> effects {alloc,fs.write} {
+ if view.len(values)!=2*samples*array.len(targets){return result.err("Wrong output waveform extent")}
+ var names:array<string>=[]
+ var paths:array<string>=[]
+ var s:u64=0
+ loop{if s>=array.len(targets){break}
+  let _=try write_planar(output_name(root,s),rate,view.slice(values,2*s*samples,2*(s+1)*samples))
+  array.push(names,string.copy(array.get(targets,s)))
+  array.push(paths,text.concat(text.concat("source-",str.view(string.from_int(s+1))),".wav"))
+  s+=1}
+ var manifest:Sources=Sources{sample_rate:rate,frames:samples,names:names,files:paths,backend:string.copy(backend),checkpoint_loads:loads}
+ let encoded:string=match Sources_encode(manifest){ok(v)=>v,err(_)=>{return result.err("Cannot encode source manifest")},}
+ match files.write_new_text(path.join(root,"sources.json"),str.view(encoded)){ok(_)=>result.ok(()),err(_)=>result.err("Cannot create source manifest; source WAVs remain available"),}
+}
+
+// Opt-in file encoding. Legacy export entry points and their effects stay intact.
+pub fn preflight_as(root:str,count:u64,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.meta} {
+ let _=try preflight(root,count)
+ preflight_source_files(root,count)
+}
+// Also usable for planned nested output directories before their creation.
+pub fn preflight_source_files(root:str,count:u64)->result<unit,string> effects {alloc,fs.meta} {
+ var i:u64=0
+ loop{if i==count{break}
+  let _=try wav.preflight_file(output_name(root,i))
+  i+=1}
+ wav.preflight_file(path.join(root,"sources.json"))
+}
+pub fn write_planar_as(file:str,rate:u32,values:view<f32>,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ wav.write_planar(file,rate,values,kind)
+}
+pub fn export_as(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,samples:u64,backend:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ export_with_loads_as(root,rate,targets,values,samples,backend,1,kind)
+}
+pub fn export_with_loads_as(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,samples:u64,backend:str,loads:u64,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ if array.len(targets)==0 or samples==0 or samples>view.len(values)/2/array.len(targets) or view.len(values)!=2*samples*array.len(targets){return result.err("Wrong output waveform extent")}
+ let _=try preflight_as(root,array.len(targets),kind)
+ var names:array<string>=[]
+ var paths:array<string>=[]
+ var s:u64=0
+ loop{if s==array.len(targets){break}
+  let _=try write_planar_as(output_name(root,s),rate,view.slice(values,2*s*samples,2*(s+1)*samples),kind)
+  array.push(names,string.copy(array.get(targets,s)))
+  array.push(paths,text.concat("source-",text.concat(string.from_int(s+1),".wav")))
+  s+=1}
+ let manifest:Sources=Sources{sample_rate:rate,frames:samples,names:names,files:paths,backend:string.copy(backend),checkpoint_loads:loads}
+ let encoded:string=try Sources_encode(manifest) map_err codec.describe
+ wav.write_metadata(path.join(root,"sources.json"),encoded,kind)
+}
+pub fn export_ragged_as(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,frames:ref<array<u64>>,backend:str,loads:u64,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ if array.len(targets)==0 or array.len(targets)!=array.len(frames) or not num.finite(values){return result.err("Wrong ragged source extent")}
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(frames){break}
+  let count:u64=array.get(frames,i)
+  if count==0 or count>158760000 or count>(view.len(values)-total)/2{return result.err("Wrong ragged source extent")}
+  total+=2*count
+  i+=1}
+ if total!=view.len(values){return result.err("Wrong ragged source extent")}
+ let _=try preflight_as(root,array.len(targets),kind)
+ var names:array<string>=[]
+ var paths:array<string>=[]
+ var extents:array<u64>=[]
+ var offset:u64=0
+ i=0
+ loop{if i==array.len(targets){break}
+  let count:u64=array.get(frames,i)
+  let _=try write_planar_as(output_name(root,i),rate,view.slice(values,offset,offset+2*count),kind)
+  array.push(names,string.copy(array.get(targets,i)))
+  array.push(paths,text.concat("source-",text.concat(string.from_int(i+1),".wav")))
+  array.push(extents,count)
+  offset+=2*count
+  i+=1}
+ let manifest:RaggedSources=RaggedSources{sample_rate:rate,frames:array.get(frames,0),names:names,files:paths,frame_counts:extents,backend:string.copy(backend),checkpoint_loads:loads}
+ let encoded:string=try RaggedSources_encode(manifest) map_err codec.describe
+ wav.write_metadata(path.join(root,"sources.json"),encoded,kind)
+}
+
+pub fn output_name_to(root:str,index:u64,plan:ref<container.Plan>)->string effects {alloc} {
+ let stem:string=if array.len(plan.source_names)>index{string.copy(array.get(plan.source_names,index))}else{text.concat("source-",string.from_int(index+1))}
+ container.target(root,stem,plan)
+}
+pub fn preflight_source_files_to(root:str,count:u64,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.meta} {
+ let _=try container.validate(plan)
+ if array.len(plan.source_names)>0 and array.len(plan.source_names)!=count{return result.err("Source filename count differs from the selected outputs")}
+ var at:u64=0
+ loop{if at==count{break}
+  let _=try container.preflight_tracked(output_name_to(root,at,plan),plan,log)
+  at+=1}
+ container.preflight_metadata_tracked(path.join(root,"sources.json"),log)
+}
+pub fn preflight_to(root:str,count:u64,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ let _=try container.verify(plan)
+ let _=try container.require_directory(root)
+ preflight_source_files_to(root,count,plan,log)
+}
+fn write_planar_to_impl(file:str,rate:u32,values:view<f32>,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ container.write_planar(file,rate,values,plan,log,cancel,progress)
+}
+pub fn write_planar_to(file:str,rate:u32,values:view<f32>,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=write_planar_to_impl(file,rate,values,cancel,progress,plan,log)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+fn export_to_impl(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,samples:u64,backend:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ export_with_loads_to(root,rate,targets,values,samples,backend,1,cancel,progress,plan,log)
+}
+pub fn export_to(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,samples:u64,backend:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=export_to_impl(root,rate,targets,values,samples,backend,cancel,progress,plan,log)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+fn export_with_loads_to_impl(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,samples:u64,backend:str,loads:u64,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ if array.len(targets)==0 or samples==0 or samples>view.len(values)/2/array.len(targets) or view.len(values)!=2*samples*array.len(targets){return result.err("Wrong output waveform extent")}
+ let start:u64=array.len(log.artifacts)
+ let _=try preflight_to(root,array.len(targets),plan,log)
+ var names:array<string>=[]
+ var paths:array<string>=[]
+ var s:u64=0
+ loop{if s==array.len(targets){break}
+  let _=try write_planar_to(output_name_to(root,s,plan),rate,view.slice(values,2*s*samples,2*(s+1)*samples),cancel,progress,plan,log)
+  array.push(names,string.copy(array.get(targets,s)))
+  array.push(paths,path.basename(output_name_to(root,s,plan)))
+  s+=1}
+ let manifest:Sources=Sources{sample_rate:rate,frames:samples,names:names,files:paths,backend:string.copy(backend),checkpoint_loads:loads}
+ let encoded:string=try Sources_encode(manifest) map_err codec.describe
+ container.write_metadata(path.join(root,"sources.json"),encoded,plan,log,start)
+}
+pub fn export_with_loads_to(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,samples:u64,backend:str,loads:u64,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=export_with_loads_to_impl(root,rate,targets,values,samples,backend,loads,cancel,progress,plan,log)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+fn export_wide_to_impl(root:str,rate:u32,targets:ref<array<string>>,values:view<f64>,samples:u64,backend:str,loads:u64,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ if array.len(targets)==0 or samples==0 or samples>view.len(values)/2/array.len(targets) or view.len(values)!=2*samples*array.len(targets){return result.err("Wrong output waveform extent")}
+ let start:u64=array.len(log.artifacts)
+ let _=try preflight_to(root,array.len(targets),plan,log)
+ var names:array<string>=[]
+ var paths:array<string>=[]
+ var s:u64=0
+ loop{if s==array.len(targets){break}
+  let _=try container.write_planar_f64(output_name_to(root,s,plan),rate,view.slice(values,2*s*samples,2*(s+1)*samples),plan,log,cancel,progress)
+  array.push(names,string.copy(array.get(targets,s)))
+  array.push(paths,path.basename(output_name_to(root,s,plan)))
+  s+=1}
+ let manifest:Sources=Sources{sample_rate:rate,frames:samples,names:names,files:paths,backend:string.copy(backend),checkpoint_loads:loads}
+ let encoded:string=try Sources_encode(manifest) map_err codec.describe
+ container.write_metadata(path.join(root,"sources.json"),encoded,plan,log,start)
+}
+pub fn export_typed_to(root:str,rate:u32,targets:ref<array<string>>,values:ref<audio_result.Samples>,frames:u64,backend:str,loads:u64,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=match audio_result.validate(values){err(e)=>result.err(e),ok(_)=>{
+  if values.precision==audio_result.Precision.Float32{
+   export_with_loads_to_impl(root,rate,targets,array.view(values.single),frames,backend,loads,cancel,progress,plan,log)
+  }else{export_wide_to_impl(root,rate,targets,array.view(values.wide),frames,backend,loads,cancel,progress,plan,log)}}}
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+fn export_ragged_to_impl(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,frames:ref<array<u64>>,backend:str,loads:u64,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ if array.len(targets)==0 or array.len(targets)!=array.len(frames) or not num.finite(values){return result.err("Wrong ragged source extent")}
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(frames){break}
+  let count:u64=array.get(frames,i)
+  if count==0 or count>158760000 or count>(view.len(values)-total)/2{return result.err("Wrong ragged source extent")}
+  total+=2*count
+  i+=1}
+ if total!=view.len(values){return result.err("Wrong ragged source extent")}
+ let start:u64=array.len(log.artifacts)
+ let _=try preflight_to(root,array.len(targets),plan,log)
+ var names:array<string>=[]
+ var paths:array<string>=[]
+ var extents:array<u64>=[]
+ var offset:u64=0
+ i=0
+ loop{if i==array.len(targets){break}
+  let count:u64=array.get(frames,i)
+  let _=try write_planar_to(output_name_to(root,i,plan),rate,view.slice(values,offset,offset+2*count),cancel,progress,plan,log)
+  array.push(names,string.copy(array.get(targets,i)))
+  array.push(paths,path.basename(output_name_to(root,i,plan)))
+  array.push(extents,count)
+  offset+=2*count
+  i+=1}
+ let manifest:RaggedSources=RaggedSources{sample_rate:rate,frames:array.get(frames,0),names:names,files:paths,frame_counts:extents,backend:string.copy(backend),checkpoint_loads:loads}
+ let encoded:string=try RaggedSources_encode(manifest) map_err codec.describe
+ container.write_metadata(path.join(root,"sources.json"),encoded,plan,log,start)
+}
+pub fn export_ragged_to(root:str,rate:u32,targets:ref<array<string>>,values:view<f32>,frames:ref<array<u64>>,backend:str,loads:u64,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=export_ragged_to_impl(root,rate,targets,values,frames,backend,loads,cancel,progress,plan,log)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+
+// Already-normalized, independently typed stereo sources. No precision join,
+// reload, normalization or re-encoding occurs before the selected writer.
+fn export_waves_to_impl(root:str,rate:u32,waves:ref<array<typed_source.Wave>>,backend:str,loads:u64,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let _=try typed_source.validate(waves)
+ let count:u64=array.len(waves)
+ let start:u64=array.len(log.artifacts)
+ let _=try preflight_to(root,count,plan,log)
+ let first:u64=array.borrow(waves,0).frames
+ var uniform:bool=true
+ var i:u64=0
+ loop{if i==count{break}
+  if array.borrow(waves,i).frames!=first{uniform=false}
+  i+=1}
+ var names:array<string>=[]
+ var paths:array<string>=[]
+ var extents:array<u64>=[]
+ i=0
+ loop{if i==count{break}
+  let wave:ref<typed_source.Wave>=array.borrow(waves,i)
+  let output:string=output_name_to(root,i,plan)
+  if wave.samples.precision==audio_result.Precision.Float32{
+   let _=try container.write_planar(output,rate,array.view(wave.samples.single),plan,log,cancel,progress)
+  }else{let _=try container.write_planar_f64(output,rate,array.view(wave.samples.wide),plan,log,cancel,progress)}
+  array.push(names,string.copy(wave.target))
+  array.push(paths,path.basename(output))
+  array.push(extents,wave.frames)
+  i+=1}
+ let encoded:string=if uniform{
+  let manifest:Sources=Sources{sample_rate:rate,frames:first,names:names,files:paths,backend:string.copy(backend),checkpoint_loads:loads}
+  try Sources_encode(manifest) map_err codec.describe
+ }else{
+  let manifest:RaggedSources=RaggedSources{sample_rate:rate,frames:first,names:names,files:paths,frame_counts:extents,backend:string.copy(backend),checkpoint_loads:loads}
+  try RaggedSources_encode(manifest) map_err codec.describe}
+ container.write_metadata(path.join(root,"sources.json"),encoded,plan,log,start)
+}
+pub fn export_waves_to(root:str,rate:u32,waves:ref<array<typed_source.Wave>>,backend:str,loads:u64,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=export_waves_to_impl(root,rate,waves,backend,loads,cancel,progress,plan,log)
+ match outcome{ok(v)=>result.ok(v),err(problem)=>{
+  if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}

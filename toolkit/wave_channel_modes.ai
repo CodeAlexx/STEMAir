@@ -1,0 +1,72 @@
+module stemair.wave_channel_modes
+import "numeric.ai" as num
+import std.float as fp
+
+// Planar stereo transforms applied before analysis and after inverse synthesis.
+pub fn valid(mode:str)->bool effects {} {
+ mode=="stereo" or mode=="time-reversed" or mode=="mid-side" or mode=="half-cross"
+}
+pub fn analyze(input:view<f32>,mode:str)->result<array<f32>,string> effects {alloc} {
+ if not valid(mode) or view.len(input)==0 or view.len(input)%2!=0 or view.len(input)>536870912 or not num.finite(input){
+  return result.err("Invalid stereo waveform transform")}
+ var output:array<f32>=num.copy(input)
+ let frames:u64=view.len(input)/2
+ var i:u64=0
+ loop{if i==frames{break}
+  let left:f32=view.get(input,i)
+  let right:f32=view.get(input,frames+i)
+  var first:f32=left
+  var second:f32=right
+  if mode=="time-reversed"{
+   first=view.get(input,frames-1-i)
+   second=view.get(input,2*frames-1-i)}
+  if mode=="mid-side"{let sum:f32=left+right
+   first=sum/2.0
+   second=left-right}
+  if mode=="half-cross"{let half_left:f32=left*0.5
+   let half_right:f32=right*0.5
+   first=right+half_left
+   second=left-half_right}
+  array.set(output,i,first)
+  array.set(output,frames+i,second)
+  i+=1}
+ if not num.finite(array.view(output)){return result.err("Stereo waveform transform overflow")}
+ result.ok(output)
+}
+pub fn restore(input:array<f64> own,mode:str)->result<array<f64>,string> effects {alloc} {
+ var output:array<f64>=input
+ if not valid(mode) or array.len(output)==0 or array.len(output)%2!=0 or array.len(output)>536870912{
+  return result.err("Invalid inverse stereo waveform transform")}
+ let frames:u64=array.len(output)/2
+ var i:u64=0
+ loop{if i==frames{break}
+  let left:f64=array.get(output,i)
+  let right:f64=array.get(output,frames+i)
+  if not fp.is_finite(left) or not fp.is_finite(right){return result.err("Nonfinite inverse stereo waveform")}
+  var first:f64=left
+  var second:f64=right
+  if mode=="mid-side"{let half:f64=right/2.0
+   first=left+half
+   second=left-half}
+  if mode=="half-cross"{let right_main:f64=right/1.25
+   let left_cross:f64=0.4*left
+   let left_main:f64=left/1.25
+   let right_cross:f64=0.4*right
+   first=right_main+left_cross
+   second=left_main-right_cross}
+  if not fp.is_finite(first) or not fp.is_finite(second){return result.err("Inverse stereo waveform overflow")}
+  array.set(output,i,first)
+  array.set(output,frames+i,second)
+  i+=1}
+ if mode=="time-reversed"{
+  i=0
+  loop{if i==frames/2{break}
+   let left:f64=array.get(output,i)
+   let right:f64=array.get(output,frames+i)
+   array.set(output,i,array.get(output,frames-1-i))
+   array.set(output,frames+i,array.get(output,2*frames-1-i))
+   array.set(output,frames-1-i,left)
+   array.set(output,2*frames-1-i,right)
+   i+=1}}
+ result.ok(output)
+}

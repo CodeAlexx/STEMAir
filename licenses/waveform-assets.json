@@ -1,0 +1,9 @@
+{
+  "model": "waveform-v1",
+  "filename": "waveform-v1.th",
+  "url": "https://dl.fbaipublicfiles.com/demucs/v2.0/light.th",
+  "bytes": 1062727712,
+  "sha256": "79d1ee3c1541c729c552327756954340a1a46a11ce0009dea77dc583e4b6269c",
+  "credit": "Demucs by Alexandre Defossez and Facebook AI Research",
+  "license": "MIT; full original v2 notice in waveform-MIT.txt; https://github.com/facebookresearch/demucs/blob/v2/LICENSE"
+}

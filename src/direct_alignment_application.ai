@@ -1,0 +1,36 @@
+// Explicit no-local-window whole-track alignment over checked retained audio.
+module stemair.direct_alignment_application
+import "../toolkit/direct_alignment.ai" as direct
+import "../toolkit/recording_preparation.ai" as prep
+import "../toolkit/recording_resources.ai" as resources
+import "../toolkit/alignment_options.ai" as options
+import "../toolkit/control.ai" as control
+import std.audio as audio
+import std.cpu_dot as dot
+import std.cabi as native
+import std.files as files
+pub type Settings=struct{dot_runtime:string,dot_sha256:string,math_runtime:string,max_decoded_bytes:u64,max_working_bytes:u64}
+fn problem(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+pub fn compute_buffers(settings:ref<Settings>,first:ref<audio.AudioBuffer>,second:ref<audio.AudioBuffer>,intros:options.IntroSet,gain:options.GainChoice,preparation:prep.Recipe,save_aligned:bool,cancel:str,progress:str,capture:bool)->result<direct.Output,string>
+ effects {alloc,fs.read,fs.meta,fs.write,ffi} {
+ if control.cancelled(cancel){return result.err("Whole-track alignment cancelled")}
+ if first.rate!=44100 or second.rate!=44100 or (first.channels!=1 and first.channels!=2) or (second.channels!=1 and second.channels!=2){return result.err("Whole-track alignment requires44100-Hz mono or stereo inputs")}
+ if array.len(first.samples)%cast.wrap(first.channels)!=0 or array.len(second.samples)%cast.wrap(second.channels)!=0{return result.err("Whole-track alignment requires complete input frames")}
+ let limits:resources.Limits=resources.Limits{max_decoded_bytes:settings.max_decoded_bytes,max_working_bytes:settings.max_working_bytes}
+ let _=try direct.plan(audio.num_frames(first),cast.wrap(first.channels),audio.num_frames(second),cast.wrap(second.channels),intros,gain,limits)
+ let identity:string=try files.sha256(settings.dot_runtime) map_err problem
+ if identity!=settings.dot_sha256{return result.err("CPU runtime bytes differ from the explicit pinned identity")}
+ var engine:dot.Engine=try dot.open(settings.dot_runtime,"0.3.20","Zen")
+ let readiness:result<unit,string>=dot.require_threads(engine,1)
+ match readiness{err(error)=>{dot.close(engine)
+  return result.err(error)},ok(_)=>{}}
+ let wide:result<unit,string>=dot.check_f64(engine)
+ match wide{err(error)=>{dot.close(engine)
+  return result.err(error)},ok(_)=>{}}
+ var math:CAbiLibrary=match native.open(settings.math_runtime){ok(value)=>value,err(error)=>{dot.close(engine)
+  return result.err(native.error_message(error))}}
+ let value:result<direct.Output,string>=direct.process(engine,math,array.view(first.samples),cast.wrap(first.channels),array.view(second.samples),cast.wrap(second.channels),intros,gain,preparation,save_aligned,limits,cancel,progress,capture)
+ let closed:result<unit,cabi.error>=native.close(math)
+ dot.close(engine)
+ match closed{err(error)=>result.err(native.error_message(error)),ok(_)=>value}
+}

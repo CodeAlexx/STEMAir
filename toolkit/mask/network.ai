@@ -1,0 +1,138 @@
+module stemair.mask.network
+import "../weights.ai" as weights
+import std.table as table
+import std.text as text
+import std.float as fp
+
+pub type Convolution=struct{weight:u64,scale:u64=0,bias:u64=0,normalized:bool=false,activation:u64=0,
+ groups:u64=1,stride:u64=1,pad:u64=0,dilation:u64=1,
+ stride_w:u64=0,pad_w:u64=18446744073709551615,dilation_w:u64=0,
+ statistics_ready:bool=false,normalization_gamma:u64=0,normalization_beta:u64=0,normalization_mean:u64=0,normalization_variance:u64=0}
+pub type Pair=struct{first:Convolution,second:Convolution}
+pub type Branch=struct{first:Convolution,second:option<Convolution>}
+pub type Base=struct{encoder:array<Pair>,branches:array<Branch>,bottleneck:Convolution,decoder:array<Convolution>}
+pub type Network=struct{weights:weights.Model,low:Base,high:Base,bridge2:Convolution,second:Base,
+ bridge3:Convolution,third:Base,output:Convolution,bins:u64,offset:u64=128,original_parameters:u64}
+fn key(base:str,suffix:str)->string effects {alloc} {text.concat(base,suffix)}
+fn value(w:ref<weights.Model>,index:u64,i:u64)->f32 effects {} {array.get(array.borrow(w.parameters.values,index).values,i)}
+pub fn affine(w:ref<weights.Model>,base:str,channels:u64)->result<array<u64>,string> effects {alloc} {
+ let shape:array<u64>=[channels]
+ let gamma:u64=try weights.index(w,key(base,".weight"),array.view(shape))
+ let beta:u64=try weights.index(w,key(base,".bias"),array.view(shape))
+ let mean:u64=try weights.index(w,key(base,".running_mean"),array.view(shape))
+ let variance:u64=try weights.index(w,key(base,".running_var"),array.view(shape))
+ var scales:array<f32>=[]
+ var biases:array<f32>=[]
+ var i:u64=0
+ loop{if i>=channels{break}
+  let v:f32=value(w,variance,i)
+  if v<0.0{return result.err("Negative evaluation variance")}
+  let scale:f32=value(w,gamma,i)/fp.sqrt(v+0.00001)
+  let bias:f32=value(w,beta,i)-value(w,mean,i)*scale
+  if not fp.is_finite(scale) or not fp.is_finite(bias){return result.err("Non-finite prepared evaluation normalization")}
+  array.push(scales,scale)
+  array.push(biases,bias)
+  i+=1}
+ let scale_id:u64=array.len(w.parameters.values)
+ let scale_key:string=key("__prepared_mask_scale_",str.view(string.from_int(scale_id)))
+ if table.contains(struct.borrow(w,field=parameters),str.view(scale_key)){return result.err("Prepared parameter key collision")}
+ let _=table.put(struct.borrow(w,field=parameters),str.view(scale_key),weights.Parameter{shape:[channels],values:scales})
+ let bias_id:u64=array.len(w.parameters.values)
+ let bias_key:string=key("__prepared_mask_bias_",str.view(string.from_int(bias_id)))
+ if table.contains(struct.borrow(w,field=parameters),str.view(bias_key)){return result.err("Prepared parameter key collision")}
+ let _=table.put(struct.borrow(w,field=parameters),str.view(bias_key),weights.Parameter{shape:[channels],values:biases})
+ result.ok([scale_id,bias_id,gamma,beta,mean,variance])
+}
+pub fn plain(w:ref<weights.Model>,name:str,ci:u64,co:u64,k:u64,stride:u64,pad:u64,dilation:u64,groups:u64)->result<Convolution,string> effects {alloc} {
+ let shape:array<u64>=[co,ci/groups,k,k]
+ let id:u64=try weights.index(w,key(name,".weight"),array.view(shape))
+ result.ok(Convolution{weight:id,groups:groups,stride:stride,pad:pad,dilation:dilation})
+}
+pub fn block(w:ref<weights.Model>,name:str,ci:u64,co:u64,k:u64,stride:u64,pad:u64,activation:u64)->result<Convolution,string> effects {alloc} {
+ var conv:Convolution=try plain(w,key(name,".conv.0"),ci,co,k,stride,pad,1,1)
+ let norm:array<u64>=try affine(w,key(name,".conv.1"),co)
+ conv.scale=array.get(norm,0)
+ conv.bias=array.get(norm,1)
+ conv.normalized=true
+ conv.statistics_ready=true
+ conv.normalization_gamma=array.get(norm,2)
+ conv.normalization_beta=array.get(norm,3)
+ conv.normalization_mean=array.get(norm,4)
+ conv.normalization_variance=array.get(norm,5)
+ conv.activation=activation
+ result.ok(conv)
+}
+fn separable(w:ref<weights.Model>,name:str,channels:u64,dilation:u64)->result<Branch,string> effects {alloc} {
+ let depth:Convolution=try plain(w,key(name,".conv.0"),channels,channels,3,1,dilation,dilation,channels)
+ var point:Convolution=try plain(w,key(name,".conv.1"),channels,channels,1,1,0,1,1)
+ let norm:array<u64>=try affine(w,key(name,".conv.2"),channels)
+ point.scale=array.get(norm,0)
+ point.bias=array.get(norm,1)
+ point.normalized=true
+ point.statistics_ready=true
+ point.normalization_gamma=array.get(norm,2)
+ point.normalization_beta=array.get(norm,3)
+ point.normalization_mean=array.get(norm,4)
+ point.normalization_variance=array.get(norm,5)
+ point.activation=1
+ result.ok(Branch{first:depth,second:option.some(point)})
+}
+fn base(w:ref<weights.Model>,name:str,input:u64,channels:u64,levels:u64,branches:u64)->result<Base,string> effects {alloc} {
+ var encoder:array<Pair>=[]
+ var previous:u64=input
+ var current:u64=channels
+ var i:u64=0
+ loop{if i>=levels{break}
+  let prefix:string=key(key(name,".enc"),str.view(string.from_int(i+1)))
+  let first:Convolution=try block(w,key(prefix,".conv1"),previous,current,3,1,1,2)
+  let second:Convolution=try block(w,key(prefix,".conv2"),current,current,3,2,1,2)
+  array.push(encoder,Pair{first:first,second:second})
+  previous=current
+  current*=2
+  i+=1}
+ let bottom:u64=previous
+ var pool:array<Branch>=[]
+ let pooled:Convolution=try block(w,key(name,".aspp.conv1.1"),bottom,bottom,1,1,0,1)
+ array.push(pool,Branch{first:pooled,second:option.none()})
+ let point:Convolution=try block(w,key(name,".aspp.conv2"),bottom,bottom,1,1,0,1)
+ array.push(pool,Branch{first:point,second:option.none()})
+ let rates:array<u64>=[4,8,16,16,16]
+ i=2
+ loop{if i>=branches{break}
+  let prefix:string=key(key(name,".aspp.conv"),str.view(string.from_int(i+1)))
+  array.push(pool,try separable(w,str.view(prefix),bottom,array.get(rates,i-2)))
+  i+=1}
+ // The seven-branch constructor registers the same module twice. Loading the
+ // later state entry overwrites the shared earlier branch, so both calls use
+ // the final branch's parameters. Validate both original entries above.
+ if branches==7{array.set(pool,5,array.get(pool,6))}
+ let bottleneck:Convolution=try block(w,key(name,".aspp.bottleneck.0"),bottom*branches,bottom*2,1,1,0,1)
+ var decoder:array<Convolution>=[]
+ i=levels
+ current=bottom
+ loop{if i==0{break}
+  let prefix:string=key(key(name,".dec"),str.view(string.from_int(i)))
+  array.push(decoder,try block(w,key(prefix,".conv"),current*3,current,3,1,1,1))
+  current/=2
+  i-=1}
+ result.ok(Base{encoder:encoder,branches:pool,bottleneck:bottleneck,decoder:decoder})
+}
+pub fn open(path:str,channels:u64,levels:u64,branches:u64,bins:u64)->result<Network,string> effects {alloc,fs.read} {
+ if (channels!=16 and channels!=32 and channels!=64) or levels<4 or levels>5 or branches<5 or branches>7 or
+  bins<64 or bins>8192 or bins%64!=0{return result.err("Invalid cascaded mask architecture")}
+ var w:weights.Model=try weights.open_with_counters(path,true)
+ let original:u64=array.len(w.parameters.values)
+ if original!=4*(15*levels+3+6*branches)+13{return result.err("Checkpoint parameter set does not match the cascaded mask architecture")}
+ let low:Base=try base(w,"stg1_low_band_net",2,channels,levels,branches)
+ let high:Base=try base(w,"stg1_high_band_net",2,channels,levels,branches)
+ let bridge2:Convolution=try block(w,"stg2_bridge",2+channels,channels/2,1,1,0,1)
+ let second:Base=try base(w,"stg2_full_band_net",channels/2,channels,levels,branches)
+ let bridge3:Convolution=try block(w,"stg3_bridge",2+2*channels,channels,1,1,0,1)
+ let third:Base=try base(w,"stg3_full_band_net",channels,2*channels,levels,branches)
+ let output:Convolution=try plain(w,"out",2*channels,2,1,1,0,1,1)
+ let aux_shape:array<u64>=[2,channels,1,1]
+ let _=try weights.index(w,"aux1_out.weight",array.view(aux_shape))
+ let _=try weights.index(w,"aux2_out.weight",array.view(aux_shape))
+ result.ok(Network{weights:w,low:low,high:high,bridge2:bridge2,second:second,bridge3:bridge3,third:third,
+  output:output,bins:bins,original_parameters:original})
+}

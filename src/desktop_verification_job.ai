@@ -1,0 +1,22 @@
+module stemair.desktop_verification_job
+import "input_verification.ai" as verification
+import "input_verification_application.ai" as application
+import "checked_input.ai" as checked
+import "job.ai" as job
+import "../toolkit/model_cache.ai" as cache
+import std.codec as codec
+
+pub type Work=struct{retained:option<cache.Cache>,inputs:array<string>,queue:bool,generation:u64,
+ policy:checked.Options,progress:string}
+
+pub fn run(work:Work own)->job.Completed effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ var w:Work=work
+ let report:verification.Report=verification.scan(struct.borrow(w,field=inputs),struct.borrow(w,field=policy),65536,w.progress)
+ var envelope:verification.Envelope=verification.Envelope{queue:w.queue,generation:w.generation,
+  inputs:struct.replace(w,[],field=inputs),report:report}
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ let encoded:string=match verification.Envelope_encode(envelope){ok(value)=>value,err(error)=>{
+  return job.Completed{retained:retained,ok:false,message:codec.describe(error),queue_report:option.none()}}}
+ job.Completed{retained:retained,ok:envelope.report.completed,message:string.copy(envelope.report.message),
+  queue_report:option.none(),verification_report:encoded}
+}

@@ -1,0 +1,46 @@
+module stemair.paired_desktop_runtime
+import "preferences.ai" as prefs
+import "paired_panel_state.ai" as panel
+import "paired_desktop_job.ai" as worker
+import "alignment_choices.ai" as choices
+import "recording_alignment_runtime.ai" as runtime
+import "recording_alignment_application.ai" as alignment
+import "codec_runtime.ai" as codec_runtime
+import "audio_io_policy.ai" as io_policy
+import "checked_input.ai" as checked
+import "container_export.ai" as container
+import "../toolkit/compressed_export.ai" as compressed
+import std.codec as codec
+
+pub fn accept(value:ref<prefs.State>,root:str)->result<string,string> effects {alloc,env,fs.read,fs.meta} {
+ let _=try prefs.validate(value)
+ let _=try container.require_directory(value.output)
+ let recipe:choices.Recipe=try choices.from_full_indices(value.alignment_windows,value.alignment_intros,value.alignment_gain,value.alignment_phase,value.alignment_save_aligned,value.alignment_initial_polarity,value.alignment_match_silence,value.alignment_spectral_match)
+ let _=try choices.validate_any(recipe)
+ let encoded:string=try codec_runtime.settings(root,value.codec_directory,cast.sat(value.output_container),cast.sat(value.export_subtype),cast.sat(value.mp3_bitrate))
+ let limits:compressed.Limits=try io_policy.output(cast.sat(value.audio_budget),str.len(encoded)>0)
+ let applied:panel.Applied=panel.Applied{recipe:try choices.Recipe_encode(recipe) map_err codec.describe,output:string.copy(value.output),
+  wav_choice:cast.sat(value.export_subtype),codec_recipe:encoded,audio_budget:cast.sat(value.audio_budget),continue_on_error:value.paired_continue,
+  max_frames:limits.max_frames,max_stage_bytes:limits.max_stage_bytes,max_encoded_bytes:limits.max_encoded_bytes}
+ var saved:panel.Snapshot=try panel.accept(struct.borrow(value,field=paired_first_inputs),struct.borrow(value,field=paired_second_inputs),applied)
+ var plan:container.Plan=try panel.plan(struct.borrow(saved,field=applied))
+ let _=try container.verify(plan)
+ panel.encode(saved)
+}
+// Return a complete request before the desktop transfers its retained model bank.
+pub fn prepare(value:ref<prefs.State>,root:str,remaining_only:bool,scratch:str,cancel:str,progress:str)->result<worker.Request,string>
+ effects {alloc,env,fs.read,fs.meta,time} {
+ if str.len(value.paired_snapshot)==0{return result.err("Accept paired recordings and options before running")}
+ var saved:panel.Snapshot=try panel.decode(value.paired_snapshot)
+ if remaining_only and array.len(saved.remaining)==0{return result.err("No unfinished pairs remain")}
+ let _=try panel.selection(saved,remaining_only)
+ let _=try container.require_directory(saved.applied.output)
+ var plan:container.Plan=try panel.plan(struct.borrow(saved,field=applied))
+ let _=try container.verify(plan)
+ let recipe:choices.Recipe=try choices.Recipe_decode(saved.applied.recipe) map_err codec.describe
+ let bytes:u64=try io_policy.budget(saved.applied.audio_budget)
+ let settings:alignment.Settings=try runtime.settings_for_windows(root,recipe.windows,recipe.save_aligned,bytes*4,bytes*2,bytes*4)
+ let options:checked.Options=try io_policy.input(root,value.codec_directory,saved.applied.audio_budget,scratch,cancel)
+ let work:worker.Work=worker.Work{retained:option.none(),settings:settings,snapshot:saved,remaining_only:remaining_only,cancel:string.copy(cancel),progress:string.copy(progress)}
+ result.ok(worker.Request{work:option.some(work),policy:option.some(options)})
+}

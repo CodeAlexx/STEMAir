@@ -1,0 +1,84 @@
+module stemair.paired_desktop_job
+import "paired_panel_state.ai" as panel
+import "job.ai" as job
+import "paired_config.ai" as config
+import "paired_alignment_application.ai" as application
+import "recording_alignment_application.ai" as alignment
+import "alignment_choices.ai" as choices
+import "checked_input.ai" as checked
+import "container_export.ai" as container
+import "audio_io_policy.ai" as io_policy
+import "../toolkit/model_cache.ai" as cache
+import std.codec as codec
+import std.text as text
+
+pub type Work=struct{retained:option<cache.Cache>,settings:alignment.Settings,snapshot:panel.Snapshot,
+ remaining_only:bool=false,cancel:string,progress:string}
+// The frontend bridge serializes this actual outcome; no failed reports are invented.
+pub type Finished=struct{retained:option<cache.Cache>,ok:bool,message:string,outcome:option<application.Outcome>,snapshot:string=""}
+fn execute(work:ref<Work>,options:ref<checked.Options>)->result<application.Outcome,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ let _=try panel.validate(struct.borrow(work,field=snapshot))
+ let applied:ref<panel.Applied>=struct.borrow(struct.borrow(work,field=snapshot),field=applied)
+ let bytes:u64=try io_policy.budget(applied.audio_budget)
+ if options.limits.max_file_bytes!=bytes*4 or options.limits.max_frames!=bytes/8 or options.limits.max_decoded_bytes!=bytes or options.limits.max_channels!=64{
+  return result.err("Paired audio input policy differs from the accepted buffer limit")}
+ if work.settings.input_limit_bytes!=bytes*4 or work.settings.max_decoded_bytes!=bytes*2 or work.settings.max_working_bytes!=bytes*4{
+  return result.err("Paired working resource policy differs from the accepted buffer limit")}
+ let recipe:choices.Recipe=try choices.Recipe_decode(applied.recipe) map_err codec.describe
+ if work.settings.save_aligned!=recipe.save_aligned{return result.err("Paired output intent differs from the accepted recipe")}
+ var selected:config.Plan=try panel.selection(struct.borrow(work,field=snapshot),work.remaining_only)
+ var plan:container.Plan=try panel.plan(applied)
+ let _=try container.verify(plan)
+ match work.retained{none=>{},some(bank)=>{let _=try cache.require_cpu_policy(bank)}}
+ application.run(struct.borrow(work,field=settings),recipe,selected,applied.output,work.cancel,work.progress,plan,options)
+}
+// The entire retained bank remains owned until all CPU policy restoration is done.
+pub fn run(request:Work own,options:checked.Options own)->Finished effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ var work:Work=request
+ var input:checked.Options=options
+ let completed:result<application.Outcome,string>=execute(work,input)
+ var success:bool=false
+ var message:string=""
+ var saved:string=""
+ let outcome:option<application.Outcome>=match completed{err(error)=>{message=error
+  option.none()},ok(value)=>{
+  success=value.ok
+  message=string.copy(value.message)
+  if value.report.poison_cpu{
+   match work.retained{none=>{var bank:cache.Cache=cache.empty()
+    cache.poison_cpu(bank)
+    work.retained=option.some(bank)},some(bank)=>cache.poison_cpu(bank)}}
+  let remaining_only:bool=work.remaining_only
+  let state:ref<panel.Snapshot>=struct.borrow(work,field=snapshot)
+  let used_plan:result<config.Plan,string>=panel.selection(state,remaining_only)
+  let updated:result<string,string>=match used_plan{err(error)=>result.err(error),ok(used)=>match panel.after(state,used,struct.borrow(value,field=report),value.report_file){err(error)=>result.err(error),ok(snapshot)=>panel.encode(snapshot)}}
+  match updated{ok(raw)=>{saved=raw},err(error)=>{success=false
+   string.append(message,text.concat("; recovery snapshot was not updated: ",error))}}
+  option.some(value)}}
+ Finished{retained:struct.replace(work,option.none(),field=retained),ok:success,message:message,outcome:outcome,snapshot:saved}
+}
+
+pub fn run_completed(request:Work own,options:checked.Options own)->job.Completed effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ var done:Finished=run(request,options)
+ var raw:string=""
+ var file:string=""
+ var directory:string=""
+ match done.outcome{none=>{},some(actual)=>{
+  file=string.copy(actual.report_file)
+  directory=string.copy(actual.report.directory)
+  match config.Report_encode(struct.borrow(actual,field=report)){ok(value)=>{raw=value},err(error)=>{
+   done.ok=false
+   string.append(done.message,text.concat("; cannot serialize actual paired report: ",codec.describe(error)))}}}}
+ job.Completed{retained:struct.replace(done,option.none(),field=retained),ok:done.ok,message:struct.replace(done,"",field=message),queue_report:option.none(),
+  directory:directory,paired_report:raw,paired_report_file:file,paired_snapshot:struct.replace(done,"",field=snapshot)}
+}
+pub type Request=struct{work:option<Work>,policy:option<checked.Options>}
+pub fn dispatch(request:Request own)->job.Completed effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ var owned:Request=request
+ let policy:option<checked.Options>=struct.replace(owned,option.none(),field=policy)
+ match struct.replace(owned,option.none(),field=work){none=>job.Completed{retained:option.none(),ok:false,message:"Paired task payload is unavailable",queue_report:option.none()},some(work)=>match policy{
+  some(input)=>run_completed(work,input),none=>{
+   var pending:Work=work
+   job.Completed{retained:struct.replace(pending,option.none(),field=retained),ok:false,message:"Paired input policy is unavailable",queue_report:option.none()}}}}
+}

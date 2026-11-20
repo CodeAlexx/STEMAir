@@ -1,0 +1,66 @@
+// Explicit retained CPU convolution and original evaluation normalization.
+module stemair.mask.host_primitives
+import "network.ai" as network
+import "host.ai" as host
+import "../weights.ai" as weights
+import "../ops.ai" as ops
+import std.cpu_primitives as primitives
+import std.cpu_conv2d as conv
+import std.channel_norm_cpu as norm
+import std.float as fp
+import std.system as system
+
+pub type Backend=struct{runtime:primitives.Engine,plans:array<option<primitives.Plan>>,adapter:string,rounding:norm.AffineRounding,prepared_calls:u64=0,policy_valid:bool=true}
+pub fn prepare(model:ref<weights.Model>,adapter:str)->result<Backend,string> effects {alloc, env, ffi}{
+ prepare_for_host(model,adapter,system.platform())
+}
+pub fn prepare_for_host(model:ref<weights.Model>,adapter:str,host:str)->result<Backend,string> effects {alloc,ffi}{
+ if host!="windows" and host!="linux"{return result.err("Original mask CPU requires a qualified host arithmetic policy")}
+ var plans:array<option<primitives.Plan>>=[]
+ var i:u64=0
+ loop{if i==array.len(model.parameters.values){break}
+  array.push(plans,option.none())
+  i+=1}
+ var runtime:primitives.Engine=try primitives.open(adapter,"3.7.1",2,primitives.Limits{})
+ let rounding:norm.AffineRounding=if host=="windows"{norm.AffineRounding.Separate}else{norm.AffineRounding.Fused}
+ result.ok(Backend{runtime:runtime,plans:plans,adapter:string.copy(adapter),rounding:rounding})
+}
+pub fn close(bank:ref<Backend>)->result<unit,string> effects {alloc,ffi}{primitives.close(struct.borrow(bank,field=runtime))}
+fn values(model:ref<weights.Model>,id:u64)->view<f32> from model effects {}{array.view(array.borrow(model.parameters.values,id).values)}
+fn convolve(model:ref<weights.Model>,bank:ref<Backend>,library:ref<CAbiLibrary>,x:ref<ops.Tensor>,c:network.Convolution)->result<ops.Tensor,string> effects {alloc,ffi}{
+ if bank.runtime.id==0{return result.err("Retained mask CPU primitive context is closed")}
+ let shape:array<u64>=[1,x.c,x.h,x.w]
+ let options:conv.Options=conv.Options{groups:c.groups,stride_height:c.stride,stride_width:if c.stride_w==0{c.stride}else{c.stride_w},padding_height:c.pad,padding_width:if c.pad_w==18446744073709551615{c.pad}else{c.pad_w},dilation_height:c.dilation,dilation_width:if c.dilation_w==0{c.dilation}else{c.dilation_w}}
+ if not option.is_some(array.get(bank.plans,c.weight)){
+  let parameter:ref<weights.Parameter>=array.borrow(model.parameters.values,c.weight)
+  let made:primitives.Plan=try primitives.prepare(struct.borrow(bank,field=runtime),array.view(shape),array.view(parameter.values),array.view(parameter.shape),[],options)
+  array.set(bank.plans,c.weight,option.some(made))
+  bank.prepared_calls+=1}
+ let chosen:primitives.Plan=match array.get(bank.plans,c.weight){some(v)=>v,none=>{return result.err("Missing retained mask CPU convolution")}}
+ if chosen.geometry.input_channels!=x.c or chosen.geometry.height!=x.h or chosen.geometry.width!=x.w{return result.err("Retained mask CPU convolution geometry changed")}
+ var result:array<f32>=try primitives.convolve(struct.borrow(bank,field=runtime),chosen,array.view(x.data))
+ if c.normalized{
+  if not c.statistics_ready{return result.err("Original mask normalization statistics are absent")}
+  var inverse:array<f32>=[]
+  let variances:view<f32>=values(model,c.normalization_variance)
+  var channel:u64=0
+  loop{if channel==chosen.geometry.output_channels{break}
+   let sum:f32=view.get(variances,channel)+0.00001
+   array.push(inverse,1.0/fp.sqrt(sum))
+   channel+=1}
+  result=try norm.affine(array.view(result),1,chosen.geometry.output_channels,chosen.geometry.output_height*chosen.geometry.output_width,array.view(array.borrow(model.parameters.values,c.normalization_mean).values),array.view(inverse),array.view(array.borrow(model.parameters.values,c.normalization_gamma).values),array.view(array.borrow(model.parameters.values,c.normalization_beta).values),bank.rounding)}
+ var i:u64=0
+ loop{if i==array.len(result){break}
+  let value:f32=array.get(result,i)
+  if value<0.0{if c.activation==1{array.set(result,i,0.0)}else{if c.activation==2{array.set(result,i,value*0.01)}}}
+  i+=1}
+ result.ok(ops.tensor(chosen.geometry.output_channels,chosen.geometry.output_height,chosen.geometry.output_width,result))
+}
+pub fn predict(n:ref<network.Network>,bank:ref<Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta}{
+ if not bank.policy_valid{return result.err("Original CPU mask thread policy requires release")}
+ var thread_guard:primitives.ThreadScope=try primitives.enter_threads(bank.adapter,2)
+ let predicted:result<ops.Tensor,string>=host.predict_with_convolution(n,bank,library,input,cancel,convolve)
+ let restored:result<unit,string>=primitives.leave_threads(thread_guard)
+ match restored{err(e)=>{bank.policy_valid=false
+  result.err(e)},ok(_)=>predicted}
+}

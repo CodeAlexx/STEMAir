@@ -1,0 +1,181 @@
+module stemair.mask.host_session
+import "config.ai" as config
+import "network.ai" as network
+import "host.ai" as host
+import "bands.ai" as bands
+import "postprocess.ai" as postprocess
+import "../artifact_cleanup.ai" as cleanup
+import "../complex_spectral.ai" as spectral
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../control.ai" as control
+import std.float as fp
+
+fn masks<N,P>(n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,c:ref<config.Config>,magnitude:ref<ops.Tensor>,maximum:f32,shift:u64,cancel:str,progress:str,
+ predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta})->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let roi:u64=c.window-2*n.offset
+ let frames:u64=magnitude.w
+ let bins:u64=magnitude.h
+ let count:u64=(frames+shift+roi-1)/roi
+ var output:array<f32>=num.zeros(2*bins*frames)
+ var index:u64=0
+ loop{if index>=count{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  control.report(progress,index,count)
+  var values:array<f32>=num.zeros(2*bins*c.window)
+  var channel:u64=0
+  loop{if channel>=2{break}
+   var f:u64=0
+   loop{if f>=bins{break}
+    var t:u64=0
+    loop{if t>=c.window{break}
+     let position:i64=cast.sat(index*roi+t)-cast.sat(n.offset+shift)
+     let source:u64=cast.sat(position)
+     if position>=0 and source<frames{
+      array.set(values,(channel*bins+f)*c.window+t,array.get(magnitude.data,(channel*bins+f)*frames+source)/maximum)}
+     t+=1}
+    f+=1}
+   channel+=1}
+  var input:ops.Tensor=ops.tensor(2,bins,c.window,values)
+  var predicted:ops.Tensor=try predictor(n,prepared,library,input,cancel)
+  channel=0
+  loop{if channel>=2{break}
+   var f:u64=0
+   loop{if f>=bins{break}
+    var t:u64=0
+    loop{if t>=roi{break}
+     let padded:u64=index*roi+t
+     if padded>=shift and padded-shift<frames{
+      array.set(output,(channel*bins+f)*frames+padded-shift,array.get(predicted.data,(channel*bins+f)*roi+t))}
+     t+=1}
+    f+=1}
+   channel+=1}
+  index+=1}
+ control.report(progress,count,count)
+ result.ok(output)
+}
+fn separated(c:ref<config.Config>,spectrum:ref<ops.Tensor>,magnitude:ref<ops.Tensor>,mask:view<f32>,secondary:bool,adjusted:bool)->result<ops.Tensor,string> effects {alloc} {
+ let bins:u64=spectrum.h
+ let frames:u64=spectrum.w
+ var output:array<f32>=num.zeros(4*bins*frames)
+ var channel:u64=0
+ loop{if channel>=2{break}
+  var f:u64=0
+  loop{if f>=bins{break}
+   var t:u64=0
+   loop{if t>=frames{break}
+    let at:u64=(channel*bins+f)*frames+t
+    let confidence:f32=if adjusted{view.get(mask,at)}else{postprocess.confidence(c,f,view.get(mask,at))}
+    let scale:f32=if secondary{1.0-confidence}else{confidence}
+    let amplitude:f32=scale*array.get(magnitude.data,at)
+    let re:f32=array.get(spectrum.data,((2*channel)*bins+f)*frames+t)
+    let im:f32=array.get(spectrum.data,((2*channel+1)*bins+f)*frames+t)
+    let phase:f32=fp.atan2(im,re)
+    array.set(output,((2*channel)*bins+f)*frames+t,amplitude*fp.cos(phase))
+    array.set(output,((2*channel+1)*bins+f)*frames+t,amplitude*fp.sin(phase))
+    t+=1}
+   f+=1}
+  channel+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite masked spectrum")}
+ result.ok(ops.tensor(4,bins,frames,output))
+}
+pub fn separate_predicted_wide_with_cleanup<N,P>(n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},settings:ref<cleanup.Settings>)->result<array<f64>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ var lower:array<f32>=[]
+ separate_predicted_wide_with_cleanup_and_band_input(n,prepared,library,plans,c,input,cancel,progress,predictor,settings,array.view(lower))
+}
+pub fn separate_predicted_wide_with_cleanup_and_band_input<N,P>(n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},settings:ref<cleanup.Settings>,lower:view<f32>)->result<array<f64>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try cleanup.validate(settings)
+ var high:option<ops.Tensor>=option.none()
+ var spectrum:ops.Tensor=try bands.analyze_with_high_and_lower(c,plans,input,lower,high)
+ if spectrum.w<2{return result.err("Recording is too short for multiband reconstruction")}
+ var magnitudes:array<f32>=[]
+ var maximum:f32=0.0
+ var channel:u64=0
+ loop{if channel>=2{break}
+  var i:u64=0
+  loop{if i>=spectrum.h*spectrum.w{break}
+   let re:f32=array.get(spectrum.data,2*channel*spectrum.h*spectrum.w+i)
+   let im:f32=array.get(spectrum.data,(2*channel+1)*spectrum.h*spectrum.w+i)
+   let value:f32=fp.hypot(re,im)
+   if not fp.is_finite(value){return result.err("Non-finite multiband magnitude")}
+   array.push(magnitudes,value)
+   if value>maximum{maximum=value}
+   i+=1}
+  channel+=1}
+ if maximum==0.0{
+  let last:ref<config.Band>=array.borrow(c.bands,array.len(c.bands)-1)
+  var silence:array<f64>=[]
+  let count:u64=4*last.hop*(spectrum.w-1)
+  array.reserve(silence,count)
+  var i:u64=0
+  loop{if i==count{break}
+   array.push(silence,0.0)
+   i+=1}
+  return result.ok(silence)}
+ var magnitude:ops.Tensor=ops.tensor(2,spectrum.h,spectrum.w,magnitudes)
+ var mask:array<f32>=try masks(n,prepared,library,c,magnitude,maximum,0,cancel,progress,predictor)
+ if c.tta{
+  let alternate:array<f32>=try masks(n,prepared,library,c,magnitude,maximum,(c.window-2*n.offset)/2,cancel,progress,predictor)
+  var i:u64=0
+  loop{if i>=array.len(mask){break}
+   array.set(mask,i,(array.get(mask,i)+array.get(alternate,i))*0.5)
+   i+=1}
+ }
+ if not num.finite(array.view(mask)){return result.err("Non-finite predicted mask")}
+ let _=try postprocess.apply(mask,c,spectrum.h,spectrum.w,settings,cancel)
+ var primary:ops.Tensor=try separated(c,spectrum,magnitude,array.view(mask),false,settings.enabled)
+ let primary_wave:array<f64>=try bands.synthesize_with_high(c,plans,primary,high)
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var secondary:ops.Tensor=try separated(c,spectrum,magnitude,array.view(mask),true,settings.enabled)
+ let secondary_wave:array<f64>=try bands.synthesize_with_high(c,plans,secondary,high)
+ var output:array<f64>=[]
+ var i:u64=0
+ loop{if i>=array.len(primary_wave){break}
+  array.push(output,array.get(primary_wave,i))
+  i+=1}
+ i=0
+ loop{if i>=array.len(secondary_wave){break}
+  array.push(output,array.get(secondary_wave,i))
+  i+=1}
+ i=0
+ loop{if i==array.len(output){break}
+  if not fp.is_finite(array.get(output,i)){return result.err("Non-finite reconstructed sources")}
+  i+=1}
+ result.ok(output)
+}
+// Legacy consumers explicitly round the reconstructed F64 waveforms. Typed
+// consumers retain the inverse transform's actual carrier through processing.
+pub fn separate_predicted_with_cleanup<N,P>(n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},settings:ref<cleanup.Settings>)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let wide:array<f64>=try separate_predicted_wide_with_cleanup(n,prepared,library,plans,c,input,cancel,progress,predictor,settings)
+ var output:array<f32>=[]
+ array.reserve(output,array.len(wide))
+ var i:u64=0
+ loop{if i==array.len(wide){break}
+  array.push(output,cast.float(array.get(wide,i)))
+  i+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite reconstructed sources")}
+ result.ok(output)
+}
+fn predict_standard(n:ref<network.Network>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ host.predict(n,prepared,library,input,cancel)
+}
+pub fn separate(n:ref<network.Network>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ separate_predicted(n,prepared,library,plans,c,input,cancel,progress,predict_standard)
+}
+pub fn separate_predicted<N,P>(n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta})->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ var settings:cleanup.Settings=cleanup.disabled()
+ separate_predicted_with_cleanup(n,prepared,library,plans,c,input,cancel,progress,predictor,settings)
+}
+pub fn separate_with_cleanup(n:ref<network.Network>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ separate_predicted_with_cleanup(n,prepared,library,plans,c,input,cancel,progress,predict_standard,settings)
+}
+pub fn separate_wide_with_cleanup(n:ref<network.Network>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>)->result<array<f64>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ separate_predicted_wide_with_cleanup(n,prepared,library,plans,c,input,cancel,progress,predict_standard,settings)
+}
+pub fn separate_wide_with_cleanup_and_band_input(n:ref<network.Network>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>,lower:view<f32>)->result<array<f64>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ separate_predicted_wide_with_cleanup_and_band_input(n,prepared,library,plans,c,input,cancel,progress,predict_standard,settings,lower)
+}

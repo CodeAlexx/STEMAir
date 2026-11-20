@@ -1,0 +1,129 @@
+module stemair.learned_cleanup_bank
+import "learned_cleanup.ai" as core
+import "learned_cleanup_device.ai" as device
+import "learned_cleanup_request.ai" as request
+import "audio_result.ai" as audio
+import std.path as path
+import std.files as files
+import std.system as system
+import std.gpu as gpuapi
+
+pub type Entry=struct{checkpoint:string,kind:core.Kind,session:core.Session,device:array<device.State>}
+pub type Bank=struct{settings:request.Settings,entries:array<Entry>,contexts:array<GpuContext>,streams:array<GpuStream>,poisoned:bool=false,device_index:u32=0}
+pub fn empty()->Bank effects {alloc}{Bank{settings:request.disabled(),entries:[],contexts:[],streams:[]}}
+pub fn select(bank:ref<Bank>,raw:str)->result<unit,string> effects {alloc}{
+ let settings:request.Settings=try request.decode(raw)
+ if bank.poisoned{return result.err("Learned runtime requires explicit release")}
+ bank.settings=settings
+ result.ok(())
+}
+fn gpu_error(e:gpu.error)->string effects {alloc}{string.copy(e.message)}
+fn identity(file:str)->result<string,string> effects {alloc,fs.read}{
+ if path.is_absolute(file){return result.ok(path.normalize(file))}
+ let cwd:string=match files.cwd(){ok(v)=>v,err(_)=>{return result.err("Cannot resolve learned checkpoint path")}}
+ result.ok(path.normalize(path.join(cwd,file)))
+}
+fn prepare_host(bank:ref<Bank>,file:str,kind:core.Kind)->result<unit,string> effects {alloc,ffi,fs.read,fs.meta}{
+ let canonical:string=try identity(file)
+ var i:u64=0
+ loop{if i==array.len(bank.entries){break}
+  let entry:ref<Entry>=array.borrow(bank.entries,i)
+  if entry.kind==kind{
+   if str.view(entry.checkpoint)!=str.view(canonical){return result.err("Learned checkpoint changed; release retained models first")}
+   return result.ok(())}
+  i+=1}
+ let bytes:u64=match files.file_size(canonical){ok(v)=>v,err(_)=>{return result.err("Cannot inspect learned checkpoint")}}
+ if bytes==0 or bytes>2147483648{return result.err("Learned checkpoint exceeds its retained size bound")}
+ let memory:system.Memory=match system.memory(){ok(v)=>v,err(_)=>{return result.err("Cannot inspect memory for learned checkpoint")}}
+ if bytes*4+67108864>memory.available_bytes{return result.err("Not enough memory to retain learned checkpoint; release models first")}
+ let session:core.Session=try core.open_host_math(canonical,kind)
+ array.push(bank.entries,Entry{checkpoint:canonical,kind:kind,session:session,device:[]})
+ result.ok(())
+}
+pub fn configure_cpu(bank:ref<Bank>,raw:str)->result<unit,string> effects {alloc,ffi,fs.read,fs.meta}{
+ let selected:request.Settings=try request.decode(raw)
+ if bank.poisoned{return result.err("Learned runtime requires explicit release after an uncertain operation")}
+ if selected.noise{let _=try prepare_host(bank,selected.noise_checkpoint,core.Kind.Noise)}
+ if selected.room{let _=try prepare_host(bank,selected.room_checkpoint,core.Kind.Room)}
+ bank.settings=selected
+ result.ok(())
+}
+pub fn configure_gpu(bank:ref<Bank>,raw:str)->result<unit,string> effects {alloc,ffi,fs.read,fs.meta,gpu}{
+ configure_gpu_on_device(bank,raw,0)
+}
+pub fn configure_gpu_on_device(bank:ref<Bank>,raw:str,index:u32)->result<unit,string> effects {alloc,ffi,fs.read,fs.meta,gpu}{
+ if array.len(bank.contexts)!=0 and bank.device_index!=index{return result.err("Learned GPU index changed; release retained models first")}
+ let _=try configure_cpu(bank,raw)
+ if not bank.settings.noise and not bank.settings.room{return result.ok(())}
+ if array.len(bank.contexts)==0{
+  let context:GpuContext=try gpuapi.open(index) map_err gpu_error
+  bank.device_index=index
+  array.push(bank.contexts,context)}
+ if array.len(bank.streams)==0{
+  let stream:GpuStream=try gpuapi.compute_stream(array.borrow(bank.contexts,0)) map_err gpu_error
+  array.push(bank.streams,stream)}
+ var i:u64=0
+ loop{if i==array.len(bank.entries){break}
+  let entry:ref<Entry>=array.borrow(bank.entries,i)
+  let enabled:bool=if entry.kind==core.Kind.Noise{bank.settings.noise}else{bank.settings.room}
+  if enabled and array.len(entry.device)==0{
+   match device.prepare(array.borrow(bank.contexts,0),array.borrow(bank.streams,0),struct.borrow(entry,field=session)){
+    ok(value)=>{array.push(entry.device,value)},err(e)=>{bank.poisoned=true
+     return result.err(e)}}}
+  i+=1}
+ result.ok(())
+}
+fn find(bank:ref<Bank>,kind:core.Kind)->result<u64,string> effects {alloc}{
+ if bank.poisoned{return result.err("Learned runtime requires release")}
+ if (kind==core.Kind.Noise and not bank.settings.noise) or (kind==core.Kind.Room and not bank.settings.room){return result.err("Learned helper is disabled")}
+ var i:u64=0
+ loop{if i==array.len(bank.entries){break}
+  if array.borrow(bank.entries,i).kind==kind{return result.ok(i)}
+  i+=1}
+ result.err("Learned helper was not prepared at session startup")
+}
+pub fn apply_cpu(bank:ref<Bank>,kind:core.Kind,library:ref<CAbiLibrary>,input:ref<audio.Samples>,cancel:str)->result<core.Output,string> effects {alloc,ffi,fs.meta}{
+ let i:u64=try find(bank,kind)
+ core.apply_samples(struct.borrow(array.borrow(bank.entries,i),field=session),library,input,cancel)
+}
+pub fn apply_gpu(bank:ref<Bank>,kind:core.Kind,input:ref<audio.Samples>,cancel:str)->result<core.Output,string> effects {alloc,gpu,fs.meta}{
+ let i:u64=try find(bank,kind)
+ let entry:ref<Entry>=array.borrow(bank.entries,i)
+ if array.len(entry.device)!=1 or array.len(bank.contexts)!=1 or array.len(bank.streams)!=1{return result.err("Learned GPU helper was not prepared at session startup")}
+ let states:ref<array<device.State>>=struct.borrow(entry,field=device)
+ let session:ref<core.Session>=struct.borrow(entry,field=session)
+ device.apply_samples(array.borrow(bank.contexts,0),array.borrow(bank.streams,0),array.borrow(states,0),session,input,cancel)
+}
+pub fn close_host(bank:ref<Bank>)->result<unit,string> effects {alloc}{
+ if array.len(bank.contexts)!=0 or array.len(bank.streams)!=0{return result.err("Learned GPU state must be closed before host release")}
+ bank.entries=[]
+ bank.settings=request.disabled()
+ bank.poisoned=false
+ result.ok(())
+}
+pub fn close_gpu(bank:ref<Bank>)->result<unit,string> effects {alloc,gpu}{
+ bank.poisoned=true
+ var i:u64=0
+ loop{if i==array.len(bank.entries){break}
+  let entry:ref<Entry>=array.borrow(bank.entries,i)
+  if array.len(entry.device)!=0{let _=try device.close(array.borrow(entry.device,0))
+   entry.device=[]}
+  i+=1}
+ if array.len(bank.streams)!=0{
+  let _=try gpuapi.sync_stream(array.borrow(bank.streams,0)) map_err gpu_error
+  let held:GpuStream=match array.pop(bank.streams){some(v)=>v,none=>{return result.err("Learned stream ownership was lost")}}
+  let _=try gpuapi.close_stream(held) map_err gpu_error}
+ if array.len(bank.contexts)!=0{
+  let held:GpuContext=match array.pop(bank.contexts){some(v)=>v,none=>{return result.err("Learned context ownership was lost")}}
+  let _=try gpuapi.close(held) map_err gpu_error}
+ close_host(bank)
+}
+pub fn loads(bank:ref<Bank>)->u64 effects {}{array.len(bank.entries)}
+pub fn bytes_read(bank:ref<Bank>)->u64 effects {}{
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(bank.entries){break}
+  total+=array.borrow(bank.entries,i).session.network.weights.bytes_read
+  i+=1}
+ total
+}

@@ -1,0 +1,146 @@
+module stemair.ensemble_application
+import "wav_export.ai" as wav
+import "checked_input.ai" as checked_input
+import "container_export.ai" as container
+import "application.ai" as app
+import "../toolkit/ensemble.ai" as ensemble
+import "../toolkit/control.ai" as control
+import std.audio as audio
+import std.codec as codec
+import std.files as files
+import std.path as path
+
+pub type Settings=struct{method:string,domain:string="spectrum",normalize:bool=false,inputs:array<string>} derive codec(strict)
+type Manifest=struct{method:string,domain:string,normalize:bool,inputs:array<string>,sample_rate:u32,
+ frames:u64,compared_frames:u64,file:string,backend:string,checkpoint_loads:u64} derive codec(strict)
+pub fn validate(c:ref<Settings>)->result<unit,string> effects {alloc} {
+ if not ensemble.valid_method(c.method) or not ensemble.valid_domain(c.domain){return result.err("Choose a valid ensemble method and domain")}
+ if array.len(c.inputs)<2{return result.err("Select at least two audio inputs to ensemble")}
+ var i:u64=0
+ loop{if i==array.len(c.inputs){break}
+  let name:str=array.get(c.inputs,i)
+  if str.len(name)==0{return result.err("An ensemble input path is empty")}
+  i+=1}
+ result.ok(())
+}
+pub fn read(file:str)->result<Settings,string> effects {alloc,fs.read} {
+ let raw:string=match files.read_text(file){ok(v)=>v,err(_)=>{return result.err("Cannot read ensemble recipe")}}
+ var c:Settings=try Settings_decode(raw) map_err codec.describe
+ let _=try validate(c)
+ result.ok(c)
+}
+pub fn preflight(directory:str)->result<unit,string> effects {alloc,fs.meta} {
+ let exists:bool=match files.is_dir(directory){ok(v)=>v,err(_)=>false}
+ if not exists{return result.err("Output directory must already exist")}
+ let names:array<string>=["ensemble.wav","ensemble.json"]
+ var i:u64=0
+ loop{if i==2{break}
+  let target:string=path.join(directory,array.get(names,i))
+  let found:bool=match files.exists(target){ok(v)=>v,err(_)=>{return result.err("Cannot inspect ensemble output")}}
+  if found{return result.err("An ensemble output already exists; choose an empty directory")}
+  i+=1}
+ result.ok(())
+}
+type Computed=struct{output:ensemble.Output,names:array<string>}
+fn compute(c:ref<Settings>,directory:str,cancel:str,progress:str,input_options:ref<option<checked_input.Options>>)->result<Computed,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ var inputs:array<array<f32>>=[]
+ var names:array<string>=[]
+ var retained_values:u64=0
+ var i:u64=0
+ loop{if i==array.len(c.inputs){break}
+  if control.cancelled(cancel){return result.err("Ensemble cancelled")}
+  let name:str=array.get(c.inputs,i)
+  var decoded:audio.AudioBuffer=try match input_options{none=>app.read_recording(name,44100,directory),some(options)=>checked_input.buffer(name,44100,checked_input.queue_item(options,i,cancel))}
+  var planar:array<f32>=try app.planar(decoded,44100)
+  if array.len(planar)>536870912-retained_values{return result.err("Ensemble exceeds its retained host memory bound")}
+  retained_values+=array.len(planar)
+  array.push(inputs,planar)
+  array.push(names,string.copy(name))
+  control.report(progress,i+1,array.len(c.inputs))
+  i+=1}
+ var combined:ensemble.Output=try ensemble.combine(inputs,c.method,c.domain,c.normalize,cancel,progress)
+ if control.cancelled(cancel){return result.err("Ensemble cancelled")}
+ result.ok(Computed{output:combined,names:names})
+}
+fn run_impl(c:ref<Settings>,directory:str,cancel:str,progress:str,encoding:option<audio.WavSubtype>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let _=try validate(c)
+ if control.cancelled(cancel){return result.err("Ensemble cancelled")}
+ match encoding{some(kind)=>{let _=try preflight_as(directory,kind)},none=>{let _=try preflight(directory)}}
+ var input_options:option<checked_input.Options>=option.none()
+ var computed:Computed=try compute(c,directory,cancel,progress,input_options)
+ let names:array<string>=struct.replace(computed,[],field=names)
+ let combined:ref<ensemble.Output>=struct.borrow(computed,field=output)
+ let samples:array<f32>=wav.interleave(array.view(combined.values),combined.frames,2)
+ var buffer:audio.AudioBuffer=audio.AudioBuffer{samples:samples,rate:44100,channels:2}
+ match encoding{some(kind)=>{let _=try wav.write_buffer_controlled(path.join(directory,"ensemble.wav"),buffer,kind,cancel,progress)},none=>{
+ let encoded:bytes=try audio.encode_wav(buffer,32) map_err audio.message
+ match files.write_new_bytes(path.join(directory,"ensemble.wav"),bytes.view(encoded)){
+  ok(_)=>{},err(_)=>{return result.err("Cannot create ensemble WAV; existing files are preserved")}}
+ }}
+ var manifest:Manifest=Manifest{method:string.copy(c.method),domain:if str.view(c.method)=="average"{"waveform"}else{string.copy(c.domain)},
+  normalize:c.normalize,inputs:names,sample_rate:44100,frames:combined.frames,compared_frames:combined.compared_frames,
+  file:"ensemble.wav",backend:"native-air-cpu-f32",checkpoint_loads:0}
+ let text:string=try Manifest_encode(manifest) map_err codec.describe
+ match encoding{some(kind)=>wav.write_metadata(path.join(directory,"ensemble.json"),text,kind),none=>{
+ match files.write_new_text(path.join(directory,"ensemble.json"),text){ok(_)=>result.ok(()),err(_)=>result.err("Cannot create ensemble manifest; the WAV remains available")}
+ }}
+}
+pub fn run(c:ref<Settings>,directory:str,cancel:str,progress:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ run_impl(c,directory,cancel,progress,option.none())
+}
+pub fn run_as(c:ref<Settings>,directory:str,cancel:str,progress:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ run_impl(c,directory,cancel,progress,option.some(kind))
+}
+
+
+pub fn preflight_as(directory:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.meta} {
+ let _=try preflight(directory)
+ let names:array<string>=["ensemble.wav","ensemble.json"]
+ var i:u64=0
+ loop{if i==array.len(names){break}
+  let _=try wav.preflight_file(path.join(directory,array.get(names,i)))
+  i+=1}
+ result.ok(())
+}
+
+
+pub fn preflight_to(directory:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ let _=try container.verify(plan)
+ let _=try container.require_directory(directory)
+ let _=try container.preflight_tracked(container.target(directory,"ensemble",plan),plan,log)
+ container.preflight_metadata_tracked(path.join(directory,"ensemble.json"),log)
+}
+
+fn run_to_impl(c:ref<Settings>,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>,input_options:ref<option<checked_input.Options>>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let _=try validate(c)
+ if control.cancelled(cancel){return result.err("Ensemble cancelled")}
+ let start:u64=array.len(log.artifacts)
+ let _=try preflight_to(directory,plan,log)
+ var computed:Computed=try compute(c,directory,cancel,progress,input_options)
+ let names:array<string>=struct.replace(computed,[],field=names)
+ let combined:ref<ensemble.Output>=struct.borrow(computed,field=output)
+ let samples:array<f32>=wav.interleave(array.view(combined.values),combined.frames,2)
+ var buffer:audio.AudioBuffer=audio.AudioBuffer{samples:samples,rate:44100,channels:2}
+ let _=try container.write_buffer(container.target(directory,"ensemble",plan),buffer,plan,log,cancel,progress)
+ var manifest:Manifest=Manifest{method:string.copy(c.method),domain:if str.view(c.method)=="average"{"waveform"}else{string.copy(c.domain)},
+  normalize:c.normalize,inputs:names,sample_rate:44100,frames:combined.frames,compared_frames:combined.compared_frames,
+  file:container.filename("ensemble",plan),backend:"native-air-cpu-f32",checkpoint_loads:0}
+ let text:string=try Manifest_encode(manifest) map_err codec.describe
+ container.write_metadata(path.join(directory,"ensemble.json"),text,plan,log,start)
+}
+pub fn run_to(c:ref<Settings>,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ var input_options:option<checked_input.Options>=option.none()
+ let outcome:result<unit,string>=run_to_impl(c,directory,cancel,progress,plan,log,input_options)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+
+pub fn run_with_input_to(c:ref<Settings>,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>,input_options:ref<option<checked_input.Options>>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=run_to_impl(c,directory,cancel,progress,plan,log,input_options)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}

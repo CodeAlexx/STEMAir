@@ -1,0 +1,100 @@
+module stemair.recurrent_device
+import "recurrent.ai" as recurrent
+import "weights.ai" as weights
+import "ops.ai" as ops
+import "numeric.ai" as num
+import "control.ai" as control
+import std.tensor as tensor
+import std.compute as compute
+import std.float as fp
+import std.text as text
+
+pub type Observer<O>=struct{callback:option<fn(ref<O>,str,view<u64>,view<f32>)->result<unit,string> effects {alloc}>}
+fn observe_state<O>(observer:ref<Observer<O>>,observations:ref<O>,prefix:str,direction:u64,batch:u64,hidden:u64,state:view<f32>,cell:view<f32>)->result<unit,string> effects {alloc} {
+ match observer.callback{none=>result.ok(()),some(invoke)=>{
+  let base:string=text.concat(text.concat(prefix,"-"),if direction==0{"forward"}else{"reverse"})
+  let shape:array<u64>=[batch,hidden]
+  let _=try invoke(observations,text.concat(base,"-hidden"),array.view(shape),state)
+  invoke(observations,text.concat(base,"-cell"),array.view(shape),cell)}}
+}
+
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+fn value(w:ref<weights.Model>,parameter:u64,index:u64)->f32 effects {} {
+ array.get(array.borrow(w.parameters.values,parameter).values,index)
+}
+fn sigmoid(value:f32)->f32 effects {} {1.0/(1.0+fp.exp(-value))}
+fn project(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ input:ref<tensor.Tensor>,weight:u64,rows:u64,features:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let shape:array<u64>=[rows,features]
+ var output:tensor.Tensor=try tensor.empty(context,array.view(shape),tensor.DType.F32) map_err error
+ let _=try compute.linear_f32(stream,input,array.borrow(parameters,weight),output) map_err error
+ result.ok(output)
+}
+// The large learned products use shared F32 GPU linear operations. Gate/state
+// arithmetic remains native F32, with distinct input and recurrent bias adds.
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ w:ref<weights.Model>,layer:recurrent.Bidirectional,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if input.c!=1{return result.err("Single-batch recurrent input required")}
+ forward_batched(context,stream,parameters,w,layer,input,cancel)
+}
+// Independent zero-initialized sequences share the same retained parameters.
+// Layout is [batch,time,features]; a direction never crosses a batch boundary.
+pub fn forward_batched_observed<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ w:ref<weights.Model>,layer:recurrent.Bidirectional,input:ref<ops.Tensor>,cancel:str,prefix:str,observer:ref<Observer<O>>,observations:ref<O>)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if input.c==0 or input.c>4096 or input.w!=layer.input_features or input.h==0 or input.h>65536 or input.c*input.h>65536 or
+  array.len(input.data)!=input.c*input.h*input.w or
+  not num.finite(array.view(input.data)){return result.err("Invalid GPU recurrent input rows")}
+ let hidden:u64=layer.hidden_features
+ let input_shape:array<u64>=[input.c*input.h,input.w]
+ var packed:tensor.Tensor=try tensor.from_f32(context,stream,array.view(input.data),array.view(input_shape),tensor.DType.F32) map_err error
+ var output:array<f32>=num.zeros(input.c*input.h*2*hidden)
+ var direction:u64=0
+ loop{if direction==2{break}
+  let p:recurrent.Direction=if direction==0{layer.forward}else{layer.reverse}
+  var projected:tensor.Tensor=try project(context,stream,parameters,packed,p.input,input.c*input.h,4*hidden)
+  let input_values:array<f32>=try tensor.to_f32(stream,projected) map_err error
+  var state:array<f32>=num.zeros(input.c*hidden)
+  var cell:array<f32>=num.zeros(input.c*hidden)
+  var step:u64=0
+  loop{if step==input.h{break}
+   if control.cancelled(cancel){return result.err("Separation cancelled")}
+   let time:u64=if direction==0{step}else{input.h-1-step}
+   let shape:array<u64>=[input.c,hidden]
+   var current:tensor.Tensor=try tensor.from_f32(context,stream,array.view(state),array.view(shape),tensor.DType.F32) map_err error
+   var projected_state:tensor.Tensor=try project(context,stream,parameters,current,p.hidden,input.c,4*hidden)
+   let state_values:array<f32>=try tensor.to_f32(stream,projected_state) map_err error
+   var batch:u64=0
+   loop{if batch==input.c{break}
+   var gates:array<f32>=[]
+   array.reserve(gates,4*hidden)
+   var gate:u64=0
+   loop{if gate==4*hidden{break}
+    let a:f32=array.get(input_values,(batch*input.h+time)*4*hidden+gate)+value(w,p.input_bias,gate)
+    let b:f32=array.get(state_values,batch*4*hidden+gate)+value(w,p.hidden_bias,gate)
+    array.push(gates,a+b)
+    gate+=1}
+   var i:u64=0
+   loop{if i==hidden{break}
+    let input_gate:f32=sigmoid(array.get(gates,i))
+    let forget:f32=sigmoid(array.get(gates,hidden+i))
+    let proposal:f32=fp.tanh(array.get(gates,2*hidden+i))
+    let output_gate:f32=sigmoid(array.get(gates,3*hidden+i))
+    let updated:f32=forget*array.get(cell,batch*hidden+i)+input_gate*proposal
+    let activated:f32=output_gate*fp.tanh(updated)
+    array.set(cell,batch*hidden+i,updated)
+    array.set(state,batch*hidden+i,activated)
+    array.set(output,(batch*input.h+time)*2*hidden+direction*hidden+i,activated)
+    i+=1}
+   batch+=1}
+   step+=1}
+  let _=try observe_state(observer,observations,prefix,direction,input.c,hidden,array.view(state),array.view(cell))
+  direction+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite GPU recurrent output")}
+ result.ok(ops.tensor(input.c,input.h,2*hidden,output))
+}
+pub fn forward_batched(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ w:ref<weights.Model>,layer:recurrent.Bidirectional,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ var observations:unit=()
+ forward_batched_observed(context,stream,parameters,w,layer,input,cancel,"",observer,observations)
+}

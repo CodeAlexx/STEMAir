@@ -1,0 +1,29 @@
+module stemair.exchange.config
+import std.files as files
+import std.codec as codec
+import std.float as fp
+
+pub type Config=struct{engine:string="exchange",sample_rate:u32,n_fft:u64,hop:u64,frequency_bins:u64,frames:u64,
+ overlap_mode:string="automatic",overlap:f64=0.25,compensation:f64=1.0,denoise:bool=false,targets:array<string>} derive codec(strict)
+fn validate_impl(c:ref<Config>,typed:bool)->result<unit,string> effects {alloc} {
+ if str.view(c.engine)!="exchange" or c.sample_rate!=44100 or c.n_fft<32 or c.n_fft>32768 or c.n_fft%2!=0 or
+  c.hop==0 or c.hop>c.n_fft/2 or c.frequency_bins<3 or c.frequency_bins>c.n_fft/2+1 or c.frames<32 or c.frames>4096 or
+  not fp.is_finite(c.compensation) or c.compensation<0.0 or not fp.is_finite(c.overlap) or
+  c.overlap<0.0 or c.overlap>0.99 or array.len(c.targets)!=2 or c.hop*(c.frames-1)<=c.n_fft{
+  return result.err("Invalid interchange separation configuration")}
+ if not typed and c.compensation>=3.4e38{return result.err("Compensation requires promoted Float64 separation outputs, which are not yet supported")}
+ if str.view(c.overlap_mode)!="automatic" and str.view(c.overlap_mode)!="fraction"{return result.err("Unknown overlap mode")}
+ let first:string=string.copy(array.get(c.targets,0))
+ let second:string=string.copy(array.get(c.targets,1))
+ if first==second or str.len(str.view(first))==0 or str.len(str.view(second))==0{
+  return result.err("Two distinct source names are required")}
+ result.ok(())
+}
+pub fn validate(c:ref<Config>)->result<unit,string> effects {alloc} {validate_impl(c,false)}
+pub fn validate_typed(c:ref<Config>)->result<unit,string> effects {alloc} {validate_impl(c,true)}
+pub fn read(path:str)->result<Config,string> effects {alloc,fs.read} {
+ let raw:string=match files.read_text(path){ok(v)=>v,err(_)=>{return result.err("Cannot read interchange configuration")},}
+ var c:Config=match Config_decode(str.view(raw)){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+ let _=try validate(c)
+ result.ok(c)
+}

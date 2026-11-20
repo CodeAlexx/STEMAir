@@ -1,0 +1,42 @@
+module stemair.alignment_runtime
+import "alignment_application.ai" as alignment
+import std.files as files
+import std.path as path
+import std.system as system
+import std.json as json
+import std.codec as codec
+
+pub fn settings_for_polarity(root:str,polarity:u32,save_aligned:bool)->result<alignment.Settings,string>
+ effects {alloc,env,fs.read,fs.meta} {
+ if polarity>2{return result.err("Choose unchanged, inverted or automatic polarity")}
+ var out:alignment.Settings=try settings(root,polarity==1,save_aligned)
+ out.auto_polarity=polarity==2
+ result.ok(out)
+}
+
+// Deployment policy stays outside the reusable alignment core. Both installed
+// and development layouts use a native runtime with the same pinned identity.
+pub fn settings(root:str,invert:bool,save_aligned:bool)->result<alignment.Settings,string>
+ effects {alloc,env,fs.read,fs.meta} {
+ let raw:bytes=match files.read_limited(path.join(root,"licenses/cpu-dot-source.json"),16384){ok(v)=>v,err(_)=>{
+  return result.err("The CPU audio runtime identity is unavailable")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("The CPU audio runtime identity must be UTF-8")}}
+ var document:json.Document=match json.parse(source){ok(v)=>v,err(_)=>{return result.err("The CPU audio runtime identity is invalid")}}
+ var reader:codec.Reader=codec.root_reader(codec.Policy{reject_unknown:false,reject_duplicates:true})
+ let windows:bool=system.platform()=="windows"
+ let sha:string=try codec.text_field(document,reader,if windows{"windows_sha256"}else{"linux_sha256"}) map_err codec.describe
+ let _=try codec.reader_finish(document,reader) map_err codec.describe
+ if str.len(sha)!=64{return result.err("The CPU audio runtime identity is incomplete")}
+ let filename:str=if windows{"cpu-dot.dll"}else{"cpu-dot.so"}
+ let candidates:array<string>=[path.join(path.join(root,"runtime/cpu-dot"),filename),path.join(path.join(root,"build/runtime/cpu-dot"),filename)]
+ var i:u64=0
+ loop{if i==array.len(candidates){break}
+  let candidate:str=array.get(candidates,i)
+  match files.symlink_metadata(candidate){
+   ok(info)=>{
+    if not info.is_file or info.is_symlink{return result.err("The CPU audio runtime must be an ordinary file")}
+    return result.ok(alignment.Settings{runtime:string.copy(candidate),runtime_sha256:string.copy(sha),invert:invert,save_aligned:save_aligned})},
+   err(error)=>{if error.code!=1{return result.err("Cannot inspect the CPU audio runtime")}}}
+  i+=1}
+ result.err("Coarse alignment requires the optional CPU audio runtime")
+}

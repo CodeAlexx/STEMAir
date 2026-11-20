@@ -1,0 +1,129 @@
+module stemair.paired_panel_state
+import "paired_config.ai" as config
+import "alignment_choices.ai" as choices
+import "container_export.ai" as container
+import "wav_export.ai" as wav
+import "audio_io_policy.ai" as io_policy
+import "../toolkit/paired_inputs.ai" as ordered
+import "../toolkit/compressed_export.ai" as compressed
+import std.codec as codec
+
+// Saved pending work is independent of editable rows and live controls.
+pub type Applied=struct{recipe:string,output:string,wav_choice:u32=4,codec_recipe:string="",audio_budget:u32=1,
+ continue_on_error:bool=false,max_frames:u64=0,max_stage_bytes:u64=0,max_encoded_bytes:u64=0} derive codec(strict)
+// Local value records keep persistence independent of runtime-owned config items.
+pub type Item=struct{first:string,second:string,folder:string} derive codec(strict)
+pub type Snapshot=struct{version:u64=1,accepted:array<Item>,remaining:array<Item>,applied:Applied,
+ report_file:string="",report:string=""} derive codec(strict)
+pub fn plan(value:ref<Applied>)->result<container.Plan,string> effects {alloc} {
+ let kind=try wav.from_choice(value.wav_choice)
+ if view.len(str.bytes(value.codec_recipe))>16384{return result.err("Paired codec recipe exceeds 16 KiB")}
+ var selected:container.Plan=if str.len(value.codec_recipe)==0{container.wav_plan(kind)}else{
+  let settings:compressed.Settings=try compressed.Settings_decode(value.codec_recipe) map_err codec.describe
+  try container.compressed_plan(kind,settings)}
+ if value.max_frames>0 or value.max_stage_bytes>0 or value.max_encoded_bytes>0{
+  selected=try container.with_limits(selected,compressed.Limits{max_frames:value.max_frames,max_stage_bytes:value.max_stage_bytes,max_encoded_bytes:value.max_encoded_bytes})}
+ result.ok(selected)
+}
+fn same(first:ref<Item>,second:ref<Item>)->bool effects {} {
+ str.view(first.first)==str.view(second.first) and str.view(first.second)==str.view(second.second) and str.view(first.folder)==str.view(second.folder)
+}
+pub fn validate(value:ref<Snapshot>)->result<unit,string> effects {alloc} {
+ if value.version!=1{return result.err("Saved paired work uses an unsupported version")}
+ if array.len(value.accepted)==0 or array.len(value.accepted)>4096 or array.len(value.remaining)>4096{return result.err("Saved paired work exceeds its entry limits")}
+ let _=try config.validate(runtime_items(struct.borrow(value,field=accepted)))
+ if array.len(value.remaining)>0{let _=try config.validate(runtime_items(struct.borrow(value,field=remaining)))}
+ if str.len(value.applied.output)==0{return result.err("Choose an output directory before accepting pairs")}
+ if str.len(value.applied.recipe)>16384{return result.err("Paired alignment recipe exceeds 16 KiB")}
+ let recipe:choices.Recipe=try choices.Recipe_decode(value.applied.recipe) map_err codec.describe
+ let _=try choices.validate_any(recipe)
+ if not (try choices.is_canonical(value.applied.recipe)){return result.err("Saved paired work requires its canonical applied recipe")}
+ let _=try io_policy.budget(value.applied.audio_budget)
+ let _=try plan(struct.borrow(value,field=applied))
+ var scan:u64=0
+ var i:u64=0
+ loop{if i==array.len(value.remaining){break}
+  let item:ref<Item>=array.borrow(struct.borrow(value,field=remaining),i)
+  loop{if scan==array.len(value.accepted){return result.err("Saved remaining pairs differ from the accepted ordered snapshot")}
+   let found:bool=same(item,array.borrow(struct.borrow(value,field=accepted),scan))
+   scan+=1
+   if found{break}}
+  i+=1}
+ result.ok(())
+}
+pub fn encode(value:ref<Snapshot>)->result<string,string> effects {alloc} {
+ let _=try validate(value)
+ let raw:string=try Snapshot_encode(value) map_err codec.describe
+ if view.len(str.bytes(raw))>4194304{return result.err("Saved paired work exceeds 4 MiB")}
+ result.ok(raw)
+}
+pub fn decode(raw:str)->result<Snapshot,string> effects {alloc} {
+ if view.len(str.bytes(raw))>4194304{return result.err("Saved paired work exceeds 4 MiB")}
+ let value:Snapshot=try Snapshot_decode(raw) map_err codec.describe
+ let _=try validate(value)
+ result.ok(value)
+}
+fn runtime_items(items:ref<array<Item>>)->array<config.Item> effects {alloc} {
+ var out:array<config.Item>=[]
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  let item:ref<Item>=array.borrow(items,i)
+  array.push(out,config.Item{first:string.copy(item.first),second:string.copy(item.second),folder:string.copy(item.folder)})
+  i+=1}
+ out
+}
+fn stored_items(items:ref<array<config.Item>>)->array<Item> effects {alloc} {
+ var out:array<Item>=[]
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  let item:ref<config.Item>=array.borrow(items,i)
+  array.push(out,Item{first:string.copy(item.first),second:string.copy(item.second),folder:string.copy(item.folder)})
+  i+=1}
+ out
+}
+pub fn accept(first:ref<array<string>>,second:ref<array<string>>,applied:Applied own)->result<Snapshot,string> effects {alloc} {
+ let pairing:ordered.Pairing=try ordered.pair(first,second)
+ var selected:config.Plan=try config.from_pairs(pairing)
+ let accepted:array<Item>=stored_items(struct.borrow(selected,field=items))
+ var chosen:Applied=applied
+ let recipe:choices.Recipe=try choices.Recipe_decode(chosen.recipe) map_err codec.describe
+ chosen.recipe=try choices.Recipe_encode(recipe) map_err codec.describe
+ let value:Snapshot=Snapshot{accepted:accepted,remaining:stored_items(struct.borrow(selected,field=items)),applied:chosen}
+ let _=try validate(value)
+ result.ok(value)
+}
+pub fn selection(value:ref<Snapshot>,remaining_only:bool)->result<config.Plan,string> effects {alloc} {
+ let _=try validate(value)
+ let items:array<config.Item>=if remaining_only{runtime_items(struct.borrow(value,field=remaining))}else{runtime_items(struct.borrow(value,field=accepted))}
+ let _=try config.validate(items)
+ result.ok(config.Plan{items:items,continue_on_error:value.applied.continue_on_error})
+}
+fn same_plan(items:ref<array<config.Item>>,saved:ref<array<Item>>)->bool effects {} {
+ if array.len(items)!=array.len(saved){return false}
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  let actual:ref<config.Item>=array.borrow(items,i)
+  let expected:ref<Item>=array.borrow(saved,i)
+  if str.view(actual.first)!=str.view(expected.first) or str.view(actual.second)!=str.view(expected.second) or str.view(actual.folder)!=str.view(expected.folder){return false}
+  i+=1}
+ true
+}
+// Update atomically from the actual completed request, retaining stable folders.
+pub fn after(value:ref<Snapshot>,used:ref<config.Plan>,report:ref<config.Report>,report_file:str)->result<Snapshot,string> effects {alloc} {
+ let _=try validate(value)
+ if used.continue_on_error!=value.applied.continue_on_error or not (same_plan(struct.borrow(used,field=items),struct.borrow(value,field=accepted)) or same_plan(struct.borrow(used,field=items),struct.borrow(value,field=remaining))){return result.err("Paired completion does not belong to the accepted request")}
+ if str.view(report.recipe)!=str.view(value.applied.recipe) or str.view(report.directory)!=str.view(value.applied.output) or array.len(report.items)!=array.len(used.items){return result.err("Paired completion differs from its applied snapshot")}
+ var i:u64=0
+ loop{if i==array.len(used.items){break}
+  let expected:ref<config.Item>=array.borrow(struct.borrow(used,field=items),i)
+  let actual:ref<config.Outcome>=array.borrow(struct.borrow(report,field=items),i)
+  if str.view(expected.first)!=str.view(actual.first) or str.view(expected.second)!=str.view(actual.second) or str.view(expected.folder)!=str.view(actual.folder){return result.err("Paired completion changed an accepted row or folder identity")}
+  i+=1}
+ var next:Snapshot=try decode(try encode(value))
+ let remaining:array<config.Item>=config.remaining(report)
+ next.remaining=stored_items(remaining)
+ next.report_file=string.copy(report_file)
+ next.report=try config.Report_encode(report) map_err codec.describe
+ let _=try validate(next)
+ result.ok(next)
+}

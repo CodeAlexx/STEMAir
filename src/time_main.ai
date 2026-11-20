@@ -1,0 +1,18 @@
+module stemair.time_main
+import "time_application.ai" as app
+pub fn main(args:view<str>)->i32 effects {alloc,fs.read,fs.write,fs.meta,process,time,env,io.write} {
+ if view.len(args)<4 or view.len(args)>6{io.ewrite("Use stem-time RECIPE.json INPUT.wav OUTPUT_DIRECTORY [CANCEL_FILE] [PROGRESS_FILE]\n")
+  return 2}
+ let settings:app.Settings=match app.read(view.get(args,1)){ok(value)=>value,err(problem)=>{io.ewrite(problem)
+  return 1}}
+ let cancel:string=if view.len(args)>=5{string.copy(view.get(args,4))}else{""}
+ let progress:string=if view.len(args)>=6{string.copy(view.get(args,5))}else{""}
+ match app.run(settings,view.get(args,2),view.get(args,3),cancel,progress){
+  ok(report)=>{io.write("Audio tool complete\n")
+   if not report.temporary_removed{io.write("Owned temporary audio remains: ")
+    io.write(report.work_directory)
+    io.write("\n")}
+   0},err(problem)=>{io.ewrite(problem)
+   io.ewrite("\n")
+   1}}
+}

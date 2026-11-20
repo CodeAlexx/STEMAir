@@ -1,0 +1,107 @@
+module stemair.learned_cleanup_device
+import "learned_cleanup.ai" as core
+import "mask/recurrent_device.ai" as recurrent
+import "mask/device.ai" as common
+import "recurrent.ai" as recurrent_core
+import "recurrent_vendor.ai" as vendor
+import "ops.ai" as ops
+import "numeric.ai" as num
+import "control.ai" as control
+import "audio_result.ai" as audio
+import std.tensor as tensor
+import std.cuda_batch_norm_f32 as dense_norm
+import std.resize_bilinear as resize
+import std.gpu as devicegpu
+pub type State=struct{parameters:array<tensor.Tensor>,recurrence:vendor.State,normalizer:dense_norm.Engine,interpolation:resize.Engine,uploads:u64=1,requests:u64=0,patches:u64=0,groups:u64=0}
+fn error(e:gpu.error)->string effects {alloc}{string.copy(e.message)}
+pub fn prepare(context:ref<GpuContext>,stream:ref<GpuStream>,session:ref<core.Session>)->result<State,string> effects {alloc,gpu} {
+ var parameters:array<tensor.Tensor>=try recurrent.upload(context,stream,struct.borrow(session,field=network))
+ var retained:vendor.State=vendor.empty(67108864)
+ let layers:array<recurrent_core.Bidirectional>=[session.network.low1.recurrent.layer,session.network.high1.recurrent.layer,session.network.low2.recurrent.layer,session.network.high2.recurrent.layer,session.network.full.recurrent.layer]
+ var i:u64=0
+ loop{if i==5{break}
+  let one:array<recurrent_core.Bidirectional>=[array.get(layers,i)]
+  let _=try vendor.prepare(retained,context,stream,struct.borrow(session.network,field=weights),array.view(one),16777216)
+  i+=1}
+ var normalizer:dense_norm.Engine=try dense_norm.create(context) map_err error
+ var interpolation:resize.Engine=try resize.create_corners(context) map_err error
+ result.ok(State{parameters:parameters,recurrence:retained,normalizer:normalizer,interpolation:interpolation})
+}
+pub fn close(state:ref<State>)->result<unit,string> effects {alloc,gpu} {
+ var i:u64=0
+ loop{if i==array.len(state.parameters){break}
+  let _=try tensor.release(array.borrow(state.parameters,i)) map_err error
+  i+=1}
+ state.parameters=[]
+ state.recurrence.entries=[]
+ let held:dense_norm.Engine=struct.replace(state,dense_norm.Engine{kernel:option.none()},field=normalizer)
+ let _=try dense_norm.close(held) map_err error
+ let interpolation:resize.Engine=struct.replace(state,resize.Engine{kernels:[]},field=interpolation)
+ let _=try resize.close(interpolation) map_err error
+ result.ok(())
+}
+pub fn apply(context:ref<GpuContext>,stream:ref<GpuStream>,state:ref<State>,session:ref<core.Session>,input:view<f32>,cancel:str)->result<core.Output,string> effects {alloc,gpu,fs.meta} {
+ var spectrum:ops.Tensor=try core.analyze(session,input)
+ apply_analyzed(context,stream,state,session,spectrum,view.len(input)/2,cancel)
+}
+pub fn apply_samples(context:ref<GpuContext>,stream:ref<GpuStream>,state:ref<State>,session:ref<core.Session>,input:ref<audio.Samples>,cancel:str)->result<core.Output,string> effects {alloc,gpu,fs.meta}{
+ var spectrum:ops.Tensor=try core.analyze_samples(session,input)
+ apply_analyzed(context,stream,state,session,spectrum,audio.count(input)/2,cancel)
+}
+fn apply_analyzed(context:ref<GpuContext>,stream:ref<GpuStream>,state:ref<State>,session:ref<core.Session>,captured:ops.Tensor own,output_frames:u64,cancel:str)->result<core.Output,string> effects {alloc,gpu,fs.meta}{
+ var spectrum:ops.Tensor=captured
+ if array.len(state.parameters)!=array.len(session.network.weights.parameters.values){return result.err("Learned cleanup device state is not prepared")}
+ var magnitude:ops.Tensor=core.magnitudes_with_recipe(spectrum,session.magnitude_recipe)
+ let largest:f32=core.maximum(magnitude)
+ let frames:u64=magnitude.w
+ let bins:u64=magnitude.h
+ let patches:u64=frames/128+1
+ var mask:array<f32>=num.zeros(2*bins*frames)
+ var group:u64=0
+ loop{if group>=patches{break}
+  let end:u64=if patches-group>4{group+4}else{patches}
+  var members:array<ops.Tensor>=[]
+  var index:u64=group
+  loop{if index==end{break}
+   if control.cancelled(cancel){return result.err("Learned cleanup cancelled")}
+   var values:array<f32>=num.zeros(2*bins*256)
+   var ch:u64=0
+   loop{if ch==2{break}
+    var f:u64=0
+    loop{if f==bins{break}
+     var t:u64=0
+     loop{if t==256{break}
+      let pos:i64=cast.sat(index*128+t)-64
+      let at:u64=cast.sat(pos)
+      if pos>=0 and at<frames{array.set(values,(ch*bins+f)*256+t,array.get(magnitude.data,(ch*bins+f)*frames+at)/largest)}
+      t+=1}
+     f+=1}
+    ch+=1}
+   array.push(members,ops.tensor(2,bins,256,values))
+   index+=1}
+  var chunk:tensor.Tensor=try common.from_members(context,stream,members)
+  let policy:common.ConvolutionPolicy=common.ConvolutionPolicy{workspace_bytes:2147483648,deterministic:false,allow_tf32:true,original_statistics:true}
+  var predictions:array<ops.Tensor>=try recurrent.predict_batch_prepared(context,stream,struct.borrow(state,field=parameters),struct.borrow(session,field=network),chunk,cancel,policy,struct.borrow(state,field=recurrence),struct.borrow(state,field=normalizer),struct.borrow(state,field=interpolation))
+  if array.len(predictions)!=end-group{return result.err("Learned cleanup batch prediction count differs")}
+  index=group
+  loop{if index==end{break}
+   let predicted:ref<ops.Tensor>=array.borrow(predictions,index-group)
+   var ch:u64=0
+   loop{if ch==2{break}
+    var f:u64=0
+    loop{if f==bins{break}
+     var t:u64=0
+     loop{if t==128{break}
+      let at:u64=index*128+t
+      if at<frames{array.set(mask,(ch*bins+f)*frames+at,array.get(predicted.data,(ch*bins+f)*128+t))}
+      t+=1}
+     f+=1}
+    ch+=1}
+   state.patches+=1
+   index+=1}
+  state.groups+=1
+  group=end}
+ let _=try devicegpu.sync_stream(stream) map_err error
+ state.requests+=1
+ core.finish(session,spectrum,magnitude,array.view(mask),output_frames)
+}

@@ -1,0 +1,29 @@
+module stemair.source_input_runtime
+import "sound_file_runtime.ai" as identities
+import "../toolkit/recording_input.ai" as recording
+import std.sndfile as sound
+import std.files as files
+import std.path as path
+import std.system as system
+
+fn installed(root:str)->result<string,string> effects {alloc,env,fs.meta} {
+ let name:str=if system.platform()=="windows"{"libsndfile_64bit.dll"}else{"libsndfile.so.1.0.37"}
+ let candidates:array<string>=[path.join(path.join(root,"runtime/sound-file"),name),path.join(path.join(root,"build/runtime/sound-file"),name)]
+ var i:u64=0
+ loop{if i==array.len(candidates){break}
+  let candidate:str=array.get(candidates,i)
+  match files.symlink_metadata(candidate){ok(info)=>{
+   if not info.is_file or info.is_symlink{return result.err("The recording decoder runtime must be an ordinary file")}
+   return result.ok(string.copy(candidate))},err(e)=>{if e.code!=1{return result.err("Cannot inspect the recording decoder runtime")}}}
+  i+=1}
+ result.err("This model requires the qualified sound-file recording decoder runtime")
+}
+pub fn open(root:str,explicit_library:str)->result<recording.Session,string> effects {alloc,env,fs.read,fs.meta,ffi} {
+ let file:string=if str.len(explicit_library)>0{string.copy(explicit_library)}else{try installed(root)}
+ let tool:sound.Tool=match try identities.decoder(root,file){some(value)=>value,none=>{return result.err("The recording decoder identity is unavailable")}}
+ recording.open(tool,try identities.rate_filter(root))
+}
+pub fn tool(root:str,explicit_library:str)->result<sound.Tool,string> effects {alloc,env,fs.read,fs.meta} {
+ let file:string=if str.len(explicit_library)>0{string.copy(explicit_library)}else{try installed(root)}
+ match try identities.decoder(root,file){some(value)=>result.ok(value),none=>result.err("The recording decoder identity is unavailable")}
+}

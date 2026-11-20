@@ -1,0 +1,149 @@
+module stemair.attention.device
+import "network.ai" as network
+import "stack.ai" as stack
+import "../hybrid/device.ai" as layers
+import "../hybrid/spectral.ai" as spectral
+import "../hybrid/frontend.ai" as retained
+import "../device_ops.ai" as ops
+import "../ops.ai" as host
+import "../numeric.ai" as num
+import "../control.ai" as control
+import std.tensor as tensor
+import std.text as text
+
+pub type Observer<O>=struct{callback:option<fn(ref<O>,str,view<u64>,view<f32>)->result<unit,string> effects {alloc}>}
+fn observe<O>(stream:ref<GpuStream>,observer:ref<Observer<O>>,observations:ref<O>,name:str,value:ref<tensor.Tensor>)->result<unit,string> effects {alloc,gpu}{
+ match observer.callback{none=>result.ok(()),some(invoke)=>{
+  let values:array<f32>=try tensor.to_f32(stream,value) map_err ops.error
+  invoke(observations,name,array.view(value.dimensions),array.view(values))}}}
+
+fn project(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ x:ref<tensor.Tensor>,projection:option<ops.Convolution>,state:ref<ops.ExecutionState>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let conv:ops.Convolution=match projection{none=>{return result.ok(try tensor.view(x) map_err ops.error)},some(v)=>v}
+ let batch:u64=array.get(x.dimensions,0)
+ let channels:u64=array.get(x.dimensions,1)
+ let frequencies:u64=array.get(x.dimensions,2)
+ let time:u64=array.get(x.dimensions,3)
+ // Preserve the source's frequency-major flattening for these 1-D convolutions;
+ // the transformer changes to time-major token rows separately.
+ let flat:array<u64>=[batch,channels,1,frequencies*time]
+ var input:tensor.Tensor=try tensor.reshape(x,array.view(flat)) map_err ops.error
+ var output:tensor.Tensor=try ops.convolution_with_policy(context,stream,parameters,input,conv,state.convolution)
+ let shape:array<u64>=[batch,array.get(output.dimensions,1),frequencies,time]
+ result.ok(try tensor.reshape(output,array.view(shape)) map_err ops.error)
+}
+pub fn forward_observed_with_frontend<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,frontend:ref<layers.Frontend>,observer:ref<Observer<O>>,observations:ref<O>)->result<host.Tensor,string> effects {alloc,gpu,fs.meta} {
+ forward_observed_at_training_length(context,stream,parameters,n,input,cancel,state,frontend,observer,observations,n.training_length)
+}
+pub fn forward_observed_at_training_length<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,frontend:ref<layers.Frontend>,observer:ref<Observer<O>>,observations:ref<O>,length:u64)->result<host.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if tensor.rank(input)!=4 or input.dtype!=tensor.DType.F32 or array.get(input.dimensions,0)!=1 or
+  array.get(input.dimensions,1)!=2 or array.get(input.dimensions,2)!=1{return result.err("Invalid attention waveform tensor")}
+ let requested:u64=array.get(input.dimensions,3)
+ if requested==0 or requested>length or length>134217728{return result.err("Attention input exceeds its fixed training segment")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let original:array<f32>=try tensor.to_f32(stream,input) map_err ops.error
+ var padded:array<f32>=num.zeros(2*length)
+ var interleaved:array<f32>=num.zeros(2*length)
+ var i:u64=0
+ loop{if i==requested{break}
+  array.set(padded,i,array.get(original,i))
+  array.set(padded,length+i,array.get(original,requested+i))
+  array.set(interleaved,2*i,array.get(original,i))
+  array.set(interleaved,2*i+1,array.get(original,requested+i))
+  i+=1}
+ var spectrum:host.Tensor=match frontend.retained{none=>try spectral.analyze(struct.borrow(n,field=spectral),array.view(interleaved),2),some(f)=>try retained.analyze(f,context,stream,array.view(padded))}
+ var frequency_norm:layers.Normalized=match frontend.retained{none=>try layers.normalized(array.view(spectrum.data)),some(f)=>{
+  var value:retained.Normalized=try retained.normalize(f,context,stream,array.view(spectrum.data))
+  layers.Normalized{values:struct.replace(value,[],field=values),mean:value.mean,deviation:value.deviation}}}
+ var time_norm:layers.Normalized=match frontend.retained{none=>try layers.normalized(array.view(padded)),some(f)=>{
+  var value:retained.Normalized=try retained.normalize(f,context,stream,array.view(padded))
+  layers.Normalized{values:struct.replace(value,[],field=values),mean:value.mean,deviation:value.deviation}}}
+ let frequency_shape:array<u64>=[1,4,spectrum.h,spectrum.w]
+ let time_shape:array<u64>=[1,2,1,length]
+ var x:tensor.Tensor=try tensor.from_f32(context,stream,array.view(frequency_norm.values),array.view(frequency_shape),tensor.DType.F32) map_err ops.error
+ var xt:tensor.Tensor=try tensor.from_f32(context,stream,array.view(time_norm.values),array.view(time_shape),tensor.DType.F32) map_err ops.error
+ let _=try observe(stream,observer,observations,"frequency-normalized",x)
+ let _=try observe(stream,observer,observations,"time-normalized",xt)
+ var saved:array<tensor.Tensor>=[]
+ var saved_time:array<tensor.Tensor>=[]
+ var lengths:array<u64>=[]
+ var time_lengths:array<u64>=[]
+ i=0
+ loop{if i==4{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  array.push(lengths,array.get(x.dimensions,3))
+  array.push(time_lengths,array.get(xt.dimensions,3))
+  xt=try layers.encode_with_execution(context,stream,parameters,n,array.get(n.tencoder,i),xt,option.none(),cancel,state)
+  x=try layers.encode_with_execution(context,stream,parameters,n,array.get(n.encoder,i),x,option.none(),cancel,state)
+  let _=try observe(stream,observer,observations,text.concat("frequency-encoder-",string.from_int(i)),x)
+  let _=try observe(stream,observer,observations,text.concat("time-encoder-",string.from_int(i)),xt)
+  if i==0{x=try layers.embedding(context,stream,n,x)}
+  array.push(saved,try tensor.view(x) map_err ops.error)
+  array.push(saved_time,try tensor.view(xt) map_err ops.error)
+  i+=1}
+ x=try project(context,stream,parameters,x,n.up,state)
+ xt=try project(context,stream,parameters,xt,n.time_up,state)
+ let _=try observe(stream,observer,observations,"frequency-stack-input",x)
+ let _=try observe(stream,observer,observations,"time-stack-input",xt)
+ var stack_observer:stack.Observer<O>=stack.Observer<O>{callback:observer.callback}
+ var streams:stack.Streams=try stack.forward_observed(context,stream,parameters,struct.borrow(n,field=transformer),x,xt,cancel,state,stack_observer,observations)
+ x=struct.replace(streams,try tensor.view(x) map_err ops.error,field=frequency)
+ xt=struct.replace(streams,try tensor.view(xt) map_err ops.error,field=time)
+ let _=try observe(stream,observer,observations,"frequency-stack-output",x)
+ let _=try observe(stream,observer,observations,"time-stack-output",xt)
+ x=try project(context,stream,parameters,x,n.down,state)
+ xt=try project(context,stream,parameters,xt,n.time_down,state)
+ i=4
+ loop{if i==0{break}
+  i-=1
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var skip:tensor.Tensor=match array.pop(saved){some(v)=>v,none=>{return result.err("Missing attention frequency skip")}}
+  var time_skip:tensor.Tensor=match array.pop(saved_time){some(v)=>v,none=>{return result.err("Missing attention time skip")}}
+  let extent:u64=match array.pop(lengths){some(v)=>v,none=>{return result.err("Missing attention frequency extent")}}
+  let time_extent:u64=match array.pop(time_lengths){some(v)=>v,none=>{return result.err("Missing attention time extent")}}
+  var decoded:layers.Decoded=try layers.decode_with_execution(context,stream,parameters,n,array.get(n.decoder,i),x,skip,extent,cancel,state)
+  var time_decoded:layers.Decoded=try layers.decode_with_execution(context,stream,parameters,n,array.get(n.tdecoder,i),xt,time_skip,time_extent,cancel,state)
+  x=struct.replace(decoded,try tensor.view(x) map_err ops.error,field=output)
+  xt=struct.replace(time_decoded,try tensor.view(xt) map_err ops.error,field=output)
+  let _=try observe(stream,observer,observations,text.concat("frequency-decoder-",string.from_int(i)),x)
+  let _=try observe(stream,observer,observations,text.concat("time-decoder-",string.from_int(i)),xt)}
+ let frequency_output:array<f32>=try tensor.to_f32(stream,x) map_err ops.error
+ let time_output:array<f32>=try tensor.to_f32(stream,xt) map_err ops.error
+ let channels:u64=2*n.source_count
+ var complex:host.Tensor=host.tensor(2*channels,spectrum.h,spectrum.w,num.copy(array.view(frequency_output)))
+ i=0
+ loop{if i==array.len(complex.data){break}
+  array.set(complex.data,i,array.get(complex.data,i)*frequency_norm.deviation+frequency_norm.mean)
+  i+=1}
+ let inverse:array<f32>=match frontend.retained{none=>try spectral.synthesize(struct.borrow(n,field=spectral),complex,length),some(f)=>try retained.synthesize(f,context,stream,complex)}
+ var output:array<f32>=num.zeros(channels*requested)
+ var channel:u64=0
+ loop{if channel==channels{break}
+  i=0
+  loop{if i==requested{break}
+   let wave:f32=array.get(time_output,channel*length+i)*time_norm.deviation+time_norm.mean
+   array.set(output,channel*requested+i,wave+array.get(inverse,i*channels+channel))
+   i+=1}
+  channel+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite attention output")}
+ result.ok(host.tensor(channels,1,requested,output))
+}
+
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<host.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var state:ops.ExecutionState=ops.current_execution(ops.ConvolutionPolicy{})
+ var frontend:layers.Frontend=layers.Frontend{retained:option.none()}
+ forward_with_frontend(context,stream,parameters,n,input,cancel,state,frontend)
+}
+
+pub fn forward_with_frontend(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,frontend:ref<layers.Frontend>)->result<host.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observations:unit=()
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ forward_observed_with_frontend(context,stream,parameters,n,input,cancel,state,frontend,observer,observations)
+}
+pub fn forward_with_frontend_at_training_length(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,frontend:ref<layers.Frontend>,length:u64)->result<host.Tensor,string> effects {alloc,gpu,fs.meta}{
+ var observations:unit=()
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ forward_observed_at_training_length(context,stream,parameters,n,input,cancel,state,frontend,observer,observations,length)
+}

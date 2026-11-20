@@ -1,0 +1,72 @@
+module stemair.attention.bag_recording
+import "session.ai" as session
+import "network.ai" as network
+import "host.ai" as host
+import "host_session.ai" as host_session
+import "device.ai" as device
+import "retained_session.ai" as retained
+import "position.ai" as position
+import "config.ai" as config
+import "../hybrid/frontend.ai" as frontend
+import "../hybrid/device.ai" as layers
+import "../host_recording_audio.ai" as cpu_recording
+import "../recording_audio.ai" as gpu_recording
+import "../audio_normalization.ai" as normalization
+import "../recording_shifts.ai" as shifts
+import "../device_ops.ai" as ops
+import "../ops.ai" as rows
+import std.tensor as tensor
+import std.layer_norm_vectorized as row_norm
+import std.sinusoidal_positions as positions
+import std.mkl_vml as math
+fn length_for(s:ref<session.Session>,length:u64)->result<u64,string> effects {alloc}{
+ if s.active_training_length==0 or length==0 or length>s.active_training_length{return result.err("Attention chunk exceeds the selected bag training segment")}
+ result.ok(s.active_training_length)
+}
+fn cpu_predict(s:ref<session.Session>,unused:ref<unit>,library:ref<CAbiLibrary>,input:ref<rows.Tensor>,cancel:str)->result<rows.Tensor,string> effects {alloc,ffi,fs.meta}{
+ let output:rows.Tensor=try host.forward_at_training_length(struct.borrow(s,field=network),struct.borrow(array.borrow(s.cpu,0),field=backend),library,input,cancel,s.active_training_length)
+ let bank:ref<host_session.Prepared>=array.borrow(s.cpu,0)
+ bank.forward_calls+=1
+ result.ok(output)
+}
+pub fn separate_cpu_group(s:ref<session.Session>,library:ref<CAbiLibrary>,c:ref<config.Config>,training:u64,schedule:ref<shifts.Schedule>,preparation:normalization.Prepared own,group:ref<shifts.Group>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write}{
+ let _=try config.validate(c)
+ if array.len(s.cpu)!=1 or s.active_training_length!=0 or training==0 or training>134217728{return result.err("Invalid retained attention bag execution state")}
+ var unused:unit=()
+ s.active_training_length=training
+ let output:result<array<f32>,string>=cpu_recording.separate_normalized_group_sources<session.Session,unit,config.Config>(s,unused,library,c,schedule,training,s.network.source_count,preparation,group,cancel,progress,cpu_predict,length_for)
+ s.active_training_length=0
+ if result.is_ok(output){s.requests+=1
+  let bank:ref<host_session.Prepared>=array.borrow(s.cpu,0)
+  bank.requests+=1}
+ output
+}
+fn gpu_predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<session.Session>,input:ref<tensor.Tensor>,cancel:str)->result<rows.Tensor,string> effects {alloc,gpu,fs.meta}{
+ if array.len(s.gpu)!=1{return result.err("Attention bag GPU work was not prepared")}
+ device.forward_with_frontend_at_training_length(context,stream,parameters,struct.borrow(s,field=network),input,cancel,struct.borrow(array.borrow(s.gpu,0),field=execution),struct.borrow(array.borrow(s.gpu,0),field=frontend),s.active_training_length)
+}
+pub fn prepare_work(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>,runtime:str,length:u64,training:u64,limits:ref<frontend.Limits>)->result<retained.Work,string> effects {alloc,ffi,gpu}{
+ if length==0 or length>134217728 or training==0 or training>134217728{return result.err("Invalid attention bag recording or training extent")}
+ let policy:ops.ConvolutionPolicy=ops.ConvolutionPolicy{workspace_bytes:2147483648,deterministic:false,allow_tf32:true}
+ var execution:ops.ExecutionState=try ops.prepare_execution(context,policy,ops.ActivationRecipe.OrderedF32,ops.NormalizationRecipe.OrderedF32)
+ execution.projection=ops.ProjectionPolicy{recipe:ops.ProjectionRecipe.EagerF32,workspace_bytes:1048576}
+ execution.transformer_recipe=ops.TransformerRecipe.EfficientF32
+ execution.row_normalizer=option.some(try row_norm.create(context) map_err ops.error)
+ execution.position_engine=option.some(try positions.create(context) map_err ops.error)
+ var library:math.Vml=try math.open(runtime)
+ execution.frequency_positions=try position.spectral_with_math(library,n.spectral.base.n/512,(training+n.spectral.base.hop-1)/n.spectral.base.hop,n.transformer.width,10000.0)
+ let transformed:frontend.State=try frontend.create_sources_with_limits(context,stream,runtime,n.spectral.base.n,n.spectral.base.hop,training,n.spectral.old,n.source_count,limits)
+ result.ok(retained.Work{execution:execution,frontend:layers.Frontend{retained:option.some(transformed)},length:length})
+}
+pub fn separate_gpu_group(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<session.Session>,runtime:str,c:ref<config.Config>,training:u64,schedule:ref<shifts.Schedule>,preparation:normalization.Prepared own,group:ref<shifts.Group>,cancel:str,progress:str,limits:ref<frontend.Limits>)->result<array<f32>,string> effects {alloc,ffi,gpu,fs.meta,fs.write}{
+ let _=try config.validate(c)
+ if array.len(s.gpu)!=0 or s.active_training_length!=0{return result.err("Previous attention bag work was not released")}
+ let work:retained.Work=try prepare_work(context,stream,struct.borrow(s,field=network),runtime,preparation.frames,training,limits)
+ array.push(s.gpu,work)
+ s.active_training_length=training
+ let output:result<array<f32>,string>=gpu_recording.separate_normalized_group_sources(context,stream,parameters,s,c,schedule,training,s.network.source_count,preparation,group,cancel,progress,gpu_predict,length_for)
+ s.active_training_length=0
+ s.gpu=[]
+ if result.is_ok(output){s.requests+=1}
+ output
+}

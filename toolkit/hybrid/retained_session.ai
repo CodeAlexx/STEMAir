@@ -1,0 +1,132 @@
+module stemair.hybrid.retained_session
+import "network.ai" as network
+import "host_session.ai" as cpu_host
+import "device.ai" as device
+import "frontend.ai" as frontend
+import "config.ai" as config
+import "../device_ops.ai" as ops
+import "../recording_audio.ai" as recording
+import "../recording_moments.ai" as moments
+import "../audio_normalization.ai" as normalization
+import "../numeric.ai" as num
+import "../ops.ai" as host
+import std.tensor as tensor
+
+pub type Work=struct{execution:ops.ExecutionState,frontend:device.Frontend,additional:array<device.Frontend>,length:u64,cpu_threads:u64=2,requests:u64=0}
+pub type State=struct{network:network.Network,gpu:array<Work>,cpu:array<cpu_host.Prepared>,cpu_preparations:u64=0,requests:u64=0}
+pub fn model_limits(n:ref<network.Network>)->frontend.Limits effects {}{
+ if not n.constructor.kwargs.cac and n.constructor.kwargs.channels==48 and n.constructor.kwargs.depth==6 and n.constructor.kwargs.segment==112{
+  return frontend.Limits{workspace_bytes:67108864,clone_bytes:1073741824,retained_bytes:2147483648,max_frames:8192}}
+ if array.len(n.constructor.kwargs.multi_freqs)!=0 and n.constructor.kwargs.segment==112{
+  return frontend.Limits{workspace_bytes:268435456,clone_bytes:1073741824,retained_bytes:3221225472,max_frames:8192}}
+ frontend.Limits{workspace_bytes:67108864,clone_bytes:67108864,retained_bytes:9223372036854775807}
+}
+pub fn prepare_work(context:ref<GpuContext>,stream:ref<GpuStream>,model:ref<network.Network>,runtime:str,length:u64)->result<Work,string> effects {alloc,ffi,gpu} {
+ let budget:frontend.Limits=frontend.Limits{workspace_bytes:67108864,clone_bytes:67108864,retained_bytes:201326592}
+ prepare_work_with_limits(context,stream,model,runtime,length,budget)
+}
+pub fn prepare_work_with_limits(context:ref<GpuContext>,stream:ref<GpuStream>,model:ref<network.Network>,runtime:str,length:u64,budget:ref<frontend.Limits>)->result<Work,string> effects {alloc,ffi,gpu} {
+ let policy:ops.ConvolutionPolicy=ops.ConvolutionPolicy{workspace_bytes:2147483648,deterministic:false,allow_tf32:true}
+ var execution:ops.ExecutionState=try ops.prepare_execution(context,policy,ops.ActivationRecipe.OrderedF32,ops.NormalizationRecipe.OrderedF32)
+ if (array.len(model.constructor.kwargs.multi_freqs)!=0 or not model.constructor.kwargs.cac) and model.constructor.kwargs.segment==112{
+  execution.local_state_scores=134217728}
+ let _=try device.prepare_recurrent(context,stream,model,execution,33554432,268435456)
+ execution.projection=ops.ProjectionPolicy{recipe:ops.ProjectionRecipe.EagerF32,workspace_bytes:1048576}
+ let _=try ops.prepare_attention(context,execution)
+ let transformed:frontend.State=if model.constructor.kwargs.cac{try frontend.create_sources_with_limits(context,stream,runtime,model.spectral.base.n,model.spectral.base.hop,length,model.spectral.old,array.len(model.constructor.kwargs.sources),budget)}else{try frontend.create_magnitude_sources_with_limits(context,stream,runtime,model.spectral.base.n,model.spectral.base.hop,length,model.spectral.old,array.len(model.constructor.kwargs.sources),budget)}
+ result.ok(Work{execution:execution,frontend:device.Frontend{retained:option.some(transformed)},additional:[],length:length})
+}
+fn add_length(lengths:ref<array<u64>>,length:u64)->result<unit,string> effects {alloc}{
+ var i:u64=0
+ loop{if i==array.len(lengths){break}
+  if array.get(lengths,i)==length{return result.ok(())}
+  i+=1}
+ if array.len(lengths)>=65{return result.err("Recording needs more than65 retained transform geometries")}
+ array.push(lengths,length)
+ result.ok(())
+}
+// Prepare every distinct segment/tail before any recording callback runs.
+// Existing host/device parameters are reused; no checkpoint is reopened.
+pub fn prepare_work_controlled(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>,runtime:str,length:u64,c:ref<config.Config>)->result<Work,string> effects {alloc,ffi,gpu}{
+ let limits:frontend.Limits=model_limits(n)
+ prepare_work_controlled_with_limits(context,stream,n,runtime,length,c,limits)
+}
+pub fn prepare_work_controlled_with_limits(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>,runtime:str,length:u64,c:ref<config.Config>,limits:ref<frontend.Limits>)->result<Work,string> effects {alloc,ffi,gpu}{
+ let _=try config.validate(c)
+ if length==0 or length>134217728{return result.err("Invalid complete recording extent")}
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{n.constructor.kwargs.segment*44100}
+ let stride:u64=if c.split{cast.sat((1.0-c.overlap)*cast.float(size))}else{length}
+ if stride==0{return result.err("Recording overlap leaves no stride")}
+ var lengths:array<u64>=[]
+ let shifts:u64=if array.len(c.shift_offsets)==0{1}else{array.len(c.shift_offsets)}
+ var s:u64=0
+ loop{if s==shifts{break}
+  let count:u64=if array.len(c.shift_offsets)==0{length}else{length+22050-array.get(c.shift_offsets,s)}
+  if not c.split{let _=try add_length(lengths,count)}else{
+   var offset:u64=0
+   loop{if offset>=count{break}
+    let _=try add_length(lengths,if count-offset<size{count-offset}else{size})
+    offset+=stride}}
+  s+=1}
+ let _=try if n.constructor.kwargs.cac{frontend.preflight_lengths(n.spectral.base.n,n.spectral.base.hop,array.view(lengths),n.spectral.old,array.len(n.constructor.kwargs.sources),limits)}else{frontend.preflight_magnitude_lengths(n.spectral.base.n,n.spectral.base.hop,array.view(lengths),n.spectral.old,array.len(n.constructor.kwargs.sources),limits)}
+ var state:Work=try prepare_work_with_limits(context,stream,n,runtime,array.get(lengths,0),limits)
+ state.length=length
+ var i:u64=1
+ loop{if i==array.len(lengths){break}
+  let f:frontend.State=if n.constructor.kwargs.cac{try frontend.create_sources_with_limits(context,stream,runtime,n.spectral.base.n,n.spectral.base.hop,array.get(lengths,i),n.spectral.old,array.len(n.constructor.kwargs.sources),limits)}else{try frontend.create_magnitude_sources_with_limits(context,stream,runtime,n.spectral.base.n,n.spectral.base.hop,array.get(lengths,i),n.spectral.old,array.len(n.constructor.kwargs.sources),limits)}
+  array.push(state.additional,device.Frontend{retained:option.some(f)})
+  i+=1}
+ result.ok(state)
+}
+pub fn retained_predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<State>,input:ref<tensor.Tensor>,cancel:str)->result<host.Tensor,string> effects {alloc,gpu,fs.meta} {
+ let length:u64=array.get(input.dimensions,3)
+ let primary:bool=match array.borrow(s.gpu,0).frontend.retained{some(f)=>f.geometry.length==length,none=>false}
+ if primary{return device.forward_with_frontend(context,stream,parameters,struct.borrow(s,field=network),input,cancel,struct.borrow(array.borrow(s.gpu,0),field=execution),struct.borrow(array.borrow(s.gpu,0),field=frontend))}
+ var i:u64=0
+ loop{if i==array.len(array.borrow(s.gpu,0).additional){break}
+  let matches:bool=match array.borrow(array.borrow(s.gpu,0).additional,i).retained{some(f)=>f.geometry.length==length,none=>false}
+  if matches{return device.forward_with_frontend(context,stream,parameters,struct.borrow(s,field=network),input,cancel,struct.borrow(array.borrow(s.gpu,0),field=execution),array.borrow(array.borrow(s.gpu,0).additional,i))}
+  i+=1}
+ result.err("Recording transform extent was not prepared")
+}
+pub fn retained_length(s:ref<State>,length:u64)->result<u64,string> effects {alloc} {
+ result.ok(length)
+}
+pub fn separate(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<State>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ if array.len(s.gpu)!=1{return result.err("Retained GPU work is unavailable")}
+ if view.len(input)!=2*array.borrow(s.gpu,0).length{return result.err("Retained recording extent differs")}
+ var prepared:normalization.Prepared=try moments.prepare(input,array.borrow(s.gpu,0).cpu_threads)
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{s.network.constructor.kwargs.segment*44100}
+ let output:array<f32>=try recording.separate_prepared_sources(context,stream,parameters,s,c,size,array.len(s.network.constructor.kwargs.sources),prepared,cancel,progress,retained_predict,retained_length)
+ s.requests+=1
+ result.ok(output)
+}
+
+pub fn prepare(context:ref<GpuContext>,stream:ref<GpuStream>,n:network.Network own,runtime:str,length:u64)->result<State,string> effects {alloc,ffi,gpu} {
+ var state:State=State{network:n,gpu:[],cpu:[]}
+ let work:Work=try prepare_work(context,stream,struct.borrow(state,field=network),runtime,length)
+ array.push(state.gpu,work)
+ result.ok(state)
+}
+pub fn prepare_controlled(context:ref<GpuContext>,stream:ref<GpuStream>,n:network.Network own,runtime:str,length:u64,c:ref<config.Config>)->result<State,string> effects {alloc,ffi,gpu} {
+ var state:State=State{network:n,gpu:[],cpu:[]}
+ let work:Work=try prepare_work_controlled(context,stream,struct.borrow(state,field=network),runtime,length,c)
+ array.push(state.gpu,work)
+ result.ok(state)
+}
+// Parameters and work belong to the caller's context. Release them on both
+// success and failure before that context closes; host model weights stay owned.
+pub fn separate_once(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<State>,runtime:str,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,gpu,fs.meta,fs.write} {
+ let limits:frontend.Limits=model_limits(struct.borrow(s,field=network))
+ separate_once_with_limits(context,stream,parameters,s,runtime,c,input,cancel,progress,limits)
+}
+pub fn separate_once_with_limits(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<State>,runtime:str,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,limits:ref<frontend.Limits>)->result<array<f32>,string> effects {alloc,ffi,gpu,fs.meta,fs.write}{
+ if array.len(s.gpu)!=0{return result.err("Previous GPU work was not released")}
+ if view.len(input)%2!=0{return result.err("Expected complete stereo recording")}
+ let work:Work=try prepare_work_controlled_with_limits(context,stream,struct.borrow(s,field=network),runtime,view.len(input)/2,c,limits)
+ array.push(s.gpu,work)
+ let output:result<array<f32>,string>=separate(context,stream,parameters,s,c,input,cancel,progress)
+ s.gpu=[]
+ output
+}

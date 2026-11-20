@@ -1,0 +1,11 @@
+module stemair.learned_controls_policy
+import "../toolkit/learned_cleanup_request.ai" as request
+pub fn encode(noise:bool,room:bool,targets:str,noise_checkpoint:str,room_checkpoint:str)->result<string,string> effects {alloc}{
+ var settings:request.Settings=request.Settings{noise:noise,room:room,room_targets:string.copy(targets),noise_checkpoint:string.copy(noise_checkpoint),room_checkpoint:string.copy(room_checkpoint)}
+ request.encode(settings)
+}
+pub fn current(noise:bool,room:bool,targets:f64,noise_checkpoint:str,room_checkpoint:str)->result<string,string> effects {alloc}{
+ if targets!=0.0 and targets!=1.0 and targets!=2.0 and targets!=3.0{return result.err("Choose vocals, lead vocals, backing vocals or all vocal outputs for room reduction")}
+ let selected:str=if targets==0.0{"vocals"}else{if targets==1.0{"lead"}else{if targets==2.0{"backing"}else{"all"}}}
+ encode(noise,room,selected,noise_checkpoint,room_checkpoint)
+}

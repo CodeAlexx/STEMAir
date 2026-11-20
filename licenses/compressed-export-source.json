@@ -1,0 +1,29 @@
+{
+  "application": {
+    "name": "Ultimate Vocal Remover GUI",
+    "authors": "Anjok07, aufr33 and contributors",
+    "url": "https://github.com/Anjok07/ultimatevocalremovergui",
+    "revision": "a5f88453bfb2b38b05a965bcf67727243e0cbf19",
+    "authority": "separate.py write_audio/save_audio_file/save_format; spec_utils.normalize; constants MP3_BIT_RATES; UVR.py process_check_wav_type",
+    "license": "MIT according to pinned README, absent root notice documented in THIRD-PARTY.md"
+  },
+  "segment_reference": {
+    "name": "pydub",
+    "authors": "James Robert and contributors",
+    "url": "https://github.com/jiaaro/pydub",
+    "version": "0.25.1",
+    "revision": "2c8a1034951ea2d210be9057927bc1ff699c4ffc",
+    "license": "MIT",
+    "unchanged_notice": "segment-reference-MIT.txt",
+    "use": "Independent orchestration/byte-layout implementation and original development oracle; no Python runtime or package shipped"
+  },
+  "external_runtime": {
+    "name": "FFmpeg and FFprobe",
+    "authors": "The FFmpeg developers and codec contributors",
+    "url": "https://ffmpeg.org/",
+    "use": "Explicit installed ordinary audio codec executables, never model inference",
+    "redistribution": "No executable or library is vendored or committed. Any optional redistributor must separately satisfy the exact build's GPL and component terms; system runtime/codec dependencies remain host prerequisites."
+  },
+  "product_python_dependency": false,
+  "vendor_binaries_in_git": false
+}

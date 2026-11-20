@@ -1,0 +1,94 @@
+// Dense F32 waveform selection; numerical reduction is shared, source ordering is here.
+module stemair.selection_ensemble
+import std.float as fp
+import std.pairwise_mean as mean
+import std.text as text
+import "recording_resources.ai" as resources
+import "control.ai" as control
+pub type Part=struct{start:u64,frames:u64,selected:u64,costs:array<f32>}
+pub type Output=struct{samples:array<f32>,parts:array<Part>}
+pub fn abs_mean_f32(values:view<f32>)->f32 effects {alloc} {
+ var absolute:array<f32>=[]
+ array.reserve(absolute,view.len(values))
+ var i:u64=0
+ loop{if i==view.len(values){break}
+  array.push(absolute,fp.abs(view.get(values,i)))
+  i+=1}
+ mean.mean_f32(array.view(absolute))
+}
+// Fresh scalar mean keys: equality replaces the value and preserves insertion order.
+pub fn ordered_unique_indices(costs:view<f32>)->array<u64> effects {alloc} {
+ var keys:array<f32>=[]
+ var values:array<u64>=[]
+ var i:u64=0
+ loop{if i==view.len(costs){break}
+  let cost:f32=view.get(costs,i)
+  var key:u64=0
+  loop{if key==array.len(keys) or cost==array.get(keys,key){break}
+   key+=1}
+  if key==array.len(keys){array.push(keys,cost)
+   array.push(values,i)}else{array.set(values,key,i)}
+  i+=1}
+ values
+}
+// Source array argmin: first finite tie, but the first NaN wins whenever present.
+pub fn first_min_index(costs:view<f32>)->result<u64,string> effects {alloc} {
+ if view.len(costs)==0{return result.err("Cannot select from empty section costs")}
+ var best:u64=0
+ var value:f32=view.get(costs,0)
+ if fp.is_nan(value){return result.ok(0)}
+ var i:u64=1
+ loop{if i==view.len(costs){break}
+  let current:f32=view.get(costs,i)
+  if fp.is_nan(current){return result.ok(i)}
+  if current<value{value=current
+   best=i}
+  i+=1}
+ result.ok(best)
+}
+pub fn select_chunks(waves:ref<array<array<f32>>>,frames:u64,channels:u64,sections:u64,max_working_bytes:u64,cancel:str,progress:str)->result<Output,string>
+ effects {alloc,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Waveform selection cancelled")}
+ let count:u64=array.len(waves)
+ if count==0 or count>5 or (channels!=1 and channels!=2) or (sections!=12 and sections!=240){return result.err("Waveform selection requires one tofive equally shaped mono/stereo tracks and12or240 sections")}
+ let samples:u64=try resources.multiply(frames,channels)
+ let bytes:u64=try resources.multiply(samples,4)
+ let retained:u64=try resources.multiply(bytes,count)
+ let estimate:u64=try resources.checked_add(try resources.checked_add(retained,try resources.multiply(bytes,2)),try resources.multiply(sections,128+count*16))
+ if estimate>max_working_bytes{return result.err("Waveform selection exceeds the caller working-memory limit")}
+ var i:u64=0
+ loop{if i==count{break}
+  let wave:ref<array<f32>>=array.borrow(waves,i)
+  if array.len(wave)!=samples{return result.err("Waveform selection input extents differ")}
+  i+=1}
+ var selected:array<f32>=[]
+ array.reserve(selected,samples)
+ var parts:array<Part>=[]
+ array.reserve(parts,sections)
+ let small:u64=frames/sections
+ let extra:u64=frames%sections
+ var start:u64=0
+ var part:u64=0
+ loop{if part==sections{break}
+  if control.cancelled(cancel){return result.err("Waveform selection cancelled")}
+  control.status(progress,text.concat("Selecting section ",string.from_int(part)))
+  let length:u64=small+(if part<extra{1}else{0})
+  let begin:u64=start*channels
+  let end:u64=(start+length)*channels
+  var costs:array<f32>=[]
+  i=0
+  loop{if i==count{break}
+   let wave:ref<array<f32>>=array.borrow(waves,i)
+   array.push(costs,abs_mean_f32(view.slice(array.view(wave),begin,end)))
+   i+=1}
+  let choice:u64=try first_min_index(array.view(costs))
+  let source:ref<array<f32>>=array.borrow(waves,choice)
+  i=begin
+  loop{if i==end{break}
+   array.push(selected,array.get(source,i))
+   i+=1}
+  array.push(parts,Part{start:start,frames:length,selected:choice,costs:costs})
+  start+=length
+  part+=1}
+ result.ok(Output{samples:selected,parts:parts})
+}

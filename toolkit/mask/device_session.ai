@@ -1,0 +1,260 @@
+module stemair.mask.device_session
+import "config.ai" as config
+import "network.ai" as network
+import "device.ai" as device
+import "bands.ai" as bands
+import "postprocess.ai" as postprocess
+import "../artifact_cleanup.ai" as cleanup
+import "../complex_spectral.ai" as spectral
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../control.ai" as control
+import std.float as fp
+import std.tensor as tensor
+import std.resize_bilinear as interpolation
+import std.table as table
+import std.complex_norm_f32 as norm
+import "../weights.ai" as weights
+import std.libm as libm
+import std.cabi as foreign
+
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+fn masks<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,c:ref<config.Config>,magnitude:ref<ops.Tensor>,maximum:f32,shift:u64,cancel:str,progress:str,
+ predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ let roi:u64=c.window-2*n.offset
+ let frames:u64=magnitude.w
+ let bins:u64=magnitude.h
+ let count:u64=(frames+shift+roi-1)/roi
+ var output:array<f32>=num.zeros(2*bins*frames)
+ var index:u64=0
+ loop{if index>=count{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  control.report(progress,index,count)
+  var values:array<f32>=num.zeros(2*bins*c.window)
+  var channel:u64=0
+  loop{if channel>=2{break}
+   var f:u64=0
+   loop{if f>=bins{break}
+    var t:u64=0
+    loop{if t>=c.window{break}
+     let position:i64=cast.sat(index*roi+t)-cast.sat(n.offset+shift)
+     let source:u64=cast.sat(position)
+     if position>=0 and source<frames{
+      array.set(values,(channel*bins+f)*c.window+t,array.get(magnitude.data,(channel*bins+f)*frames+source)/maximum)}
+     t+=1}
+    f+=1}
+   channel+=1}
+  let shape:array<u64>=[1,2,bins,c.window]
+  var input:tensor.Tensor=try tensor.from_f32(context,stream,array.view(values),array.view(shape),tensor.DType.F32) map_err error
+  var predicted:ops.Tensor=try predictor(context,stream,parameters,n,input,cancel)
+  channel=0
+  loop{if channel>=2{break}
+   var f:u64=0
+   loop{if f>=bins{break}
+    var t:u64=0
+    loop{if t>=roi{break}
+     let padded:u64=index*roi+t
+     if padded>=shift and padded-shift<frames{
+      array.set(output,(channel*bins+f)*frames+padded-shift,array.get(predicted.data,(channel*bins+f)*roi+t))}
+     t+=1}
+    f+=1}
+   channel+=1}
+  index+=1}
+ control.report(progress,count,count)
+ result.ok(output)
+}
+fn separated(c:ref<config.Config>,spectrum:ref<ops.Tensor>,magnitude:ref<ops.Tensor>,mask:view<f32>,secondary:bool,adjusted:bool,host_math:ref<option<libm.Runtime>>)->result<ops.Tensor,string> effects {alloc,ffi} {
+ let bins:u64=spectrum.h
+ let frames:u64=spectrum.w
+ var output:array<f32>=num.zeros(4*bins*frames)
+ var channel:u64=0
+ loop{if channel>=2{break}
+  var f:u64=0
+  loop{if f>=bins{break}
+   var t:u64=0
+   loop{if t>=frames{break}
+    let at:u64=(channel*bins+f)*frames+t
+    let confidence:f32=if adjusted{view.get(mask,at)}else{match host_math{none=>postprocess.confidence(c,f,view.get(mask,at)),some(runtime)=>try postprocess.confidence_host(c,f,view.get(mask,at),struct.borrow(runtime,field=library))}}
+    let scale:f32=if secondary{1.0-confidence}else{confidence}
+    let amplitude:f32=scale*array.get(magnitude.data,at)
+    let re:f32=array.get(spectrum.data,((2*channel)*bins+f)*frames+t)
+    let im:f32=array.get(spectrum.data,((2*channel+1)*bins+f)*frames+t)
+    let phase:f32=fp.atan2(im,re)
+    let cosine:f32=match host_math{none=>fp.cos(phase),some(runtime)=>try libm.cosf(struct.borrow(runtime,field=library),phase) map_err foreign.error_message}
+    let sine:f32=match host_math{none=>fp.sin(phase),some(runtime)=>try libm.sinf(struct.borrow(runtime,field=library),phase) map_err foreign.error_message}
+    array.set(output,((2*channel)*bins+f)*frames+t,amplitude*cosine)
+    array.set(output,((2*channel+1)*bins+f)*frames+t,amplitude*sine)
+    t+=1}
+   f+=1}
+  channel+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite masked spectrum")}
+ result.ok(ops.tensor(4,bins,frames,output))
+}
+pub fn separate_predicted_wide_with_cleanup<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},settings:ref<cleanup.Settings>)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ var lower:array<f32>=[]
+ separate_predicted_wide_with_cleanup_and_band_input(context,stream,parameters,n,plans,c,input,cancel,progress,predictor,settings,array.view(lower))
+}
+pub fn separate_predicted_wide_with_cleanup_and_band_input<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},settings:ref<cleanup.Settings>,lower:view<f32>)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ separate_predicted_wide_with_cleanup_and_band_input_recipe(context,stream,parameters,n,plans,c,input,cancel,progress,predictor,settings,lower,norm.Recipe.WideHypot)
+}
+pub fn separate_predicted_wide_with_cleanup_and_band_input_recipe<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},settings:ref<cleanup.Settings>,lower:view<f32>,magnitude_recipe:norm.Recipe)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ var host_math:option<libm.Runtime>=option.none()
+ separate_with_host_math(context,stream,parameters,n,plans,c,input,cancel,progress,predictor,settings,lower,magnitude_recipe,host_math)
+}
+fn separate_with_host_math<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},settings:ref<cleanup.Settings>,lower:view<f32>,magnitude_recipe:norm.Recipe,host_math:ref<option<libm.Runtime>>)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ let _=try cleanup.validate(settings)
+ var high:option<ops.Tensor>=option.none()
+ var spectrum:ops.Tensor=try bands.analyze_with_high_and_lower(c,plans,input,lower,high)
+ if spectrum.w<2{return result.err("Recording is too short for multiband reconstruction")}
+ var magnitudes:array<f32>=[]
+ var maximum:f32=0.0
+ var channel:u64=0
+ loop{if channel>=2{break}
+  var i:u64=0
+  loop{if i>=spectrum.h*spectrum.w{break}
+   let re:f32=array.get(spectrum.data,2*channel*spectrum.h*spectrum.w+i)
+   let im:f32=array.get(spectrum.data,(2*channel+1)*spectrum.h*spectrum.w+i)
+   let value:f32=if magnitude_recipe==norm.Recipe.ScaledFma{norm.magnitude(re,im,magnitude_recipe)}else{fp.hypot(re,im)}
+   if not fp.is_finite(value){return result.err("Non-finite multiband magnitude")}
+   array.push(magnitudes,value)
+   if value>maximum{maximum=value}
+   i+=1}
+  channel+=1}
+ if maximum==0.0{
+  let last:ref<config.Band>=array.borrow(c.bands,array.len(c.bands)-1)
+  var silence:array<f64>=[]
+  let count:u64=4*last.hop*(spectrum.w-1)
+  array.reserve(silence,count)
+  var i:u64=0
+  loop{if i==count{break}
+   array.push(silence,0.0)
+   i+=1}
+  return result.ok(silence)}
+ var magnitude:ops.Tensor=ops.tensor(2,spectrum.h,spectrum.w,magnitudes)
+ var mask:array<f32>=try masks(context,stream,parameters,n,c,magnitude,maximum,0,cancel,progress,predictor)
+ if c.tta{
+  let alternate:array<f32>=try masks(context,stream,parameters,n,c,magnitude,maximum,(c.window-2*n.offset)/2,cancel,progress,predictor)
+  var i:u64=0
+  loop{if i>=array.len(mask){break}
+   array.set(mask,i,(array.get(mask,i)+array.get(alternate,i))*0.5)
+   i+=1}
+ }
+ if not num.finite(array.view(mask)){return result.err("Non-finite predicted mask")}
+ let _=match host_math{none=>try postprocess.apply(mask,c,spectrum.h,spectrum.w,settings,cancel),some(runtime)=>try postprocess.apply_host(mask,c,spectrum.h,spectrum.w,settings,cancel,struct.borrow(runtime,field=library))}
+ var primary:ops.Tensor=try separated(c,spectrum,magnitude,array.view(mask),false,settings.enabled,host_math)
+ let primary_wave:array<f64>=try bands.synthesize_with_high(c,plans,primary,high)
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var secondary:ops.Tensor=try separated(c,spectrum,magnitude,array.view(mask),true,settings.enabled,host_math)
+ let secondary_wave:array<f64>=try bands.synthesize_with_high(c,plans,secondary,high)
+ var output:array<f64>=[]
+ var i:u64=0
+ loop{if i>=array.len(primary_wave){break}
+  array.push(output,array.get(primary_wave,i))
+  i+=1}
+ i=0
+ loop{if i>=array.len(secondary_wave){break}
+  array.push(output,array.get(secondary_wave,i))
+  i+=1}
+ i=0
+ loop{if i==array.len(output){break}
+  if not fp.is_finite(array.get(output,i)){return result.err("Non-finite reconstructed sources")}
+  i+=1}
+ result.ok(output)
+}
+// Preserve the inverse transform carrier for typed callers. Legacy callers
+// retain their explicit final F32 rounding and finite-range validation.
+pub fn separate_predicted_with_cleanup<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},settings:ref<cleanup.Settings>)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ let wide:array<f64>=try separate_predicted_wide_with_cleanup(context,stream,parameters,n,plans,c,input,cancel,progress,predictor,settings)
+ var output:array<f32>=[]
+ array.reserve(output,array.len(wide))
+ var i:u64=0
+ loop{if i==array.len(wide){break}
+  array.push(output,cast.float(array.get(wide,i)))
+  i+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite reconstructed sources")}
+ result.ok(output)
+}
+// Per-recording GPU state owns the model temporarily and restores it before
+// returning, including cancellation/errors. No device handle enters CPU state.
+type Prepared=struct{network:network.Network,offset:u64,resizers:array<interpolation.Engine>}
+fn vacant_base()->network.Base effects {alloc}{network.Base{encoder:[],branches:[],bottleneck:network.Convolution{weight:0},decoder:[]}}
+fn vacant()->network.Network effects {alloc}{
+ network.Network{weights:weights.Model{parameters:table.new(),bytes_read:0,loads:0},low:vacant_base(),high:vacant_base(),bridge2:network.Convolution{weight:0},second:vacant_base(),bridge3:network.Convolution{weight:0},third:vacant_base(),output:network.Convolution{weight:0},bins:0,original_parameters:0}
+}
+fn predict_spatial(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<Prepared>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta}{
+ device.predict_with_spatial(context,stream,parameters,struct.borrow(n,field=network),input,cancel,device.ConvolutionPolicy{workspace_bytes:0,deterministic:false,allow_tf32:true,original_statistics:true},struct.borrow(n,field=resizers))
+}
+fn separate_spatial(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi}{
+ var lower:array<f32>=[]
+ separate_spatial_with_band_input(context,stream,parameters,n,plans,c,input,cancel,progress,settings,array.view(lower))
+}
+// Explicit original convolution/normalization/interpolation policy. Existing
+// public default routes retain their admitted behavior.
+pub fn separate_original_wide_with_band_input(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>,lower:view<f32>,magnitude_recipe:norm.Recipe)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi}{
+ separate_spatial_with_band_input_recipe_and_host_math(context,stream,parameters,n,plans,c,input,cancel,progress,settings,lower,magnitude_recipe,true)
+}
+fn separate_spatial_with_band_input(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>,lower:view<f32>)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi}{
+ separate_spatial_with_band_input_recipe(context,stream,parameters,n,plans,c,input,cancel,progress,settings,lower,norm.Recipe.WideHypot)
+}
+fn separate_spatial_with_band_input_recipe(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>,lower:view<f32>,magnitude_recipe:norm.Recipe)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi}{
+ separate_spatial_with_band_input_recipe_and_host_math(context,stream,parameters,n,plans,c,input,cancel,progress,settings,lower,magnitude_recipe,false)
+}
+fn separate_spatial_with_band_input_recipe_and_host_math(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>,lower:view<f32>,magnitude_recipe:norm.Recipe,use_host_math:bool)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi}{
+ var host_math:option<libm.Runtime>=option.none()
+ if use_host_math{
+  var runtime:libm.Runtime=try libm.open_runtime() map_err foreign.error_message
+  if runtime.host==libm.Host.Posix{host_math=option.some(runtime)}else{libm.close_runtime(runtime)}}
+ let resizer:interpolation.Engine=try interpolation.create_corners(context) map_err error
+ let offset:u64=n.offset
+ var prepared:Prepared=Prepared{network:ref.swap(n,vacant()),offset:offset,resizers:[resizer]}
+ let output:result<array<f64>,string>=separate_with_host_math(context,stream,parameters,prepared,plans,c,input,cancel,progress,predict_spatial,settings,lower,magnitude_recipe,host_math)
+ let restored:network.Network=struct.replace(prepared,vacant(),field=network)
+ let _=ref.swap(n,restored)
+ match array.pop(prepared.resizers){none=>{return result.err("Prepared mask interpolation resource was lost")},some(kernel)=>{let _=try interpolation.close(kernel) map_err error}}
+ output
+}
+fn round_output(wide:view<f64>)->result<array<f32>,string> effects {alloc}{
+ var output:array<f32>=[]
+ array.reserve(output,view.len(wide))
+ var i:u64=0
+ loop{if i==view.len(wide){break}
+  array.push(output,cast.float(view.get(wide,i)))
+  i+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite reconstructed sources")}
+ result.ok(output)
+}
+fn predict_standard(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if array.len(n.low.branches)==7{return device.predict_with_policy(context,stream,parameters,n,input,cancel,device.ConvolutionPolicy{workspace_bytes:0,deterministic:false,allow_tf32:true,original_statistics:true})}
+ device.predict(context,stream,parameters,n,input,cancel)
+}
+pub fn separate(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ if array.len(n.low.branches)==7{
+  var settings:cleanup.Settings=cleanup.disabled()
+  let wide:array<f64>=try separate_spatial(context,stream,parameters,n,plans,c,input,cancel,progress,settings)
+  return round_output(array.view(wide))}
+ separate_predicted(context,stream,parameters,n,plans,c,input,cancel,progress,predict_standard)
+}
+pub fn separate_predicted<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ var settings:cleanup.Settings=cleanup.disabled()
+ separate_predicted_with_cleanup(context,stream,parameters,n,plans,c,input,cancel,progress,predictor,settings)
+}
+pub fn separate_with_cleanup(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ if array.len(n.low.branches)==7{
+  let wide:array<f64>=try separate_spatial(context,stream,parameters,n,plans,c,input,cancel,progress,settings)
+  return round_output(array.view(wide))}
+ separate_predicted_with_cleanup(context,stream,parameters,n,plans,c,input,cancel,progress,predict_standard,settings)
+}
+pub fn separate_wide_with_cleanup(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ if array.len(n.low.branches)==7{return separate_spatial(context,stream,parameters,n,plans,c,input,cancel,progress,settings)}
+ separate_predicted_wide_with_cleanup(context,stream,parameters,n,plans,c,input,cancel,progress,predict_standard,settings)
+}
+pub fn separate_wide_with_cleanup_and_band_input(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>,lower:view<f32>)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ if array.len(n.low.branches)==7{return separate_spatial_with_band_input(context,stream,parameters,n,plans,c,input,cancel,progress,settings,lower)}
+ separate_predicted_wide_with_cleanup_and_band_input(context,stream,parameters,n,plans,c,input,cancel,progress,predict_standard,settings,lower)
+}

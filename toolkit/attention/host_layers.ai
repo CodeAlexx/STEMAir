@@ -1,0 +1,218 @@
+module stemair.attention.host_layers
+import "network.ai" as network
+import "../hybrid/network.ai" as layers
+import "../hybrid/residual.ai" as residual_definition
+import "../weights.ai" as weights
+import "../device_ops.ai" as definition
+import "../numeric.ai" as num
+import "../control.ai" as control
+import std.cpu_conv2d as convolution
+import std.cpu_transpose_conv2d as transpose
+import std.cpu_matmul as matrix
+import std.cpu_neural_f32 as neural
+import std.float as fp
+import std.text as text
+pub type Tensor=struct{n:u64,c:u64,h:u64,w:u64,data:array<f32>}
+pub type Backend=struct{convolutions:array<option<convolution.Prepared>>,transposes:array<option<transpose.Prepared>>,packs:u64,bytes:u64,affine:neural.Affine}
+pub fn tensor(n:u64,c:u64,h:u64,w:u64,data:array<f32> own)->Tensor effects {} {Tensor{n:n,c:c,h:h,w:w,data:data}}
+pub fn copy(x:ref<Tensor>)->Tensor effects {alloc} {tensor(x.n,x.c,x.h,x.w,num.copy(array.view(x.data)))}
+pub fn prepare(n:ref<network.Network>,affine:neural.Affine)->result<Backend,string> effects {alloc} {
+ var convs:array<option<convolution.Prepared>>=[]
+ var ups:array<option<transpose.Prepared>>=[]
+ var total:u64=0
+ var count:u64=0
+ var id:u64=0
+ loop{if id==array.len(n.weights.parameters.values){break}
+  let is_up:bool=text.contains(array.get(n.weights.parameters.keys,id),".conv_tr.weight")
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,id)
+  let rank:u64=array.len(p.shape)
+  if rank==3 or rank==4{
+   let shape:array<u64>=if rank==3{[array.get(p.shape,0),array.get(p.shape,1),1,array.get(p.shape,2)]}else{[array.get(p.shape,0),array.get(p.shape,1),array.get(p.shape,2),array.get(p.shape,3)]}
+   if is_up{
+    var prepared:transpose.Prepared=try transpose.prepare(array.view(p.values),array.view(shape),1,transpose.Limits{matrix:matrix.Limits{}})
+    var i:u64=0
+    loop{if i==array.len(prepared.weights){break}
+     total+=view.len(bytes.view(array.borrow(prepared.weights,i).data))
+     i+=1}
+    array.push(ups,option.some(prepared))
+    array.push(convs,option.none())
+   }else{
+    let prepared:convolution.Prepared=try convolution.prepare(array.view(p.values),array.view(shape))
+    total+=view.len(bytes.view(prepared.values))
+    array.push(convs,option.some(prepared))
+    array.push(ups,option.none())}
+   count+=1
+  }else{array.push(convs,option.none())
+   array.push(ups,option.none())}
+  id+=1}
+ result.ok(Backend{convolutions:convs,transposes:ups,packs:count,bytes:total,affine:affine})
+}
+pub fn convolve(n:ref<network.Network>,backend:ref<Backend>,library:ref<CAbiLibrary>,x:ref<Tensor>,c:definition.Convolution)->result<Tensor,string> effects {alloc,ffi} {
+ let shape:array<u64>=[x.n,x.c,x.h,x.w]
+ let bias:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,c.bias)
+ if c.up{
+  let packed:ref<transpose.Prepared>=match array.borrow(backend.transposes,c.weight){some(v)=>v,none=>{return result.err("CPU attention transposed convolution was not prepared")}}
+  let options:transpose.Options=transpose.Options{stride_height:c.stride_h,stride_width:c.stride_w,padding_height:c.pad_h,padding_width:c.pad_w,dilation_height:c.dilation_h,dilation_width:c.dilation_w}
+  let limits:transpose.Limits=transpose.Limits{matrix:matrix.Limits{}}
+  let g:transpose.Geometry=try transpose.geometry_general(array.view(shape),packed,options,limits)
+  let out:array<f32>=try transpose.convolve_general(library,array.view(x.data),array.view(shape),packed,array.view(bias.values),options,limits)
+  return result.ok(tensor(x.n,g.output_channels,g.output_height,g.output_width,out))}
+ let packed:ref<convolution.Prepared>=match array.borrow(backend.convolutions,c.weight){some(v)=>v,none=>{return result.err("CPU attention convolution was not prepared")}}
+ let options:convolution.Options=convolution.Options{stride_height:c.stride_h,stride_width:c.stride_w,padding_height:c.pad_h,padding_width:c.pad_w,dilation_height:c.dilation_h,dilation_width:c.dilation_w}
+ let g:convolution.Geometry=try convolution.geometry(array.view(shape),array.view(packed.shape),options)
+ let out:array<f32>=try convolution.convolve_blas(library,array.view(x.data),array.view(shape),packed,array.view(bias.values),options,8388608)
+ result.ok(tensor(x.n,g.output_channels,g.output_height,g.output_width,out))
+}
+fn norm(n:ref<network.Network>,backend:ref<Backend>,x:Tensor own,form:option<definition.Normalization>)->result<Tensor,string> effects {alloc} {
+ var y:Tensor=x
+ match form{some(f)=>{
+  let gamma:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,f.weight)
+  let beta:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,f.bias)
+  y.data=try neural.group_norm_nchw_with_affine(array.view(y.data),array.view(gamma.values),array.view(beta.values),y.n,y.c,y.h*y.w,f.groups,0.00001,backend.affine,neural.Limits{lanes:8})
+ },none=>{}}
+ result.ok(y)
+}
+fn gelu(x:Tensor own)->result<Tensor,string> effects {alloc} {
+ var y:Tensor=x
+ y.data=try neural.gelu(array.view(y.data),neural.Limits{})
+ result.ok(y)
+}
+fn glu(x:ref<Tensor>)->result<Tensor,string> effects {alloc} {
+ if x.c==0 or x.c%2!=0{return result.err("CPU attention gate channels differ")}
+ let channels:u64=x.c/2
+ let plane:u64=x.h*x.w
+ var out:array<f32>=[]
+ array.reserve(out,x.n*channels*plane)
+ var b:u64=0
+ loop{if b==x.n{break}
+  var i:u64=0
+  loop{if i==channels*plane{break}
+   let a:f32=array.get(x.data,b*x.c*plane+i)
+   let gate:f32=array.get(x.data,(b*x.c+channels)*plane+i)
+   let sigmoid:f32=1.0/(1.0+fp.exp(0.0-gate))
+   array.push(out,a*sigmoid)
+   i+=1}
+  b+=1}
+ result.ok(tensor(x.n,channels,x.h,x.w,out))
+}
+fn add_residual(x:ref<Tensor>,other:ref<Tensor>)->result<Tensor,string> effects {alloc} {
+ if x.n!=other.n or x.c!=other.c or x.h!=other.h or x.w!=other.w{return result.err("CPU attention layer residual shape differs")}
+ var out:array<f32>=[]
+ array.reserve(out,array.len(x.data))
+ var i:u64=0
+ loop{if i==array.len(x.data){break}
+  array.push(out,array.get(x.data,i)+array.get(other.data,i))
+  i+=1}
+ result.ok(tensor(x.n,x.c,x.h,x.w,out))
+}
+fn residual(n:ref<network.Network>,backend:ref<Backend>,library:ref<CAbiLibrary>,input:ref<Tensor>,index:u64,frequency:bool,cancel:str)->result<Tensor,string> effects {alloc,ffi,fs.meta} {
+ var x:Tensor=copy(input)
+ if frequency{
+  var folded:array<f32>=[]
+  array.reserve(folded,array.len(x.data))
+  var b:u64=0
+  loop{if b==x.n{break}
+   var f:u64=0
+   loop{if f==x.h{break}
+    var c:u64=0
+    loop{if c==x.c{break}
+     var t:u64=0
+     loop{if t==x.w{break}
+      array.push(folded,array.get(x.data,((b*x.c+c)*x.h+f)*x.w+t))
+      t+=1}
+     c+=1}
+    f+=1}
+   b+=1}
+  x=tensor(x.n*x.h,x.c,1,x.w,folded)}
+ let branches:u64=array.len(array.borrow(n.residuals,index).branches)
+ var i:u64=0
+ loop{if i==branches{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let branch:residual_definition.Branch=array.get(array.borrow(n.residuals,index).branches,i)
+  if option.is_some(branch.recurrence) or option.is_some(branch.state){return result.err("CPU attention recurrent or local state recipe is not admitted")}
+  var y:Tensor=try convolve(n,backend,library,x,branch.expand)
+  y=try norm(n,backend,y,option.some(branch.norm1))
+  y=try gelu(y)
+  y=try convolve(n,backend,library,y,branch.project)
+  y=try norm(n,backend,y,option.some(branch.norm2))
+  y=try glu(y)
+  let scales:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,branch.scale)
+  var at:u64=0
+  loop{if at==array.len(y.data){break}
+   let channel:u64=(at/y.w)%y.c
+   array.set(y.data,at,array.get(y.data,at)*array.get(scales.values,channel))
+   at+=1}
+  x=try add_residual(x,y)
+  i+=1}
+ if frequency{
+  var unfolded:array<f32>=[]
+  array.reserve(unfolded,array.len(x.data))
+  var b:u64=0
+  loop{if b==input.n{break}
+   var c:u64=0
+   loop{if c==x.c{break}
+    var f:u64=0
+    loop{if f==input.h{break}
+     var t:u64=0
+     loop{if t==x.w{break}
+      array.push(unfolded,array.get(x.data,((b*input.h+f)*x.c+c)*x.w+t))
+      t+=1}
+     f+=1}
+    c+=1}
+   b+=1}
+  x=tensor(input.n,x.c,input.h,x.w,unfolded)}
+ result.ok(x)
+}
+pub fn encode(n:ref<network.Network>,backend:ref<Backend>,library:ref<CAbiLibrary>,block:layers.Encoder,input:ref<Tensor>,cancel:str)->result<Tensor,string> effects {alloc,ffi,fs.meta} {
+ var x:Tensor=copy(input)
+ if not block.frequency and x.w%block.stride!=0{
+  let width:u64=x.w+block.stride-x.w%block.stride
+  var padded:array<f32>=num.zeros(x.n*x.c*x.h*width)
+  var row:u64=0
+  loop{if row==x.n*x.c*x.h{break}
+   var t:u64=0
+   loop{if t==x.w{break}
+    array.set(padded,row*width+t,array.get(x.data,row*x.w+t))
+    t+=1}
+   row+=1}
+  x=tensor(x.n,x.c,x.h,width,padded)}
+ var y:Tensor=try convolve(n,backend,library,x,block.conv)
+ x.data=[]
+ if block.empty{return result.ok(y)}
+ y=try norm(n,backend,y,block.norm1)
+ y=try gelu(y)
+ match block.residual{some(id)=>{y=try residual(n,backend,library,y,id,block.frequency,cancel)},none=>{}}
+ y=try convolve(n,backend,library,y,block.rewrite)
+ y=try norm(n,backend,y,block.norm2)
+ glu(y)
+}
+pub fn decode(n:ref<network.Network>,backend:ref<Backend>,library:ref<CAbiLibrary>,block:layers.Decoder,input:ref<Tensor>,skip:ref<Tensor>,length:u64,cancel:str)->result<Tensor,string> effects {alloc,ffi,fs.meta} {
+ var y:Tensor=copy(input)
+ if not block.empty{
+  y=try add_residual(y,skip)
+  y=try convolve(n,backend,library,y,block.rewrite)
+  y=try norm(n,backend,y,block.norm1)
+  y=try glu(y)
+  match block.residual{some(id)=>{y=try residual(n,backend,library,y,id,block.frequency,cancel)},none=>{}}}
+ var z:Tensor=try convolve(n,backend,library,y,block.conv)
+ y.data=[]
+ z=try norm(n,backend,z,block.norm2)
+ let h:u64=if block.frequency{z.h-2*block.pad}else{z.h}
+ let w:u64=if block.frequency{z.w}else{length}
+ if h==0 or w==0 or (block.frequency and z.h<=2*block.pad) or (not block.frequency and block.pad+w>z.w){return result.err("CPU attention decoder crop differs")}
+ var cropped:array<f32>=[]
+ array.reserve(cropped,z.n*z.c*h*w)
+ var row:u64=0
+ loop{if row==z.n*z.c{break}
+  var f:u64=0
+  loop{if f==h{break}
+   var t:u64=0
+   loop{if t==w{break}
+    array.push(cropped,array.get(z.data,(row*z.h+f+if block.frequency{block.pad}else{0})*z.w+t+if block.frequency{0}else{block.pad}))
+    t+=1}
+   f+=1}
+  row+=1}
+ z=tensor(z.n,z.c,h,w,cropped)
+ if not block.last{z=try gelu(z)}
+ result.ok(z)
+}

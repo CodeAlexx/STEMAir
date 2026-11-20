@@ -1,0 +1,80 @@
+{
+  "version": "3.1.2",
+  "windows": {
+    "executable_sha256": "fc3e44cd8f0905a2337546af810c3a2702feeb09a77b0ef12d9c95dd5473c70b",
+    "dependencies": [
+      {
+        "path": "sndfile.dll",
+        "sha256": "20e549902ddd1d2005bd5c272dda018666e3136e2902a71f3010aa7e93e504b8"
+      }
+    ]
+  },
+  "linux": {
+    "executable_sha256": "6d050d48a7a89c06b8ad4d375728b83077db0bf0bfd2904b40654f4b7d1e3ce5",
+    "dependencies": [
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libsndfile.so.1",
+        "sha256": "dd944b9bf1d06df6bb1c4f730fdcb3321d114aace43f66560ece7eeb726ed1c4"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libstdc++.so.6",
+        "sha256": "5bb0d21308f123b6ad46c6f35b42cedfcb8d6d439a53aa3dae04d880aaffdde3"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libm.so.6",
+        "sha256": "1c488db6f4fe8cecb72456bc018de000b7a9b539c2994864b0416b5e8371b3d8"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+        "sha256": "9d339ecb409578d6a5d587e6c537a8f9589b8a13fefba30d167433a4b5758bee"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "sha256": "85e64f97e348786a8fb4d9f3d52fec289e2fb86bba20f0731dfe61990525e0f7"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libFLAC.so.14",
+        "sha256": "575e74dd5c9f2c3e6acfe7d3647f7dc10eb9c37f106d588c66aba8d7648aae5d"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libvorbis.so.0",
+        "sha256": "518db59c055b4754e6c07ac81e86ed30ef5dfc0c10a1d2a3cbb19eb120fe3ec5"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libvorbisenc.so.2",
+        "sha256": "66a7009084fa7eef7a21321fd5462b9e7dd355bcfcf35ddcc39852a65e600501"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libopus.so.0",
+        "sha256": "5f01eaf11e7326d83f9c341a1d943851a0b00e3444668697dd663c14b138476e"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libogg.so.0",
+        "sha256": "cb4b444d7f473530c04e31a70347bd572abd5e53a8b28e0f653fe76cf2255bc8"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libmpg123.so.0",
+        "sha256": "97c50f2bc117d0edd3721d7886809a76e92a96c9572b84549d4c34fea4fe11e0"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libmp3lame.so.0",
+        "sha256": "e0676e6702b0095212724f2d298685d189dc3b54845c90cb1db1bd2970c29ed2"
+      },
+      {
+        "path": "/lib64/ld-linux-x86-64.so.2",
+        "sha256": "bda779ea9e9ad234f60315477d7cfd0bdde861cd8ddd9df8cdaf62f18c4cec14"
+      },
+      {
+        "path": "/usr/lib/x86_64-linux-gnu/libmvec.so.1",
+        "sha256": "2f2e7f4ad88e1b13f2f8345c826b25f85ba61c93527d91e59dd0d2943eac6e80"
+      }
+    ],
+    "minimum_glibc": "2.43",
+    "portable_to_older_distributions": false
+  },
+  "license_notices": [
+    "external-time-processor-GPL-2.txt",
+    "external-time-file-io-LGPL-2.1.txt",
+    "time-wrapper-ISC.txt"
+  ]
+}

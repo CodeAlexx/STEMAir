@@ -1,0 +1,88 @@
+// Immutable reader policy is bound to parameter geometry, not weight identity.
+module stemair.band_input_rule
+import "mask/config.ai" as mask
+import std.codec as codec
+import std.json as json
+import std.text as text
+type BandShape=struct{rate:u32,n_fft:u64,hop:u64,crop_start:u64,crop_stop:u64,low_start:u64,low_stop:u64,high_start:u64,high_stop:u64,channel_mode:string,resample:string} derive codec(strict)
+type Shape=struct{rate:u32,bins:u64,pre_start:u64,pre_stop:u64,channel_mode:string,bands:array<BandShape>} derive codec(strict)
+pub type Binding=struct{geometry:string,rate:u32,method:string,source_parameter:string,source_sha256:string} derive codec(strict)
+pub type Rules=struct{version:u32,bindings:array<Binding>} derive codec(strict)
+fn native_method(method:str)->string effects {alloc}{
+ if method=="sinc-fast"{return "sinc_fastest"}
+ string.copy(method)
+}
+pub fn signature(c:ref<mask.Config>)->result<string,string> effects {alloc}{
+ var shape:Shape=Shape{rate:c.sample_rate,bins:c.bins,pre_start:c.pre_filter_start,pre_stop:c.pre_filter_stop,channel_mode:string.copy(c.channel_mode),bands:[]}
+ var i:u64=0
+ loop{if i==array.len(c.bands){break}
+  let b:ref<mask.Band>=array.borrow(c.bands,i)
+  array.push(shape.bands,BandShape{rate:b.sample_rate,n_fft:b.n_fft,hop:b.hop,crop_start:b.crop_start,crop_stop:b.crop_stop,low_start:b.low_start,low_stop:b.low_stop,high_start:b.high_start,high_stop:b.high_stop,channel_mode:string.copy(b.channel_mode),resample:if i+1==array.len(c.bands){""}else{native_method(b.input_resample)}})
+  i+=1}
+ result.ok(try Shape_encode(shape) map_err codec.describe)
+}
+fn valid_method(method:str)->bool effects {}{
+ method=="sinc_best" or method=="sinc_medium" or method=="sinc_fastest" or method=="kaiser_best" or method=="kaiser_fast" or method=="polyphase"
+}
+pub fn select(c:ref<mask.Config>,rules:ref<Rules>)->result<Binding,string> effects {alloc}{
+ if rules.version!=1{return result.err("Unsupported band-reader parameter mapping")}
+ let geometry:string=try signature(c)
+ var found:option<u64>=option.none()
+ var i:u64=0
+ loop{if i==array.len(rules.bindings){break}
+  let b:ref<Binding>=array.borrow(rules.bindings,i)
+  if str.view(b.geometry)==str.view(geometry){
+   if b.rate!=c.sample_rate or not valid_method(b.method) or str.len(b.source_sha256)!=64{return result.err("Invalid bound analysis-band reader rule")}
+   match found{none=>{found=option.some(i)},some(at)=>{
+    if str.view(array.borrow(rules.bindings,at).method)!=str.view(b.method){return result.err("Analysis-band geometry has ambiguous reader methods")}}}}
+  i+=1}
+ let at:u64=match found{some(value)=>value,none=>{return result.err("This mask parameter geometry has no accepted source reader rule")}}
+ let selected:ref<Binding>=array.borrow(rules.bindings,at)
+ result.ok(Binding{geometry:string.copy(selected.geometry),rate:selected.rate,method:string.copy(selected.method),source_parameter:string.copy(selected.source_parameter),source_sha256:string.copy(selected.source_sha256)})
+}
+fn channel_mode(source:str)->string effects {alloc}{
+ if source=="mid_side"{return "mid-side"}
+ if source=="mid_side_c"{return "cross-mid-side"}
+ if source=="stereo_n"{return "coupled-stereo"}
+ "stereo"
+}
+fn high_start(data:ref<json.Document>,source:ref<codec.Reader>)->result<u64,string> effects {alloc}{
+ let value:i64=try codec.i64_or(data,source,"hpf_start",0) map_err codec.describe
+ if value== -1{return result.ok(0)}
+ if value<0{return result.err("Unknown negative source filter sentinel")}
+ result.ok(cast.wrap(value))
+}
+// Import the original data format with shared JSON/codec facilities. The exact
+// source file hash/identity is retained; unrelated model constructor fields
+// are deliberately absent from this reader-only geometry signature.
+pub fn import_parameter(raw:str,id:str,sha:str)->result<Binding,string> effects {alloc}{
+ var data:json.Document=try json.parse(raw) map_err json.message
+ let policy:codec.Policy=codec.Policy{reject_unknown:false,reject_duplicates:true}
+ var root:codec.Reader=codec.root_reader(policy)
+ let rate:u32=try codec.u32_field(data,root,"sr") map_err codec.describe
+ let bins:u64=if try codec.has_field(data,root,"n_bins") map_err codec.describe{try codec.u64_field(data,root,"n_bins") map_err codec.describe}else{try codec.u64_field(data,root,"bins") map_err codec.describe}
+ let pre_start:u64=try codec.u64_or(data,root,"pre_filter_start",0) map_err codec.describe
+ let pre_stop:u64=try codec.u64_or(data,root,"pre_filter_stop",0) map_err codec.describe
+ let reverse:bool=try codec.bool_or(data,root,"reverse",false) map_err codec.describe
+ let mid_side:bool=try codec.bool_or(data,root,"mid_side",false) map_err codec.describe
+ let half_cross:bool=try codec.bool_or(data,root,"mid_side_b2",false) map_err codec.describe
+ var bands:codec.Reader=try codec.object_field(data,root,"band",policy) map_err codec.describe
+ let keys:array<string>=match json.keys(data,codec.node_index(bands)){some(value)=>value,none=>{return result.err("The source parameter band map is unavailable")}}
+ if array.len(keys)==0 or array.len(keys)>8{return result.err("The source parameter band count is unsupported")}
+ var shape:Shape=Shape{rate:rate,bins:bins,pre_start:pre_start,pre_stop:pre_stop,channel_mode:if reverse{"time-reversed"}else{if mid_side{"mid-side"}else{if half_cross{"half-cross"}else{"stereo"}}},bands:[]}
+ var method:string=""
+ var i:u64=0
+ loop{if i==array.len(keys){break}
+  let name:string=string.from_int(i+1)
+  var source:codec.Reader=try codec.object_field(data,bands,name,policy) map_err codec.describe
+  let selected:string=try codec.text_field(data,source,"res_type") map_err codec.describe
+  let last:bool=i+1==array.len(keys)
+  if last{method=string.copy(selected)}
+  array.push(shape.bands,BandShape{rate:try codec.u32_field(data,source,"sr") map_err codec.describe,n_fft:try codec.u64_field(data,source,"n_fft") map_err codec.describe,hop:try codec.u64_field(data,source,"hl") map_err codec.describe,crop_start:try codec.u64_field(data,source,"crop_start") map_err codec.describe,crop_stop:try codec.u64_field(data,source,"crop_stop") map_err codec.describe,low_start:try codec.u64_or(data,source,"lpf_start",0) map_err codec.describe,low_stop:try codec.u64_or(data,source,"lpf_stop",0) map_err codec.describe,high_start:try high_start(data,source),high_stop:try codec.u64_or(data,source,"hpf_stop",0) map_err codec.describe,channel_mode:channel_mode(try codec.text_or(data,source,"convert_channels","") map_err codec.describe),resample:if last{""}else{string.copy(selected)}})
+  let _=try codec.reader_finish(data,source) map_err codec.describe
+  i+=1}
+ let _=try codec.reader_finish(data,bands) map_err codec.describe
+ let _=try codec.reader_finish(data,root) map_err codec.describe
+ if not valid_method(method) or str.len(sha)!=64{return result.err("The source highest-band method/identity is unsupported")}
+ result.ok(Binding{geometry:try Shape_encode(shape) map_err codec.describe,rate:rate,method:method,source_parameter:string.copy(id),source_sha256:string.copy(sha)})
+}

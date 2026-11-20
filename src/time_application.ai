@@ -1,0 +1,159 @@
+module stemair.time_application
+import "wav_export.ai" as wav
+import "checked_input.ai" as checked_input
+import "application.ai" as application
+import "container_export.ai" as container
+import "../toolkit/time_tool.ai" as core
+import "../toolkit/time_tool_process.ai" as transport
+import "../toolkit/control.ai" as control
+import std.audio as audio
+import std.codec as codec
+import std.files as files
+import std.path as path
+import std.system as system
+import std.text as text
+
+pub type Settings=transport.Recipe
+pub type Report=struct{operation:string,value:f64,normalize:bool,input:string,input_frames:u64,frames:u64,sample_rate:u32,channels:u64,
+ file:string,backend:string,bypassed:bool,external_children:u64,configured_tool_sha256:string,tool_verified:bool,
+ temporary_removed:bool,work_directory:string,checkpoint_loads:u64} derive codec(strict)
+pub fn action(settings:ref<Settings>)->result<core.Action,string> effects {alloc} {
+ let selected:core.Action=if settings.operation=="tempo"{core.Action.Tempo(settings.value)}else{
+  if settings.operation=="pitch-preserve-duration"{core.Action.Pitch(settings.value)}else{
+   return result.err("Choose tempo or pitch-preserve-duration")}}
+ let _=try core.validate(selected) map_err transport.message
+ result.ok(selected)
+}
+pub fn read(file:str)->result<Settings,string> effects {alloc,fs.read} {
+ let raw:bytes=match files.read_limited(file,262144){ok(value)=>value,err(_)=>{return result.err("Cannot read a bounded external audio recipe")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(value)=>value,none=>{return result.err("External audio recipe must be UTF-8")}}
+ decode(source)
+}
+pub fn decode(source:str)->result<Settings,string> effects {alloc} {
+ let settings:Settings=try transport.Recipe_decode(source) map_err codec.describe
+ let _=try action(settings)
+ result.ok(settings)
+}
+pub fn encode(settings:ref<Settings>)->result<string,string> effects {alloc} {
+ result.ok(try transport.Recipe_encode(settings) map_err codec.describe)
+}
+pub fn preflight(directory:str)->result<unit,string> effects {alloc,fs.meta} {
+ if not match files.is_dir(directory){ok(value)=>value,err(_)=>false}{return result.err("Output directory must already exist")}
+ let names:array<string>=["time.wav","audio-time.json"]
+ var i:u64=0
+ loop{if i==2{break}
+  match files.symlink_metadata(path.join(directory,array.get(names,i))){ok(_)=>{return result.err("An audio tool output already exists; choose an empty directory")},err(error)=>{
+   if error.code!=1{return result.err("Cannot inspect audio tool output directory")}}}
+  i+=1}
+ result.ok(())
+}
+pub fn load(file:str)->result<audio.AudioBuffer,string> effects {alloc,fs.read} {
+ let raw:bytes=match files.read_limited(file,67174400){ok(value)=>value,err(_)=>{return result.err("Cannot read a bounded audio tool WAV")}}
+ let source:audio.AudioBuffer=try audio.decode_wav(bytes.view(raw)) map_err audio.message
+ result.ok(source)
+}
+fn io_error(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+type Computed=struct{processed:core.Output,input_frames:u64}
+fn compute(settings:ref<Settings>,input:str,absolute:str,cancel:str,progress:str,selected:core.Action,input_options:ref<option<checked_input.Options>>)->result<Computed,string> effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ let source:audio.AudioBuffer=try match input_options{none=>load(input),some(options)=>checked_input.buffer(input,44100,options)} map_err application.recording_error
+ let private_name:string=text.concat(".time-work-",text.concat(string.from_int(system.process_id()),text.concat("-",string.from_int(time.monotonic_ns()))))
+ let scratch:string=path.join(absolute,private_name)
+ var processed:core.Output=try core.process(struct.borrow(settings,field=tool),source,selected,settings.normalize,scratch,cancel,progress) map_err core.describe
+ result.ok(Computed{processed:processed,input_frames:audio.num_frames(source)})
+}
+fn run_impl(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str,encoding:option<audio.WavSubtype>)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ let selected:core.Action=try action(settings)
+ if control.cancelled(cancel){return result.err("External audio processing cancelled")}
+ let absolute:string=if path.is_absolute(directory){path.normalize(directory)}else{path.join(try files.cwd() map_err io_error,directory)}
+ match encoding{some(kind)=>{let _=try preflight_as(absolute,kind)},none=>{let _=try preflight(absolute)}}
+ var input_options:option<checked_input.Options>=option.none()
+ var computed:Computed=try compute(settings,input,absolute,cancel,progress,selected,input_options)
+ let input_frames:u64=computed.input_frames
+ let processed:ref<core.Output>=struct.borrow(computed,field=processed)
+ if control.cancelled(cancel){return result.err("External audio processing cancelled before export")}
+ match encoding{some(kind)=>{let _=try wav.write_buffer_controlled(path.join(absolute,"time.wav"),struct.borrow(processed,field=buffer),kind,cancel,progress)},none=>{
+ let encoded:bytes=try audio.encode_wav(struct.borrow(processed,field=buffer),32) map_err audio.message
+ if control.cancelled(cancel){return result.err("External audio processing cancelled before export")}
+ let _=match files.write_new_bytes(path.join(absolute,"time.wav"),bytes.view(encoded)){ok(_)=>(),err(_)=>{
+  return result.err("Cannot create audio tool WAV; existing outputs are preserved and an owned partial file may remain")}}
+ }}
+ let report:Report=Report{operation:string.copy(settings.operation),value:settings.value,normalize:settings.normalize,input:string.copy(input),
+  input_frames:input_frames,frames:audio.num_frames(struct.borrow(processed,field=buffer)),sample_rate:44100,channels:cast.wrap(processed.buffer.channels),file:"time.wav",
+  backend:if processed.bypassed{"native-air-identity"}else{"external-command-audio"},bypassed:processed.bypassed,external_children:processed.children,
+  configured_tool_sha256:string.copy(settings.tool.sha256),tool_verified:not processed.bypassed,temporary_removed:processed.temporary_removed,
+  work_directory:string.copy(processed.work_directory),checkpoint_loads:0}
+ let manifest:string=try Report_encode(report) map_err codec.describe
+ match encoding{some(kind)=>{let _=try wav.write_metadata(path.join(absolute,"audio-time.json"),manifest,kind)},none=>{
+ let _=match files.write_new_text(path.join(absolute,"audio-time.json"),manifest){ok(_)=>(),err(_)=>{
+  return result.err("Cannot create audio tool manifest; the completed WAV remains available")}}
+ }}
+ result.ok(report)
+}
+pub fn run(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ run_impl(settings,input,directory,cancel,progress,option.none())
+}
+pub fn run_as(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str,kind:audio.WavSubtype)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ run_impl(settings,input,directory,cancel,progress,option.some(kind))
+}
+
+
+pub fn preflight_as(directory:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.meta} {
+ let _=try preflight(directory)
+ let names:array<string>=["time.wav","audio-time.json"]
+ var i:u64=0
+ loop{if i==array.len(names){break}
+  let _=try wav.preflight_file(path.join(directory,array.get(names,i)))
+  i+=1}
+ result.ok(())
+}
+
+
+pub fn preflight_to(directory:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ let _=try container.verify(plan)
+ let _=try container.require_directory(directory)
+ let _=try container.preflight_tracked(container.target(directory,"time",plan),plan,log)
+ container.preflight_metadata_tracked(path.join(directory,"audio-time.json"),log)
+}
+
+fn run_to_impl(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>,input_options:ref<option<checked_input.Options>>)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ let selected:core.Action=try action(settings)
+ if control.cancelled(cancel){return result.err("External audio processing cancelled")}
+ let absolute:string=if path.is_absolute(directory){path.normalize(directory)}else{path.join(try files.cwd() map_err io_error,directory)}
+ let start:u64=array.len(log.artifacts)
+ let _=try preflight_to(absolute,plan,log)
+ var computed:Computed=try compute(settings,input,absolute,cancel,progress,selected,input_options)
+ let input_frames:u64=computed.input_frames
+ let processed:ref<core.Output>=struct.borrow(computed,field=processed)
+ if control.cancelled(cancel){return result.err("External audio processing cancelled before export")}
+ let _=try container.write_buffer(container.target(absolute,"time",plan),struct.borrow(processed,field=buffer),plan,log,cancel,progress)
+ let report:Report=Report{operation:string.copy(settings.operation),value:settings.value,normalize:settings.normalize,input:string.copy(input),
+  input_frames:input_frames,frames:audio.num_frames(struct.borrow(processed,field=buffer)),sample_rate:44100,channels:cast.wrap(processed.buffer.channels),file:container.filename("time",plan),
+  backend:if processed.bypassed{"native-air-identity"}else{"external-command-audio"},bypassed:processed.bypassed,external_children:processed.children,
+  configured_tool_sha256:string.copy(settings.tool.sha256),tool_verified:not processed.bypassed,temporary_removed:processed.temporary_removed,
+  work_directory:string.copy(processed.work_directory),checkpoint_loads:0}
+ let manifest:string=try Report_encode(report) map_err codec.describe
+ let _=try container.write_metadata(path.join(absolute,"audio-time.json"),manifest,plan,log,start)
+ result.ok(report)
+}
+pub fn run_to(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ log.attempted=""
+ log.failure=""
+ var input_options:option<checked_input.Options>=option.none()
+ let outcome:result<Report,string>=run_to_impl(settings,input,directory,cancel,progress,plan,log,input_options)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+
+pub fn run_with_input_to(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>,input_options:ref<option<checked_input.Options>>)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<Report,string>=run_to_impl(settings,input,directory,cancel,progress,plan,log,input_options)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}

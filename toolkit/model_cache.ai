@@ -1,0 +1,402 @@
+module stemair.model_cache
+import "engine.ai" as engine
+import std.files as files
+import std.cpu_dot as dot
+import std.codec as codec
+import "mask/config.ai" as mask_config
+import "waveform/config.ai" as waveform_config
+import "hybrid/config.ai" as hybrid_config
+import "attention/config.ai" as attention_config
+import "attention/bundle_config.ai" as bundle_config
+import "config.ai" as spectral_config
+import "mask/request.ai" as mask_request
+import std.path as path
+import std.system as system
+import "audio_result.ai" as audio_result
+import "spectral_cpu_recipe.ai" as spectral_recipe
+import "learned_cleanup_bank.ai" as learned
+import "learned_cleanup.ai" as learned_core
+import "learned_cleanup_request.ai" as learned_request
+import "mask/session.ai" as mask_session
+import "recording_bag_config.ai" as recording_bag_config
+import "recording_bag_state.ai" as recording_bag_state
+
+pub type Entry=struct{checkpoint:string,model:engine.Loaded}
+pub type CpuBackend=struct{path:string,sha256:string,version:string,core:string,host:string="",spectral_recipe:string="",mask_recipe:string="",transform_runtime:string=""}
+pub type Cache=struct{entries:array<Entry>,cpu:array<dot.Engine>,cpu_path:string="",cpu_sha256:string="",cpu_version:string="",cpu_core:string="",cpu_host:string="",cpu_policy_valid:bool=true,spectral_recipe:string="",learned:array<learned.Bank>,learned_mask_recipe:string="",transform_runtime:string=""}
+pub fn empty()->Cache effects {alloc} {Cache{entries:[],cpu:[],learned:[]}}
+// Explicit session boundary: release vendor contexts before dropping their AIR
+// owner. An uncertain close preserves the bank and prevents further CPU work.
+pub fn close(cache:ref<Cache>)->result<unit,string> effects {alloc,ffi}{
+ if array.len(cache.learned)!=0{let _=try learned.close_host(array.borrow(cache.learned,0))
+  cache.learned=[]}
+ var i:u64=0
+ loop{if i==array.len(cache.entries){break}
+  match array.borrow(cache.entries,i).model.mask{none=>{},some(value)=>{match mask_session.close_original_cpu(value){ok(_)=>{},err(e)=>{cache.cpu_policy_valid=false
+   return result.err(e)}}}}
+  match engine.close_cpu(struct.borrow(array.borrow(cache.entries,i),field=model)){ok(_)=>{},err(e)=>{cache.cpu_policy_valid=false
+   return result.err(e)}}
+  i+=1}
+ cache.entries=[]
+ cache.cpu=[]
+ cache.cpu_path=""
+ cache.cpu_sha256=""
+ cache.cpu_version=""
+ cache.cpu_core=""
+ cache.cpu_host=""
+ cache.transform_runtime=""
+ cache.spectral_recipe=""
+ cache.learned_mask_recipe=""
+ cache.cpu_policy_valid=true
+ result.ok(())
+}
+// Additive auxiliary session state: main-model identity and dispatch stay exact.
+pub fn select_learned(cache:ref<Cache>,raw:str)->result<unit,string> effects {alloc}{
+ let _=try learned_request.decode(raw)
+ if array.len(cache.learned)==0{array.push(cache.learned,learned.empty())}
+ learned.select(array.borrow(cache.learned,0),raw)
+}
+pub fn prepare_learned_cpu(cache:ref<Cache>)->result<unit,string> effects {alloc,ffi,fs.read,fs.meta}{
+ if array.len(cache.learned)==0{return result.ok(())}
+ let raw:string=try learned_request.encode(struct.borrow(array.borrow(cache.learned,0),field=settings))
+ configure_learned_cpu(cache,raw)
+}
+pub fn configure_learned_cpu(cache:ref<Cache>,raw:str)->result<unit,string> effects {alloc,ffi,fs.read,fs.meta}{
+ let _=try learned_request.decode(raw)
+ let _=try require_cpu_policy(cache)
+ if array.len(cache.learned)==0{array.push(cache.learned,learned.empty())}
+ learned.configure_cpu(array.borrow(cache.learned,0),raw)
+}
+pub fn configure_learned_gpu(cache:ref<Cache>,raw:str)->result<unit,string> effects {alloc,ffi,fs.read,fs.meta,gpu}{
+ configure_learned_gpu_on_device(cache,raw,0)
+}
+pub fn configure_learned_gpu_on_device(cache:ref<Cache>,raw:str,index:u32)->result<unit,string> effects {alloc,ffi,fs.read,fs.meta,gpu}{
+ let _=try learned_request.decode(raw)
+ let _=try require_cpu_policy(cache)
+ if array.len(cache.learned)==0{array.push(cache.learned,learned.empty())}
+ learned.configure_gpu_on_device(array.borrow(cache.learned,0),raw,index)
+}
+pub fn close_learned_gpu(cache:ref<Cache>)->result<unit,string> effects {alloc,gpu}{
+ if array.len(cache.learned)!=0{let _=try learned.close_gpu(array.borrow(cache.learned,0))
+  cache.learned=[]}
+ result.ok(())
+}
+pub fn close_all(cache:ref<Cache>)->result<unit,string> effects {alloc,ffi,gpu}{
+ let _=try close_learned_gpu(cache)
+ close(cache)
+}
+pub fn learned_settings(cache:ref<Cache>)->learned_request.Settings effects {alloc}{
+ if array.len(cache.learned)==0{return learned_request.disabled()}
+ let selected:ref<learned_request.Settings>=struct.borrow(array.borrow(cache.learned,0),field=settings)
+ learned_request.Settings{noise:selected.noise,room:selected.room,room_targets:string.copy(selected.room_targets),noise_checkpoint:string.copy(selected.noise_checkpoint),room_checkpoint:string.copy(selected.room_checkpoint)}
+}
+pub fn prepare_learned_masks_cpu(cache:ref<Cache>,raw:str)->result<unit,string> effects {alloc,env,ffi,fs.read,fs.meta}{
+ let settings=learned_settings(cache)
+ if not settings.room{return result.ok(())}
+ let _=try require_cpu_policy(cache)
+ let selected:spectral_recipe.Recipe=try spectral_recipe.decode(raw)
+ if str.len(cache.learned_mask_recipe)!=0 and cache.learned_mask_recipe!=raw{return result.err("Learned mask CPU runtime changed; release models first")}
+ if str.len(cache.learned_mask_recipe)==0{let _=try spectral_recipe.verify(selected)
+  cache.learned_mask_recipe=string.copy(raw)}
+ var i:u64=0
+ loop{if i==array.len(cache.entries){break}
+  let host:string=string.copy(cache.cpu_host)
+  match array.borrow(cache.entries,i).model.mask{none=>{},some(value)=>{let _=try mask_session.prepare_original_cpu(value,selected.adapter,host)}}
+  i+=1}
+ result.ok(())
+}
+pub fn separate_learned_mask_cpu(cache:ref<Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>)->result<audio_result.Samples,string> effects {alloc,ffi,fs.meta,fs.write}{
+ var lower:array<f32>=[]
+ separate_original_mask_cpu_with_band_input(cache,index,input,cancel,progress,policy,array.view(lower))
+}
+pub fn separate_original_mask_cpu_with_band_input(cache:ref<Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,lower:view<f32>)->result<audio_result.Samples,string> effects {alloc,ffi,fs.meta,fs.write}{
+ let _=try require_cpu_policy(cache)
+ let _=try mask_request.validate_policy(policy)
+ if index>=array.len(cache.entries) or array.len(cache.cpu)!=1{return result.err("Learned mask CPU session is unavailable")}
+ let identity:string=string.copy(array.borrow(cache.entries,index).model.profile.identity)
+ var configuration:mask_config.Config=try mask_request.settings_with_policy(identity,policy)
+ let libraries:ref<array<dot.Engine>>=struct.borrow(cache,field=cpu)
+ let entries:ref<array<Entry>>=struct.borrow(cache,field=entries)
+ let library:ref<CAbiLibrary>=struct.borrow(array.borrow(libraries,0),field=library)
+ match array.borrow(entries,index).model.mask{none=>result.err("Learned mask CPU session is not a cascaded model"),some(value)=>{
+  let result:result<audio_result.Samples,string>=mask_session.separate_original_cpu_with_band_input(value,library,configuration,input,cancel,progress,policy,lower)
+  if array.len(value.original_cpu)==1 and not array.borrow(value.original_cpu,0).policy_valid{cache.cpu_policy_valid=false}
+  match result{err(e)=>result.err(e),ok(v)=>{let entry:ref<Entry>=array.borrow(cache.entries,index)
+   entry.model.requests+=1
+   result.ok(v)}}}}
+}
+pub fn apply_learned_cpu(cache:ref<Cache>,kind:learned_core.Kind,input:ref<audio_result.Samples>,cancel:str)->result<learned_core.Output,string> effects {alloc,ffi,fs.meta}{
+ let _=try require_cpu_policy(cache)
+ if array.len(cache.learned)!=1{return result.err("Learned helpers must be configured before prediction")}
+ if array.len(cache.cpu)!=1{return result.err("Learned CPU cleanup requires a qualified retained CPU runtime")}
+ learned.apply_cpu(array.borrow(cache.learned,0),kind,struct.borrow(array.borrow(cache.cpu,0),field=library),input,cancel)
+}
+pub fn apply_learned_gpu(cache:ref<Cache>,kind:learned_core.Kind,input:ref<audio_result.Samples>,cancel:str)->result<learned_core.Output,string> effects {alloc,gpu,fs.meta}{
+ if array.len(cache.learned)!=1{return result.err("Learned helpers must be configured before prediction")}
+ learned.apply_gpu(array.borrow(cache.learned,0),kind,input,cancel)
+}
+pub fn learned_loads(cache:ref<Cache>)->u64 effects {}{
+ if array.len(cache.learned)==0{0}else{learned.loads(array.borrow(cache.learned,0))}
+}
+pub fn learned_bytes_read(cache:ref<Cache>)->u64 effects {}{
+ if array.len(cache.learned)==0{0}else{learned.bytes_read(array.borrow(cache.learned,0))}
+}
+// Preserve resident weights and telemetry, but refuse CPU work until explicit release.
+pub fn poison_cpu(cache:ref<Cache>)->unit effects {} {cache.cpu_policy_valid=false}
+pub fn require_cpu_policy(cache:ref<Cache>)->result<unit,string> effects {alloc} {
+ if not cache.cpu_policy_valid{return result.err("CPU runtime policy could not be restored; release loaded models before further CPU processing")}
+ result.ok(())
+}
+pub fn checkpoint_id(file:str)->result<string,string> effects {alloc,fs.read} {
+ if str.len(file)==0{return result.err("A model checkpoint path is empty")}
+ if path.is_absolute(file){return result.ok(path.normalize(file))}
+ let cwd:string=match files.cwd(){ok(v)=>v,err(_)=>{return result.err("Cannot resolve model checkpoint path")}}
+ result.ok(path.normalize(path.join(cwd,file)))
+}
+pub fn acquire(cache:ref<Cache>,file:str,profile:engine.Profile own)->result<u64,string> effects {alloc,fs.read,fs.meta} {
+ acquire_impl(cache,file,profile,false)
+}
+pub fn acquire_typed(cache:ref<Cache>,file:str,profile:engine.Profile own)->result<u64,string> effects {alloc,fs.read,fs.meta} {
+ acquire_impl(cache,file,profile,true)
+}
+fn acquire_impl(cache:ref<Cache>,file:str,profile:engine.Profile own,typed:bool)->result<u64,string> effects {alloc,fs.read,fs.meta} {
+ var requested:engine.Profile=profile
+ let identity:string=try checkpoint_id(file)
+ var i:u64=0
+ loop{if i==array.len(cache.entries){break}
+  let entry:ref<Entry>=array.borrow(cache.entries,i)
+  if str.view(entry.checkpoint)==str.view(identity){
+   if str.view(entry.model.profile.identity)!=str.view(requested.identity){
+    return result.err("Checkpoint settings changed; release the loaded models before processing")}
+   return result.ok(i)}
+  i+=1}
+ // Every admitted checkpoint is an original uncompressed archive or native
+ // tensor graph. Three file lengths cover archive plus promoted F32 startup
+ // storage; keep additional headroom for descriptors and allocator metadata.
+ var bytes:u64=match files.file_size(identity){ok(v)=>v,err(_)=>{return result.err("Cannot inspect model checkpoint")}}
+ var bag_limits:array<recording_bag_state.Limits>=[]
+ if requested.kind=="recording-bundle"{
+  var settings:recording_bag_config.Config=try recording_bag_config.Config_decode(requested.identity) map_err codec.describe
+  let intake:recording_bag_state.Intake=try recording_bag_state.inspect(identity,settings)
+  if intake.checkpoint_bytes>18446744073709551615-bytes{return result.err("Recording bundle retained intake extent overflows")}
+  bytes+=intake.checkpoint_bytes
+  array.push(bag_limits,recording_bag_state.Limits{max_members:array.len(settings.members),max_checkpoint_bytes:intake.checkpoint_bytes,max_definition_bytes:intake.definition_bytes})}
+ if requested.kind=="attention-bundle"{
+  var settings:bundle_config.Config=try bundle_config.decode(requested.identity)
+  var member:u64=0
+  loop{if member==array.len(settings.members){break}
+   let filename:string=path.join(path.dirname(identity),array.borrow(settings.members,member).filename)
+   let count:u64=match files.file_size(filename){ok(v)=>v,err(_)=>{return result.err("Cannot inspect a bundle checkpoint")}}
+   if count==0 or count>2147483648{return result.err("Bundle checkpoint exceeds its size bound")}
+   bytes+=count
+   member+=1}}
+ if bytes==0 or bytes>6148914691214147583{return result.err("Invalid model checkpoint size")}
+ let memory:system.Memory=match system.memory(){ok(v)=>v,err(_)=>{return result.err("Cannot query host memory for retained model loading")}}
+ if bytes*3+67108864>memory.available_bytes{return result.err("Not enough host memory to retain another model; release loaded models first")}
+ let opened:engine.Loaded=try if array.len(bag_limits)==1{engine.open_recording_bag(identity,requested,array.borrow(bag_limits,0))}else{if typed{engine.open_typed(identity,requested)}else{engine.open(identity,requested)}}
+ array.push(cache.entries,Entry{checkpoint:identity,model:opened})
+ result.ok(i)
+}
+pub fn loads(cache:ref<Cache>)->u64 effects {} {
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(cache.entries){break}
+  total+=engine.loads(struct.borrow(array.borrow(cache.entries,i),field=model))
+  i+=1}
+ total
+}
+pub fn requests(cache:ref<Cache>)->u64 effects {} {
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(cache.entries){break}
+  total+=array.borrow(cache.entries,i).model.requests
+  i+=1}
+ total
+}
+pub fn bytes_read(cache:ref<Cache>)->u64 effects {} {
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(cache.entries){break}
+  total+=engine.bytes_read(struct.borrow(array.borrow(cache.entries,i),field=model))
+  i+=1}
+ total
+}
+
+// Prepared spectral admission is per model, independent of a shared library's presence.
+pub fn spectral_cpu_profile(profile:ref<engine.Profile>)->bool effects {alloc} {
+ if profile.kind!="spectral"{return false}
+ match spectral_config.Config_decode(profile.identity){err(_)=>false,ok(c)=>{
+  c.sample_rate==44100 and c.n_fft==8192 and c.hop==1024 and c.frequency_bins==4096 and c.bands==4 and c.channels==128 and c.growth==128 and c.scales==5 and c.blocks==2 and c.bottleneck==4 and array.len(c.targets)==2 and (c.frames==32 or c.frames==256) and c.overlap==8}}
+}
+pub fn original_mask_cpu_profile(profile:ref<engine.Profile>)->bool effects {alloc}{
+ if profile.kind!="mask"{return false}
+ match mask_config.Config_decode(profile.identity){err(_)=>false,ok(c)=>c.architecture=="cascade" and c.sample_rate==44100 and c.channels==16 and c.levels==4 and c.branches==5 and c.bins==768 and c.window==512}
+}
+// Explicit application policy is consulted only for the CPU engine that needs it.
+pub fn ensure_cpu_backend(cache:ref<Cache>,profile:ref<engine.Profile>,backend:ref<option<CpuBackend>>)->result<unit,string> effects {alloc,fs.read,fs.meta,ffi} {
+ let _=try require_cpu_policy(cache)
+ match backend{none=>{},some(value)=>{
+  if str.len(value.transform_runtime)!=0{
+   if str.len(cache.transform_runtime)!=0 and str.view(cache.transform_runtime)!=str.view(value.transform_runtime){return result.err("CPU transform runtime changed; release models first")}
+   cache.transform_runtime=string.copy(value.transform_runtime)}}}
+ if original_mask_cpu_profile(profile){match backend{none=>{},some(value)=>{
+  if str.len(value.mask_recipe)!=0{
+   if str.len(cache.learned_mask_recipe)!=0 and str.view(cache.learned_mask_recipe)!=str.view(value.mask_recipe){return result.err("Original mask CPU runtime changed; release models first")}
+   if str.len(cache.learned_mask_recipe)==0{var selected:spectral_recipe.Recipe=try spectral_recipe.decode(value.mask_recipe)
+    let _=try spectral_recipe.verify(selected)
+    cache.learned_mask_recipe=string.copy(value.mask_recipe)}
+  }}}}
+ if profile.kind=="spectral"{match backend{none=>{},some(value)=>{
+  if str.len(value.spectral_recipe)!=0{
+   if not spectral_cpu_profile(profile){return result.err("This strict spectral CPU geometry has not been qualified")}
+   let recipe:spectral_recipe.Recipe=try spectral_recipe.decode(value.spectral_recipe)
+   if str.len(cache.spectral_recipe)!=0 and str.view(cache.spectral_recipe)!=str.view(value.spectral_recipe){return result.err("Spectral CPU runtime changed; release loaded models first")}
+   if str.len(cache.spectral_recipe)==0{let _=try spectral_recipe.verify(recipe)
+    cache.spectral_recipe=string.copy(value.spectral_recipe)}
+  }}}}
+ if profile.kind=="attention-bundle" or profile.kind=="recording-bundle"{
+  var host:string=string.copy(cache.cpu_host)
+  match backend{none=>{},some(value)=>{host=string.copy(value.host)}}
+  if host!="windows" and host!="linux"{return result.err("CPU attention bundle requires an explicit qualified host arithmetic policy")}}
+ if profile.kind=="spectral" and not spectral_cpu_profile(profile){return result.ok(())}
+ if profile.kind!="mask" and profile.kind!="exchange" and profile.kind!="waveform" and profile.kind!="hybrid" and profile.kind!="residual-waveform" and profile.kind!="spectral" and profile.kind!="temporal" and profile.kind!="attention" and profile.kind!="attention-bundle" and profile.kind!="recording-bundle"{return result.ok(())}
+ if profile.kind=="attention"{
+  let settings:attention_config.Config=try attention_config.Config_decode(profile.identity) map_err codec.describe
+  let _=try attention_config.validate(settings)
+  var host:string=string.copy(cache.cpu_host)
+  match backend{none=>{},some(value)=>{host=string.copy(value.host)}}
+  if host!="windows" and host!="linux"{return result.err("CPU attention requires an explicit qualified host arithmetic policy")}
+ }
+ if profile.kind=="hybrid"{
+  let settings:hybrid_config.Config=try hybrid_config.Config_decode(profile.identity) map_err codec.describe
+  let _=try hybrid_config.validate(settings)
+ }
+ if profile.kind=="mask"{
+  let config:mask_config.Config=try mask_config.Config_decode(profile.identity) map_err codec.describe
+  if config.architecture=="recurrent"{
+   if config.channels!=48 or config.recurrent_width!=128 or config.levels!=4 or config.branches!=5 or config.bins!=672{return result.err("This CPU recurrent mask capacity has not been qualified")}
+  }else{if config.architecture!="cascade" or config.levels!=4 or not (((config.channels==16 or config.channels==32) and config.branches==5 and config.bins==768) or (config.channels==64 and config.branches==7 and config.bins==640)){return result.err("This CPU mask capacity has not been qualified")}}
+ }else{if profile.kind=="waveform" or profile.kind=="residual-waveform" or profile.kind=="hybrid" or profile.kind=="temporal" or profile.kind=="attention" or profile.kind=="attention-bundle" or profile.kind=="recording-bundle"{
+  if profile.kind=="waveform" or profile.kind=="temporal"{
+  let settings:waveform_config.Config=try waveform_config.Config_decode(profile.identity) map_err codec.describe
+  let _=try waveform_config.validate(settings)
+  if settings.generation!=1 and settings.generation!=2{return result.err("This CPU waveform generation has not been qualified")}
+  }
+ }else{
+  // A dependency-free caller can explicitly retain the original scalar route.
+  // Application deployment selects a qualified library before acquisition.
+  if array.len(cache.cpu)==0{match backend{none=>{return result.ok(())},some(_)=>{}}}
+ }}
+ if array.len(cache.cpu)==0{
+  let selected:ref<CpuBackend>=match backend{some(v)=>v,none=>{return result.err("Prepared CPU execution requires the explicit qualified CPU audio runtime")}}
+  if str.len(selected.sha256)!=64{return result.err("CPU audio runtime identity is incomplete")}
+  let sha:string=match files.sha256(selected.path){ok(v)=>v,err(_)=>{return result.err("Cannot read the selected CPU audio runtime")}}
+  if sha!=selected.sha256{return result.err("CPU audio runtime SHA256 differs from its qualified identity")}
+  let library:dot.Engine=try dot.open(selected.path,selected.version,selected.core)
+  cache.cpu_path=string.copy(selected.path)
+  cache.cpu_sha256=string.copy(selected.sha256)
+  cache.cpu_version=string.copy(selected.version)
+  cache.cpu_core=string.copy(selected.core)
+  cache.cpu_host=string.copy(selected.host)
+  array.push(cache.cpu,library)
+ }else{match backend{none=>{},some(v)=>{if str.view(v.path)!=str.view(cache.cpu_path) or str.view(v.sha256)!=str.view(cache.cpu_sha256) or str.view(v.version)!=str.view(cache.cpu_version) or str.view(v.core)!=str.view(cache.cpu_core) or str.view(v.host)!=str.view(cache.cpu_host){return result.err("CPU runtime changed; release loaded models first")}}}}
+ result.ok(())
+}
+pub fn acquire_cpu(cache:ref<Cache>,file:str,profile:engine.Profile own,backend:ref<option<CpuBackend>>)->result<u64,string> effects {alloc,fs.read,fs.meta,ffi} {
+ var requested:engine.Profile=profile
+ let _=try ensure_cpu_backend(cache,requested,backend)
+ let index:u64=try acquire(cache,file,requested)
+ let platform:string=string.copy(cache.cpu_host)
+ let transform_runtime:string=string.copy(cache.transform_runtime)
+ let mask_recipe:string=string.copy(cache.learned_mask_recipe)
+ let model:ref<engine.Loaded>=struct.borrow(array.borrow(cache.entries,index),field=model)
+ if original_mask_cpu_profile(struct.borrow(model,field=profile)) and str.len(mask_recipe)!=0{var selected:spectral_recipe.Recipe=try spectral_recipe.decode(mask_recipe)
+  match model.mask{none=>{},some(value)=>{let _=try mask_session.prepare_original_cpu(value,selected.adapter,platform)}}}
+ if model.profile.kind=="spectral"{
+  if str.len(cache.spectral_recipe)!=0{var recipe:spectral_recipe.Recipe=try spectral_recipe.decode(cache.spectral_recipe)
+   let _=try engine.prepare_spectral_strict(model,recipe)
+  }else{if spectral_cpu_profile(struct.borrow(model,field=profile)) and array.len(cache.cpu)!=0{let _=try engine.prepare_cpu_for_platform(model,platform)}}
+ }else{if model.profile.kind!="exchange" or array.len(cache.cpu)!=0{let _=try engine.prepare_cpu_for_platform(model,platform)}}
+ let _=try engine.configure_cpu_transform(model,transform_runtime)
+ result.ok(index)
+}
+pub fn acquire_cpu_typed(cache:ref<Cache>,file:str,profile:engine.Profile own,backend:ref<option<CpuBackend>>)->result<u64,string> effects {alloc,fs.read,fs.meta,ffi} {
+ var requested:engine.Profile=profile
+ let _=try ensure_cpu_backend(cache,requested,backend)
+ let index:u64=try acquire_typed(cache,file,requested)
+ let platform:string=string.copy(cache.cpu_host)
+ let transform_runtime:string=string.copy(cache.transform_runtime)
+ let mask_recipe:string=string.copy(cache.learned_mask_recipe)
+ let model:ref<engine.Loaded>=struct.borrow(array.borrow(cache.entries,index),field=model)
+ if original_mask_cpu_profile(struct.borrow(model,field=profile)) and str.len(mask_recipe)!=0{var selected:spectral_recipe.Recipe=try spectral_recipe.decode(mask_recipe)
+  match model.mask{none=>{},some(value)=>{let _=try mask_session.prepare_original_cpu(value,selected.adapter,platform)}}}
+ if model.profile.kind=="spectral"{
+  if str.len(cache.spectral_recipe)!=0{var recipe:spectral_recipe.Recipe=try spectral_recipe.decode(cache.spectral_recipe)
+   let _=try engine.prepare_spectral_strict(model,recipe)
+  }else{if spectral_cpu_profile(struct.borrow(model,field=profile)) and array.len(cache.cpu)!=0{let _=try engine.prepare_cpu_for_platform(model,platform)}}
+ }else{if model.profile.kind!="exchange" or array.len(cache.cpu)!=0{let _=try engine.prepare_cpu_for_platform(model,platform)}}
+ let _=try engine.configure_cpu_transform(model,transform_runtime)
+ result.ok(index)
+}
+
+pub fn separate_cpu(cache:ref<Cache>,index:u64,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ separate_cpu_with_high_band(cache,index,input,cancel,progress,mask_request.HighBand.Profile)
+}
+pub fn separate_cpu_with_high_band(cache:ref<Cache>,index:u64,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ separate_cpu_with_request(cache,index,input,cancel,progress,high_band,mask_request.Foreground.Profile)
+}
+fn prepared_exchange(model:ref<engine.Loaded>)->bool effects {} {
+ match model.exchange{none=>false,some(value)=>value.cpu_preparations!=0}
+}
+pub fn separate_cpu_with_request(cache:ref<Cache>,index:u64,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,foreground:mask_request.Foreground)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try require_cpu_policy(cache)
+ let model:ref<engine.Loaded>=struct.borrow(array.borrow(cache.entries,index),field=model)
+ if model.profile.kind!="mask" and model.profile.kind!="waveform" and model.profile.kind!="temporal" and model.profile.kind!="hybrid" and model.profile.kind!="residual-waveform" and model.profile.kind!="attention" and model.profile.kind!="attention-bundle" and model.profile.kind!="recording-bundle" and array.len(model.spectral_cpu)==0 and array.len(model.strict_spectral_cpu)==0 and not prepared_exchange(model){return engine.separate_cpu(model,input,cancel,progress)}
+ if array.len(cache.cpu)!=1{return result.err("Prepared CPU execution has no retained CPU backend")}
+ engine.separate_cpu_prepared_with_request(model,struct.borrow(array.borrow(cache.cpu,0),field=library),input,cancel,progress,high_band,foreground)
+}
+pub fn separate_cpu_typed(cache:ref<Cache>,index:u64,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,foreground:mask_request.Foreground)->result<audio_result.Samples,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try require_cpu_policy(cache)
+ if index>=array.len(cache.entries){return result.err("CPU inference member is out of range")}
+ let prepared:bool=match array.borrow(cache.entries,index).model.mask{none=>false,some(value)=>array.len(value.original_cpu)==1}
+ if prepared{
+  var policy:mask_request.Policy=mask_request.defaults()
+  policy.high_band=high_band
+  policy.foreground=foreground
+  return separate_learned_mask_cpu(cache,index,input,cancel,progress,policy)}
+ if array.borrow(cache.entries,index).model.profile.kind=="mask"{
+  if array.len(cache.cpu)!=1{return result.err("Prepared CPU execution has no retained CPU backend")}
+  return engine.separate_cpu_prepared_typed(struct.borrow(array.borrow(cache.entries,index),field=model),struct.borrow(array.borrow(cache.cpu,0),field=library),input,cancel,progress,high_band,foreground)}
+ if array.borrow(cache.entries,index).model.profile.kind=="exchange"{
+  if prepared_exchange(struct.borrow(array.borrow(cache.entries,index),field=model)){
+   if array.len(cache.cpu)!=1{return result.err("Prepared CPU execution has no retained CPU backend")}
+   return engine.separate_cpu_prepared_typed(struct.borrow(array.borrow(cache.entries,index),field=model),struct.borrow(array.borrow(cache.cpu,0),field=library),input,cancel,progress,high_band,foreground)}
+  return engine.separate_cpu_typed(struct.borrow(array.borrow(cache.entries,index),field=model),input,cancel,progress)}
+ result.ok(audio_result.from_single(try separate_cpu_with_request(cache,index,input,cancel,progress,high_band,foreground)))
+}
+pub fn separate_cpu_with_policy(cache:ref<Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try mask_request.validate_policy(policy)
+ let _=try require_cpu_policy(cache)
+ let mask:bool=array.borrow(cache.entries,index).model.profile.kind=="mask"
+ if not mask{return separate_cpu_with_request(cache,index,input,cancel,progress,policy.high_band,policy.foreground)}
+ let model:ref<engine.Loaded>=struct.borrow(array.borrow(cache.entries,index),field=model)
+ if array.len(cache.cpu)!=1{return result.err("Prepared CPU execution has no retained CPU backend")}
+ engine.separate_cpu_prepared_with_policy(model,struct.borrow(array.borrow(cache.cpu,0),field=library),input,cancel,progress,policy)
+}
+pub fn separate_cpu_typed_with_policy(cache:ref<Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>)->result<audio_result.Samples,string> effects {alloc,ffi,fs.meta,fs.write} {
+ var lower:array<f32>=[]
+ separate_cpu_typed_with_policy_and_band_input(cache,index,input,cancel,progress,policy,array.view(lower))
+}
+pub fn separate_cpu_typed_with_policy_and_band_input(cache:ref<Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,lower:view<f32>)->result<audio_result.Samples,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try mask_request.validate_policy(policy)
+ let _=try require_cpu_policy(cache)
+ if index>=array.len(cache.entries){return result.err("CPU inference member is out of range")}
+ let prepared:bool=match array.borrow(cache.entries,index).model.mask{none=>false,some(value)=>array.len(value.original_cpu)==1}
+ if prepared{return separate_original_mask_cpu_with_band_input(cache,index,input,cancel,progress,policy,lower)}
+ let mask:bool=array.borrow(cache.entries,index).model.profile.kind=="mask"
+ if not mask{if view.len(lower)>0{return result.err("Lower-band recording input requires a mask model")}
+  return separate_cpu_typed(cache,index,input,cancel,progress,policy.high_band,policy.foreground)}
+ let model:ref<engine.Loaded>=struct.borrow(array.borrow(cache.entries,index),field=model)
+ if array.len(cache.cpu)!=1{return result.err("Prepared CPU execution has no retained CPU backend")}
+ engine.separate_cpu_prepared_typed_with_policy_and_band_input(model,struct.borrow(array.borrow(cache.cpu,0),field=library),input,cancel,progress,policy,lower)
+}

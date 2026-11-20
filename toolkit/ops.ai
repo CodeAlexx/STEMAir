@@ -1,0 +1,150 @@
+module stemair.ops
+import "numeric.ai" as num
+import "weights.ai" as weights
+import std.float as fp
+import std.math as math
+
+pub type Tensor=struct{c:u64,h:u64,w:u64,data:array<f32>}
+pub fn tensor(c:u64,h:u64,w:u64,data:array<f32> own)->Tensor effects {} {
+ if c==0 or h==0 or w==0 or array.len(data)!=c*h*w{panic "Invalid host tensor geometry"}
+ Tensor{c:c,h:h,w:w,data:data}
+}
+pub fn conv(x:ref<Tensor>,p:ref<weights.Parameter>,stride:u64,padding:u64,transpose:bool)->Tensor effects {alloc} {
+ if array.len(p.shape)!=4 or stride==0{panic "Invalid convolution parameters"}
+ let ci:u64=if transpose{array.get(p.shape,0)}else{array.get(p.shape,1)}
+ let co:u64=if transpose{array.get(p.shape,1)}else{array.get(p.shape,0)}
+ let kh:u64=array.get(p.shape,2)
+ let kw:u64=array.get(p.shape,3)
+ if ci!=x.c or kh==0 or kw==0{panic "Convolution channel mismatch"}
+ let oh:u64=if transpose{(x.h-1)*stride+kh-2*padding}else{(x.h+2*padding-kh)/stride+1}
+ let ow:u64=if transpose{(x.w-1)*stride+kw-2*padding}else{(x.w+2*padding-kw)/stride+1}
+ var out:array<f32>=[]
+ array.reserve(out,co*oh*ow)
+ var o:u64=0
+ loop{if o>=co{break}
+  var h:u64=0
+  loop{if h>=oh{break}
+   var w:u64=0
+   loop{if w>=ow{break}
+    var sum:f32=0.0
+    var c:u64=0
+    loop{if c>=ci{break}
+     var y:u64=0
+     loop{if y>=kh{break}
+      var z:u64=0
+      loop{if z>=kw{break}
+       let iy:i64=if transpose{cast.sat(h+padding)-cast.sat(y)}else{cast.sat(h*stride+y)-cast.sat(padding)}
+       let ix:i64=if transpose{cast.sat(w+padding)-cast.sat(z)}else{cast.sat(w*stride+z)-cast.sat(padding)}
+       if iy>=0 and ix>=0 {
+        let uy:u64=cast.sat(iy)
+        let ux:u64=cast.sat(ix)
+        let valid:bool=not transpose or (uy%stride==0 and ux%stride==0)
+        let sy:u64=if transpose{uy/stride}else{uy}
+        let sx:u64=if transpose{ux/stride}else{ux}
+        if valid and sy<x.h and sx<x.w {
+         let wi:u64=if transpose{((c*co+o)*kh+y)*kw+z}else{((o*ci+c)*kh+y)*kw+z}
+         sum+=array.get(x.data,(c*x.h+sy)*x.w+sx)*array.get(p.values,wi)}}
+       z+=1}
+      y+=1}
+     c+=1}
+    array.push(out,sum)
+    w+=1}
+   h+=1}
+  o+=1}
+ tensor(co,oh,ow,out)
+}
+pub fn normalize(x:ref<Tensor>,scale:ref<weights.Parameter>,bias:ref<weights.Parameter>)->Tensor effects {alloc} {
+ if array.len(scale.values)!=x.c or array.len(bias.values)!=x.c or x.h*x.w<2{panic "Invalid instance normalization geometry"}
+ let spatial:u64=x.h*x.w
+ var out:array<f32>=[]
+ array.reserve(out,array.len(x.data))
+ var c:u64=0
+ loop{if c>=x.c{break}
+  var total:f64=0.0
+  var i:u64=0
+  loop{if i>=spatial{break}
+   total+=cast.float(array.get(x.data,c*spatial+i))
+   i+=1}
+  let mean:f64=total/cast.float(spatial)
+  var variance:f64=0.0
+  i=0
+  loop{if i>=spatial{break}
+   let delta:f64=cast.float(array.get(x.data,c*spatial+i))-mean
+   variance+=delta*delta
+   i+=1}
+  let inv:f64=1.0/fp.sqrt(variance/cast.float(spatial)+0.00001)
+  i=0
+  loop{if i>=spatial{break}
+   let centered:f64=cast.float(array.get(x.data,c*spatial+i))-mean
+   let v:f32=cast.float(centered*inv)
+   array.push(out,v*array.get(scale.values,c)+array.get(bias.values,c))
+   i+=1}
+  c+=1}
+ tensor(x.c,x.h,x.w,out)
+}
+pub fn gelu(x:ref<Tensor>)->Tensor effects {alloc} {
+ var out:array<f32>=[]
+ array.reserve(out,array.len(x.data))
+ var i:u64=0
+ loop{if i>=array.len(x.data){break}
+  let value:f32=array.get(x.data,i)
+  let erf:f32=cast.float(1.0-math.erfc(cast.float(value*0.7071067811865476)))
+  array.push(out,value*0.5*(1.0+erf))
+  i+=1}
+ tensor(x.c,x.h,x.w,out)
+}
+pub fn linear(x:ref<Tensor>,p:ref<weights.Parameter>)->Tensor effects {alloc} {
+ if array.len(p.shape)!=2 or array.get(p.shape,1)!=x.w{panic "Invalid frequency projection geometry"}
+ let width:u64=array.get(p.shape,0)
+ var out:array<f32>=[]
+ array.reserve(out,x.c*x.h*width)
+ var row:u64=0
+ loop{if row>=x.c*x.h{break}
+  var o:u64=0
+  loop{if o>=width{break}
+   var sum:f32=0.0
+   var i:u64=0
+   loop{if i>=x.w{break}
+    sum+=array.get(x.data,row*x.w+i)*array.get(p.values,o*x.w+i)
+    i+=1}
+   array.push(out,sum)
+   o+=1}
+  row+=1}
+ tensor(x.c,x.h,width,out)
+}
+pub fn combine(a:ref<Tensor>,b:ref<Tensor>,multiply:bool)->Tensor effects {alloc} {
+ if a.c!=b.c or a.h!=b.h or a.w!=b.w{panic "Tensor combination shape mismatch"}
+ var out:array<f32>=[]
+ array.reserve(out,array.len(a.data))
+ var i:u64=0
+ loop{if i>=array.len(a.data){break}
+  let x:f32=array.get(a.data,i)
+  let y:f32=array.get(b.data,i)
+  array.push(out,if multiply{x*y}else{x+y})
+  i+=1}
+ tensor(a.c,a.h,a.w,out)
+}
+pub fn transpose(x:ref<Tensor>)->Tensor effects {alloc} {
+ var out:array<f32>=[]
+ array.reserve(out,array.len(x.data))
+ var c:u64=0
+ loop{if c>=x.c{break}
+  var w:u64=0
+  loop{if w>=x.w{break}
+   var h:u64=0
+   loop{if h>=x.h{break}
+    array.push(out,array.get(x.data,(c*x.h+h)*x.w+w))
+    h+=1}
+   w+=1}
+  c+=1}
+ tensor(x.c,x.w,x.h,out)
+}
+pub fn concat(a:ref<Tensor>,b:ref<Tensor>)->Tensor effects {alloc} {
+ if a.h!=b.h or a.w!=b.w{panic "Tensor concatenation shape mismatch"}
+ var data:array<f32>=num.copy(array.view(a.data))
+ var i:u64=0
+ loop{if i>=array.len(b.data){break}
+  array.push(data,array.get(b.data,i))
+  i+=1}
+ tensor(a.c+b.c,a.h,a.w,data)
+}

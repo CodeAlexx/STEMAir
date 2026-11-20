@@ -1,0 +1,187 @@
+module stemair.asset_acquisition
+import "control.ai" as control
+import std.files as files
+import std.http as http
+import std.http_tools as urls
+import std.path as path
+import std.text as text
+
+pub type Asset=struct{filename:string,url:string,bytes:u64,sha256:string} derive codec(strict)
+pub type Options=struct{timeout_ms:u64=600000,connect_timeout_ms:u64=15000,idle_timeout_ms:u64=5000,
+ redirects:u64=5,chunk_bytes:u64=65536,durable:bool=false,allow_http:bool=false,ca_bundle:string=""}
+pub type Report=struct{path:string,downloaded:bool,bytes:u64,chunks:u64,redirects:u64,maximum_chunk:u64,
+ staging_removed:bool=true,staging_path:string="",directory_sync_completed:bool=false} derive codec(strict)
+
+pub fn valid_filename(name:str)->bool effects {} {
+ if str.len(name)==0 or str.len(name)>128 or name=="." or name==".."{return false}
+ var i:u64=0
+ loop{if i==str.len(name){break}
+  let value:u8=cast.bits(view.get(str.bytes(name),i))
+  if not text.ascii_is_alnum(cast.bits(value)) and value!=45 and value!=46 and value!=95{return false}
+  i+=1}
+ true
+}
+pub fn validate(asset:ref<Asset>)->result<unit,string> effects {alloc} {
+ if not valid_filename(asset.filename){return result.err("Asset filename must be a single bounded file name")}
+ if asset.bytes==0 or asset.bytes>3221225472{return result.err("Asset size is outside the supported three-GiB bound")}
+ if str.len(asset.sha256)!=64{return result.err("Asset SHA256 must have 64 lowercase hexadecimal characters")}
+ var i:u64=0
+ loop{if i==64{break}
+  let c:u8=cast.bits(view.get(str.bytes(asset.sha256),i))
+  if not ((c>=48 and c<=57) or (c>=97 and c<=102)){return result.err("Asset SHA256 must have 64 lowercase hexadecimal characters")}
+  i+=1}
+ let _=try http.parse_url(asset.url) map_err http.message
+ result.ok(())
+}
+pub fn validate_options(settings:ref<Options>)->result<unit,string> effects {alloc} {
+ if settings.timeout_ms==0 or settings.timeout_ms>3600000 or settings.connect_timeout_ms==0 or settings.connect_timeout_ms>60000 or
+  settings.idle_timeout_ms==0 or settings.idle_timeout_ms>60000 or settings.redirects>8 or settings.chunk_bytes==0 or settings.chunk_bytes>65536{
+  return result.err("Invalid asset transfer deadline, redirect or chunk bound")}
+ result.ok(())
+}
+pub fn verify(asset:ref<Asset>,file:str)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ let _=try validate(asset)
+ let info:fs.meta=match files.symlink_metadata(file){ok(v)=>v,err(_)=>{return result.err("Asset file is unavailable")}}
+ if not info.is_file or info.is_symlink{return result.err("Asset path must be an ordinary file")}
+ if info.size!=asset.bytes{return result.err("Existing asset size does not match its pinned identity")}
+ let digest:string=match files.sha256(file){ok(v)=>v,err(_)=>{return result.err("Cannot read asset identity")}}
+ if digest!=asset.sha256{return result.err("Existing asset SHA256 does not match its pinned identity")}
+ result.ok(())
+}
+fn checked_url(url:str,settings:ref<Options>)->result<unit,string> effects {alloc} {
+ let parsed:http.Url=try http.parse_url(url) map_err http.message
+ if not parsed.tls and not settings.allow_http{return result.err("Asset acquisition requires HTTPS")}
+ result.ok(())
+}
+fn note(progress:str,stage:str,done:u64,total:u64)->unit effects {alloc,fs.write} {
+ control.status(progress,text.concat(stage,text.concat(" ",text.concat(string.from_int(done),text.concat(" / ",string.from_int(total))))))
+}
+fn interrupted(cancel:str,deadline:u64)->result<unit,string> effects {alloc,fs.meta,time} {
+ if control.cancelled(cancel){return result.err("Asset acquisition cancelled")}
+ if time.monotonic_ns()>=deadline{return result.err("Asset acquisition exceeded its total deadline")}
+ result.ok(())
+}
+fn failure(problem:fs.error)->string effects {alloc} {string.copy(fs.error.message(problem))}
+fn redirect(status:u16)->bool effects {} {status==301 or status==302 or status==303 or status==307 or status==308}
+fn location(base:str,target:str)->result<string,string> effects {alloc} {
+ if str.starts_with(target,"//"){
+  let parsed:http.Url=try http.parse_url(base) map_err http.message
+  return result.ok(text.concat(if parsed.tls{"https:"}else{"http:"},target))}
+ let resolved:string=try urls.absolute_redirect(base,target) map_err urls.message
+ result.ok(resolved)
+}
+type ReadContext=struct{cancel:string,deadline:u64}
+fn before_read(context:ref<ReadContext>,maximum:u64,received:u64,deadline:u64)->result<u64,http.Error>
+ effects {alloc,fs.read,fs.write,fs.meta,net,random,time} {
+ if deadline!=context.deadline or control.cancelled(context.cancel) or time.monotonic_ns()>=deadline{
+  return result.err(http.Error.InvalidRequest)}
+ result.ok(maximum)
+}
+fn after_read(context:ref<ReadContext>,outcome:ref<http.ReadOutcome>)->unit
+ effects {alloc,fs.read,fs.write,fs.meta,net,random,time} {}
+fn network_problem(error:http.Error,cancel:str,deadline:u64)->string effects {alloc,fs.meta,time} {
+ match interrupted(cancel,deadline){err(problem)=>problem,ok(_)=>http.message(error)}
+}
+
+pub fn acquire(asset:ref<Asset>,directory:str,settings:ref<Options>,cancel:str,progress:str)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,net,random,time} {
+ let _=try validate(asset)
+ let _=try validate_options(settings)
+ let _=try checked_url(asset.url,settings)
+ if control.cancelled(cancel){return result.err("Asset acquisition cancelled")}
+ if not match files.is_dir(directory){ok(v)=>v,err(_)=>false}{return result.err("Asset directory must already exist")}
+ let destination:string=path.join(directory,asset.filename)
+ match files.symlink_metadata(destination){
+  ok(_)=>{let _=try verify(asset,destination)
+   note(progress,"Verified",asset.bytes,asset.bytes)
+   return result.ok(Report{path:destination,downloaded:false,bytes:asset.bytes,chunks:0,redirects:0,maximum_chunk:0})},
+  err(problem)=>{if problem.code!=1{return result.err("Cannot inspect existing asset destination")}}}
+ let temporary:string=text.concat(destination,".download")
+ var sink:files.Sink=try files.sink_create(destination,temporary) map_err failure
+ let deadline:u64=time.monotonic_ns()+settings.timeout_ms*1000000
+ var gate:http.ReadGate<ReadContext>=http.ReadGate<ReadContext>{context:ReadContext{cancel:string.copy(cancel),deadline:deadline},before:before_read,after:after_read}
+ var current:string=string.copy(asset.url)
+ var hops:u64=0
+ var bytes_written:u64=0
+ var chunks:u64=0
+ var largest:u64=0
+ var problem:string=""
+ loop{
+  match interrupted(cancel,deadline){ok(_)=>{},err(e)=>{problem=e
+   break}}
+  let _=match checked_url(current,settings){ok(_)=>(),err(e)=>{problem=e
+   break}}
+  let now:u64=time.monotonic_ns()
+  if now>=deadline{problem="Asset acquisition exceeded its total deadline"
+   break}
+  let remaining:u64=(deadline-now)/1000000
+  if remaining==0{problem="Asset acquisition exceeded its total deadline"
+   break}
+  var options:http.Options=http.options(if remaining<settings.connect_timeout_ms{remaining}else{settings.connect_timeout_ms})
+  options.ca_bundle=string.copy(settings.ca_bundle)
+  var carrier:http.Carrier=match http.carrier_open(current,options){ok(v)=>v,err(e)=>{problem=network_problem(e,cancel,deadline)
+   break}}
+  let idle:u64=if remaining<settings.idle_timeout_ms{remaining}else{settings.idle_timeout_ms}
+  let _=http.carrier_inactivity(carrier,idle)
+  var observation:http.CarrierObservation=http.CarrierObservation{}
+  var headers:array<http.Header>=[http.header("User-Agent","StemAIR"),http.header("Accept-Encoding","identity")]
+  var incoming:http.CarrierExchange=match http.carrier_request_gated(carrier,"GET",current,headers,b"",asset.bytes,observation,gate,deadline){
+   ok(v)=>v,err(e)=>{problem=network_problem(e,cancel,deadline)
+    break}}
+  let status:u16=incoming.response.status
+  if redirect(status){
+   let target:option<string>=http.header_value(struct.borrow(struct.borrow(incoming,field=response),field=headers),"Location")
+   let _=http.carrier_abort(incoming,observation)
+   if hops==settings.redirects{problem="Asset redirect limit exceeded"
+    break}
+   let next:string=match target{some(v)=>v,none=>{problem="Asset redirect has no Location"
+    break}}
+   current=match location(current,next){ok(v)=>v,err(e)=>{problem=e
+    break}}
+   hops+=1
+   continue}
+  if status!=200{let _=http.carrier_abort(incoming,observation)
+   problem=text.concat("Asset server returned HTTP ",string.from_int(status))
+   break}
+  note(progress,"Downloading",0,asset.bytes)
+  var next_report:u64=1048576
+  loop{
+   match interrupted(cancel,deadline){ok(_)=>{},err(e)=>{problem=e
+    break}}
+   let piece:option<bytes>=match http.carrier_read_gated(incoming,settings.chunk_bytes,observation,gate,deadline){
+    ok(v)=>v,err(e)=>{problem=network_problem(e,cancel,deadline)
+     break}}
+   match piece{none=>{break},some(value)=>{
+    let count:u64=view.len(bytes.view(value))
+    if count>asset.bytes-bytes_written{problem="Downloaded asset exceeds its pinned byte count"
+     break}
+    match files.sink_write(sink,bytes.view(value)){ok(_)=>{},err(e)=>{problem=string.copy(fs.error.message(e))
+     break}}
+    bytes_written+=count
+    chunks+=1
+    if count>largest{largest=count}
+    if bytes_written>=next_report or bytes_written==asset.bytes{
+     note(progress,"Downloading",bytes_written,asset.bytes)
+     next_report=bytes_written+1048576}}}}
+  let complete:bool=http.complete(struct.borrow(incoming,field=response))
+  let _=http.carrier_abort(incoming,observation)
+  if str.len(problem)==0 and (not complete or bytes_written!=asset.bytes){problem="Downloaded asset byte count is incomplete"}
+  break}
+ if str.len(problem)==0{match interrupted(cancel,deadline){ok(_)=>{},err(e)=>{problem=e}}}
+ if str.len(problem)==0{
+  note(progress,"Verifying",bytes_written,asset.bytes)
+  let digest:string=match files.sha256(temporary){ok(v)=>v,err(_)=>{problem="Cannot verify staged asset SHA256"
+   ""}}
+  if str.len(problem)==0 and digest!=asset.sha256{problem="Downloaded asset SHA256 does not match its pinned identity"}}
+ if str.len(problem)==0{match interrupted(cancel,deadline){ok(_)=>{},err(e)=>{problem=e}}}
+ if str.len(problem)>0{
+  let discarded:result<unit,fs.error>=files.sink_discard(sink)
+  if not result.is_ok(discarded){string.append(problem,"; owned staging cleanup failed")}
+  return result.err(problem)}
+ let publication:files.Publication=match files.sink_publish_new(sink,settings.durable){ok(v)=>v,err(_)=>{
+  return result.err("Cannot publish verified asset to a new name; existing destination is preserved")}}
+ note(progress,"Available",bytes_written,asset.bytes)
+ result.ok(Report{path:destination,downloaded:true,bytes:bytes_written,chunks:chunks,redirects:hops,maximum_chunk:largest,
+  staging_removed:publication.temporary_removed,staging_path:if publication.temporary_removed{""}else{string.copy(publication.temporary)},
+  directory_sync_completed:publication.directory_sync_completed})
+}

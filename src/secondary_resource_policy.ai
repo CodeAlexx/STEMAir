@@ -1,0 +1,10 @@
+module stemair.secondary_resource_policy
+import "../toolkit/typed_secondary_cpu.ai" as secondary
+
+// Preserve the existing secondary cache byte ceiling (536870912 F32 words).
+// Typed storage counts actual source and captured-master payload bytes together.
+// The working bound matches the existing selected-WAV callback allocation bound.
+// Neither is a process RSS bound or includes retained model weights.
+pub fn limits()->secondary.Limits effects {} {
+ secondary.Limits{max_retained_bytes:2147483648,max_working_bytes:12884901952+64}
+}

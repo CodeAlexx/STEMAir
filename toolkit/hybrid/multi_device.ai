@@ -1,0 +1,67 @@
+module stemair.hybrid.multi_device
+import "../device_ops.ai" as ops
+import std.tensor as tensor
+import std.compute as compute
+pub fn span(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,start:u64,count:u64,left:u64,right:u64)->result<tensor.Tensor,string> effects {alloc,gpu}{
+ if tensor.rank(x)!=4 or x.dtype!=tensor.DType.F32{return result.err("Frequency band tensor must be rank-four F32")}
+ let height:u64=array.get(x.dimensions,2)
+ if count==0 or start>height or count>height-start or count>1048576 or left>1048576-count or right>1048576-count-left{return result.err("Frequency band span exceeds input")}
+ var part:tensor.Tensor=try ops.slice(context,stream,x,2,start,count)
+ if left==0 and right==0{return result.ok(part)}
+ let shape:array<u64>=[array.get(x.dimensions,0),array.get(x.dimensions,1),left+count+right,array.get(x.dimensions,3)]
+ var out:tensor.Tensor=try tensor.zeros(context,stream,array.view(shape),tensor.DType.F32) map_err ops.error
+ var destination:tensor.Tensor=try tensor.narrow(out,2,left,count) map_err ops.error
+ let _=try tensor.try_scatter_into(context,stream,part,destination) map_err tensor.message
+ result.ok(out)
+}
+pub fn join(context:ref<GpuContext>,stream:ref<GpuStream>,parts:ref<array<tensor.Tensor>>)->result<tensor.Tensor,string> effects {alloc,gpu}{
+ if array.len(parts)==0{return result.err("No frequency bands to concatenate")}
+ let first:ref<tensor.Tensor>=array.borrow(parts,0)
+ if tensor.rank(first)!=4{return result.err("Frequency band rank differs")}
+ let n:u64=array.get(first.dimensions,0)
+ let c:u64=array.get(first.dimensions,1)
+ let time:u64=array.get(first.dimensions,3)
+ var height:u64=0
+ var i:u64=0
+ loop{if i==array.len(parts){break}
+  let part:ref<tensor.Tensor>=array.borrow(parts,i)
+  if tensor.rank(part)!=4 or part.dtype!=tensor.DType.F32 or array.get(part.dimensions,0)!=n or array.get(part.dimensions,1)!=c or array.get(part.dimensions,3)!=time or array.get(part.dimensions,2)>1048576-height{return result.err("Frequency band concatenation geometry differs")}
+  height+=array.get(part.dimensions,2)
+  i+=1}
+ let shape:array<u64>=[n,c,height,time]
+ var out:tensor.Tensor=try ops.empty(context,array.view(shape))
+ var start:u64=0
+ i=0
+ loop{if i==array.len(parts){break}
+  let part:ref<tensor.Tensor>=array.borrow(parts,i)
+  let size:u64=array.get(part.dimensions,2)
+  var destination:tensor.Tensor=try tensor.narrow(out,2,start,size) map_err ops.error
+  let _=try tensor.try_scatter_into(context,stream,part,destination) map_err tensor.message
+  start+=size
+  i+=1}
+ result.ok(out)
+}
+pub fn overlap(context:ref<GpuContext>,stream:ref<GpuStream>,previous:ref<tensor.Tensor>,following:ref<tensor.Tensor>,bias:ref<tensor.Tensor>,stride:u64)->result<unit,string> effects {alloc,gpu}{
+ if tensor.rank(previous)!=4 or tensor.rank(following)!=4 or tensor.rank(bias)!=1 or stride==0{return result.err("Frequency overlap rank differs")}
+ let n:u64=array.get(previous.dimensions,0)
+ let c:u64=array.get(previous.dimensions,1)
+ let h:u64=array.get(previous.dimensions,2)
+ let time:u64=array.get(previous.dimensions,3)
+ if array.get(following.dimensions,0)!=n or array.get(following.dimensions,1)!=c or array.get(following.dimensions,3)!=time or h<stride or array.get(following.dimensions,2)<stride or array.get(bias.dimensions,0)!=c{return result.err("Frequency overlap geometry differs")}
+ var tail:tensor.Tensor=try ops.slice(context,stream,previous,2,h-stride,stride)
+ var head:tensor.Tensor=try ops.slice(context,stream,following,2,0,stride)
+ let matrix_shape:array<u64>=[n*stride*time,c]
+ var repeated:tensor.Tensor=try ops.empty(context,array.view(matrix_shape))
+ let _=try compute.broadcast_rows(stream,bias,repeated) map_err ops.error
+ let three:array<u64>=[n,stride*time,c]
+ var rows:tensor.Tensor=try tensor.reshape(repeated,array.view(three)) map_err ops.error
+ let order:array<u64>=[0,2,1]
+ var columns:tensor.Tensor=try ops.transpose(context,stream,rows,array.view(order))
+ var bias_plane:tensor.Tensor=try tensor.reshape(columns,array.view(head.dimensions)) map_err ops.error
+ var removed:tensor.Tensor=try ops.empty(context,array.view(head.dimensions))
+ let _=try compute.sub(stream,head,bias_plane,removed) map_err ops.error
+ var added:tensor.Tensor=try ops.add(context,stream,tail,removed)
+ var destination:tensor.Tensor=try tensor.narrow(previous,2,h-stride,stride) map_err ops.error
+ let _=try tensor.try_scatter_into(context,stream,added,destination) map_err tensor.message
+ result.ok(())
+}

@@ -1,0 +1,62 @@
+// Borrowed model-input selection, independent of file/runtime/application policy.
+module stemair.recording_sources
+import "audio_result.ai" as audio
+import "typed_source_wave.ai" as wave
+import "numeric.ai" as num
+pub type Variant=struct{profiles:array<string>,samples:array<f32>,lower:array<f32>}
+pub type Set=struct{common_profiles:array<string>,common_lower:array<f32>,variants:array<Variant>,owned_bytes:u64}
+pub fn empty()->Set effects {alloc}{Set{common_profiles:[],common_lower:[],variants:[],owned_bytes:0}}
+fn contains(values:ref<array<string>>,profile:str)->bool effects {}{
+ var i:u64=0
+ loop{if i==array.len(values){break}
+  if array.get(values,i)==profile{return true}
+  i+=1}
+ false
+}
+fn selected(inputs:ref<Set>,profile:str)->result<u64,string> effects {alloc}{
+ if array.len(inputs.common_profiles)==0 and array.len(inputs.variants)==0{return result.ok(0)}
+ if contains(struct.borrow(inputs,field=common_profiles),profile){return result.ok(0)}
+ var i:u64=0
+ loop{if i==array.len(inputs.variants){break}
+  if contains(struct.borrow(array.borrow(inputs.variants,i),field=profiles),profile){return result.ok(i+1)}
+  i+=1}
+ result.err("This model has no accepted recording reader input")
+}
+pub fn extent(inputs:ref<Set>)->result<u64,string> effects {alloc}{
+ var count:u64=array.len(inputs.common_lower)
+ var i:u64=0
+ loop{if i==array.len(inputs.variants){break}
+  let member:ref<Variant>=array.borrow(inputs.variants,i)
+  let samples:u64=array.len(member.samples)
+  let lower:u64=array.len(member.lower)
+  if count>18446744073709551615-samples or count+samples>18446744073709551615-lower{return result.err("Recording reader sample extent overflows")}
+  count+=samples+lower
+  i+=1}
+ if count>18446744073709551615/4{return result.err("Recording reader byte extent overflows")}
+ let bytes:u64=count*4
+ if bytes!=inputs.owned_bytes{return result.err("Recording reader retained byte accounting differs")}
+ result.ok(bytes)
+}
+pub fn available(inputs:ref<Set>,budget:u64)->result<u64,string> effects {alloc}{
+ let held:u64=try extent(inputs)
+ if held>budget or budget-held<64{return result.err("Selected recording inputs exceed the audio working-byte budget")}
+ result.ok(budget-held)
+}
+fn copied(values:view<f32>,limits:wave.Limits)->result<audio.Samples,string> effects {alloc}{
+ if view.len(values)==0 or view.len(values)%2!=0 or view.len(values)>limits.max_working_bytes/4 or not num.finite(values){return result.err("Invalid or oversized selected recording input")}
+ result.ok(audio.from_single(num.copy(values)))
+}
+pub fn master(inputs:ref<Set>,profile:str,common:ref<audio.Samples>,limits:wave.Limits)->result<audio.Samples,string> effects {alloc}{
+ let at:u64=try selected(inputs,profile)
+ if at==0{return wave.copy(common,limits)}
+ copied(array.view(array.borrow(inputs.variants,at-1).samples),limits)
+}
+pub fn lower(inputs:ref<Set>,profile:str,limits:wave.Limits)->result<array<f32>,string> effects {alloc}{
+ let at:u64=try selected(inputs,profile)
+ if at==0{
+  if array.len(inputs.common_lower)>limits.max_working_bytes/4 or array.len(inputs.common_lower)%2!=0 or not num.finite(array.view(inputs.common_lower)){return result.err("Invalid or oversized lower-band recording override")}
+  return result.ok(num.copy(array.view(inputs.common_lower)))}
+ let member:ref<Variant>=array.borrow(inputs.variants,at-1)
+ if array.len(member.lower)>limits.max_working_bytes/4 or array.len(member.lower)%2!=0 or not num.finite(array.view(member.lower)){return result.err("Invalid or oversized lower-band recording override")}
+ result.ok(num.copy(array.view(member.lower)))
+}

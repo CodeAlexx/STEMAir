@@ -1,0 +1,96 @@
+module stemair.attention.metadata
+import std.codec as codec
+import std.decode as decode
+import std.json as json
+import std.text as text
+
+fn floats(document:ref<json.Document>,reader:ref<codec.Reader>,name:str,expected:view<f64>)->result<unit,string> effects {alloc} {
+ // Consume with the strict codec reader, then use the shared typed node API
+ // for floats, which the record derive does not yet support in arrays.
+ let _=try codec.items_field(document,reader,name,codec.strict()) map_err codec.describe
+ let parent:decode.Node=decode.Node{index:codec.node_index(reader),path:codec.reader_path(reader)}
+ let node:decode.Node=try decode.field(document,parent,name) map_err decode.message
+ if try decode.array_len(document,node) map_err decode.message != view.len(expected){return result.err("Unsupported attention float-list length")}
+ var i:u64=0
+ loop{if i==view.len(expected){break}
+  let item:decode.Node=try decode.at(document,node,i) map_err decode.message
+  if try decode.as_f64(document,item) map_err decode.message != view.get(expected,i){return result.err("Unsupported attention float-list value")}
+  i+=1}
+ result.ok(())
+}
+pub type Description=struct{training_length:u64,sources:u64,width:u64,projected:bool}
+pub fn validate(source:str)->result<u64,string> effects {alloc} {
+ let description:Description=try inspect(source)
+ result.ok(description.training_length)
+}
+pub fn inspect(source:str)->result<Description,string> effects {alloc} {
+ var document:json.Document=try json.parse(source) map_err json.error_message
+ var root:codec.Reader=codec.root_reader(codec.strict())
+ let args:array<u64>=try codec.u64_array_field(document,root,"args") map_err codec.describe
+ if array.len(args)!=0{return result.err("Unsupported attention positional arguments")}
+ var c:codec.Reader=try codec.object_field(document,root,"kwargs",codec.strict()) map_err codec.describe
+ let sources:array<string>=try codec.text_array_field(document,c,"sources") map_err codec.describe
+ let names:array<string>=["drums","bass","other","vocals","guitar","piano"]
+ if array.len(sources)!=4 and array.len(sources)!=6{return result.err("Unsupported attention source count")}
+ var i:u64=0
+ loop{if i==array.len(sources){break}
+  let actual:str=array.get(sources,i)
+  let expected:str=array.get(names,i)
+  if actual!=expected{return result.err("Unsupported attention source order")}
+  i+=1}
+ var segment:codec.Reader=try codec.object_field(document,c,"segment",codec.strict()) map_err codec.describe
+ let numerator:u64=try codec.u64_field(document,segment,"numerator") map_err codec.describe
+ let denominator:u64=try codec.u64_field(document,segment,"denominator") map_err codec.describe
+ let _=try codec.reader_finish(document,segment) map_err codec.describe
+ if numerator!=39 or denominator!=5{return result.err("Unsupported attention training segment")}
+ let integer_keys:array<string>=["audio_channels","samplerate","channels","nfft","wiener_iters","end_iters","depth",
+  "multi_freqs_depth","kernel_size","stride","time_stride","context","context_enc","norm_starts","norm_groups",
+  "dconv_mode","dconv_depth","t_layers","t_heads","t_max_positions","t_sin_random_shift",
+  "t_mask_random_seed","t_sparse_attn_window","t_global_window"]
+ let integers:array<u64>=[2,44100,48,4096,0,0,4,3,8,4,2,1,0,4,4,3,2,5,8,10000,0,42,400,100]
+ let bottom:u64=try codec.u64_field(document,c,"bottom_channels") map_err codec.describe
+ if (array.len(sources)==4 and bottom!=512) or (array.len(sources)==6 and bottom!=0){return result.err("Unsupported attention bottleneck/source combination")}
+ i=0
+ loop{if i==array.len(integer_keys){break}
+  let key:str=array.get(integer_keys,i)
+  if try codec.u64_field(document,c,key) map_err codec.describe != array.get(integers,i){return result.err(text.concat("Unsupported attention constructor: ",key))}
+  i+=1}
+ let float_keys:array<string>=["growth","freq_emb","emb_scale","dconv_comp","dconv_init","t_hidden_scale","t_dropout",
+  "t_max_period","t_weight_pos_embed","t_sparsity","rescale"]
+ let values:array<f64>=[2.0,0.2,10.0,8.0,0.001,4.0,0.02,10000.0,1.0,0.95,0.1]
+ // This constructor value is used only by make_optim_group, not forward.
+ let decay:f64=try codec.f64_field(document,c,"t_weight_decay") map_err codec.describe
+ if decay!=0.0 and decay!=0.05{return result.err("Unsupported attention training metadata")}
+ i=0
+ loop{if i==array.len(float_keys){break}
+  let key:str=array.get(float_keys,i)
+  if try codec.f64_field(document,c,key) map_err codec.describe != array.get(values,i){return result.err(text.concat("Unsupported attention constructor: ",key))}
+  i+=1}
+ let true_keys:array<string>=["cac","rewrite","emb_smooth","t_layer_scale","t_gelu","t_cape_mean_normalize",
+  "t_cape_augment","t_norm_in","t_norm_first","t_norm_out"]
+ i=0
+ loop{if i==array.len(true_keys){break}
+  if not try codec.bool_field(document,c,array.get(true_keys,i)) map_err codec.describe{return result.err("Unsupported attention enabled flag")}
+  i+=1}
+ let false_keys:array<string>=["wiener_residual","t_norm_in_group","t_group_norm","t_sparse_self_attn",
+  "t_sparse_cross_attn","t_auto_sparsity","t_cross_first"]
+ i=0
+ loop{if i==array.len(false_keys){break}
+  if try codec.bool_field(document,c,array.get(false_keys,i)) map_err codec.describe{return result.err("Unsupported attention disabled flag")}
+  i+=1}
+ if not try codec.null_field(document,c,"channels_time") map_err codec.describe or
+  not try codec.null_field(document,c,"t_lr") map_err codec.describe{return result.err("Unsupported attention nullable option")}
+ if try codec.text_field(document,c,"t_emb") map_err codec.describe != "sin" or
+  try codec.text_field(document,c,"t_mask_type") map_err codec.describe != "diag"{return result.err("Unsupported attention embedding or mask")}
+ let bands:array<u64>=try codec.u64_array_field(document,c,"multi_freqs") map_err codec.describe
+ if array.len(bands)!=0{return result.err("Unsupported attention frequency bands")}
+ let scale:array<f64>=[5000.0,1.0,1.4]
+ let _=try floats(document,c,"t_cape_glob_loc_scale",array.view(scale))
+ // The original omits this default-true inference option. If explicitly
+ // present, preserve its meaning rather than changing the model's extent.
+ if try codec.has_field(document,c,"use_train_segment") map_err codec.describe{
+  if not try codec.bool_field(document,c,"use_train_segment") map_err codec.describe{return result.err("Attention training-segment mode is required")}}
+ let _=try codec.reader_finish(document,c) map_err codec.describe
+ let _=try codec.reader_finish(document,root) map_err codec.describe
+ result.ok(Description{training_length:numerator*44100/denominator,sources:array.len(sources),width:if bottom==0{384}else{bottom},projected:bottom!=0})
+}

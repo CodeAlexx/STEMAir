@@ -1,0 +1,10 @@
+{
+ "engine":"temporal",
+ "generation":2,
+ "sample_rate":44100,
+ "split":true,
+ "segment_samples":352800,
+ "overlap":0.25,
+ "shift_offsets":[],
+ "targets":["bass","drums","other","vocals"]
+}

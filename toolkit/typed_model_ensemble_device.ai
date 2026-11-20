@@ -1,0 +1,65 @@
+module stemair.typed_model_ensemble_device
+import "recording_context.ai" as recording_context
+import "gpu_inference.ai" as gpu_request
+import "typed_model_ensemble.ai" as ensemble
+import "typed_source_wave.ai" as source
+import "audio_result.ai" as audio_result
+import "model_ensemble.ai" as legacy
+import "model_ensemble_config.ai" as config
+import "model_cache.ai" as cache
+import "engine.ai" as engine
+import "device_engine.ai" as device
+import "mask/request.ai" as request
+import "control.ai" as control
+import "numeric.ai" as numeric
+import "recording_sources.ai" as recording_sources
+import "wave_boundary.ai" as boundary
+import "learned_cleanup_waves.ai" as learned
+import "typed_model_result.ai" as model_result
+import std.audio as audio
+
+// Device execution owns only prediction dispatch. The shared typed accumulator
+// owns source selection, serialization, reload, normalization and reduction.
+pub fn separate_with_policy_as(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,kind:audio.WavSubtype,limits:source.Limits)->result<ensemble.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ var inputs:recording_sources.Set=recording_sources.empty()
+ separate_with_policy_as_inputs(bank,members,c,input,cancel,progress,policy,kind,limits,inputs)
+}
+pub fn separate_with_policy_as_inputs(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,kind:audio.WavSubtype,requested:source.Limits,inputs:ref<recording_sources.Set>)->result<ensemble.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ var controls:recording_context.Context=recording_context.disabled()
+ separate_with_policy_as_controlled_inputs(bank,members,c,input,cancel,progress,policy,kind,requested,controls,inputs)
+}
+pub fn separate_with_policy_as_controlled(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,kind:audio.WavSubtype,requested:source.Limits,controls:ref<recording_context.Context>)->result<ensemble.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ var inputs:recording_sources.Set=recording_sources.empty()
+ separate_with_policy_as_controlled_inputs(bank,members,c,input,cancel,progress,policy,kind,requested,controls,inputs)
+}
+pub fn separate_with_policy_as_controlled_inputs(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,kind:audio.WavSubtype,requested:source.Limits,controls:ref<recording_context.Context>,inputs:ref<recording_sources.Set>)->result<ensemble.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ let _=try recording_context.validate(controls)
+ var limits:source.Limits=requested
+ limits.max_working_bytes=try recording_sources.available(inputs,limits.max_working_bytes)
+ let _=try request.validate_policy(policy)
+ let _=try legacy.validate_members(bank,members)
+ var acc:ensemble.Accumulator=try ensemble.begin(c,kind,limits)
+ var mixture:audio_result.Samples=audio_result.from_single(numeric.copy(input))
+ var i:u64=0
+ loop{if i==view.len(members){break}
+  if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+  let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,view.get(members,i)),field=model)
+  let targets:array<string>=legacy.names(struct.borrow(struct.borrow(model,field=profile),field=targets))
+  let model_kind:string=string.copy(model.profile.kind)
+  var selected:audio_result.Samples=try recording_sources.master(inputs,model.profile.identity,mixture,limits)
+  let tensor:array<f32>=try boundary.model_f32(selected,boundary.Limits{max_working_bytes:limits.max_working_bytes})
+  let lower:array<f32>=try recording_sources.lower(inputs,model.profile.identity,limits)
+  var output:audio_result.Samples=try gpu_request.separate_with_policy_and_band_input(bank,view.get(members,i),array.view(tensor),cancel,progress,policy,controls,array.view(lower))
+  let count:u64=array.len(targets)
+  if count==0 or audio_result.count(output)%(2*count)!=0{return result.err("Wrong typed member output extent")}
+  let frames:u64=audio_result.count(output)/(2*count)
+  let settings=cache.learned_settings(bank)
+  if settings.noise or array.len(controls.frequency_reference)>0{
+   let names:array<string>=legacy.names(targets)
+   var finished:model_result.Output=try model_result.finish_with_reference(model_kind,"recording",names,selected,output,limits,array.view(controls.frequency_reference))
+   let _=try learned.noise_gpu(bank,model_kind,struct.borrow(finished,field=sources),selected,limits,cancel)
+   let _=try ensemble.push_waves(acc,c,struct.replace(finished,[],field=sources),frames,selected,cancel)
+  }else{let _=try ensemble.push(acc,c,targets,output,frames,selected,cancel)}
+  i+=1}
+ ensemble.finish(acc,c,cancel,progress)
+}

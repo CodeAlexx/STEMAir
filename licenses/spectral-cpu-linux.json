@@ -1,0 +1,15 @@
+{
+  "adapter": "libair-cpu-primitives.so",
+  "adapter_sha256": "4861a6db6451f57997de67a182a221f3d89d27277f9c6f8b7dcb81b39753d47c",
+  "runtime": "libdnnl.so.3.7",
+  "runtime_sha256": "fd7735b898b34f35c4ad9283fd6536a09a0bde24518895452cd13001d0dd55f4",
+  "matrix_adapter": "air-mkl-vml.so",
+  "matrix_adapter_sha256": "dfd46b76ae219ca5bb1ea608a0588b8fe0f0910e1c27ee8a347d5ba1e2c97b15",
+  "mkl": "libmkl_rt.so.2",
+  "mkl_sha256": "0f3c805b85c36f3aaf6792930b054d80a945af032f0a97c4926d7ad94a7d61d9",
+  "mkl_version": "2024.2",
+  "affine_separate": false,
+  "owned_bytes": 1610612736,
+  "scratch_bytes": 142606336,
+  "staging_bytes": 536870912
+}

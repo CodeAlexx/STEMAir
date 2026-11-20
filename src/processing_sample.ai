@@ -1,0 +1,63 @@
+module stemair.processing_sample
+import "recording_sample_application.ai" as sample
+import "../toolkit/recording_sample.ai" as timing
+import "checked_input.ai" as checked
+import "../toolkit/rate_filter.ai" as filter
+import std.ffmpeg_probe as probe
+import std.sndfile as sound
+import std.files as files
+import std.path as path
+import std.text as text
+
+// One caller-owned preparation per recording, shared by its processing models.
+pub type Lease=struct{directory:string,path:string,report:sample.Report,file_removed:bool,closed:bool}
+fn failure(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+
+pub fn queue_options(options:ref<sample.Options>,index:u64,cancel:str)->sample.Options effects {alloc} {
+ sample.Options{seconds:options.seconds,output_directory:string.copy(options.output_directory),
+  input:checked.queue_item(struct.borrow(options,field=input),index,cancel),max_header_bytes:options.max_header_bytes,resampling:options.resampling,
+  probe:match options.probe{none=>option.none(),some(value)=>option.some(probe.Tool{path:string.copy(value.path),sha256:string.copy(value.sha256)})},
+  filter:match options.filter{none=>option.none(),some(value)=>option.some(filter.Asset{path:string.copy(value.path),sha256:string.copy(value.sha256),
+   max_archive_bytes:value.max_archive_bytes,max_values:value.max_values,max_header_bytes:value.max_header_bytes})},
+  sndfile:match options.sndfile{none=>option.none(),some(value)=>option.some(sound.Tool{path:string.copy(value.path),sha256:string.copy(value.sha256),version:string.copy(value.version),wide_paths:value.wide_paths})}}
+}
+
+pub fn ready(lease:ref<Lease>)->bool effects {} {
+ lease.report.completed and not lease.report.cancelled and lease.report.total==1 and
+ array.len(lease.report.rows)==1 and array.borrow(lease.report.rows,0).success and not lease.closed
+}
+pub fn problem(lease:ref<Lease>)->string effects {alloc} {
+ if array.len(lease.report.rows)>0{
+  let row:ref<sample.Row>=array.borrow(lease.report.rows,0)
+  if not row.success{return text.concat("Cannot prepare processing sample: ",row.message)}}
+ string.copy(lease.report.message)
+}
+
+pub fn open(input:str,directory:str,options:sample.Options own,progress:str)->result<Lease,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var selected:sample.Options=options
+ let _=try timing.plan(0,44100,selected.seconds)
+ if not path.is_absolute(input) or not path.is_absolute(directory){return result.err("Processing sample input and scratch directory must be absolute")}
+ // An existing directory is not ours, even if it appears empty.
+ let _=try files.create_dir(directory) map_err failure
+ selected.output_directory=string.copy(directory)
+ selected.input.scratch_directory=path.join(directory,"decode")
+ var rows:array<sample.Selection>=[sample.Selection{index:0,path:string.copy(input)}]
+ let report:sample.Report=sample.run(rows,selected,progress)
+ var result:Lease=Lease{directory:string.copy(directory),path:"",report:report,file_removed:false,closed:false}
+ // Cancellation may arrive after publication: that file is still ours to close.
+ if array.len(result.report.rows)==1 and array.borrow(result.report.rows,0).success{
+  result.path=string.copy(array.borrow(result.report.rows,0).path)}
+ result.ok(result)
+}
+
+// Call after success, processing failure or cancellation. Never recurse through
+// a directory: an unexpected entry remains intact and makes cleanup fail.
+pub fn close(lease:ref<Lease>)->result<unit,string> effects {alloc,fs.write} {
+ if lease.closed{return result.ok(())}
+ if not lease.file_removed and str.len(lease.path)>0{
+  match files.remove(lease.path){ok(_)=>{lease.file_removed=true},err(error)=>{
+   return result.err(text.concat("Cannot remove owned processing sample: ",text.concat(lease.path,text.concat(" — ",failure(error)))))}}}
+ match files.remove(lease.directory){ok(_)=>{lease.closed=true
+  result.ok(())},err(error)=>result.err(text.concat("Processing sample scratch remains: ",text.concat(lease.directory,text.concat(" — ",failure(error)))))}
+}

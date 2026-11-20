@@ -1,0 +1,159 @@
+module stemair.recording_inference_policy
+import "../toolkit/recording_inference.ai" as inference
+import "../toolkit/recording_context.ai" as context
+import "../toolkit/recording_shifts.ai" as shifts
+import "../toolkit/inference_pitch.ai" as pitch
+import std.codec as codec
+import std.system as system
+import std.cabi as native
+import std.text as text
+import "secondary_resource_policy.ai" as resources
+import "../toolkit/engine.ai" as engine
+import "../toolkit/recording_bag_config.ai" as bag
+import "../toolkit/recording_state.ai" as transport
+import "../toolkit/secondary_config.ai" as secondary
+import std.files as files
+// Empty text inherits the profile. A nonempty accepted snapshot is independent
+// of checkpoint identity and records its explicit integer-seeded replay policy.
+pub type Controls=struct{shifts:u64=2,split:bool=true,overlap:f64=0.25,segment_seconds:u64=0,seed:option<u64>,recording_enabled:bool=true,pitch_enabled:bool=false,pitch_semitones:f64=0.0,match_frequency:bool=false} derive codec(strict)
+fn error(e:fs.error)->string effects {alloc} {string.copy(fs.error.message(e))}
+pub fn options(c:ref<Controls>)->inference.Options effects {} {inference.Options{shifts:c.shifts,split:c.split,overlap:c.overlap,segment_seconds:c.segment_seconds}}
+pub fn validate(c:ref<Controls>)->result<unit,string> effects {alloc} {
+ let _=try pitch.validate(pitch.Settings{enabled:c.pitch_enabled,semitones:c.pitch_semitones,match_frequency:c.match_frequency})
+ let selected:inference.Options=options(c)
+ inference.validate(selected)
+}
+pub fn decode(raw:str)->result<Controls,string> effects {alloc} {
+ if str.len(raw)==0 or str.len(raw)>1024{return result.err("Recording controls need a bounded nonempty snapshot")}
+ let c:Controls=try Controls_decode(raw) map_err codec.describe
+ let _=try validate(c)
+ result.ok(c)
+}
+pub fn encode(c:ref<Controls>)->result<string,string> effects {alloc} {
+ let _=try validate(c)
+ result.ok(try Controls_encode(c) map_err codec.describe)
+}
+// Entropy is acquired only when accepting a request, never once per member.
+pub fn accept(raw:str)->result<string,string> effects {alloc,random} {
+ if str.len(raw)==0{return result.ok("")}
+ var c:Controls=try decode(raw)
+ match c.seed{some(_)=>{},none=>{
+  let bytes:bytes=try system.secure_random(8) map_err error
+  c.seed=option.some(native.read_u64(bytes.view(bytes),0))}}
+ encode(c)
+}
+// The selected decoded-input budget also bounds shift-offset arrays. It is not
+// an estimate or promise for retained model weights and graph workspace.
+pub fn resolve(raw:str,max_offset_bytes:u64)->result<context.Context,string> effects {alloc} {
+ if str.len(raw)==0{
+  var selected:context.Context=context.disabled()
+  selected.waveform_bytes=resources.limits().max_working_bytes
+  return result.ok(selected)}
+ let c:Controls=try decode(raw)
+ let seed:u64=match c.seed{none=>{return result.err("Recording controls must be accepted with a replay seed before execution")},some(value)=>value}
+ if c.recording_enabled and max_offset_bytes<176400{return result.err("Recording control allocation budget cannot hold the fixed shuffle population")}
+ var selected:context.Context=if c.recording_enabled{try context.accepted(options(c),seed,shifts.Limits{max_forwards:18446744073709551615,max_groups:18446744073709551615,max_group_offsets:max_offset_bytes/8,max_random_calls:18446744073709551615})}else{context.disabled()}
+ selected.pitch=pitch.Settings{enabled:c.pitch_enabled,semitones:c.pitch_semitones,match_frequency:c.match_frequency}
+ selected.snapshot_provided=true
+ selected.waveform_bytes=resources.limits().max_working_bytes
+ result.ok(selected)
+}
+fn marked(profile:ref<engine.Profile>)->result<bool,string> effects {alloc}{
+ if profile.kind!="recording-bundle"{return result.ok(false)}
+ let c:bag.Config=try bag.Config_decode(profile.identity) map_err codec.describe
+ result.ok(c.source_defaults)
+}
+fn activate(c:ref<context.Context>,max_offset_bytes:u64,seed:u64)->result<unit,string> effects {alloc}{
+ if max_offset_bytes<176400{return result.err("Recording defaults require the caller's offset allocation budget")}
+ var selected:context.Context=try context.accepted(inference.Options{shifts:2,split:true,overlap:0.25,segment_seconds:0},seed,shifts.Limits{max_forwards:18446744073709551615,max_groups:18446744073709551615,max_group_offsets:max_offset_bytes/8,max_random_calls:18446744073709551615})
+ selected.pitch=pitch.Settings{enabled:c.pitch.enabled,semitones:c.pitch.semitones,match_frequency:c.pitch.match_frequency}
+ selected.waveform_bytes=c.waveform_bytes
+ selected.transform_bytes=c.transform_bytes
+ selected.device_index=c.device_index
+ selected.frequency_reference=struct.replace(c,[],field=frequency_reference)
+ let _=ref.swap(c,selected)
+ result.ok(())
+}
+fn fresh_seed()->result<u64,string> effects {alloc,random}{
+ let request:Controls=Controls{seed:option.none()}
+ let accepted:Controls=try decode(try accept(try encode(request)))
+ match accepted.seed{some(value)=>result.ok(value),none=>result.err("Recording defaults did not acquire a replay seed")}
+}
+// Only the application boundary acquires entropy. Explicit snapshots take
+// precedence; profiles without the new marker keep their existing defaults.
+pub fn ensure_source_defaults(c:ref<context.Context>,profile:ref<engine.Profile>,max_offset_bytes:u64)->result<unit,string> effects {alloc,random}{
+ if c.enabled or c.snapshot_provided{return result.ok(())}
+ if not try marked(profile){return result.ok(())}
+ activate(c,max_offset_bytes,try fresh_seed())
+}
+pub fn resolve_sources(raw:str,max_offset_bytes:u64,saved:str,configurations:ref<array<string>>)->result<context.Context,string> effects {alloc,fs.read,random}{
+ var selected:context.Context=try resolve(raw,max_offset_bytes)
+ if str.len(raw)==0{
+  var i:u64=0
+  loop{if i==array.len(configurations){break}
+   let profile:engine.Profile=try engine.read_typed(array.get(configurations,i))
+   if try marked(profile){
+    let seed:u64=if str.len(saved)!=0{try transport.seed(saved)}else{try fresh_seed()}
+    let _=try activate(selected,max_offset_bytes,seed)
+    break}
+   i+=1}}
+ let _=try transport.restore(selected,saved)
+ result.ok(selected)
+}
+pub fn configurations<T>(models:ref<array<T>>)->array<string> effects {alloc}{
+ var files:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(models){break}
+  array.push(files,string.copy(array.borrow(models,i).config))
+  i+=1}
+ files
+}
+pub fn include_processing(files:ref<array<string>>,recipe:str)->result<unit,string> effects {alloc,fs.read}{
+ if str.len(recipe)==0{return result.ok(())}
+ let raw:string=try files.read_text(recipe) map_err error
+ var c:secondary.Recipe=try secondary.Recipe_decode(raw) map_err codec.describe
+ var i:u64=0
+ loop{if i==array.len(c.models){break}
+  array.push(files,string.copy(array.borrow(c.models,i).config))
+  i+=1}
+ result.ok(())
+}
+pub fn ensure_sources(c:ref<context.Context>,files:ref<array<string>>,max_offset_bytes:u64)->result<unit,string> effects {alloc,fs.read,random}{
+ if c.enabled or c.snapshot_provided{return result.ok(())}
+ var i:u64=0
+ loop{if i==array.len(files){break}
+  let profile:engine.Profile=try engine.read_typed(array.get(files,i))
+  let _=try ensure_source_defaults(c,profile,max_offset_bytes)
+  if c.enabled{break}
+  i+=1}
+ result.ok(())
+}
+fn integer(raw:str)->result<u64,string> effects {alloc} {
+ if str.len(raw)==0 or str.len(raw)>20{return result.err("Enter a bounded nonnegative whole number")}
+ var i:u64=0
+ loop{if i==str.len(raw){break}
+  let byte:u8=cast.bits(view.get(str.bytes(raw),i))
+  if byte<48 or byte>57{return result.err("Enter a nonnegative whole number")}
+  i+=1}
+ match text.parse_u64(raw){none=>result.err("Whole number exceeds the supported integer extent"),some(value)=>result.ok(value)}
+}
+pub fn current(enabled:bool,shifts:str,split:bool,overlap:str,segment:str,seed:str)->result<string,string> effects {alloc} {
+ if not enabled{return result.ok("")}
+ var c:Controls=Controls{shifts:try integer(shifts),split:split,seed:option.none()}
+ c.overlap=match text.parse_f64(overlap){none=>{return result.err("Recording overlap must be a decimal from zero to below one")},some(value)=>value}
+ if segment!="Default"{c.segment_seconds=try integer(segment)
+  if c.segment_seconds==0{return result.err("Use Default or a segment from 1 to 200 seconds")}}
+ if seed!="Random"{c.seed=option.some(try integer(seed))}
+ encode(c)
+}
+pub fn current_with_pitch(enabled:bool,shifts:str,split:bool,overlap:str,segment:str,seed:str,pitch_enabled:bool,semitones:str,match_frequency:bool)->result<string,string> effects {alloc}{
+ let amount:f64=match text.parse_f64(semitones){none=>{return result.err("Inference pitch must be a decimal from -20 to 20")},some(value)=>value}
+ let _=try pitch.validate(pitch.Settings{enabled:pitch_enabled,semitones:amount,match_frequency:match_frequency})
+ if not pitch_enabled and not match_frequency{return current(enabled,shifts,split,overlap,segment,seed)}
+ var selected:Controls=if enabled{try decode(try current(true,shifts,split,overlap,segment,seed))}else{Controls{seed:option.none()}}
+ selected.recording_enabled=enabled
+ selected.pitch_enabled=pitch_enabled
+ selected.pitch_semitones=amount
+ selected.match_frequency=match_frequency
+ encode(selected)
+}

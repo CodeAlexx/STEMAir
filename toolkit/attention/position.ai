@@ -1,0 +1,105 @@
+module stemair.attention.position
+import std.float as fp
+import std.mkl_vml as vml
+
+fn valid(dim:u64,period:f64)->bool effects {} {dim>=4 and dim<=8192 and fp.is_finite(period) and period>1.0}
+// Row-major [time,channel], with cosine half followed by sine half.
+pub fn temporal(length:u64,dim:u64,shift:u64,period:f64)->result<array<f32>,string> effects {alloc} {
+ if not valid(dim,period) or dim%2!=0 or length==0 or length>65536 or shift>65536{return result.err("Invalid temporal position geometry")}
+ let half:u64=dim/2
+ let base:f32=cast.float(period)
+ var scales:array<f32>=[]
+ var i:u64=0
+ loop{if i==half{break}
+  let exponent:f32=cast.float(i)/cast.float(half-1)
+  array.push(scales,fp.pow(base,exponent))
+  i+=1}
+ var output:array<f32>=[]
+ array.reserve(output,length*dim)
+ var time:u64=0
+ loop{if time==length{break}
+  let position:f32=cast.float(time+shift)
+  i=0
+  loop{if i==half{break}
+   let phase:f32=position/array.get(scales,i)
+   array.push(output,fp.cos(phase))
+   i+=1}
+  i=0
+  loop{if i==half{break}
+   let phase:f32=position/array.get(scales,i)
+   array.push(output,fp.sin(phase))
+   i+=1}
+  time+=1}
+ result.ok(output)
+}
+// Row-major [time*frequency,channel]; interleaved sine/cosine pairs for the
+// time half, then separate frequency pairs. The two source formulas differ.
+pub fn spectral(frequencies:u64,time:u64,dim:u64,period:f64)->result<array<f32>,string> effects {alloc} {
+ if not valid(dim,period) or dim%4!=0 or frequencies==0 or frequencies>8192 or time==0 or frequencies*time>65536{
+  return result.err("Invalid spectral position geometry")}
+ let half:u64=dim/2
+ let quarter:u64=dim/4
+ let factor:f32=cast.float(-fp.log(period)/cast.float(half))
+ var scales:array<f32>=[]
+ var i:u64=0
+ loop{if i==quarter{break}
+  let exponent:f32=cast.float(2*i)*factor
+  array.push(scales,fp.exp(exponent))
+  i+=1}
+ var output:array<f32>=[]
+ array.reserve(output,frequencies*time*dim)
+ var t:u64=0
+ loop{if t==time{break}
+  var f:u64=0
+  loop{if f==frequencies{break}
+   i=0
+   loop{if i==quarter{break}
+    let phase:f32=cast.float(t)*array.get(scales,i)
+    array.push(output,fp.sin(phase))
+    array.push(output,fp.cos(phase))
+    i+=1}
+   i=0
+   loop{if i==quarter{break}
+    let phase:f32=cast.float(f)*array.get(scales,i)
+    array.push(output,fp.sin(phase))
+    array.push(output,fp.cos(phase))
+    i+=1}
+   f+=1}
+  t+=1}
+ result.ok(output)
+}
+
+pub fn spectral_with_math(library:ref<vml.Vml>,frequencies:u64,time:u64,dim:u64,period:f64)->result<array<f32>,string> effects {alloc,ffi} {
+ if not valid(dim,period) or dim%4!=0 or frequencies==0 or frequencies>8192 or time==0 or frequencies*time>65536{
+  return result.err("Invalid spectral position geometry")}
+ let half:u64=dim/2
+ let quarter:u64=dim/4
+ let factor:f32=cast.float(-fp.log(period)/cast.float(half))
+ var scales:array<f32>=[]
+ var i:u64=0
+ loop{if i==quarter{break}
+  let exponent:f32=cast.float(2*i)*factor
+  array.push(scales,try vml.exp(library,exponent))
+  i+=1}
+ var output:array<f32>=[]
+ array.reserve(output,frequencies*time*dim)
+ var t:u64=0
+ loop{if t==time{break}
+  var f:u64=0
+  loop{if f==frequencies{break}
+   i=0
+   loop{if i==quarter{break}
+    let phase:f32=cast.float(t)*array.get(scales,i)
+    array.push(output,try vml.sin(library,phase))
+    array.push(output,try vml.cos(library,phase))
+    i+=1}
+   i=0
+   loop{if i==quarter{break}
+    let phase:f32=cast.float(f)*array.get(scales,i)
+    array.push(output,try vml.sin(library,phase))
+    array.push(output,try vml.cos(library,phase))
+    i+=1}
+   f+=1}
+  t+=1}
+ result.ok(output)
+}

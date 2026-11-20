@@ -1,0 +1,182 @@
+// Retained waveform preparation with explicit measured/not-run observations.
+module stemair.recording_preparation
+import "recording_resources.ai" as resources
+import "initial_polarity.ai" as initial
+import "leading_silence.ai" as silence
+import "coarse_alignment.ai" as coarse
+import "numeric.ai" as num
+import "control.ai" as control
+import std.cpu_dot as dot
+pub type Polarity=enum{Automatic,Positive,Negative,Native}
+pub type Recipe=struct{polarity:Polarity,match_silence:bool}
+pub type Observation=struct{inverted:bool,automatic:option<initial.Decision>,reference_silence:option<silence.End>,target_silence:option<silence.End>,silence_delta:i64,adjusted_second_frames:u64}
+pub type Geometry=struct{frames:u64,other_frames:u64,channels:u64,first_input_channels:u64,second_input_channels:u64,silence_delta:i64,adjusted_second_frames:u64}
+pub type Inputs=struct{first:array<f32>,second:array<f32>,geometry:Geometry,observation:Observation}
+pub type Estimate=struct{divisor:u64,index:u64,lags:array<coarse.Lag>,unmatched_frames:u64,promoted:bool}
+pub type Matched=struct{first:array<f32>,raw_second:array<f64>,frames:u64,channels:u64,raw_second_promoted:bool,intro_index:u64,lags:array<coarse.Lag>}
+fn upmix(values:view<f32>,input_channels:u64,channels:u64)->array<f32> effects {alloc} {
+ var out:array<f32>=[]
+ array.reserve(out,view.len(values)/input_channels*channels)
+ var i:u64=0
+ loop{if i==view.len(values)/input_channels{break}
+  var ch:u64=0
+  loop{if ch==channels{break}
+   array.push(out,view.get(values,i*input_channels+if input_channels==1{0}else{ch}))
+   ch+=1}
+  i+=1}
+ out
+}
+fn probe(values:view<f32>,channels:u64)->array<f32> effects {alloc} {
+ let frames:u64=view.len(values)/channels
+ let count:u64=if frames<1000{frames}else{1000}
+ var out:array<f32>=[]
+ var ch:u64=0
+ loop{if ch==channels{break}
+  var i:u64=0
+  loop{if i==count{break}
+   array.push(out,view.get(values,i*channels+ch))
+   i+=1}
+  ch+=1}
+ out
+}
+pub fn adjusted(values:view<f32>,frames:u64,channels:u64,at:u64,ch:u64,delta:i64)->f32 effects {} {
+ let source:i64=cast.sat(at)-delta
+ if source<0 or source>=cast.sat(frames){0.0}else{view.get(values,cast.wrap(source)*channels+ch)}
+}
+pub fn prepare(engine:ref<dot.Engine>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,recipe:Recipe,limits:resources.Limits,cancel:str,progress:str)->result<Inputs,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ if (first_channels!=1 and first_channels!=2) or (second_channels!=1 and second_channels!=2) or view.len(first)==0 or view.len(second)==0 or view.len(first)%first_channels!=0 or view.len(second)%second_channels!=0{return result.err("Recording alignment requires nonempty interleaved mono or stereo inputs")}
+ let frames:u64=view.len(first)/first_channels
+ let other:u64=view.len(second)/second_channels
+ let _=try resources.plan(frames,first_channels,other,second_channels,limits,true)
+ if not num.finite(first) or not num.finite(second){return result.err("Recording alignment requires finite samples")}
+ let channels:u64=if first_channels==1 and second_channels==1{1}else{2}
+ var a:array<f32>=upmix(first,first_channels,channels)
+ var b:array<f32>=upmix(second,second_channels,channels)
+ let decision:option<initial.Decision>=if recipe.polarity==Polarity.Automatic{
+  let first_probe:array<f32>=probe(array.view(a),channels)
+  let second_probe:array<f32>=probe(array.view(b),channels)
+  option.some(try initial.detect(engine,array.view(first_probe),array.view(second_probe),channels,channels))
+ }else{option.none()}
+ let inverted:bool=match decision{some(value)=>value.inverted,none=>recipe.polarity==Polarity.Negative}
+ if inverted{
+  var i:u64=0
+  loop{if i==array.len(b){break}
+   let value:f32=array.get(b,i)
+   array.set(b,i,-value)
+   i+=1}}
+ var reference:option<silence.End>=option.none()
+ var target:option<silence.End>=option.none()
+ var delta:i64=0
+ if recipe.match_silence{
+  let reference_silence:silence.End=try silence.analyze(array.view(a),channels)
+  let target_silence:silence.End=try silence.analyze(array.view(b),channels)
+  delta=cast.sat(reference_silence.frame)-cast.sat(target_silence.frame)
+  reference=option.some(reference_silence)
+  target=option.some(target_silence)}
+ let adjusted_count:i64=cast.sat(other)+delta
+ if adjusted_count<=0{return result.err("Recording alignment has an empty second probe after silence matching")}
+ let count:u64=cast.wrap(adjusted_count)
+ let geometry:Geometry=Geometry{frames:frames,other_frames:other,channels:channels,first_input_channels:first_channels,second_input_channels:second_channels,silence_delta:delta,adjusted_second_frames:count}
+ let observation:Observation=Observation{inverted:inverted,automatic:decision,reference_silence:reference,target_silence:target,silence_delta:delta,adjusted_second_frames:count}
+ result.ok(Inputs{first:a,second:b,geometry:geometry,observation:observation})
+}
+fn validate(first:view<f32>,second:view<f32>,shape:Geometry,limits:resources.Limits)->result<unit,string> effects {alloc} {
+ if shape.channels!=1 and shape.channels!=2{return result.err("Prepared input channels differ")}
+ if view.len(first)!=(try resources.multiply(shape.frames,shape.channels)) or view.len(second)!=(try resources.multiply(shape.other_frames,shape.channels)){return result.err("Prepared input extents differ")}
+ let _=try resources.plan(shape.frames,shape.first_input_channels,shape.other_frames,shape.second_input_channels,limits,true)
+ result.ok(())
+}
+pub fn estimate_views(engine:ref<dot.Engine>,first:view<f32>,second:view<f32>,shape:Geometry,divisor:u64,limits:resources.Limits,cancel:str,progress:str)->result<Estimate,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if divisor!=1 and divisor!=2 and divisor!=4 and divisor!=6 and divisor!=8 and divisor!=10{return result.err("Unsupported alignment intro divisor")}
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ let _=try validate(first,second,shape,limits)
+ let frames:u64=shape.frames
+ let other:u64=shape.other_frames
+ let channels:u64=shape.channels
+ let count:u64=shape.adjusted_second_frames
+ let delta:i64=shape.silence_delta
+ let first_seconds:u64=frames/44100
+ let second_seconds:u64=count/44100
+ let seconds:u64=if first_seconds<second_seconds{first_seconds}else{second_seconds}
+ let index:u64=if divisor==1{44100}else{44100*(seconds/divisor)}
+ if index>=frames or index>=count{return result.err("Alignment intro selects an empty coarse probe")}
+ let a_count:u64=if frames-index<44100{frames-index}else{44100}
+ let b_count:u64=if count-index<44100{count-index}else{44100}
+ var lags:array<coarse.Lag>=[]
+ var ch:u64=0
+ loop{if ch==channels{break}
+  if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+  var left:array<f32>=[]
+  var right:array<f32>=[]
+  var i:u64=0
+  loop{if i==a_count{break}
+   array.push(left,view.get(first,(index+i)*channels+ch))
+   i+=1}
+  i=0
+  loop{if i==b_count{break}
+   array.push(right,adjusted(second,other,channels,index+i,ch,delta))
+   i+=1}
+  let lag:coarse.Lag=if delta>0{
+   var wide_left:array<f64>=[]
+   var wide_right:array<f64>=[]
+   i=0
+   loop{if i==array.len(left){break}
+    array.push(wide_left,cast.float(array.get(left,i)))
+    i+=1}
+   i=0
+   loop{if i==array.len(right){break}
+    array.push(wide_right,cast.float(array.get(right,i)))
+    i+=1}
+   try coarse.estimate_f64(engine,array.view(wide_left),array.view(wide_right),cancel,progress)
+  }else{try coarse.estimate(engine,array.view(left),array.view(right),cancel,progress)}
+  array.push(lags,lag)
+  ch+=1}
+ let lag:i64=array.get(lags,0).samples
+ let unmatched:u64=if lag>=0{try resources.checked_add(count,cast.wrap(lag))}else{count-cast.wrap(-lag)}
+ result.ok(Estimate{divisor:divisor,index:index,lags:lags,unmatched_frames:unmatched,promoted:delta>0 or lag>0})
+}
+fn copy_lags(values:view<coarse.Lag>)->array<coarse.Lag> effects {alloc} {
+ var out:array<coarse.Lag>=[]
+ var i:u64=0
+ loop{if i==view.len(values){break}
+  array.push(out,view.get(values,i))
+  i+=1}
+ out
+}
+pub fn match_views(first:view<f32>,second:view<f32>,shape:Geometry,lags:view<coarse.Lag>,index:u64,limits:resources.Limits,cancel:str)->result<Matched,string> effects {alloc,fs.meta} {
+ let _=try validate(first,second,shape,limits)
+ let frames:u64=shape.frames
+ let other:u64=shape.other_frames
+ let channels:u64=shape.channels
+ let count:u64=shape.adjusted_second_frames
+ let delta:i64=shape.silence_delta
+ if view.len(lags)!=channels{return result.err("Prepared intro extents differ")}
+ let lag:coarse.Lag=view.get(lags,0)
+ var raw:array<f64>=[]
+ array.reserve(raw,frames*channels)
+ var i:u64=0
+ loop{if i==frames{break}
+  if i%4096==0 and control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+  let after_coarse:i64=cast.sat(i)-lag.samples
+  var ch:u64=0
+  loop{if ch==channels{break}
+   let value:f32=if after_coarse<0 or after_coarse>=cast.sat(count){0.0}else{adjusted(second,other,channels,cast.wrap(after_coarse),ch,delta)}
+   array.push(raw,cast.float(value))
+   ch+=1}
+  i+=1}
+ result.ok(Matched{first:num.copy(first),raw_second:raw,frames:frames,channels:channels,raw_second_promoted:delta>0 or lag.samples>0,intro_index:index,lags:copy_lags(lags)})
+}
+pub fn estimate(engine:ref<dot.Engine>,inputs:ref<Inputs>,divisor:u64,limits:resources.Limits,cancel:str,progress:str)->result<Estimate,string> effects {alloc,ffi,fs.meta,fs.write} {
+ estimate_views(engine,array.view(inputs.first),array.view(inputs.second),inputs.geometry,divisor,limits,cancel,progress)
+}
+pub fn materialize(inputs:ref<Inputs>,estimate:ref<Estimate>,limits:resources.Limits,cancel:str)->result<Matched,string> effects {alloc,fs.meta} {
+ match_views(array.view(inputs.first),array.view(inputs.second),inputs.geometry,array.view(estimate.lags),estimate.index,limits,cancel)
+}
+pub fn copy_observation(value:ref<Observation>)->Observation effects {alloc} {
+ var reference:option<silence.End>=option.none()
+ var target:option<silence.End>=option.none()
+ match struct.borrow(value,field=reference_silence){some(end)=>{reference=option.some(silence.End{frame:end.frame,channel:end.channel,energies:num.copy(array.view(end.energies))})},none=>{}}
+ match struct.borrow(value,field=target_silence){some(end)=>{target=option.some(silence.End{frame:end.frame,channel:end.channel,energies:num.copy(array.view(end.energies))})},none=>{}}
+ Observation{inverted:value.inverted,automatic:value.automatic,reference_silence:reference,target_silence:target,silence_delta:value.silence_delta,adjusted_second_frames:value.adjusted_second_frames}
+}

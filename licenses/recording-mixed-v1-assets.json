@@ -1,0 +1,35 @@
+{
+  "model": "recording-mixed-v1",
+  "filename": "recording-mixed-v1.yaml",
+  "url": "https://raw.githubusercontent.com/facebookresearch/demucs/main/demucs/remote/mdx.yaml",
+  "bytes": 162,
+  "sha256": "aa6c377673bfa31dffc9b1de314c1c5335f96be18be869e4cc91f172aae1f4a4",
+  "configuration": "configs/recording-mixed-v1.json",
+  "credit": "Original Demucs models by Meta Platforms and collaborators, MIT license; attention-MIT.txt, hybrid-MIT.txt and waveform-MIT.txt. Original identifiers preserve checkpoint compatibility.",
+  "dependencies": [
+    {
+      "filename": "residual-long-1-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/0d19c1c6-0f06f20e.th",
+      "bytes": 178048329,
+      "sha256": "0f06f20ed6ddc8058fa72ccc4845f3a88916eff7d007b623924193de217bbcf4"
+    },
+    {
+      "filename": "residual-long-2-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/7ecf8ec1-70f50cc9.th",
+      "bytes": 178048329,
+      "sha256": "70f50cc947d08f32e6dd8e2b687d398fa5ef9e51d1bd7600e32205d1f44be6b9"
+    },
+    {
+      "filename": "hybrid-magnitude-1-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/c511e2ab-fe698775.th",
+      "bytes": 167334095,
+      "sha256": "fe6987756a7087d339bf63b19bb481b12cea02d3bc0de7583df7597210209649"
+    },
+    {
+      "filename": "hybrid-bands-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/7d865c68-3d5dd56b.th",
+      "bytes": 167918783,
+      "sha256": "3d5dd56b5bc986f136dff98655ded22b2b033f465ccec7a28640a6b15fd71ed6"
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+module stemair.paired_alignment_cli
+import "paired_alignment_application.ai" as application
+import "paired_config.ai" as config
+import "alignment_choices.ai" as choices
+import "recording_alignment_runtime.ai" as runtime
+import "cli_audio_policy.ai" as policy
+import "checked_input.ai" as checked
+import "container_export.ai" as container
+import std.codec as codec
+import std.json as json
+import std.text as text
+
+pub fn run(args:view<str>,settings:ref<policy.Settings>)->result<i32,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi,io.write} {
+ if view.len(args)!=5{return result.err("Use pair-align ALIGNMENT_RECIPE PAIRS_JSON OUTPUT_DIRECTORY")}
+ let recipe:choices.Recipe=try choices.read(view.get(args,2))
+ var selection:config.Plan=try config.read(view.get(args,3))
+ var i:u64=0
+ loop{if i==array.len(selection.items){break}
+  let item:ref<config.Item>=array.borrow(struct.borrow(selection,field=items),i)
+  item.first=try policy.absolute(item.first)
+  item.second=try policy.absolute(item.second)
+  i+=1}
+ let directory:string=try policy.absolute(view.get(args,4))
+ let cancel:string=try policy.absolute_optional(settings.cancel_file)
+ let progress:string=try policy.absolute_optional(settings.progress_file)
+ var plan:container.Plan=try policy.plan(settings)
+ var input:checked.Options=try policy.input(settings,directory,cancel)
+ let bytes:u64=cast.wrap(settings.audio_buffer_mib)*1048576
+ let selected=try runtime.settings_for_windows(try policy.root(settings),recipe.windows,recipe.save_aligned,bytes*4,bytes*2,bytes*4)
+ var completed:application.Outcome=try application.run(selected,recipe,selection,directory,cancel,progress,plan,input)
+ let report:string=try config.Report_encode(struct.borrow(completed,field=report)) map_err codec.describe
+ let keys:array<string>=["ok","report_file","report","message"]
+ let values:array<string>=[if completed.ok{"true"}else{"false"},json.quote(completed.report_file),report,json.quote(completed.message)]
+ io.write(try json.encode_object(keys,values) map_err json.message)
+ io.write("\n")
+ result.ok(if completed.ok{0}else{1})
+}

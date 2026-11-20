@@ -1,0 +1,69 @@
+module stemair.vocal_chain
+import "numeric.ai" as num
+import "audio_tools.ai" as tools
+import "ensemble.ai" as ensemble
+import "control.ai" as control
+import std.float as fp
+
+pub type Settings=struct{rebalance:f64=0.0,mixes:bool=false,mix_only:bool=false,vocal_only:bool=false,normalize:bool=false}
+pub type Stem=struct{target:string,values:array<f32>,frames:u64}
+pub fn validate(c:ref<Settings>)->result<unit,string> effects {alloc} {
+ if not fp.is_finite(c.rebalance) or c.rebalance<0.0 or c.rebalance>1.0{return result.err("Vocal rebalance must be between 0 and 1")}
+ if c.mix_only and (not c.mixes or c.vocal_only){return result.err("Instrumental-only vocal splitting requires mixed outputs and excludes vocal-only output")}
+ result.ok(())
+}
+pub fn prepare(vocals:view<f32>,instrumental:view<f32>,c:ref<Settings>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try validate(c)
+ if control.cancelled(cancel){return result.err("Vocal splitting cancelled")}
+ if view.len(vocals)==0 or view.len(vocals)%2!=0 or not num.finite(vocals){return result.err("Vocal splitting requires finite stereo vocals")}
+ if c.rebalance==0.0{return result.ok(num.copy(vocals))}
+ var inputs:array<array<f32>>=[num.copy(instrumental),num.copy(vocals)]
+ var mixed:tools.Output=try tools.process(inputs,"reduce",c.rebalance,cancel,progress)
+ result.ok(struct.replace(mixed,[],field=values))
+}
+fn extract(targets:ref<array<string>>,values:view<f32>,frames:u64,name:str)->result<array<f32>,string> effects {alloc} {
+ var index:u64=0
+ loop{if index==array.len(targets){return result.err("A vocal splitter must provide lead and backing stems")}
+  if array.get(targets,index)==name{break}
+  index+=1}
+ result.ok(num.copy(view.slice(values,index*2*frames,(index+1)*2*frames)))
+}
+pub fn finish(targets:ref<array<string>>,values:view<f32>,frames:u64,vocals:view<f32>,instrumental:view<f32>,c:ref<Settings>,cancel:str,progress:str)->result<array<Stem>,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try validate(c)
+ if control.cancelled(cancel){return result.err("Vocal splitting cancelled")}
+ if array.len(targets)!=2 or frames==0 or frames>134217728 or view.len(values)!=4*frames or not num.finite(values){return result.err("Invalid vocal split prediction")}
+ var backing:array<f32>=try extract(targets,values,frames,"backing")
+ var lead:array<f32>=try extract(targets,values,frames,"lead")
+ if c.rebalance>0.0{
+  let master:array<f32>=try num.fit_stereo(vocals,frames)
+  var i:u64=0
+  loop{if i==array.len(lead){break}
+   // The source derives this signed lead estimate from backing minus master.
+   array.set(lead,i,array.get(backing,i)-array.get(master,i))
+   i+=1}}
+ if not num.finite(array.view(lead)){return result.err("Vocal rebalance overflow")}
+ if not c.mix_only{
+  // Vocal files are saved before their instrumental mixes. Source normalization
+  // mutates these estimates, so the following mixes use the normalized values.
+  let _=try ensemble.normalize(backing,c.normalize)
+  let _=try ensemble.normalize(lead,c.normalize)}
+ var output:array<Stem>=[]
+ if c.mixes and not c.vocal_only{
+  var backing_inputs:array<array<f32>>=[num.copy(instrumental),num.copy(array.view(backing))]
+  var backing_mix:tools.Output=try tools.process(backing_inputs,"combine",0.0,cancel,progress)
+  var mixed_lead:array<f32>=num.copy(array.view(lead))
+  if c.rebalance>0.0{var i:u64=0
+   loop{if i==array.len(mixed_lead){break}
+    array.set(mixed_lead,i,-array.get(mixed_lead,i))
+    i+=1}}
+  var lead_inputs:array<array<f32>>=[num.copy(instrumental),mixed_lead]
+  var lead_mix:tools.Output=try tools.process(lead_inputs,"combine",0.0,cancel,progress)
+  let _=try ensemble.normalize(struct.borrow(backing_mix,field=values),c.normalize)
+  let _=try ensemble.normalize(struct.borrow(lead_mix,field=values),c.normalize)
+  array.push(output,Stem{target:"instrumental_with_backing",values:struct.replace(backing_mix,[],field=values),frames:backing_mix.frames})
+  array.push(output,Stem{target:"instrumental_with_lead",values:struct.replace(lead_mix,[],field=values),frames:lead_mix.frames})}
+ if not c.mix_only{
+  array.push(output,Stem{target:"backing",values:backing,frames:frames})
+  array.push(output,Stem{target:"lead",values:lead,frames:frames})}
+ result.ok(output)
+}

@@ -1,0 +1,82 @@
+// Caller resource policy, separate from waveform mathematics and duration.
+module stemair.recording_resources
+pub type Limits=struct{max_decoded_bytes:u64,max_working_bytes:u64}
+pub type Plan=struct{frames:u64,channels:u64,decoded_bytes:u64,working_bytes:u64,windows:u64}
+pub fn checked_add(a:u64,b:u64)->result<u64,string> effects {alloc} {
+ if b>18446744073709551615-a{return result.err("Recording resource arithmetic overflows")}
+ result.ok(a+b)
+}
+pub fn multiply(a:u64,b:u64)->result<u64,string> effects {alloc} {
+ if a!=0 and b>18446744073709551615/a{return result.err("Recording resource arithmetic overflows")}
+ result.ok(a*b)
+}
+pub fn capacity(samples:u64)->result<u64,string> effects {alloc} {
+ if samples==0{return result.ok(0)}
+ var count:u64=4
+ loop{if count>=samples{break}
+  count=try multiply(count,2)}
+ result.ok(count)
+}
+pub fn plan(first_frames:u64,first_channels:u64,second_frames:u64,second_channels:u64,limits:Limits,capture:bool)->result<Plan,string> effects {alloc} {
+ if first_frames==0 or second_frames==0 or (first_channels!=1 and first_channels!=2) or (second_channels!=1 and second_channels!=2){return result.err("Recording alignment requires nonempty mono or stereo inputs")}
+ if first_frames>4611686018427387903 or second_frames>4611686018427387903{return result.err("Recording frame extents exceed signed indexing safety")}
+ let channels:u64=if first_channels==1 and second_channels==1{1}else{2}
+ let decoded:u64=try multiply(try checked_add(try multiply(first_frames,first_channels),try multiply(second_frames,second_channels)),4)
+ if decoded>limits.max_decoded_bytes{return result.err("Combined decoded recording inputs exceed the caller byte limit")}
+ let s:u64=try multiply(first_frames,channels)
+ let t:u64=try multiply(second_frames,channels)
+ var capacity:u64=1
+ loop{if capacity>=s{break}
+  capacity=try multiply(capacity,2)}
+ let per_channel:u64=if first_frames>11025{1+(first_frames-11026)/5512}else{0}
+ let windows:u64=try multiply(per_channel,channels)
+ let decoded_capacity:u64=try multiply(try checked_add(try capacity(try multiply(first_frames,first_channels)),try capacity(try multiply(second_frames,second_channels))),4)
+ let base:u64=try checked_add(try checked_add(decoded_capacity,try multiply(t,4)),try multiply(s,36))
+ let workspace:u64=try checked_add(try checked_add(base,try multiply(capacity,10)),67108864)
+ let working:u64=try checked_add(workspace,try multiply(windows,if capture{2048}else{512}))
+ if working>limits.max_working_bytes{return result.err("Recording alignment exceeds the caller working-memory limit")}
+ result.ok(Plan{frames:first_frames,channels:channels,decoded_bytes:decoded,working_bytes:working,windows:windows})
+}
+// Candidate vectors and conservative transform/cache scratch for the seven
+// supported windows. Preserve the original small-window reservation exactly.
+pub fn local_workspace(size:u64,candidates:u64)->result<u64,string> effects {alloc} {
+ if size<=22050{return result.ok(67108864)}
+ let retained:u64=try multiply(try multiply(try capacity(size),8),try checked_add(candidates,64))
+ result.ok(try checked_add(67108864,retained))
+}
+// Additive window/opposite-pair recipe budget; old plan stays exact.
+pub fn plan_choices(first_frames:u64,first_channels:u64,second_frames:u64,second_channels:u64,limits:Limits,capture:bool,size:u64,hop:u64,candidates:u64)->result<Plan,string> effects {alloc} {
+ if size==0 or hop==0 or candidates==0 or candidates>82{return result.err("Invalid supported alignment-choice resource recipe")}
+ let prior:Plan=try plan(first_frames,first_channels,second_frames,second_channels,Limits{max_decoded_bytes:limits.max_decoded_bytes,max_working_bytes:18446744073709551615},capture)
+ let old_steps:u64=try multiply(prior.windows,if capture{2048}else{512})
+ let per_channel:u64=if first_frames>size{1+(first_frames-size-1)/hop}else{0}
+ let windows:u64=try multiply(per_channel,prior.channels)
+ let reservation:u64=try checked_add(if capture{2048}else{512},try multiply(candidates,if capture{256}else{48}))
+ let extra:u64=(try local_workspace(size,candidates))-67108864
+ let working:u64=try checked_add(try checked_add(prior.working_bytes-old_steps,extra),try multiply(windows,reservation))
+ if working>limits.max_working_bytes{return result.err("Alignment choices exceed the caller working-memory limit")}
+ result.ok(Plan{frames:prior.frames,channels:prior.channels,decoded_bytes:prior.decoded_bytes,working_bytes:working,windows:windows})
+}
+
+// Phase searches retain original/analytic input and one winning residual,
+// rather than one waveform per candidate. Scalar diagnostics still include all.
+pub fn local_phase_workspace(size:u64,candidates:u64)->result<u64,string> effects {alloc} {
+ if size==0 or size>88200 or candidates==0 or candidates>14760{return result.err("Invalid local phase-search resource recipe")}
+ let prior:u64=try local_workspace(size,2)
+ let analytic:u64=try multiply(try capacity(size),64)
+ let diagnostics:u64=try multiply(candidates,256)
+ result.ok(try checked_add(try checked_add(prior,analytic),diagnostics))
+}
+pub fn plan_search_choices(first_frames:u64,first_channels:u64,second_frames:u64,second_channels:u64,limits:Limits,capture:bool,size:u64,hop:u64,candidates:u64,analytic:bool)->result<Plan,string> effects {alloc} {
+ if not analytic{return plan_choices(first_frames,first_channels,second_frames,second_channels,limits,capture,size,hop,candidates)}
+ if hop==0{return result.err("Invalid local phase-search hop")}
+ let workspace:u64=try local_phase_workspace(size,candidates)
+ let prior:Plan=try plan(first_frames,first_channels,second_frames,second_channels,Limits{max_decoded_bytes:limits.max_decoded_bytes,max_working_bytes:18446744073709551615},capture)
+ let old_steps:u64=try multiply(prior.windows,if capture{2048}else{512})
+ let per_channel:u64=if first_frames>size{1+(first_frames-size-1)/hop}else{0}
+ let windows:u64=try multiply(per_channel,prior.channels)
+ let reservation:u64=try checked_add(if capture{2048}else{512},try multiply(candidates,if capture{256}else{48}))
+ let working:u64=try checked_add(try checked_add(prior.working_bytes-old_steps,workspace-67108864),try multiply(windows,reservation))
+ if working>limits.max_working_bytes{return result.err("Phase search exceeds the caller working-memory limit")}
+ result.ok(Plan{frames:prior.frames,channels:prior.channels,decoded_bytes:prior.decoded_bytes,working_bytes:working,windows:windows})
+}

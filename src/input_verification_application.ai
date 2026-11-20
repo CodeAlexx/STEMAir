@@ -1,0 +1,58 @@
+module stemair.input_verification_application
+import "input_verification.ai" as verification
+import "queue_config.ai" as queue
+import std.text as text
+
+fn indices(envelope:ref<verification.Envelope>,inputs:ref<array<string>>,generation:u64)->result<array<u64>,string> effects {alloc} {
+ if generation!=envelope.generation or array.len(inputs)!=array.len(envelope.inputs){
+  return result.err("The verified input list changed; run verification again")}
+ var i:u64=0
+ loop{if i==array.len(inputs){break}
+  let current:str=array.get(inputs,i)
+  let previous:str=array.get(envelope.inputs,i)
+  if current!=previous{return result.err("A verified recording changed; run verification again")}
+  i+=1}
+ verification.retained(struct.borrow(envelope,field=report),array.len(inputs))
+}
+pub fn apply_audio(envelope:ref<verification.Envelope>,inputs:ref<array<string>>,generation:u64)->result<unit,string> effects {alloc} {
+ if envelope.queue{return result.err("Verification report belongs to the other input list")}
+ let kept:array<u64>=try indices(envelope,inputs,generation)
+ var next:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(kept){break}
+  array.push(next,string.copy(array.get(inputs,array.get(kept,i))))
+  i+=1}
+ let _=ref.swap(inputs,next)
+ result.ok(())
+}
+pub fn apply_queue(envelope:ref<verification.Envelope>,inputs:ref<array<queue.Item>>,generation:u64)->result<unit,string> effects {alloc} {
+ if not envelope.queue{return result.err("Verification report belongs to the other input list")}
+ var paths:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(inputs){break}
+  array.push(paths,string.copy(array.borrow(inputs,i).input))
+  i+=1}
+ let kept:array<u64>=try indices(envelope,paths,generation)
+ var next:array<queue.Item>=[]
+ i=0
+ loop{if i==array.len(kept){break}
+  let item:ref<queue.Item>=array.borrow(inputs,array.get(kept,i))
+  array.push(next,queue.Item{input:string.copy(item.input),folder:string.copy(item.folder)})
+  i+=1}
+ let _=ref.swap(inputs,next)
+ result.ok(())
+}
+pub fn details(envelope:ref<verification.Envelope>)->string effects {alloc} {
+ var text:string=string.copy(envelope.report.message)
+ var i:u64=0
+ loop{if i==array.len(envelope.report.failures){break}
+  let item:ref<verification.Failure>=array.borrow(envelope.report.failures,i)
+  string.append(text,"\n\n")
+  string.append(text,string.from_int(item.index+1))
+  string.append(text,". ")
+  string.append(text,item.input)
+  string.append(text,"\n")
+  string.append(text,item.message)
+  i+=1}
+ text
+}

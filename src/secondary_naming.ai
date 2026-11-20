@@ -1,0 +1,64 @@
+module stemair.secondary_naming
+import "output_naming.ai" as naming
+import "../toolkit/model_roles.ai" as roles
+import "container_export.ai" as container
+import "../toolkit/output_names.ai" as names
+import "../toolkit/secondary.ai" as secondary
+import "../toolkit/typed_secondary_targets.ai" as typed_targets
+import "../toolkit/typed_model_result.ai" as model_result
+import "../toolkit/secondary_config.ai" as config
+import "../toolkit/engine.ai" as engine
+import std.text as text
+
+pub fn select(input:str,directory:str,context:ref<naming.Chain>,profiles:ref<array<engine.Profile>>,recipe:ref<config.Recipe>,format:ref<container.Plan>)->result<naming.Selected,string> effects {alloc} {
+ if array.len(context.models)!=array.len(recipe.models){return result.err("Choose one naming context for each processing model")}
+ var resolved:secondary.Plan=try secondary.materialize(profiles,recipe)
+ var targets:array<string>=secondary.output_targets(resolved,recipe)
+ select_targets(input,directory,context,profiles,recipe,format,resolved,targets)
+}
+pub fn select_typed(input:str,directory:str,context:ref<naming.Chain>,profiles:ref<array<engine.Profile>>,recipe:ref<config.Recipe>,format:ref<container.Plan>)->result<naming.Selected,string> effects {alloc} {
+ if array.len(context.models)!=array.len(recipe.models){return result.err("Choose one naming context for each processing model")}
+ var resolved:secondary.Plan=try secondary.materialize(profiles,recipe)
+ let split:u64=secondary.vocal_model(recipe)
+ var split_names:array<string>=[]
+ if split>0{
+  var physical:array<string>=try roles.targets(array.borrow(profiles,split),array.borrow(recipe.models,split),"vocals")
+  split_names=try model_result.write_order(array.borrow(profiles,split).kind,"vocals",physical)}
+ var targets:array<string>=try typed_targets.outputs(resolved,recipe,split_names)
+ select_targets(input,directory,context,profiles,recipe,format,resolved,targets)
+}
+fn select_targets(input:str,directory:str,context:ref<naming.Chain>,profiles:ref<array<engine.Profile>>,recipe:ref<config.Recipe>,format:ref<container.Plan>,resolved:ref<secondary.Plan>,targets:ref<array<string>>)->result<naming.Selected,string> effects {alloc} {
+ var selected:naming.Selected=try naming.select(input,directory,struct.borrow(context,field=main),targets,format)
+ let layout:names.Layout=try naming.layout(input,struct.borrow(context,field=main))
+ var index:u64=0
+ loop{if index==array.len(targets){break}
+  let target:str=array.get(targets,index)
+  if secondary.vocal_model(recipe)>0{
+   if target=="lead"{array.set(selected.plan.source_names,index,try names.split_output(layout.base,"Vocals","lead_only"))}
+   if target=="backing"{array.set(selected.plan.source_names,index,try names.split_output(layout.base,"Vocals","backing_only"))}
+   if target=="instrumental_with_lead"{array.set(selected.plan.source_names,index,try names.split_output(layout.base,"Instrumental","with_lead_vocals"))}
+   if target=="instrumental_with_backing"{array.set(selected.plan.source_names,index,try names.split_output(layout.base,"Instrumental","with_backing_vocals"))}}
+  if target=="other_instruments" and secondary.extra_instrumental(resolved,recipe){
+   let complement:string=naming.label(struct.borrow(context,field=main),array.get(resolved.outputs,1))
+   array.set(selected.plan.source_names,index,try names.stem_output(layout.base,text.concat(complement," Instrumental")))}
+  index+=1}
+ let _=try container.validate(struct.borrow(selected,field=plan))
+ if recipe.keep_members{
+  var stages:array<secondary.Stage>=secondary.stages(resolved,recipe)
+  index=0
+  loop{if index==array.len(stages){break}
+   let stage:ref<secondary.Stage>=array.borrow(stages,index)
+   var member:naming.Context=try naming.copy(array.borrow(context.models,stage.model))
+   member.ordinal=context.main.ordinal
+   member.timestamp=context.main.timestamp
+   member.testing=context.main.testing
+   member.model_folder=false
+   let profile:ref<engine.Profile>=array.borrow(profiles,stage.model)
+   var stage_targets:array<string>=try roles.targets(profile,array.borrow(recipe.models,stage.model),stage.source)
+   var output:naming.Selected=try naming.select(input,directory,member,stage_targets,format)
+   let suffix:string=if stage.source=="recording"{""}else{text.concat("-",stage.source)}
+   let key:string=text.concat("members/model-",text.concat(string.from_int(stage.model),suffix))
+   selected.plan=try container.with_scope_names(struct.borrow(selected,field=plan),key,struct.borrow(struct.borrow(output,field=plan),field=source_names))
+   index+=1}}
+ result.ok(selected)
+}

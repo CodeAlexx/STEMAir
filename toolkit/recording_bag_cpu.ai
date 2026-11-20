@@ -1,0 +1,85 @@
+module stemair.recording_bag_cpu
+import "recording_bag_state.ai" as state
+import "recording_bag_request.ai" as request
+import "recording_context.ai" as context
+import "recording_inference.ai" as inference
+import "audio_normalization.ai" as normalization
+import "recording_moments.ai" as moments
+import "weighted_sources.ai" as weighted
+import "numeric.ai" as num
+import "control.ai" as control
+import "attention/config.ai" as attention_config
+import "attention/session.ai" as attention
+import "attention/bag_recording.ai" as attention_recording
+import "hybrid/config.ai" as hybrid_config
+import "hybrid/session.ai" as hybrid
+import "hybrid/host_session.ai" as hybrid_recording
+import "residual_waveform/config.ai" as residual_config
+import "residual_waveform/session.ai" as residual
+import std.codec as codec
+fn run_attention(s:ref<attention.Session>,library:ref<CAbiLibrary>,c:ref<attention_config.Config>,size:u64,invocation:ref<request.Invocation>,preparation:normalization.Prepared own,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write}{
+ let group=try request.group(invocation,c)
+ attention_recording.separate_cpu_group(s,library,c,size,struct.borrow(invocation,field=schedule),preparation,group,cancel,progress)
+}
+fn run_hybrid(s:ref<hybrid.Session>,library:ref<CAbiLibrary>,c:ref<hybrid_config.Config>,size:u64,invocation:ref<request.Invocation>,preparation:normalization.Prepared own,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write}{
+ let group=try request.group(invocation,c)
+ if array.len(s.cpu)!=1{return result.err("Recording bundle hybrid CPU weights were not prepared")}
+ hybrid_recording.separate_normalized_group(struct.borrow(s,field=network),array.borrow(s.cpu,0),library,c,struct.borrow(invocation,field=schedule),preparation,group,cancel,progress)
+}
+fn run_residual(s:ref<residual.Session>,library:ref<CAbiLibrary>,c:ref<residual_config.Config>,invocation:ref<request.Invocation>,preparation:normalization.Prepared own,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write}{
+ let group=try request.group(invocation,c)
+ residual.separate_normalized_cpu_group(s,library,c,struct.borrow(invocation,field=schedule),preparation,group,cancel,progress)
+}
+fn member(slot:ref<state.Slot>,position:ref<state.Member>,library:ref<CAbiLibrary>,controls:ref<context.Context>,preparation:normalization.Prepared own,cancel:str,progress:str)->result<request.MemberOutput,string> effects {alloc,ffi,fs.meta,fs.write}{
+ let identity:string=string.copy(slot.identity)
+ let frames:u64=preparation.frames
+ match slot.model{
+  Attention(model)=>{
+   var c:attention_config.Config=try attention_config.Config_decode(identity) map_err codec.describe
+   let _=request.configure(c,controls)
+   let size:u64=try request.segment(position,controls,model.network.training_length)
+   var invocation=try request.begin(c,controls,frames,size)
+   let outcome:result<array<f32>,string>=run_attention(model,library,c,size,invocation,preparation,cancel,progress)
+   let observation=request.finish(invocation,controls)
+   result.ok(request.MemberOutput{values:try outcome,observation:observation})},
+  Hybrid(model)=>{
+   var c:hybrid_config.Config=try hybrid_config.Config_decode(identity) map_err codec.describe
+   let _=request.configure(c,controls)
+   c.segment_samples=try request.segment(position,controls,if c.segment_samples!=0{c.segment_samples}else{model.network.constructor.kwargs.segment*44100})
+   var invocation=try request.begin(c,controls,frames,c.segment_samples)
+   let outcome:result<array<f32>,string>=run_hybrid(model,library,c,c.segment_samples,invocation,preparation,cancel,progress)
+   let observation=request.finish(invocation,controls)
+   result.ok(request.MemberOutput{values:try outcome,observation:observation})},
+  Residual(model)=>{
+   var c:residual_config.Config=try residual_config.Config_decode(identity) map_err codec.describe
+   let _=request.configure(c,controls)
+   c.segment_samples=try request.segment(position,controls,residual.segment(model,c))
+   var invocation=try request.begin(c,controls,frames,c.segment_samples)
+   let outcome:result<array<f32>,string>=run_residual(model,library,c,invocation,preparation,cancel,progress)
+   let observation=request.finish(invocation,controls)
+   result.ok(request.MemberOutput{values:try outcome,observation:observation})}}
+}
+pub fn separate(s:ref<state.State>,library:ref<CAbiLibrary>,input:view<f32>,controls:ref<context.Context>,limits:ref<request.Limits>,cancel:str,progress:str)->result<request.Output,string> effects {alloc,ffi,fs.meta,fs.write}{
+ let _=try request.preflight(s,input,controls,limits)
+ let preparation:normalization.Prepared=try if state.has_magnitude(s){moments.prepare(input,2)}else{normalization.prepare(input)}
+ let sources:u64=array.len(s.targets)
+ if preparation.scale==0.0{return result.ok(request.Output{values:num.zeros(2*sources*preparation.frames),observations:[]})}
+ var accumulator:weighted.Accumulator=try weighted.create(preparation.frames,sources)
+ var observations:array<inference.Observation>=[]
+ var i:u64=0
+ loop{if i==array.len(s.members){break}
+  if control.cancelled(cancel){return result.err("Recording bundle cancelled")}
+  var position:state.Member=state.Member{slot:array.borrow(s.members,i).slot,segment_samples:array.borrow(s.members,i).segment_samples,weights:[]}
+  var source:u64=0
+  loop{if source==sources{break}
+   array.push(position.weights,array.get(array.borrow(s.members,i).weights,source))
+   source+=1}
+  var output:request.MemberOutput=try member(array.borrow(s.slots,position.slot),position,library,controls,request.copy(preparation),cancel,progress)
+  let _=try weighted.add(accumulator,array.view(output.values),array.view(position.weights))
+  array.push(observations,output.observation)
+  i+=1}
+ let combined:array<f32>=try weighted.finish(accumulator)
+ let values:array<f32>=try normalization.restore_sources(array.view(combined),preparation.frames,sources,preparation.mean,preparation.scale)
+ s.requests+=1
+ result.ok(request.Output{values:values,observations:observations})
+}

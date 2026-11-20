@@ -1,0 +1,208 @@
+module stemair.waveform.host
+import "network.ai" as network
+import "../weights.ai" as weights
+import "../ops.ai" as ops
+import "../recurrent.ai" as recurrent
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "../windowed_sinc.ai" as sinc
+import std.cpu_conv2d as convolution
+import std.cpu_transpose_conv2d as transpose
+import std.cpu_matmul as matrix
+import std.mkl_blas as blas
+import std.cpu_conv2d_accumulate as accumulating
+import std.float as fp
+
+pub type Backend=struct{convolutions:array<option<convolution.Prepared>>,transposed:array<option<transpose.Prepared>>,projection:matrix.Matrix,packs:u64,bytes:u64,
+ legacy_matrix:array<blas.Engine>,legacy_weights:array<option<matrix.Matrix>>}
+fn is_transposed(n:ref<network.Network>,id:u64)->bool effects {} {
+ var i:u64=0
+ loop{if i==array.len(n.decoder){break}
+  if array.get(n.decoder,i).first.weight==id{return true}
+  i+=1}
+ false
+}
+pub fn prepare(n:ref<network.Network>)->result<Backend,string> effects {alloc} {
+ if not ((n.options.generation==1 and (n.options.channels==64 or n.options.channels==100) and not n.options.resample) or
+  (n.options.generation==2 and (n.options.channels==4 or n.options.channels==48 or n.options.channels==64) and n.options.resample)) or
+  n.options.normalize or n.options.depth!=6 or n.options.lstm_layers!=2 or array.len(n.encoder)!=6 or array.len(n.decoder)!=6 or array.len(n.layers)!=2{return result.err("CPU waveform capacity has not been qualified")}
+ var convs:array<option<convolution.Prepared>>=[]
+ var transposed:array<option<transpose.Prepared>>=[]
+ var packs:u64=0
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(n.weights.parameters.values){break}
+  let up:bool=is_transposed(n,i)
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,i)
+  if array.len(p.shape)==3{
+   let shape:array<u64>=[array.get(p.shape,0),array.get(p.shape,1),1,array.get(p.shape,2)]
+   if up{
+    var prepared:transpose.Prepared=try transpose.prepare(array.view(p.values),array.view(shape),1,transpose.Limits{matrix:matrix.Limits{},max_output_elements:67108864})
+    total+=view.len(bytes.view(array.borrow(prepared.weights,0).data))
+    array.push(transposed,option.some(prepared))
+    array.push(convs,option.none())
+   }else{
+    let prepared:convolution.Prepared=try convolution.prepare(array.view(p.values),array.view(shape))
+    total+=view.len(bytes.view(prepared.values))
+    array.push(convs,option.some(prepared))
+    array.push(transposed,option.none())}
+   packs+=1
+  }else{array.push(convs,option.none())
+   array.push(transposed,option.none())}
+  i+=1}
+ let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,n.projection_weight)
+ let projection:matrix.Matrix=try matrix.prepare(array.view(p.values),array.get(p.shape,0),array.get(p.shape,1),matrix.Limits{})
+ total+=view.len(bytes.view(projection.data))
+ if packs!=24{return result.err("Original waveform convolution inventory differs")}
+ result.ok(Backend{convolutions:convs,transposed:transposed,projection:projection,packs:packs+1,bytes:total,legacy_matrix:[],legacy_weights:[]})
+}
+fn accumulated(engines:ref<array<blas.Engine>>,weights:ref<array<option<matrix.Matrix>>>,id:u64,input:view<f32>,shape:view<u64>,weight_shape:view<u64>,bias:view<f32>,options:convolution.Options)->result<array<f32>,string> effects {alloc,ffi}{
+ let packed:ref<matrix.Matrix>=match array.borrow(weights,id){some(v)=>v,none=>{return result.err("Explicit waveform matrix weight was not prepared")}}
+ accumulating.convolve(array.borrow(engines,0),input,shape,packed,weight_shape,bias,options,8388608)}
+fn convolve(n:ref<network.Network>,p:ref<Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,c:network.Convolution)->result<ops.Tensor,string> effects {alloc,ffi} {
+ if input.h!=1{return result.err("CPU waveform convolution requires a one-dimensional signal")}
+ let shape:array<u64>=[1,input.c,1,input.w]
+ let bias:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,c.bias)
+ if c.up{
+  let prepared:ref<transpose.Prepared>=match array.borrow(p.transposed,c.weight){some(v)=>v,none=>{return result.err("CPU waveform transpose weight was not prepared at session open")}}
+  let options:transpose.Options=transpose.Options{stride_width:c.stride}
+  let limits:transpose.Limits=transpose.Limits{matrix:matrix.Limits{max_output_elements:if n.options.generation==2{if n.options.channels==64{134217728}else{100663296}}else{67108864}},max_output_elements:67108864}
+  let g:transpose.Geometry=try transpose.geometry_general(array.view(shape),prepared,options,limits)
+  let values:array<f32>=try transpose.convolve_general(library,array.view(input.data),array.view(shape),prepared,array.view(bias.values),options,limits)
+  return result.ok(ops.tensor(g.output_channels,1,g.output_width,values))}
+ let weight_shape:array<u64>=match array.borrow(p.convolutions,c.weight){some(v)=>[array.get(v.shape,0),array.get(v.shape,1),array.get(v.shape,2),array.get(v.shape,3)],none=>{return result.err("CPU waveform convolution weight was not prepared at session open")}}
+ // Generation2's full 40-second segment is resampled 2x before its first
+ // 96-channel rewrite. Its actual activation exceeds the default 64M words.
+ let options:convolution.Options=convolution.Options{stride_width:c.stride,max_output_elements:if n.options.generation==2{if n.options.channels==64{134217728}else{100663296}}else{67108864}}
+ let g:convolution.Geometry=try convolution.geometry(array.view(shape),array.view(weight_shape),options)
+ // Original CPU 1D dispatch expands to NCHW1xW. At N1/groups1/H1 and
+ // <=20480 input words it chooses slow convolution, including bias in GEMM.
+ if array.len(p.legacy_matrix)==1 and array.len(input.data)<=20480{
+  let values:array<f32>=try accumulated(struct.borrow(p,field=legacy_matrix),struct.borrow(p,field=legacy_weights),c.weight,array.view(input.data),array.view(shape),array.view(weight_shape),array.view(bias.values),options)
+  return result.ok(ops.tensor(g.output_channels,1,g.output_width,values))}
+ let prepared:ref<convolution.Prepared>=match array.borrow(p.convolutions,c.weight){some(v)=>v,none=>{return result.err("CPU waveform convolution weight was not prepared at session open")}}
+ let values:array<f32>=try convolution.convolve_blas(library,array.view(input.data),array.view(shape),prepared,array.view(bias.values),options,8388608)
+ result.ok(ops.tensor(g.output_channels,1,g.output_width,values))
+}
+// Explicit opt-in; dependency-free/default preparation remains unchanged.
+// Packs once at session preparation, never per block or request.
+pub fn prepare_with_blas(n:ref<network.Network>,runtime:str,version:str)->result<Backend,string> effects {alloc,ffi}{
+ if n.options.generation!=2{return result.err("Explicit CPU matrix recipe is qualified for waveform generation2 only")}
+ var p:Backend=try prepare(n)
+ array.push(p.legacy_matrix,try blas.open(runtime,version))
+ var i:u64=0
+ loop{if i==array.len(n.weights.parameters.values){break}
+  let transposed:bool=is_transposed(n,i)
+  let source:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,i)
+  if array.len(source.shape)==3 and not transposed{
+   let packed:matrix.Matrix=try matrix.prepare(array.view(source.values),array.get(source.shape,0),array.get(source.shape,1)*array.get(source.shape,2),matrix.Limits{})
+   p.bytes+=view.len(bytes.view(packed.data))
+   p.packs+=1
+   array.push(p.legacy_weights,option.some(packed))
+  }else{array.push(p.legacy_weights,option.none())}
+  i+=1}
+ result.ok(p)}
+fn relu(input:ref<ops.Tensor>)->ops.Tensor effects {alloc} {
+ var values:array<f32>=[]
+ array.reserve(values,array.len(input.data))
+ var i:u64=0
+ loop{if i==array.len(input.data){break}
+  let value:f32=array.get(input.data,i)
+  array.push(values,if value>0.0{value}else{0.0})
+  i+=1}
+ ops.tensor(input.c,input.h,input.w,values)
+}
+fn glu(input:ref<ops.Tensor>)->result<ops.Tensor,string> effects {alloc} {
+ if input.c%2!=0{return result.err("CPU waveform gated channels must be even")}
+ let features:u64=input.c/2
+ let plane:u64=input.h*input.w
+ var values:array<f32>=[]
+ array.reserve(values,features*plane)
+ var i:u64=0
+ loop{if i==features*plane{break}
+  let gate:f32=1.0/(1.0+fp.exp(-array.get(input.data,features*plane+i)))
+  array.push(values,array.get(input.data,i)*gate)
+  i+=1}
+ result.ok(ops.tensor(features,input.h,input.w,values))
+}
+fn recurrence(n:ref<network.Network>,p:ref<Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ var data:array<f32>=[]
+ array.reserve(data,input.c*input.w)
+ var time:u64=0
+ loop{if time==input.w{break}
+  var feature:u64=0
+  loop{if feature==input.c{break}
+   array.push(data,array.get(input.data,feature*input.w+time))
+   feature+=1}
+  time+=1}
+ var rows:ops.Tensor=ops.tensor(1,input.w,input.c,data)
+ var layer:u64=0
+ loop{if layer==array.len(n.layers){break}
+  rows=try recurrent.forward(struct.borrow(n,field=weights),array.get(n.layers,layer),rows,cancel)
+  layer+=1}
+ var activation:matrix.Matrix=try matrix.prepare(array.view(rows.data),rows.h,rows.w,matrix.Limits{})
+ let projected:array<f32>=try matrix.multiply(library,activation,matrix.Operation.Identity,struct.borrow(p,field=projection),matrix.Operation.Transpose,matrix.Limits{})
+ let bias:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,n.projection_bias)
+ var output:array<f32>=[]
+ array.reserve(output,input.c*input.w)
+ var feature:u64=0
+ loop{if feature==input.c{break}
+  time=0
+  loop{if time==input.w{break}
+   array.push(output,array.get(projected,time*input.c+feature)+array.get(bias.values,feature))
+   time+=1}
+  feature+=1}
+ result.ok(ops.tensor(input.c,1,input.w,output))
+}
+pub fn forward(n:ref<network.Network>,p:ref<Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ let explicit_matrix:bool=array.len(p.legacy_matrix)==1 and array.len(p.legacy_weights)==array.len(n.weights.parameters.values)
+ if input.c!=2 or input.h!=1 or input.w==0 or input.w>134217728 or array.len(input.data)!=2*input.w or not num.finite(array.view(input.data)) or (if explicit_matrix{p.packs!=43}else{p.packs!=25 or array.len(p.legacy_matrix)!=0}) or array.len(p.convolutions)!=array.len(n.weights.parameters.values) or array.len(p.transposed)!=array.len(n.weights.parameters.values){return result.err("Invalid or unprepared CPU waveform input")}
+ var x:ops.Tensor=ops.tensor(input.c,input.h,input.w,num.copy(array.view(input.data)))
+ if n.options.resample{
+  // Disabled original normalization still divides every F32 value by 1+1e-5.
+  var i:u64=0
+  loop{if i==array.len(x.data){break}
+   array.set(x.data,i,array.get(x.data,i)/1.00001)
+   i+=1}
+  let values:array<f32>=try sinc.apply(struct.borrow(n,field=upsample_plan),array.view(x.data),x.c)
+  x=ops.tensor(x.c,1,x.w*2,values)}
+ var saved:array<ops.Tensor>=[]
+ var index:u64=0
+ loop{if index==array.len(n.encoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let block:network.Block=array.get(n.encoder,index)
+  var first:ops.Tensor=try convolve(n,p,library,x,block.first)
+  var activated:ops.Tensor=relu(first)
+  var rewritten:ops.Tensor=try convolve(n,p,library,activated,block.rewrite)
+  x=try glu(rewritten)
+  array.push(saved,ops.tensor(x.c,x.h,x.w,num.copy(array.view(x.data))))
+  index+=1}
+ x=try recurrence(n,p,library,x,cancel)
+ index=0
+ loop{if index==array.len(n.decoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var skip:ops.Tensor=match array.pop(saved){some(v)=>v,none=>{return result.err("CPU waveform skip is missing")}}
+  if skip.c!=x.c or skip.w<x.w{return result.err("CPU waveform skip extent differs")}
+  let left:u64=(skip.w-x.w)/2
+  var data:array<f32>=[]
+  array.reserve(data,array.len(x.data))
+  var c:u64=0
+  loop{if c==x.c{break}
+   var t:u64=0
+   loop{if t==x.w{break}
+    array.push(data,array.get(x.data,c*x.w+t)+array.get(skip.data,c*skip.w+left+t))
+    t+=1}
+   c+=1}
+  var joined:ops.Tensor=ops.tensor(x.c,1,x.w,data)
+  let block:network.Block=array.get(n.decoder,index)
+  var rewritten:ops.Tensor=try convolve(n,p,library,joined,block.rewrite)
+  var activated:ops.Tensor=try glu(rewritten)
+  x=try convolve(n,p,library,activated,block.first)
+  if index+1<array.len(n.decoder){x=relu(x)}
+  index+=1}
+ if n.options.resample{
+  let values:array<f32>=try sinc.apply(struct.borrow(n,field=downsample_plan),array.view(x.data),x.c)
+  x=ops.tensor(x.c,1,x.w/2,values)}
+ if x.c!=8 or not num.finite(array.view(x.data)){return result.err("CPU waveform graph output is invalid")}
+ result.ok(x)
+}

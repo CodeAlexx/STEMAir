@@ -1,0 +1,324 @@
+module stemair.recording_audio
+import "waveform/resampled_audio.ai" as overlap_audio
+import "audio_normalization.ai" as normalization
+import "numeric.ai" as num
+import "chunks.ai" as chunks
+import "control.ai" as control
+import "ops.ai" as ops
+import "recording_shifts.ai" as shifts
+import std.tensor as tensor
+
+type Overlap=struct{split:bool,shift_offsets:array<u64>,overlap:f64,transition_power:f64}
+// Shifts wrap the whole normalized recording before triangle-weighted chunks.
+// The caller supplies its exact valid-length rule and original model forward.
+pub fn separate<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,c:ref<C>,size:u64,input:view<f32>,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var prepared:normalization.Prepared=try normalization.prepare(input)
+ separate_prepared(context,stream,parameters,n,c,size,prepared,cancel,progress,predictor,length_for)
+}
+// Caller-selected numerical preparation; chunk/shift composition remains shared.
+pub fn separate_prepared<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,c:ref<C>,size:u64,preparation:normalization.Prepared own,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var prepared:normalization.Prepared=preparation
+ let length:u64=prepared.frames
+ let mean:f32=prepared.mean
+ let scale:f32=prepared.scale
+ if scale==0.0{return result.ok(num.zeros(8*length))}
+ let normalized:array<f32>=struct.replace(prepared,[],field=samples)
+ var overlap:Overlap=Overlap{split:c.split,shift_offsets:[],overlap:c.overlap,transition_power:c.transition_power}
+ if array.len(c.shift_offsets)==0{
+  let raw:array<f32>=try overlap_audio.separate(context,stream,parameters,n,overlap,size,array.view(normalized),cancel,progress,predictor,length_for)
+  return normalization.restore(array.view(raw),length,mean,scale)}
+ let half:u64=22050
+ let padded:array<f32>=try chunks.context_finite(array.view(normalized),2,0,length,length+2*half)
+ var averaged:array<f32>=num.zeros(8*length)
+ var shift:u64=0
+ loop{if shift==array.len(c.shift_offsets){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let offset:u64=array.get(c.shift_offsets,shift)
+  let count:u64=length+half-offset
+  let shifted:array<f32>=try chunks.context_finite(array.view(padded),2,offset,count,count)
+  let raw:array<f32>=try overlap_audio.separate(context,stream,parameters,n,overlap,size,array.view(shifted),cancel,progress,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==8{break}
+   var time:u64=0
+   loop{if time==length{break}
+    let at:u64=channel*length+time
+    array.set(averaged,at,array.get(averaged,at)+array.get(raw,channel*count+half-offset+time))
+    time+=1}
+   channel+=1}
+  shift+=1}
+ let divisor:f32=cast.float(array.len(c.shift_offsets))
+ var i:u64=0
+ loop{if i==array.len(averaged){break}
+  array.set(averaged,i,array.get(averaged,i)/divisor)
+  i+=1}
+ normalization.restore(array.view(averaged),length,mean,scale)
+}
+
+pub fn separate_scheduled<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,c:ref<C>,schedule:ref<shifts.Schedule>,size:u64,input:view<f32>,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let prepared:normalization.Prepared=try normalization.prepare(input)
+ separate_prepared_scheduled(context,stream,parameters,n,c,schedule,size,prepared,cancel,progress,predictor,length_for)
+}
+
+pub fn separate_prepared_scheduled<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,c:ref<C>,schedule:ref<shifts.Schedule>,size:u64,preparation:normalization.Prepared own,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ let _=try shifts.require_geometry(schedule,shifts.Family.Outer,preparation.frames,c.split,size,c.overlap)
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ if preparation.scale==0.0{return result.ok(num.zeros(8*preparation.frames))}
+ let group:shifts.Group=try shifts.next_group(schedule)
+ separate_prepared_group(context,stream,parameters,n,c,schedule,size,preparation,group,cancel,progress,predictor,length_for)
+}
+
+pub fn separate_prepared_group<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,c:ref<C>,schedule:ref<shifts.Schedule>,size:u64,preparation:normalization.Prepared own,group:ref<shifts.Group>,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if schedule.groups!=1 or schedule.forwards!=0 or schedule.request.family!=shifts.Family.Outer or schedule.request.frames!=preparation.frames or schedule.request.split!=c.split or schedule.plan.segment!=size or schedule.request.overlap!=c.overlap{return result.err("Prepared outer group differs from the active recording schedule")}
+ if group.divisor!=(if schedule.request.count==0{1}else{schedule.request.count}) or group.shifted!=(schedule.request.count!=0) or array.len(group.offsets)!=schedule.plan.offsets_per_group{return result.err("Prepared outer offset group differs from the active request")}
+ var checked_offset:u64=0
+ loop{if checked_offset==array.len(group.offsets){break}
+  if array.get(group.offsets,checked_offset)>22050{return result.err("Prepared outer offset exceeds the original range")}
+  checked_offset+=1}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var source:normalization.Prepared=preparation
+ let length:u64=source.frames
+ let mean:f32=source.mean
+ let scale:f32=source.scale
+ if scale==0.0{return result.ok(num.zeros(8*length))}
+ let normalized:array<f32>=struct.replace(source,[],field=samples)
+ var overlap:Overlap=Overlap{split:c.split,shift_offsets:[],overlap:c.overlap,transition_power:c.transition_power}
+ if array.len(group.offsets)==0{
+  let _=try shifts.reserve_recording(schedule,length)
+  let raw:array<f32>=try overlap_audio.separate(context,stream,parameters,n,overlap,size,array.view(normalized),cancel,progress,predictor,length_for)
+  return normalization.restore(array.view(raw),length,mean,scale)}
+ let half:u64=22050
+ let padded:array<f32>=try chunks.context_finite(array.view(normalized),2,0,length,length+2*half)
+ var averaged:array<f32>=num.zeros(8*length)
+ var shift:u64=0
+ loop{if shift==array.len(group.offsets){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let offset:u64=array.get(group.offsets,shift)
+  let count:u64=length+half-offset
+  let shifted:array<f32>=try chunks.context_finite(array.view(padded),2,offset,count,count)
+  let _=try shifts.reserve_recording(schedule,count)
+  let raw:array<f32>=try overlap_audio.separate(context,stream,parameters,n,overlap,size,array.view(shifted),cancel,progress,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==8{break}
+   var time:u64=0
+   loop{if time==length{break}
+    let at:u64=channel*length+time
+    array.set(averaged,at,array.get(averaged,at)+array.get(raw,channel*count+half-offset+time))
+    time+=1}
+   channel+=1}
+  shift+=1}
+ let divisor:f32=cast.float(group.divisor)
+ var i:u64=0
+ loop{if i==array.len(averaged){break}
+  array.set(averaged,i,array.get(averaged,i)/divisor)
+  i+=1}
+ normalization.restore(array.view(averaged),length,mean,scale)
+}
+
+pub fn separate_prepared_sources<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,c:ref<C>,size:u64,sources:u64,preparation:normalization.Prepared own,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if sources<2 or sources>18446744073709551615/2{return result.err("Invalid separated source count")}
+ if preparation.frames>18446744073709551615/(2*sources){return result.err("Separated recording extent overflows")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var prepared:normalization.Prepared=preparation
+ let length:u64=prepared.frames
+ let mean:f32=prepared.mean
+ let scale:f32=prepared.scale
+ if scale==0.0{return result.ok(num.zeros(2*sources*length))}
+ let normalized:array<f32>=struct.replace(prepared,[],field=samples)
+ var overlap:Overlap=Overlap{split:c.split,shift_offsets:[],overlap:c.overlap,transition_power:c.transition_power}
+ if array.len(c.shift_offsets)==0{
+  let raw:array<f32>=try overlap_audio.separate_sources(context,stream,parameters,n,overlap,size,sources,array.view(normalized),cancel,progress,predictor,length_for)
+  return normalization.restore_sources(array.view(raw),length,sources,mean,scale)}
+ let half:u64=22050
+ let padded:array<f32>=try chunks.context_finite(array.view(normalized),2,0,length,length+2*half)
+ var averaged:array<f32>=num.zeros(2*sources*length)
+ var shift:u64=0
+ loop{if shift==array.len(c.shift_offsets){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let offset:u64=array.get(c.shift_offsets,shift)
+  let count:u64=length+half-offset
+  let shifted:array<f32>=try chunks.context_finite(array.view(padded),2,offset,count,count)
+  let raw:array<f32>=try overlap_audio.separate_sources(context,stream,parameters,n,overlap,size,sources,array.view(shifted),cancel,progress,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==2*sources{break}
+   var time:u64=0
+   loop{if time==length{break}
+    let at:u64=channel*length+time
+    array.set(averaged,at,array.get(averaged,at)+array.get(raw,channel*count+half-offset+time))
+    time+=1}
+   channel+=1}
+  shift+=1}
+ let divisor:f32=cast.float(array.len(c.shift_offsets))
+ var i:u64=0
+ loop{if i==array.len(averaged){break}
+  array.set(averaged,i,array.get(averaged,i)/divisor)
+  i+=1}
+ normalization.restore_sources(array.view(averaged),length,sources,mean,scale)
+}
+
+
+pub fn separate_prepared_group_sources<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,c:ref<C>,schedule:ref<shifts.Schedule>,size:u64,sources:u64,preparation:normalization.Prepared own,group:ref<shifts.Group>,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if sources<2 or sources>18446744073709551615/2{return result.err("Invalid separated source count")}
+ if preparation.frames>18446744073709551615/(2*sources){return result.err("Separated recording extent overflows")}
+ if schedule.groups!=1 or schedule.forwards!=0 or schedule.request.family!=shifts.Family.Outer or schedule.request.frames!=preparation.frames or schedule.request.split!=c.split or schedule.plan.segment!=size or schedule.request.overlap!=c.overlap{return result.err("Prepared outer group differs from the active recording schedule")}
+ if group.divisor!=(if schedule.request.count==0{1}else{schedule.request.count}) or group.shifted!=(schedule.request.count!=0) or array.len(group.offsets)!=schedule.plan.offsets_per_group{return result.err("Prepared outer offset group differs from the active request")}
+ var checked_offset:u64=0
+ loop{if checked_offset==array.len(group.offsets){break}
+  if array.get(group.offsets,checked_offset)>22050{return result.err("Prepared outer offset exceeds the original range")}
+  checked_offset+=1}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var source:normalization.Prepared=preparation
+ let length:u64=source.frames
+ let mean:f32=source.mean
+ let scale:f32=source.scale
+ if scale==0.0{return result.ok(num.zeros(2*sources*length))}
+ let normalized:array<f32>=struct.replace(source,[],field=samples)
+ var overlap:Overlap=Overlap{split:c.split,shift_offsets:[],overlap:c.overlap,transition_power:c.transition_power}
+ if array.len(group.offsets)==0{
+  let _=try shifts.reserve_recording(schedule,length)
+  let raw:array<f32>=try overlap_audio.separate_sources(context,stream,parameters,n,overlap,size,sources,array.view(normalized),cancel,progress,predictor,length_for)
+  return normalization.restore_sources(array.view(raw),length,sources,mean,scale)}
+ let half:u64=22050
+ let padded:array<f32>=try chunks.context_finite(array.view(normalized),2,0,length,length+2*half)
+ var averaged:array<f32>=num.zeros(2*sources*length)
+ var shift:u64=0
+ loop{if shift==array.len(group.offsets){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let offset:u64=array.get(group.offsets,shift)
+  let count:u64=length+half-offset
+  let shifted:array<f32>=try chunks.context_finite(array.view(padded),2,offset,count,count)
+  let _=try shifts.reserve_recording(schedule,count)
+  let raw:array<f32>=try overlap_audio.separate_sources(context,stream,parameters,n,overlap,size,sources,array.view(shifted),cancel,progress,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==2*sources{break}
+   var time:u64=0
+   loop{if time==length{break}
+    let at:u64=channel*length+time
+    array.set(averaged,at,array.get(averaged,at)+array.get(raw,channel*count+half-offset+time))
+    time+=1}
+   channel+=1}
+  shift+=1}
+ let divisor:f32=cast.float(group.divisor)
+ var i:u64=0
+ loop{if i==array.len(averaged){break}
+  array.set(averaged,i,array.get(averaged,i)/divisor)
+  i+=1}
+ normalization.restore_sources(array.view(averaged),length,sources,mean,scale)
+}
+
+pub fn separate_prepared_scheduled_sources<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,c:ref<C>,schedule:ref<shifts.Schedule>,size:u64,sources:u64,preparation:normalization.Prepared own,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if sources<2 or sources>18446744073709551615/2{return result.err("Invalid separated source count")}
+ if preparation.frames>18446744073709551615/(2*sources){return result.err("Separated recording extent overflows")}
+ let _=try shifts.require_geometry(schedule,shifts.Family.Outer,preparation.frames,c.split,size,c.overlap)
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ if preparation.scale==0.0{return result.ok(num.zeros(2*sources*preparation.frames))}
+ let group:shifts.Group=try shifts.next_group(schedule)
+ separate_prepared_group_sources(context,stream,parameters,n,c,schedule,size,sources,preparation,group,cancel,progress,predictor,length_for)
+}
+
+
+pub fn separate_scheduled_sources<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,c:ref<C>,schedule:ref<shifts.Schedule>,size:u64,sources:u64,input:view<f32>,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if sources<2 or sources>18446744073709551615/2{return result.err("Invalid separated source count")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let prepared:normalization.Prepared=try normalization.prepare(input)
+ separate_prepared_scheduled_sources(context,stream,parameters,n,c,schedule,size,sources,prepared,cancel,progress,predictor,length_for)
+}
+
+
+// Normalized recording for weighted model bundles; no source reorder or restoration.
+pub fn separate_normalized_sources<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,c:ref<C>,size:u64,sources:u64,preparation:normalization.Prepared own,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if sources<2 or sources>18446744073709551615/2{return result.err("Invalid separated source count")}
+ if preparation.frames>18446744073709551615/(2*sources){return result.err("Separated recording extent overflows")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var prepared:normalization.Prepared=preparation
+ let length:u64=prepared.frames
+ let scale:f32=prepared.scale
+ if scale==0.0{return result.ok(num.zeros(2*sources*length))}
+ let normalized:array<f32>=struct.replace(prepared,[],field=samples)
+ var overlap:Overlap=Overlap{split:c.split,shift_offsets:[],overlap:c.overlap,transition_power:c.transition_power}
+ if array.len(c.shift_offsets)==0{
+  let raw:array<f32>=try overlap_audio.separate_sources(context,stream,parameters,n,overlap,size,sources,array.view(normalized),cancel,progress,predictor,length_for)
+  return result.ok(raw)}
+ let half:u64=22050
+ let padded:array<f32>=try chunks.context_finite(array.view(normalized),2,0,length,length+2*half)
+ var averaged:array<f32>=num.zeros(2*sources*length)
+ var shift:u64=0
+ loop{if shift==array.len(c.shift_offsets){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let offset:u64=array.get(c.shift_offsets,shift)
+  let count:u64=length+half-offset
+  let shifted:array<f32>=try chunks.context_finite(array.view(padded),2,offset,count,count)
+  let raw:array<f32>=try overlap_audio.separate_sources(context,stream,parameters,n,overlap,size,sources,array.view(shifted),cancel,progress,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==2*sources{break}
+   var time:u64=0
+   loop{if time==length{break}
+    let at:u64=channel*length+time
+    array.set(averaged,at,array.get(averaged,at)+array.get(raw,channel*count+half-offset+time))
+    time+=1}
+   channel+=1}
+  shift+=1}
+ let divisor:f32=cast.float(array.len(c.shift_offsets))
+ var i:u64=0
+ loop{if i==array.len(averaged){break}
+  array.set(averaged,i,array.get(averaged,i)/divisor)
+  i+=1}
+ result.ok(averaged)
+}
+
+
+
+// Bag child output stays normalized and in the original source order.
+pub fn separate_normalized_group_sources<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,c:ref<C>,schedule:ref<shifts.Schedule>,size:u64,sources:u64,preparation:normalization.Prepared own,group:ref<shifts.Group>,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if sources<2 or sources>18446744073709551615/2{return result.err("Invalid separated source count")}
+ if preparation.frames>18446744073709551615/(2*sources){return result.err("Separated recording extent overflows")}
+ if schedule.groups!=1 or schedule.forwards!=0 or schedule.request.family!=shifts.Family.Outer or schedule.request.frames!=preparation.frames or schedule.request.split!=c.split or schedule.plan.segment!=size or schedule.request.overlap!=c.overlap{return result.err("Prepared outer group differs from the active recording schedule")}
+ if group.divisor!=(if schedule.request.count==0{1}else{schedule.request.count}) or group.shifted!=(schedule.request.count!=0) or array.len(group.offsets)!=schedule.plan.offsets_per_group{return result.err("Prepared outer offset group differs from the active request")}
+ var checked_offset:u64=0
+ loop{if checked_offset==array.len(group.offsets){break}
+  if array.get(group.offsets,checked_offset)>22050{return result.err("Prepared outer offset exceeds the original range")}
+  checked_offset+=1}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var source:normalization.Prepared=preparation
+ let length:u64=source.frames
+ let scale:f32=source.scale
+ if scale==0.0{return result.ok(num.zeros(2*sources*length))}
+ let normalized:array<f32>=struct.replace(source,[],field=samples)
+ var overlap:Overlap=Overlap{split:c.split,shift_offsets:[],overlap:c.overlap,transition_power:c.transition_power}
+ if array.len(group.offsets)==0{
+  let _=try shifts.reserve_recording(schedule,length)
+  let raw:array<f32>=try overlap_audio.separate_sources(context,stream,parameters,n,overlap,size,sources,array.view(normalized),cancel,progress,predictor,length_for)
+  return result.ok(raw)}
+ let half:u64=22050
+ let padded:array<f32>=try chunks.context_finite(array.view(normalized),2,0,length,length+2*half)
+ var averaged:array<f32>=num.zeros(2*sources*length)
+ var shift:u64=0
+ loop{if shift==array.len(group.offsets){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let offset:u64=array.get(group.offsets,shift)
+  let count:u64=length+half-offset
+  let shifted:array<f32>=try chunks.context_finite(array.view(padded),2,offset,count,count)
+  let _=try shifts.reserve_recording(schedule,count)
+  let raw:array<f32>=try overlap_audio.separate_sources(context,stream,parameters,n,overlap,size,sources,array.view(shifted),cancel,progress,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==2*sources{break}
+   var time:u64=0
+   loop{if time==length{break}
+    let at:u64=channel*length+time
+    array.set(averaged,at,array.get(averaged,at)+array.get(raw,channel*count+half-offset+time))
+    time+=1}
+   channel+=1}
+  shift+=1}
+ let divisor:f32=cast.float(group.divisor)
+ var i:u64=0
+ loop{if i==array.len(averaged){break}
+  array.set(averaged,i,array.get(averaged,i)/divisor)
+  i+=1}
+ result.ok(averaged)
+}

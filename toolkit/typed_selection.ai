@@ -1,0 +1,151 @@
+// Dense retained waveform selection with explicit scalar/track storage precision.
+module stemair.typed_selection
+import std.float as fp
+import std.pairwise_mean as mean
+import std.text as text
+import "recording_resources.ai" as resources
+import "control.ai" as control
+pub type Wave=enum{Narrow(array<f32>),Wide(array<f64>)}
+pub type Scalar=enum{Narrow(f32),Wide(f64)}
+pub type Part=struct{start:u64,frames:u64,selected:u64,costs:array<Scalar>}
+pub type Output=struct{samples:Wave,parts:array<Part>}
+pub fn is_wide(wave:ref<Wave>)->bool effects {} {match wave{Narrow(_)=>false,Wide(_)=>true}}
+pub fn length(wave:ref<Wave>)->u64 effects {} {match wave{Narrow(v)=>array.len(v),Wide(v)=>array.len(v)}}
+pub fn scalar_wide(value:Scalar)->f64 effects {} {match value{Narrow(v)=>cast.float(v),Wide(v)=>v}}
+pub fn sample_wide(wave:ref<Wave>,index:u64)->f64 effects {} {
+ match wave{Narrow(v)=>cast.float(array.get(v,index)),Wide(v)=>array.get(v,index)}
+}
+pub fn sample_narrow(wave:ref<Wave>,index:u64)->f32 effects {} {
+ match wave{Narrow(v)=>array.get(v,index),Wide(v)=>cast.float(array.get(v,index))}
+}
+pub fn abs_mean(wave:ref<Wave>,begin:u64,end:u64)->Scalar effects {alloc} {
+ match wave{
+  Narrow(v)=>{
+   var absolute:array<f32>=[]
+   array.reserve(absolute,end-begin)
+   var i:u64=begin
+   loop{if i==end{break}
+    array.push(absolute,fp.abs(array.get(v,i)))
+    i+=1}
+   Scalar.Narrow(mean.mean_f32(array.view(absolute)))
+  },
+  Wide(v)=>{
+   var absolute:array<f64>=[]
+   array.reserve(absolute,end-begin)
+   var i:u64=begin
+   loop{if i==end{break}
+    array.push(absolute,fp.abs(array.get(v,i)))
+    i+=1}
+   Scalar.Wide(mean.mean_f64(array.view(absolute)))
+  }
+ }
+}
+// Numeric cross-precision equality; fresh NaN scalar keys never replace.
+pub fn ordered_unique_indices(costs:view<Scalar>)->array<u64> effects {alloc} {
+ var keys:array<Scalar>=[]
+ var values:array<u64>=[]
+ array.reserve(keys,view.len(costs))
+ array.reserve(values,view.len(costs))
+ var i:u64=0
+ loop{if i==view.len(costs){break}
+  let cost:Scalar=view.get(costs,i)
+  var key:u64=0
+  loop{if key==array.len(keys) or scalar_wide(cost)==scalar_wide(array.get(keys,key)){break}
+   key+=1}
+  if key==array.len(keys){array.push(keys,cost)
+   array.push(values,i)}else{array.set(values,key,i)}
+  i+=1}
+ values
+}
+pub fn first_min_index(costs:view<Scalar>)->result<u64,string> effects {alloc} {
+ if view.len(costs)==0{return result.err("Cannot select from empty waveform costs")}
+ var best:u64=0
+ var value:f64=scalar_wide(view.get(costs,0))
+ if fp.is_nan(value){return result.ok(0)}
+ var i:u64=1
+ loop{if i==view.len(costs){break}
+  let current:f64=scalar_wide(view.get(costs,i))
+  if fp.is_nan(current){return result.ok(i)}
+  if current<value{value=current
+   best=i}
+  i+=1}
+ result.ok(best)
+}
+pub fn select_chunks(waves:ref<array<Wave>>,indices:view<u64>,frames:u64,channels:u64,sections:u64,max_working_bytes:u64,cancel:str,progress:str)->result<Output,string>
+ effects {alloc,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Waveform selection cancelled")}
+ let count:u64=view.len(indices)
+ if count==0 or (channels!=1 and channels!=2) or sections==0{return result.err("Selection requires dense mono/stereo tracks and nonzero sections")}
+ let samples:u64=try resources.multiply(frames,channels)
+ var retained:u64=0
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  let wave:ref<Wave>=array.borrow(waves,i)
+  if length(wave)!=samples{return result.err("Waveform selection input extents differ")}
+  retained=try resources.checked_add(retained,try resources.multiply(samples,if is_wide(wave){8}else{4}))
+  i+=1}
+ i=0
+ loop{if i==count{break}
+  if view.get(indices,i)>=array.len(waves){return result.err("Waveform selection index is outside retained tracks")}
+  i+=1}
+ let metadata:u64=try resources.multiply(sections,try resources.checked_add(128,try resources.multiply(count,32)))
+ let scratch:u64=try resources.multiply(samples,16)
+ let estimate:u64=try resources.checked_add(try resources.checked_add(retained,scratch),metadata)
+ if estimate>max_working_bytes{return result.err("Waveform selection exceeds the caller working-memory limit")}
+ var parts:array<Part>=[]
+ array.reserve(parts,sections)
+ let small:u64=frames/sections
+ let extra:u64=frames%sections
+ var start:u64=0
+ var part:u64=0
+ var wide:bool=false
+ loop{if part==sections{break}
+  if control.cancelled(cancel){return result.err("Waveform selection cancelled")}
+  control.status(progress,text.concat("Selecting section ",string.from_int(part)))
+  let frames_here:u64=small+(if part<extra{1}else{0})
+  var costs:array<Scalar>=[]
+  array.reserve(costs,count)
+  i=0
+  loop{if i==count{break}
+   let wave:ref<Wave>=array.borrow(waves,view.get(indices,i))
+   array.push(costs,abs_mean(wave,start*channels,(start+frames_here)*channels))
+   i+=1}
+  let selected:u64=try first_min_index(array.view(costs))
+  let wave:ref<Wave>=array.borrow(waves,view.get(indices,selected))
+  if is_wide(wave){wide=true}
+  array.push(parts,Part{start:start,frames:frames_here,selected:selected,costs:costs})
+  start+=frames_here
+  part+=1}
+ // Empty selected chunks also participate in concatenate's output dtype.
+ if wide{
+  var out:array<f64>=[]
+  array.reserve(out,samples)
+  part=0
+  loop{if part==sections{break}
+   if control.cancelled(cancel){return result.err("Waveform selection cancelled")}
+   let item:ref<Part>=array.borrow(parts,part)
+   let wave:ref<Wave>=array.borrow(waves,view.get(indices,item.selected))
+   i=item.start*channels
+   let end:u64=(item.start+item.frames)*channels
+   loop{if i==end{break}
+    array.push(out,sample_wide(wave,i))
+    i+=1}
+   part+=1}
+  result.ok(Output{samples:Wave.Wide(out),parts:parts})
+ }else{
+  var out:array<f32>=[]
+  array.reserve(out,samples)
+  part=0
+  loop{if part==sections{break}
+   if control.cancelled(cancel){return result.err("Waveform selection cancelled")}
+   let item:ref<Part>=array.borrow(parts,part)
+   let wave:ref<Wave>=array.borrow(waves,view.get(indices,item.selected))
+   i=item.start*channels
+   let end:u64=(item.start+item.frames)*channels
+   loop{if i==end{break}
+    array.push(out,sample_narrow(wave,i))
+    i+=1}
+   part+=1}
+  result.ok(Output{samples:Wave.Narrow(out),parts:parts})
+ }
+}

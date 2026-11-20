@@ -1,0 +1,73 @@
+module stemair.input_verification
+import "checked_input.ai" as checked
+import "../toolkit/control.ai" as control
+import std.text as text
+
+pub type Failure=struct{index:u64,input:string,message:string} derive codec(strict)
+pub type Report=struct{total:u64,attempted:u64,completed:bool,cancelled:bool,failures:array<Failure>,message:string} derive codec(strict)
+pub type Envelope=struct{queue:bool,generation:u64,inputs:array<string>,report:Report} derive codec(strict)
+
+fn stopped(report:ref<Report>,options:ref<checked.Options>)->bool effects {alloc,fs.meta,time} {
+ if control.cancelled(options.cancel_file){
+  report.cancelled=true
+  report.message="Verification stopped; input list unchanged"
+  return true}
+ if time.monotonic_ns()>=options.deadline_ns{
+  report.message="Verification deadline reached; input list unchanged"
+  return true}
+ false
+}
+
+// Caller owns its immutable input snapshot, model state and list commit. This
+// worker records original row indices and never mutates inputs or model state.
+pub fn scan(inputs:ref<array<string>>,options:ref<checked.Options>,max_header_bytes:u64,progress:str)->Report
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ var report:Report=Report{total:array.len(inputs),attempted:0,completed:false,cancelled:false,failures:[],message:"No inputs to verify"}
+ if report.total==0{return report}
+ let cancel:string=string.copy(options.cancel_file)
+ var i:u64=0
+ loop{if i==report.total{break}
+  if stopped(report,options){return report}
+  control.status(progress,text.concat("Verifying recording ",text.concat(string.from_int(i+1),text.concat(" / ",string.from_int(report.total)))))
+  var policy:checked.Options=checked.queue_item(options,i,cancel)
+  let input:str=array.get(inputs,i)
+  match checked.prefix_classified(input,44100,3,max_header_bytes,policy){
+   ok(value)=>{
+    if not value.temporary_removed{
+     report.message=text.concat("Verification could not remove owned conversion files; input list unchanged: ",value.temporary_directory)
+     return report}},
+   err(problem)=>{
+    if problem.kind!=checked.PrefixFailureKind.Recording{
+     report.cancelled=problem.kind==checked.PrefixFailureKind.Cancelled
+     report.message=text.concat(problem.message,"; input list unchanged")
+     return report}
+    array.push(report.failures,Failure{index:i,input:string.copy(input),message:string.copy(problem.message)})}
+  }
+  report.attempted+=1
+  i+=1}
+ if stopped(report,options){return report}
+ report.completed=true
+ report.message=if array.len(report.failures)==0{"Verification complete: no errors found"}else{
+  text.concat("Verification complete: ",text.concat(string.from_int(array.len(report.failures))," unreadable recordings"))}
+ report
+}
+
+// Only a completed scan can produce a list edit. Validate the whole report
+// before calculating retained indices; callers preserve paths/folder identity.
+pub fn retained(report:ref<Report>,count:u64)->result<array<u64>,string> effects {alloc} {
+ if not report.completed or report.cancelled or report.total!=count or report.attempted!=count{
+  return result.err("Verification is incomplete or the input list changed")}
+ var failed:u64=0
+ loop{if failed==array.len(report.failures){break}
+  let index:u64=array.borrow(report.failures,failed).index
+  if index>=count or (failed>0 and index<=array.borrow(report.failures,failed-1).index){
+   return result.err("Verification failure rows are invalid")}
+  failed+=1}
+ var kept:array<u64>=[]
+ var i:u64=0
+ failed=0
+ loop{if i==count{break}
+  if failed<array.len(report.failures) and array.borrow(report.failures,failed).index==i{failed+=1}else{array.push(kept,i)}
+  i+=1}
+ result.ok(kept)
+}

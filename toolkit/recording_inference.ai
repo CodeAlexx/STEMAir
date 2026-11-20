@@ -1,0 +1,33 @@
+module stemair.recording_inference
+import "recording_shifts.ai" as shifts
+import std.python_random as random
+import std.float as fp
+pub type Options=struct{shifts:u64,split:bool,overlap:f64=0.25,segment_seconds:u64=0} derive codec(strict)
+// One accepted request owns one stream. Sequential models and callbacks consume
+// it in caller traversal order; no implicit reseeding or global RNG mutation.
+pub type Stream=struct{seed:u64,generator:random.Generator,active:bool=false,requests:u64=0}
+pub type Observation=struct{seed:u64,shifts:u64,groups:u64,reserved_forwards:u64,segment_frames:u64,segment_seconds_ignored:bool} derive codec(strict)
+pub fn stream(seed:u64)->Stream effects {alloc} {Stream{seed:seed,generator:random.generator(seed)}}
+pub fn validate(c:ref<Options>)->result<unit,string> effects {alloc} {
+ if not fp.is_finite(c.overlap) or c.overlap<0.0 or c.overlap>=1.0 or c.segment_seconds>200{return result.err("Invalid recording inference overlap or segment selection")}
+ result.ok(())
+}
+// The original raw-single GUI segment setter has no effect. Its requested text
+// remains observable, while the retained model's actual segment is supplied here.
+pub fn begin(s:ref<Stream>,c:ref<Options>,family:shifts.Family,frames:u64,segment:u64,limits:shifts.Limits)->result<shifts.Schedule,string> effects {alloc} {
+ let _=try validate(c)
+ if s.active{return result.err("Recording RNG stream is already borrowed by an active inference")}
+ let r:shifts.Request=shifts.Request{family:family,count:c.shifts,seed:s.seed,frames:frames,split:c.split,segment:segment,overlap:if family==shifts.Family.First{0.25}else{c.overlap}}
+ let plan:shifts.Forecast=try shifts.forecast(r,limits)
+ let generator:random.Generator=struct.replace(s,random.generator(0),field=generator)
+ s.active=true
+ result.ok(shifts.Schedule{request:r,plan:plan,limits:limits,generator:generator})
+}
+// Call after either success or failure, so cancellation preserves the actual
+// consumed RNG state. The parked stream cannot be reused while a schedule owns it.
+pub fn finish(s:ref<Stream>,schedule:ref<shifts.Schedule>,c:ref<Options>)->Observation effects {alloc} {
+ s.generator=struct.replace(schedule,random.generator(0),field=generator)
+ s.active=false
+ s.requests+=1
+ Observation{seed:s.seed,shifts:schedule.request.count,groups:schedule.groups,reserved_forwards:schedule.forwards,segment_frames:schedule.plan.segment,segment_seconds_ignored:c.segment_seconds!=0}
+}

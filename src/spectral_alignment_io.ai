@@ -1,0 +1,105 @@
+module stemair.spectral_alignment_io
+import "spectral_alignment_application.ai" as application
+import "recording_alignment_application.ai" as base
+import "alignment_choices.ai" as choices
+import "checked_input.ai" as checked
+import "container_export.ai" as container
+import "../toolkit/typed_selection.ai" as typed
+import "../toolkit/spectral_matching.ai" as spectral
+import "../toolkit/recording_preparation.ai" as preparation
+import "../toolkit/leading_silence.ai" as silence
+import "../toolkit/control.ai" as control
+import std.audio as audio
+import std.cpu_dot as dot
+import std.codec as codec
+import std.path as path
+
+type Automatic=struct{inverted:bool,coefficient_word:string,frames:u64} derive codec(strict)
+type Silence=struct{frame:u64,channel:u64,energy_words:array<string>} derive codec(strict)
+type Recipe=struct{windows:string,intros:string,gain:string,phase:string,save_aligned:bool,initial_polarity:string,match_silence:bool,spectral_match:bool} derive codec(strict)
+type Intro=struct{divisor:u64,index:u64,left_lag:i64,right_lag:i64,raw_frames:u64,promoted:bool,unique_index:u64} derive codec(strict)
+type Cost=struct{wide:bool,word:string} derive codec(strict)
+type Manifest=struct{operation:string,mode:string,first:string,second:string,frames:u64,channels:u64,sample_rate:u32,recipe:Recipe,
+ inverted:bool,silence_delta:i64,automatic:option<Automatic>,reference_silence:option<Silence>,target_silence:option<Silence>,
+ intro_candidates:array<Intro>,costs:array<Cost>,dictionary_indices:array<u64>,spectral_invocations:u64,
+ residual_dtype:string,aligned_dtype:string,residual:string,aligned:string,backend:string,checkpoint_loads:u64} derive codec(strict)
+fn silence_observation(value:ref<option<silence.End>>)->result<option<Silence>,string> effects {alloc} {
+ match value{none=>result.ok(option.none()),some(item)=>{
+  var words:array<string>=[]
+  var i:u64=0
+  loop{if i==array.len(item.energies){break}
+   let values:array<f32>=[array.get(item.energies,i)]
+   let packed:dot.Buffer=try dot.pack(array.view(values))
+   array.push(words,bytes.hex(bytes.view(packed.data)))
+   i+=1}
+  result.ok(option.some(Silence{frame:item.frame,channel:item.channel,energy_words:words}))}}
+}
+fn discard(value:typed.Wave own)->unit effects {} {()}
+fn write_wave(file:str,wave:typed.Wave own,channels:u16,plan:ref<container.Plan>,log:ref<container.Journal>,cancel:str,progress:str)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ match wave{Narrow(values)=>{
+  let buffer:audio.AudioBuffer=audio.AudioBuffer{samples:values,rate:44100,channels:channels}
+  container.write_buffer(file,buffer,plan,log,cancel,progress)},
+  Wide(values)=>container.write_buffer_f64(file,array.view(values),44100,channels,plan,log,cancel,progress)}
+}
+// Called only inside the existing common whole-bank thread lease.
+pub fn run(settings:ref<base.Settings>,recipe:ref<choices.Recipe>,first:str,second:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:ref<checked.Options>)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ let _=try choices.validate_any(recipe)
+ let _=try container.verify(plan)
+ let _=try container.require_directory(directory)
+ let start:u64=array.len(log.artifacts)
+ let _=try container.preflight_tracked(container.target(directory,"residual",plan),plan,log)
+ if recipe.save_aligned{let _=try container.preflight_tracked(container.target(directory,"aligned",plan),plan,log)}
+ let _=try container.preflight_metadata_tracked(path.join(directory,"recording-alignment.json"),log)
+ let a:audio.AudioBuffer=try checked.buffer(first,44100,checked.queue_item(options,0,cancel))
+ let b:audio.AudioBuffer=try checked.buffer(second,44100,checked.queue_item(options,1,cancel))
+ var value:application.Output=try application.compute_buffers(settings,recipe,a,b,cancel,progress,false)
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled before export")}
+ let observed:ref<preparation.Observation>=struct.borrow(value,field=preparation)
+ let automatic:option<Automatic>=match observed.automatic{none=>option.none(),some(item)=>{
+  let values:array<f64>=[item.coefficient]
+  let packed:dot.BufferF64=try dot.pack_f64(array.view(values))
+  option.some(Automatic{inverted:item.inverted,coefficient_word:bytes.hex(bytes.view(packed.data)),frames:item.frames})}}
+ let reference_silence:option<Silence>=try silence_observation(struct.borrow(observed,field=reference_silence))
+ let target_silence:option<Silence>=try silence_observation(struct.borrow(observed,field=target_silence))
+ let finalization:ref<spectral.Final>=struct.borrow(value,field=finalization)
+ let channels:u64=finalization.channels
+ let frames:u64=finalization.frames
+ let invocations:u64=finalization.invocations
+ let residual_dtype:string=string.copy(if typed.is_wide(struct.borrow(finalization,field=residual)){"f64"}else{"f32"})
+ let aligned_dtype:string=if recipe.save_aligned{string.copy(if typed.is_wide(struct.borrow(finalization,field=aligned)){"f64"}else{"f32"})}else{""}
+ let inverted:bool=observed.inverted
+ let silence_delta:i64=observed.silence_delta
+ var intros:array<Intro>=[]
+ var costs:array<Cost>=[]
+ var i:u64=0
+ loop{if i==array.len(value.intros){break}
+  let item:ref<application.Intro>=array.borrow(value.intros,i)
+  array.push(intros,Intro{divisor:item.divisor,index:item.index,left_lag:item.left_lag,right_lag:item.right_lag,raw_frames:item.raw_frames,promoted:item.promoted,unique_index:item.unique_index})
+  i+=1}
+ i=0
+ loop{if i==array.len(value.costs){break}
+  let item:ref<application.Cost>=array.borrow(value.costs,i)
+  array.push(costs,Cost{wide:item.wide,word:string.copy(item.word)})
+  i+=1}
+ let indices:array<u64>=struct.replace(value,[],field=indices)
+ let copy:Recipe=Recipe{windows:string.copy(recipe.windows),intros:string.copy(recipe.intros),gain:string.copy(recipe.gain),phase:string.copy(recipe.phase),save_aligned:recipe.save_aligned,initial_polarity:string.copy(recipe.initial_polarity),match_silence:recipe.match_silence,spectral_match:true}
+ let report:Manifest=Manifest{operation:"recording-alignment",mode:"spectral-matching",first:string.copy(first),second:string.copy(second),frames:frames,channels:channels,sample_rate:44100,recipe:copy,
+  inverted:inverted,silence_delta:silence_delta,automatic:automatic,reference_silence:reference_silence,target_silence:target_silence,
+  intro_candidates:intros,costs:costs,dictionary_indices:indices,spectral_invocations:invocations,
+  residual_dtype:residual_dtype,aligned_dtype:aligned_dtype,residual:container.filename("residual",plan),aligned:if recipe.save_aligned{container.filename("aligned",plan)}else{""},backend:"native-air-cpu",checkpoint_loads:0}
+ let raw:string=try Manifest_encode(report) map_err codec.describe
+ let output:ref<spectral.Final>=struct.borrow(value,field=finalization)
+ discard(struct.replace(output,typed.Wave.Narrow([]),field=unclipped))
+ discard(struct.replace(output,typed.Wave.Narrow([]),field=clipped))
+ if not recipe.save_aligned{discard(struct.replace(output,typed.Wave.Narrow([]),field=aligned))}
+ let residual:typed.Wave=struct.replace(output,typed.Wave.Narrow([]),field=residual)
+ let _=try write_wave(container.target(directory,"residual",plan),residual,cast.wrap(channels),plan,log,cancel,progress)
+ if recipe.save_aligned{
+  let aligned:typed.Wave=struct.replace(output,typed.Wave.Narrow([]),field=aligned)
+  let _=try write_wave(container.target(directory,"aligned",plan),aligned,cast.wrap(channels),plan,log,cancel,progress)}
+ container.write_metadata(path.join(directory,"recording-alignment.json"),raw,plan,log,start)
+}

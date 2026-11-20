@@ -1,0 +1,92 @@
+module stemair.typed_secondary_cpu
+import "recording_sources.ai" as recording_sources
+import "typed_secondary.ai" as secondary
+import "typed_secondary_cache.ai" as retained
+import "typed_source_wave.ai" as source
+import "typed_model_result.ai" as model_result
+import "learned_cleanup_waves.ai" as learned
+import "audio_result.ai" as audio
+import "wave_boundary.ai" as boundary
+import "secondary.ai" as plan
+import "secondary_config.ai" as config
+import "model_cache.ai" as cache
+import "model_roles.ai" as roles
+import "mask/request.ai" as request
+import "control.ai" as control
+import "recording_context.ai" as recording_context
+import "cpu_inference.ai" as cpu_request
+import "cpu_capability.ai" as capability
+import std.audio as wav
+
+pub type Limits=struct{max_retained_bytes:u64,max_working_bytes:u64,allow_provisional_spectral:bool=false}
+// The caller retains weights and chooses the output serialization policy.
+pub fn separate(bank:ref<cache.Cache>,bindings:ref<array<plan.Binding>>,p:ref<plan.Plan>,c:ref<config.Recipe>,input:ref<audio.Samples>,limits:Limits,working_wav:wav.WavSubtype,high_band:request.HighBand,cancel:str,progress:str)->result<secondary.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var policy:request.Policy=request.defaults()
+ policy.high_band=high_band
+ separate_with_policy(bank,bindings,p,c,input,limits,working_wav,policy,cancel,progress)
+}
+pub fn separate_with_policy(bank:ref<cache.Cache>,bindings:ref<array<plan.Binding>>,p:ref<plan.Plan>,c:ref<config.Recipe>,input:ref<audio.Samples>,limits:Limits,working_wav:wav.WavSubtype,policy:ref<request.Policy>,cancel:str,progress:str)->result<secondary.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var controls:recording_context.Context=recording_context.disabled()
+ separate_with_policy_controlled(bank,bindings,p,c,input,limits,working_wav,policy,cancel,progress,controls)
+}
+
+pub fn separate_with_policy_controlled(bank:ref<cache.Cache>,bindings:ref<array<plan.Binding>>,p:ref<plan.Plan>,c:ref<config.Recipe>,input:ref<audio.Samples>,limits:Limits,working_wav:wav.WavSubtype,policy:ref<request.Policy>,cancel:str,progress:str,controls:ref<recording_context.Context>)->result<secondary.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var inputs:recording_sources.Set=recording_sources.empty()
+ separate_with_policy_controlled_inputs(bank,bindings,p,c,input,limits,working_wav,policy,cancel,progress,controls,inputs)
+}
+pub fn separate_with_policy_controlled_inputs(bank:ref<cache.Cache>,bindings:ref<array<plan.Binding>>,p:ref<plan.Plan>,c:ref<config.Recipe>,input:ref<audio.Samples>,requested:Limits,working_wav:wav.WavSubtype,policy:ref<request.Policy>,cancel:str,progress:str,controls:ref<recording_context.Context>,inputs:ref<recording_sources.Set>)->result<secondary.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try recording_context.validate(controls)
+ var limits:Limits=requested
+ limits.max_working_bytes=try recording_sources.available(inputs,limits.max_working_bytes)
+ limits.max_retained_bytes=try recording_sources.available(inputs,limits.max_retained_bytes)
+ let _=try plan.validate(c)
+ let _=try request.validate_policy(policy)
+ let _=try cache.require_cpu_policy(bank)
+ let work:source.Limits=source.Limits{max_working_bytes:limits.max_working_bytes,allow_provisional_spectral:limits.allow_provisional_spectral}
+ let held:retained.Limits=retained.Limits{max_retained_bytes:limits.max_retained_bytes}
+ var stages:array<plan.Stage>=plan.stages(p,c)
+ var i:u64=0
+ loop{if i==array.len(stages){break}
+  let stage:ref<plan.Stage>=array.borrow(stages,i)
+  if stage.model>=array.len(c.models){return result.err("A secondary stage model is out of range")}
+  let member:u64=try plan.binding(bindings,stage.model)
+  if member>=array.len(bank.entries){return result.err("A secondary model binding is out of range")}
+  let _=try capability.require_ready(bank,member)
+  i+=1}
+ let primary_index:u64=try plan.binding(bindings,0)
+ var primary:audio.Samples=try recording_sources.master(inputs,array.borrow(bank.entries,primary_index).model.profile.identity,input,work)
+ var state:retained.State=retained.empty()
+ i=0
+ loop{if i==array.len(stages){break}
+  if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+  let stage:ref<plan.Stage>=array.borrow(stages,i)
+  let member:u64=try plan.binding(bindings,stage.model)
+  let names:array<string>=try roles.targets(struct.borrow(array.borrow(bank.entries,member).model,field=profile),array.borrow(c.models,stage.model),stage.source)
+  let kind:string=string.copy(array.borrow(bank.entries,member).model.profile.kind)
+  let mask:bool=str.view(kind)=="mask"
+  control.status(progress,plan.progress_message(c,i+1,array.len(stages)))
+  var master:audio.Samples=if str.view(stage.source)=="instrumental"{try secondary.instrumental_input(state,c,primary,work)}else{
+   if str.view(stage.source)=="vocals"{try secondary.vocal_input(state,c,primary,work,cancel,progress)}else{try recording_sources.master(inputs,array.borrow(bank.entries,member).model.profile.identity,input,work)}}
+  // Array callbacks to the band-mask family pass through the chosen WAV subtype
+  // and F32 reload. Other model families cast at their tensor input boundary.
+  let tensor:array<f32>=if mask and str.view(stage.source)!="recording"{
+   try boundary.serialized_f32(master,44100,2,working_wav,boundary.Limits{max_working_bytes:limits.max_working_bytes})
+  }else{try boundary.model_f32(master,boundary.Limits{max_working_bytes:limits.max_working_bytes})}
+  var stage_policy:request.Policy=request.with_foreground(policy,roles.foreground(array.borrow(c.models,stage.model),stage.source))
+  let lower:array<f32>=if str.view(stage.source)=="recording"{try recording_sources.lower(inputs,array.borrow(bank.entries,member).model.profile.identity,work)}else{[]}
+  let samples:audio.Samples=try cpu_request.separate_with_policy_and_band_input(bank,member,array.view(tensor),cancel,progress,stage_policy,controls,array.view(lower))
+  var predicted:model_result.Output=try model_result.finish_with_reference(kind,stage.source,names,master,samples,work,array.view(controls.frequency_reference))
+  let _=try learned.noise_cpu(bank,kind,struct.borrow(predicted,field=sources),master,work,cancel)
+  let sources:array<source.Wave>=struct.replace(predicted,[],field=sources)
+  let order:array<string>=struct.replace(predicted,[],field=write_order)
+  let _=try retained.push_sources(state,stage.model,sources,order,stage.source,held)
+  if c.keep_members and str.view(stage.source)!="recording"{let _=try retained.capture(state,stage.model,stage.source,master,held)}
+  i+=1}
+ let settings=cache.learned_settings(bank)
+ if not settings.room{return secondary.finish(state,p,c,primary,work,cancel,progress)}
+ var raw:array<source.Wave>=[]
+ var output:secondary.Output=try secondary.finish_captured(state,p,c,primary,work,cancel,progress,raw)
+ let originals:array<source.Wave>=struct.replace(output,[],field=stems)
+ output.stems=try learned.room_saved_cpu(bank,originals,raw,false,plan.vocal_model(c)>0,c.normalize,cancel)
+ result.ok(output)
+}

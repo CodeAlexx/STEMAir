@@ -1,0 +1,56 @@
+module stemair.temporal.host_session
+import "network.ai" as network
+import "host.ai" as host
+import "../waveform/config.ai" as config
+import "../waveform/host_audio.ai" as first
+import "../waveform/host_resampled_audio.ai" as second
+import "../audio_normalization.ai" as normalization
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../control.ai" as control
+
+import "../recording_shifts.ai" as shifts
+pub type Prepared=struct{backend:host.Backend,requests:u64=0,forward_calls:u64=0}
+pub fn prepare(n:ref<network.Network>)->result<Prepared,string> effects {alloc} {
+ result.ok(Prepared{backend:try host.prepare(n)})
+}
+fn length_for(n:ref<network.Network>,length:u64)->result<u64,string> effects {alloc} {network.valid_length(n,length)}
+fn predict(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ let output:ops.Tensor=try host.forward(n,struct.borrow(p,field=backend),library,input,cancel)
+ p.forward_calls+=1
+ result.ok(output)
+}
+pub fn separate(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ if c.generation!=n.options.generation or str.view(c.engine)!="temporal"{return result.err("Temporal CPU configuration differs from retained checkpoint")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var output:array<f32>=[]
+ if c.generation==1{
+  output=try first.separate(n,p,library,c,input,cancel,progress,predict,length_for)
+ }else{
+  var normalized:normalization.Prepared=try normalization.prepare(input)
+  if normalized.scale==0.0{output=num.zeros(8*normalized.frames)}else{
+   let raw:array<f32>=try second.separate(n,p,library,c,config.segment_length(c),array.view(normalized.samples),cancel,progress,predict,length_for)
+   output=try normalization.restore(array.view(raw),normalized.frames,normalized.mean,normalized.scale)}
+ }
+ p.requests+=1
+ result.ok(output)
+}
+
+// Explicit request schedule; legacy fixed-offset separate remains available.
+pub fn separate_scheduled(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,c:ref<config.Config>,schedule:ref<shifts.Schedule>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ if c.generation!=n.options.generation or str.view(c.engine)!="temporal"{return result.err("Temporal CPU configuration differs from retained checkpoint")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var output:array<f32>=[]
+ if c.generation==1{
+  output=try first.separate_scheduled(n,p,library,c,schedule,input,cancel,progress,predict,length_for)
+ }else{
+  var normalized:normalization.Prepared=try normalization.prepare(input)
+  if normalized.scale==0.0{output=num.zeros(8*normalized.frames)}else{
+   let raw:array<f32>=try second.separate_scheduled(n,p,library,c,schedule,config.segment_length(c),array.view(normalized.samples),cancel,progress,predict,length_for)
+   output=try normalization.restore(array.view(raw),normalized.frames,normalized.mean,normalized.scale)}
+ }
+ p.requests+=1
+ result.ok(output)
+}

@@ -1,0 +1,70 @@
+{
+  "schema": "air.project",
+  "version": 1,
+  "package": {
+    "name": "stem-air",
+    "version": "0.1.0",
+    "namespace": "stemair",
+    "description": "Native AIR music separation application",
+    "license": "MIT"
+  },
+  "sources": [
+    "src",
+    "toolkit",
+    "delivery/package-state.ai"
+  ],
+  "targets": {
+    "bin": [
+      {
+        "name": "stem-air",
+        "entry": "src/main.ai"
+      },
+      {
+        "name": "stem-air-gpu",
+        "entry": "src/gpu_main.ai"
+      },
+      {
+        "name": "StemAIR",
+        "entry": "src/desktop.ai"
+      },
+      {
+        "name": "stem-catalog",
+        "entry": "src/catalog_main.ai"
+      },
+      {
+        "name": "stem-align",
+        "entry": "src/alignment_main.ai"
+      },
+      {
+        "name": "stem-recording-align",
+        "entry": "src/recording_alignment_main.ai"
+      },
+      {
+        "name": "stem-time",
+        "entry": "src/time_main.ai"
+      },
+      {
+        "name": "stem-export",
+        "entry": "src/export_main.ai"
+      },
+      {
+        "name": "stem-export-codec",
+        "entry": "src/compressed_export_main.ai"
+      },
+      {
+        "name": "stem-package-state",
+        "entry": "delivery/package-state.ai"
+      }
+    ]
+  },
+  "requires": {
+    "os": [
+      "windows",
+      "linux"
+    ],
+    "arch": [
+      "x86_64"
+    ],
+    "airc": ">=0.1.0"
+  }
+}

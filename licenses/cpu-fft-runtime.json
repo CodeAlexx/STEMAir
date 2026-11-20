@@ -1,0 +1,88 @@
+{
+  "schema": "native-cpu-transform-runtime-v1",
+  "hosts": {
+    "windows": {
+      "file": "air_cpu_fft.dll",
+      "bytes": 738201,
+      "sha256": "299e0c80c655c8ed6217254ab84f42537751c2b7238947a9d3aecf5c0c32d23f",
+      "abi": 1,
+      "dynamic_dependencies": [
+        "KERNEL32.dll",
+        "api-ms-win-crt-convert-l1-1-0.dll",
+        "api-ms-win-crt-environment-l1-1-0.dll",
+        "api-ms-win-crt-heap-l1-1-0.dll",
+        "api-ms-win-crt-locale-l1-1-0.dll",
+        "api-ms-win-crt-math-l1-1-0.dll",
+        "api-ms-win-crt-private-l1-1-0.dll",
+        "api-ms-win-crt-runtime-l1-1-0.dll",
+        "api-ms-win-crt-stdio-l1-1-0.dll",
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "api-ms-win-crt-utility-l1-1-0.dll"
+      ],
+      "dynamic_symbol_versions": []
+    },
+    "linux": {
+      "file": "libair_cpu_fft.so",
+      "bytes": 211064,
+      "sha256": "3be4222632603d3240c1df1a5ee27185ba0b8ccd6721bb08124263c49f5c69cc",
+      "abi": 1,
+      "dynamic_dependencies": [
+        "ld-linux-x86-64.so.2",
+        "libc.so.6",
+        "libgcc_s.so.1",
+        "libm.so.6",
+        "libstdc++.so.6"
+      ],
+      "dynamic_symbol_versions": [
+        "CXXABI_1.3",
+        "CXXABI_1.3.9",
+        "GCC_3.0",
+        "GLIBCXX_3.4",
+        "GLIBCXX_3.4.11",
+        "GLIBCXX_3.4.21",
+        "GLIBC_2.14",
+        "GLIBC_2.2.5",
+        "GLIBC_2.32",
+        "GLIBC_2.4"
+      ]
+    }
+  },
+  "notices": [
+    {
+      "file": "licenses/cpu-fft-source/LICENSE-pocketfft.txt",
+      "sha256": "c254b2b5fd30ae3c89d36ba061730563b9760fca04f1b746a1b2c3157da2c789"
+    },
+    {
+      "file": "licenses/cpu-fft-source/PocketFFT-header-notice.txt",
+      "sha256": "ae40472d1c3a7245d89da2a05b9dcbda33e0b0c9ba0a35be483384a7e069ba92"
+    },
+    {
+      "file": "licenses/cpu-fft-source/MinGW-private-math-notices.txt",
+      "sha256": "f6ecf91f2c11444d915ba445d51f54d4ab1f24b1bb010bba4e1ec8b30f68b258"
+    },
+    {
+      "file": "licenses/cpu-fft-source/GCC-GPLv3.txt",
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+    },
+    {
+      "file": "licenses/cpu-fft-source/GCC-runtime-exception-3.1.txt",
+      "sha256": "9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74"
+    },
+    {
+      "file": "licenses/cpu-fft-source/MinGW-AUTHORS.txt",
+      "sha256": "8f308316e7a94b8410f871868bd3948f126526dc1775aeee97a0e365f9a0fd9f"
+    },
+    {
+      "file": "licenses/cpu-fft-source/MinGW-public-domain.txt",
+      "sha256": "87f33608570312a0f2a9745edcb2527275df813b13982e8c3b3f893d88a4141a"
+    },
+    {
+      "file": "licenses/cpu-fft-source/MinGW-runtime-notices.txt",
+      "sha256": "e9b2dc02451ea29092a1f25fa0f3c07207ed421f1807dffb0c4e6dce69dee7bd"
+    },
+    {
+      "file": "licenses/cpu-fft-source/MinGW-winpthreads.txt",
+      "sha256": "63263614cdd29f2f93cba85e992f041b31f9fc7b4033692f31269489a8a1b177"
+    }
+  ]
+}

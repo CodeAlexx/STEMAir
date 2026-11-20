@@ -1,0 +1,60 @@
+module stemair.rate_filter
+import std.signal_resample_table as rate
+import std.numpy_array as npy
+import std.zip as zip
+import std.files as files
+import std.float as fp
+
+pub type Asset=struct{path:string,sha256:string,max_archive_bytes:u64,max_values:u64,max_header_bytes:u64}
+pub type Loaded=struct{filter:rate.Filter,bytes_read:u64,rolloff:f64}
+fn read_error(e:files.ReadError)->string effects {alloc} {match e{Io(v)=>string.copy(fs.error.message(v)),TooLarge=>"Rate filter exceeds its selected archive limit"}}
+fn np_error(e:ref<npy.Error>)->string effects {alloc} {string.copy(npy.code(e))}
+pub fn open(asset:ref<Asset>)->result<Loaded,string> effects {alloc,fs.read} {
+ if str.len(asset.sha256)!=64 or asset.max_values<2{return result.err("Rate filter identity or limits are incomplete")}
+ // Hash the startup bytes already read; do not reread the artifact for hashing.
+ let archive:bytes=try files.read_limited(asset.path,asset.max_archive_bytes) map_err read_error
+ let bytes_read:u64=view.len(bytes.view(archive))
+ let digest:bytes=hash.sha256(bytes.view(archive))
+ let actual:string=bytes.hex(bytes.view(digest))
+ if str.view(actual)!=str.view(asset.sha256){return result.err("Rate filter differs from its selected identity")}
+ var entries:array<zip.Entry>=try zip.list(bytes.view(archive)) map_err zip.message
+ if array.len(entries)!=3{return result.err("Rate filter archive must contain its three original arrays")}
+ var seen_half:bool=false
+ var seen_precision:bool=false
+ var seen_rolloff:bool=false
+ var i:u64=0
+ loop{if i==3{break}
+  let entry:ref<zip.Entry>=array.borrow(entries,i)
+  if entry.is_dir or entry.uncompressed_size>asset.max_archive_bytes{return result.err("Rate filter entry exceeds its selected byte limit")}
+  if entry.name=="half_window.npy"{if seen_half{return result.err("Rate filter repeats its coefficient array")}
+   seen_half=true
+  }else{if entry.name=="precision.npy"{if seen_precision{return result.err("Rate filter repeats its precision array")}
+   seen_precision=true
+  }else{if entry.name=="rolloff.npy"{if seen_rolloff{return result.err("Rate filter repeats its rolloff array")}
+   seen_rolloff=true
+  }else{return result.err("Rate filter archive has an unknown array")}}}
+  i+=1}
+ let limits:npy.Limits=npy.Limits{max_header_bytes:asset.max_header_bytes,max_rank:1,max_elements:asset.max_values,max_data_bytes:asset.max_archive_bytes}
+ let precision_bytes:bytes=try zip.extract(bytes.copy(bytes.view(archive)),"precision.npy") map_err zip.message
+ var pinfo:npy.Info=try npy.inspect(bytes.view(precision_bytes),limits) map_err np_error
+ if array.len(pinfo.shape)!=0 or pinfo.elements!=1{return result.err("Rate filter precision must be scalar")}
+ let signed:i64=try npy.i64_at(bytes.view(precision_bytes),pinfo,0) map_err np_error
+ if signed<1 or signed>9007199254740991{return result.err("Rate filter precision is invalid")}
+ let rolloff_bytes:bytes=try zip.extract(bytes.copy(bytes.view(archive)),"rolloff.npy") map_err zip.message
+ var rinfo:npy.Info=try npy.inspect(bytes.view(rolloff_bytes),limits) map_err np_error
+ if array.len(rinfo.shape)!=0 or rinfo.elements!=1{return result.err("Rate filter rolloff must be scalar")}
+ let rolloff:f64=try npy.f64_at(bytes.view(rolloff_bytes),rinfo,0) map_err np_error
+ if not fp.is_finite(rolloff) or rolloff<=0.0 or rolloff>1.0{return result.err("Rate filter rolloff is invalid")}
+ let half_bytes:bytes=try zip.extract(archive,"half_window.npy") map_err zip.message
+ var hinfo:npy.Info=try npy.inspect(bytes.view(half_bytes),limits) map_err np_error
+ if array.len(hinfo.shape)!=1 or hinfo.elements<2{return result.err("Rate filter coefficients must be a bounded vector")}
+ var values:array<f64>=[]
+ array.reserve(values,hinfo.elements)
+ i=0
+ loop{if i==hinfo.elements{break}
+  let value:f64=try npy.f64_at(bytes.view(half_bytes),hinfo,i) map_err np_error
+  if not fp.is_finite(value){return result.err("Rate filter coefficients must be finite")}
+  array.push(values,value)
+  i+=1}
+ result.ok(Loaded{filter:rate.Filter{precision:cast.wrap(signed),half_window:values},bytes_read:bytes_read,rolloff:rolloff})
+}

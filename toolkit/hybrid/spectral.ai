@@ -1,0 +1,108 @@
+module stemair.hybrid.spectral
+import "../spectral.ai" as stft
+import "../numeric.ai" as num
+import "../ops.ai" as ops
+import std.float as fp
+
+// Hybrid branch framing: normalized FFT, no Nyquist bin, and two discarded
+// edge frames. Both historical outer padding contracts share the same FFT.
+pub type Plan=struct{base:stft.Plan,old:bool,scale:f32}
+pub fn plan(n:u64,old:bool)->result<Plan,string> effects {alloc} {
+ if n<8 or n>65536 or n%8!=0{return result.err("Invalid hybrid FFT geometry")}
+ let size:f32=cast.float(n)
+ result.ok(Plan{base:stft.plan(n,n/4,stft.hann(n)),old:old,scale:fp.sqrt(size)})
+}
+fn padded(p:ref<Plan>,input:view<f32>,channels:u64,channel:u64)->array<f32> effects {alloc} {
+ let count:u64=view.len(input)/channels
+ let hop:u64=p.base.hop
+ let frames:u64=(count+hop-1)/hop
+ let left:u64=hop/2*3
+ let right:u64=left+frames*hop-count
+ var extra_left:u64=0
+ var extra_right:u64=0
+ if not p.old{
+  let maximum:u64=if left>right{left}else{right}
+  if count<=maximum{
+   let extra:u64=maximum-count+1
+   extra_right=if right<extra{right}else{extra}
+   extra_left=extra-extra_right}}
+ let base_length:u64=count+extra_left+extra_right
+ let effective_left:u64=left-extra_left
+ var out:array<f32>=[]
+ array.reserve(out,count+left+right)
+ var i:u64=0
+ loop{if i==count+left+right{break}
+  var value:f32=0.0
+  if p.old{
+   if i>=left and i-left<count{value=view.get(input,(i-left)*channels+channel)}
+  }else{
+   let at:i64=cast.sat(i)-cast.sat(effective_left)
+   let reflected:i64=if at<0{-at}else{if at>=cast.sat(base_length){cast.sat(base_length*2)-2-at}else{at}}
+   let original:i64=reflected-cast.sat(extra_left)
+   if original>=0 and original<cast.sat(count){value=view.get(input,cast.sat(original)*channels+channel)}}
+  array.push(out,value)
+  i+=1}
+ out
+}
+// Input is interleaved audio; output is CHW complex-as-channels, with each
+// real channel immediately followed by its imaginary channel.
+pub fn analyze(p:ref<Plan>,input:view<f32>,channels:u64)->result<ops.Tensor,string> effects {alloc} {
+ if channels==0 or channels>32 or view.len(input)%channels!=0{return result.err("Invalid hybrid audio channels")}
+ let count:u64=view.len(input)/channels
+ if count==0 or count>16711680 or not num.finite(input){return result.err("Invalid hybrid audio extent or values")}
+ let frames:u64=(count+p.base.hop-1)/p.base.hop
+ let frequencies:u64=p.base.n/2
+ var out:array<f32>=num.zeros(channels*2*frequencies*frames)
+ var channel:u64=0
+ loop{if channel==channels{break}
+  let wave:array<f32>=padded(p,input,channels,channel)
+  var frame:u64=0
+  loop{if frame==frames{break}
+   let transformed:array<f32>=stft.analyze_frame(struct.borrow(p,field=base),array.view(wave),frame+2)
+   var frequency:u64=0
+   loop{if frequency==frequencies{break}
+    let offset:u64=channel*2*frequencies*frames+frequency*frames+frame
+    array.set(out,offset,array.get(transformed,frequency*2)/p.scale)
+    array.set(out,offset+frequencies*frames,array.get(transformed,frequency*2+1)/p.scale)
+    frequency+=1}
+   frame+=1}
+  channel+=1}
+ if not num.finite(array.view(out)){return result.err("Non-finite hybrid spectrum")}
+ result.ok(ops.Tensor{c:channels*2,h:frequencies,w:frames,data:out})
+}
+pub fn synthesize(p:ref<Plan>,spectrum:ref<ops.Tensor>,count:u64)->result<array<f32>,string> effects {alloc} {
+ if count==0 or count>16711680 or spectrum.c==0 or spectrum.c>64 or spectrum.c%2!=0 or
+    spectrum.h!=p.base.n/2 or spectrum.w!=(count+p.base.hop-1)/p.base.hop or
+    array.len(spectrum.data)!=spectrum.c*spectrum.h*spectrum.w or not num.finite(array.view(spectrum.data)){
+  return result.err("Invalid hybrid inverse spectrum geometry or values")}
+ let channels:u64=spectrum.c/2
+ let pad:u64=p.base.hop/2*3
+ let padded_count:u64=spectrum.w*p.base.hop+2*pad
+ var output:array<f32>=num.zeros(channels*count)
+ var channel:u64=0
+ loop{if channel==channels{break}
+  // Both padding generations supply four extra spectrum frames. A longer
+  // overlap accumulator preserves their contributions; historical output
+  // length selection is a prefix crop and does not alter overlap sums.
+  var overlap:stft.Overlap=stft.overlap(struct.borrow(p,field=base),padded_count)
+  var frame:u64=0
+  loop{if frame==spectrum.w+4{break}
+   var values:array<f32>=num.zeros((spectrum.h+1)*2)
+   if frame>=2 and frame<spectrum.w+2{
+    var frequency:u64=0
+    loop{if frequency==spectrum.h{break}
+     let offset:u64=channel*2*spectrum.h*spectrum.w+frequency*spectrum.w+frame-2
+     array.set(values,frequency*2,array.get(spectrum.data,offset)*p.scale)
+     array.set(values,frequency*2+1,array.get(spectrum.data,offset+spectrum.h*spectrum.w)*p.scale)
+     frequency+=1}}
+   try stft.add_frame(struct.borrow(p,field=base),overlap,array.view(values))
+   frame+=1}
+  let wave:array<f32>=try stft.finish(struct.borrow(p,field=base),overlap)
+  let start:u64=if p.old{0}else{pad}
+  var i:u64=0
+  loop{if i==count{break}
+   array.set(output,i*channels+channel,array.get(wave,start+i))
+   i+=1}
+  channel+=1}
+ result.ok(output)
+}

@@ -1,0 +1,69 @@
+module stemair.recording_sample_cli
+import "recording_sample_application.ai" as application
+import "recording_sample_runtime.ai" as runtime
+import "cli_audio_policy.ai" as policy
+import std.files as files
+import std.path as path
+import std.system as system
+import std.text as text
+import std.codec as codec
+
+pub type Selected=struct{index:u64,path:string} derive codec(strict)
+pub type Recipe=struct{seconds:u64=30,decoder_library:string="",selected:array<Selected>} derive codec(strict)
+fn read_error(error:files.ReadError)->string effects {alloc} {
+ match error{Io(detail)=>string.copy(fs.error.message(detail)),TooLarge=>"Sample recipe exceeds 16 KiB"}
+}
+fn io_error(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+pub fn read(file:str)->result<Recipe,string> effects {alloc,fs.read} {
+ let raw:bytes=try files.read_limited(file,16384) map_err read_error
+ let content:str=match str.from_bytes(bytes.view(raw)){some(value)=>value,none=>{return result.err("Sample recipe must be UTF-8")}}
+ result.ok(try Recipe_decode(content) map_err codec.describe)
+}
+pub fn choices(settings:ref<policy.Settings>)->result<unit,string> effects {alloc} {
+ let _=try policy.validate(settings)
+ // Empty fields are the existing omitted choices, not a conflicting default.
+ if settings.format!="" and settings.format!="wav"{return result.err("Recording samples use PCM16 WAV output")}
+ if settings.wav_subtype!="" and settings.wav_subtype!="s16"{return result.err("Recording samples use PCM16 WAV output")}
+ if settings.mp3_bitrate!=""{return result.err("Recording samples do not use an MP3 bitrate")}
+ result.ok(())
+}
+pub fn execute(recipe:Recipe own,directory:str,settings:ref<policy.Settings>)->result<application.Report,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let _=try choices(settings)
+ if str.len(directory)==0{return result.err("Choose an output folder for recording samples")}
+ var request:Recipe=recipe
+ if array.len(request.selected)==0{return result.err("Choose at least one recording sample row")}
+ if request.seconds<5 or request.seconds>120{return result.err("Enter a whole sample duration from 5 to 120 seconds")}
+ var selected:array<application.Selection>=[]
+ var i:u64=0
+ loop{if i==array.len(request.selected){break}
+  let row:ref<Selected>=array.borrow(request.selected,i)
+  if str.len(row.path)==0 or (i>0 and row.index<=array.borrow(request.selected,i-1).index){return result.err("Selected recording rows must have ordered unique indices and nonempty paths")}
+  array.push(selected,application.Selection{index:row.index,path:try policy.absolute(row.path)})
+  i+=1}
+ let output:string=try policy.absolute(directory)
+ let root:string=try policy.root(settings)
+ let library:string=try policy.absolute_optional(request.decoder_library)
+ let cancel:string=try policy.absolute_optional(settings.cancel_file)
+ let progress:string=try policy.absolute_optional(settings.progress_file)
+ let scratch:string=path.join(output,text.concat(".sample-input-",text.concat(string.from_int(system.process_id()),text.concat("-",string.from_int(time.monotonic_ns())))))
+ var options:application.Options=try runtime.options(root,settings.codec_directory,library,string.from_int(request.seconds),output,
+  try policy.budget_choice(settings.audio_buffer_mib),scratch,cancel)
+ match files.symlink_metadata(output){ok(info)=>{if not info.is_dir{return result.err("Sample output must be a directory")}},err(error)=>{
+  if error.code!=1{return result.err(io_error(error))}
+  let _=try files.create_dir(output) map_err io_error}}
+ result.ok(application.run(selected,options,progress))
+}
+pub fn run(args:view<str>,settings:ref<policy.Settings>)->result<i32,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi,io.write} {
+ if view.len(args)!=4{return result.err("Use sample-recordings RECIPE OUTPUT_DIRECTORY")}
+ let recipe:Recipe=try read(view.get(args,2))
+ var report:application.Report=try execute(recipe,view.get(args,3),settings)
+ io.write(text.concat(try application.Report_encode(report) map_err codec.describe,"\n"))
+ if not report.completed or report.cancelled{return result.ok(1)}
+ var i:u64=0
+ loop{if i==array.len(report.rows){break}
+  if not array.borrow(report.rows,i).success{return result.ok(1)}
+  i+=1}
+ result.ok(0)
+}

@@ -1,0 +1,9 @@
+{
+  "model": "spectral-alt-v1",
+  "filename": "spectral-alt-v1.ckpt",
+  "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/MDX23C_D1581.ckpt",
+  "bytes": 183379219,
+  "sha256": "d7d4d2137f12764950205b095da20032fef1d41f077bacc8582f20ed40e8cb28",
+  "configuration": "configs/spectral-alt-v1.json",
+  "credit": "UVR developers Anjok07 and aufr33; MDX23C network and weights credited to ZFTurbo by the application README"
+}

@@ -1,0 +1,1 @@
+{"engine":"exchange","sample_rate":44100,"n_fft":7680,"hop":1024,"frequency_bins":3072,"frames":256,"overlap_mode":"automatic","overlap":0.25,"compensation":1.043,"denoise":false,"targets":["vocals","instrumental"]}

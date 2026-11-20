@@ -1,0 +1,40 @@
+module stemair.typed_model_result
+import "audio_result.ai" as audio
+import "typed_source_wave.ai" as source
+import "model_ensemble_config.ai" as selection
+
+pub type Output=struct{sources:array<source.Wave>,write_order:array<string>}
+// Physical prediction order and the original writer call order are distinct.
+pub fn write_order(kind:str,stage:str,targets:ref<array<string>>)->result<array<string>,string> effects {alloc} {
+ if kind=="exchange" and array.len(targets)!=2{return result.err("Interchange results require two targets")}
+ var order:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(targets){break}
+  let selected_pair:bool=stage=="vocals" and array.len(targets)==2 and (kind=="exchange" or kind=="spectral")
+  let at:u64=if selected_pair{1-i}else{i}
+  array.push(order,string.copy(array.get(targets,at)))
+  i+=1}
+ result.ok(order)
+}
+pub fn finish(kind:str,stage:str,targets:array<string> own,master:ref<audio.Samples>,packed:audio.Samples own,limits:source.Limits)->result<Output,string> effects {alloc, env, ffi, fs.read} {
+ finish_with_reference(kind,stage,targets,master,packed,limits,[])
+}
+pub fn finish_with_reference(kind:str,stage:str,targets:array<string> own,master:ref<audio.Samples>,packed:audio.Samples own,limits:source.Limits,reference:view<f32>)->result<Output,string> effects {alloc, env, ffi, fs.read} {
+ var names:array<string>=targets
+ var held:audio.Samples=packed
+ let count:u64=array.len(names)
+ if count==0 or count>16 or audio.count(held)%(2*count)!=0{return result.err("Invalid packed model result")}
+ let order:array<string>=try write_order(kind,stage,names)
+ var waves:array<source.Wave>=try source.unpack(names,held,audio.count(held)/(2*count),limits)
+ if kind=="exchange"{
+  let frames:u64=try source.frames(master)
+  if frames!=array.borrow(waves,0).frames{return result.err("Interchange residual master/result frames differ")}
+  var target:selection.Target=selection.Target{target:string.copy(array.get(names,1)),method:"",exclude:string.copy(array.get(names,0))}
+  // The model input cast does not change the master used by the source residual.
+  let residual:audio.Samples=try source.select(waves,target,"residual",master,limits)
+  let secondary:ref<source.Wave>=array.borrow(waves,1)
+  secondary.samples=residual
+ }
+ let _=try source.attach_references(waves,reference,kind=="spectral",limits)
+ result.ok(Output{sources:waves,write_order:order})
+}

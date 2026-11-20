@@ -1,0 +1,201 @@
+module stemair.model_defaults
+import "../toolkit/engine.ai" as engine
+import "../toolkit/control.ai" as control
+import std.files as files
+import std.path as path
+import std.codec as codec
+import std.text as text
+import std.float as fp
+
+// Original asset identity is supplied by the established catalog/startup intake.
+// This module never opens or hashes a checkpoint.
+pub type Record=struct{version:u32=1,profile:string,asset_sha256:string,asset_bytes:u64,base_sha256:string,
+ configuration:string,labels:array<string>,role:u32=0,rebalance:f64=0.0} derive codec(strict)
+pub type Published=struct{configuration:string,definition:string,definition_sha256:string,configuration_sha256:string,
+ configuration_reused:bool,definition_reused:bool,staging_removed:bool,staging_path:string="",directory_synced:bool}
+pub type Binding=struct{profile:string,asset_sha256:string,base_sha256:string,configuration:string,definition:string,definition_sha256:string} derive codec(strict)
+pub type Bindings=struct{version:u32=1,items:array<Binding>} derive codec(strict)
+pub type LoadedRecord=struct{record:Record,sha256:string}
+fn fs_error(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+fn read_error(error:files.ReadError)->string effects {alloc} {
+ match error{Io(e)=>fs_error(e),TooLarge=>"Model settings file exceeds its bounded read limit"}
+}
+pub fn digest(raw:str)->string effects {alloc} {bytes.hex(hash.sha256(str.bytes(raw)))}
+pub fn valid_digest(value:str)->bool effects {} {
+ if str.len(value)!=64{return false}
+ var i:u64=0
+ loop{if i==64{break}
+  let b:u8=cast.bits(view.get(str.bytes(value),i))
+  if not ((b>=48 and b<=57) or (b>=97 and b<=102)){return false}
+  i+=1}
+ true
+}
+fn valid_profile(value:str)->bool effects {} {
+ if str.len(value)==0 or str.len(value)>128{return false}
+ var i:u64=0
+ loop{if i==str.len(value){break}
+  let b:byte=view.get(str.bytes(value),i)
+  if not text.ascii_is_alnum(b) and b!=45 and b!=95{return false}
+  i+=1}
+ true
+}
+pub fn validate(c:ref<Record>)->result<engine.Profile,string> effects {alloc} {
+ if c.version!=1 or not valid_profile(c.profile) or not valid_digest(c.asset_sha256) or not valid_digest(c.base_sha256) or c.asset_bytes==0 or c.asset_bytes>3221225472{return result.err("Model default identity is incomplete or outside its bounds")}
+ if str.len(c.configuration)==0 or str.len(c.configuration)>65536{return result.err("Model configuration exceeds its 64 KiB bound")}
+ let profile:engine.Profile=try engine.decode(c.configuration)
+ if str.view(profile.identity)!=str.view(c.configuration){return result.err("Model defaults require a canonical validated configuration")}
+ if array.len(c.labels)!=array.len(profile.targets){return result.err("Model labels must match the model's ordered targets")}
+ var i:u64=0
+ loop{if i==array.len(c.labels){break}
+  let label:str=array.get(c.labels,i)
+  if str.len(label)==0 or str.len(label)>128 or text.contains(label,"/") or text.contains(label,"\\"){return result.err("Model source labels must be bounded text without path separators")}
+  var at:u64=0
+  loop{if at==str.len(label){break}
+   let b:u8=cast.bits(view.get(str.bytes(label),at))
+   if b<32{return result.err("Model source labels must not contain control characters")}
+   at+=1}
+  var previous:u64=0
+  loop{if previous==i{break}
+   if array.get(c.labels,previous)==label{return result.err("Model source labels must be distinct")}
+   previous+=1}
+  i+=1}
+ if c.role>2 or not fp.is_finite(c.rebalance) or c.rebalance<0.0 or c.rebalance>0.9 or (c.role!=2 and c.rebalance!=0.0){return result.err("Invalid model default role or rebalance")}
+ if c.role>0{
+  if array.len(profile.targets)!=2{return result.err("Vocal model roles need two complementary sources")}
+  let first:str=array.get(profile.targets,0)
+  let second:str=array.get(profile.targets,1)
+  if (first!="vocals" or second!="instrumental") and (first!="instrumental" or second!="vocals"){return result.err("Vocal model roles require a vocal/instrumental primary")}}
+ result.ok(profile)
+}
+pub fn decode(raw:str)->result<Record,string> effects {alloc} {
+ if str.len(raw)>131072{return result.err("Model default record exceeds its 128 KiB bound")}
+ var record:Record=try Record_decode(raw) map_err codec.describe
+ let _=try validate(record)
+ result.ok(record)
+}
+fn read_source(file:str,limit:u64)->result<string,string> effects {alloc,fs.read,fs.meta} {
+ let info:fs.meta=try files.symlink_metadata(file) map_err fs_error
+ if not info.is_file or info.is_symlink or info.size>limit{return result.err("Choose an ordinary bounded model settings file")}
+ let raw:bytes=try files.read_limited(file,limit) map_err read_error
+ let source:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("Model default record is not UTF-8")}}
+ result.ok(string.copy(source))
+}
+pub fn read(file:str)->result<Record,string> effects {alloc,fs.read,fs.meta} {
+ decode(try read_source(file,131072))
+}
+pub fn inspect_published(file:str)->result<LoadedRecord,string> effects {alloc,fs.read,fs.meta} {
+ let raw:string=try read_source(file,131072)
+ let sha:string=digest(raw)
+ if path.basename(file)!=text.concat(sha,".definition.json"){return result.err("Selected model definition differs from its immutable file identity")}
+ let record:Record=try decode(raw)
+ result.ok(LoadedRecord{record:record,sha256:sha})
+}
+pub fn validate_bindings(value:ref<Bindings>)->result<unit,string> effects {alloc} {
+ if value.version!=1 or array.len(value.items)>256{return result.err("Saved model defaults exceed their version or entry bounds")}
+ var i:u64=0
+ loop{if i==array.len(value.items){break}
+  let item:ref<Binding>=array.borrow(value.items,i)
+  if not valid_profile(item.profile) or not valid_digest(item.asset_sha256) or not valid_digest(item.base_sha256) or not valid_digest(item.definition_sha256) or
+   not path.is_absolute(item.configuration) or not path.is_absolute(item.definition){return result.err("Saved model default binding is incomplete")}
+  var j:u64=0
+  loop{if j==i{break}
+   let earlier:ref<Binding>=array.borrow(value.items,j)
+   if str.view(earlier.profile)==str.view(item.profile) and str.view(earlier.asset_sha256)==str.view(item.asset_sha256){return result.err("Duplicate saved model default binding")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn decode_bindings(raw:str)->result<Bindings,string> effects {alloc} {
+ if str.len(raw)==0{return result.ok(Bindings{items:[]})}
+ if str.len(raw)>131072{return result.err("Saved model default bindings exceed 128 KiB")}
+ var value:Bindings=try Bindings_decode(raw) map_err codec.describe
+ let _=try validate_bindings(value)
+ result.ok(value)
+}
+fn ordinary_directory(directory:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let _=try files.mkdirs(directory) map_err fs_error
+ let info:fs.meta=try files.symlink_metadata(directory) map_err fs_error
+ if not info.is_dir or info.is_symlink{return result.err("Model settings require an ordinary application-owned directory")}
+ result.ok(())
+}
+type FilePublication=struct{reused:bool,staging_removed:bool,staging_path:string,directory_synced:bool}
+fn publish_file(file:str,raw:str,cancel:str)->result<FilePublication,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ if control.cancelled(cancel){return result.err("Model settings save cancelled")}
+ let exists:bool=try files.exists(file) map_err fs_error
+ if exists{
+  let info:fs.meta=try files.symlink_metadata(file) map_err fs_error
+  if not info.is_file or info.is_symlink or info.size!=str.len(raw){return result.err("Model settings destination already contains different data")}
+  let old:bytes=try files.read_limited(file,131072) map_err read_error
+  if bytes.hex(hash.sha256(bytes.view(old)))!=digest(raw){return result.err("Model settings destination already contains different data")}
+  return result.ok(FilePublication{reused:true,staging_removed:true,staging_path:"",directory_synced:false})}
+ let temporary:string=text.concat(file,".saving")
+ var sink:files.Sink=try files.sink_create(file,temporary) map_err fs_error
+ match files.sink_write(sink,str.bytes(raw)){ok(_)=>{},err(e)=>{let _=files.sink_discard(sink)
+  return result.err(fs_error(e))}}
+ if control.cancelled(cancel){let _=files.sink_discard(sink)
+  return result.err("Model settings save cancelled")}
+ let publication:files.Publication=try files.sink_publish_new(sink,true) map_err fs_error
+ result.ok(FilePublication{reused:false,staging_removed:publication.temporary_removed,staging_path:if publication.temporary_removed{""}else{string.copy(publication.temporary)},directory_synced:publication.directory_sync_completed})
+}
+pub fn publish(directory:str,record:ref<Record>,base_file:str,cancel:str)->result<Published,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let _=try validate(record)
+ if not path.is_absolute(directory){return result.err("Model settings storage must use an absolute directory")}
+ if control.cancelled(cancel){return result.err("Model settings save cancelled")}
+ let base:string=try read_source(base_file,65536)
+ if digest(base)!=str.view(record.base_sha256){return result.err("Bundled model configuration changed; open the editor again")}
+ let _=try ordinary_directory(directory)
+ let folder:string=path.join(directory,record.asset_sha256)
+ let _=try ordinary_directory(folder)
+ let raw:string=try Record_encode(record) map_err codec.describe
+ let configuration_sha:string=digest(record.configuration)
+ let definition_sha:string=digest(raw)
+ let configuration:string=path.join(folder,text.concat(configuration_sha,".profile.json"))
+ let definition:string=path.join(folder,text.concat(definition_sha,".definition.json"))
+ let first:FilePublication=try publish_file(configuration,record.configuration,cancel)
+ let second:FilePublication=match publish_file(definition,raw,cancel){ok(v)=>v,err(e)=>{
+  return result.err(text.concat(e,text.concat("; immutable configuration remains at ",configuration)))}}
+ result.ok(Published{configuration:configuration,definition:definition,definition_sha256:definition_sha,configuration_sha256:configuration_sha,
+  configuration_reused:first.reused,definition_reused:second.reused,staging_removed:first.staging_removed and second.staging_removed,
+  staging_path:if not first.staging_removed{string.copy(first.staging_path)}else{string.copy(second.staging_path)},directory_synced:first.directory_synced and second.directory_synced})
+}
+pub fn selected(raw:str,record:ref<Record>,published:ref<Published>)->result<string,string> effects {alloc} {
+ let _=try validate(record)
+ var current:Bindings=try decode_bindings(raw)
+ var next:Bindings=Bindings{items:[]}
+ var i:u64=0
+ loop{if i==array.len(current.items){break}
+  let item:ref<Binding>=array.borrow(current.items,i)
+  if str.view(item.profile)!=str.view(record.profile) or str.view(item.asset_sha256)!=str.view(record.asset_sha256){
+   array.push(next.items,try Binding_decode(try Binding_encode(item) map_err codec.describe) map_err codec.describe)}
+  i+=1}
+ array.push(next.items,Binding{profile:string.copy(record.profile),asset_sha256:string.copy(record.asset_sha256),base_sha256:string.copy(record.base_sha256),
+  configuration:string.copy(published.configuration),definition:string.copy(published.definition),definition_sha256:string.copy(published.definition_sha256)})
+ let _=try validate_bindings(next)
+ result.ok(try Bindings_encode(next) map_err codec.describe)
+}
+pub fn restored(raw:str,profile:str,asset_sha256:str)->result<string,string> effects {alloc} {
+ var current:Bindings=try decode_bindings(raw)
+ var next:Bindings=Bindings{items:[]}
+ var i:u64=0
+ loop{if i==array.len(current.items){break}
+  let item:ref<Binding>=array.borrow(current.items,i)
+  if str.view(item.profile)!=profile or str.view(item.asset_sha256)!=asset_sha256{
+   array.push(next.items,try Binding_decode(try Binding_encode(item) map_err codec.describe) map_err codec.describe)}
+  i+=1}
+ if array.len(next.items)==0{return result.ok("")}
+ result.ok(try Bindings_encode(next) map_err codec.describe)
+}
+pub fn resolve(binding:ref<Binding>,asset_bytes:u64,base_file:str)->result<Record,string> effects {alloc,fs.read,fs.meta} {
+ let source:string=try read_source(binding.definition,131072)
+ if digest(source)!=str.view(binding.definition_sha256){return result.err("Model default record differs from its selected byte identity")}
+ var record:Record=try decode(source)
+ if str.view(record.profile)!=str.view(binding.profile) or str.view(record.asset_sha256)!=str.view(binding.asset_sha256) or record.asset_bytes!=asset_bytes or str.view(record.base_sha256)!=str.view(binding.base_sha256){return result.err("Model default record differs from its selected identity")}
+ let base:string=try read_source(base_file,65536)
+ if digest(base)!=str.view(binding.base_sha256){return result.err("Bundled model configuration changed; review saved defaults")}
+ let info:fs.meta=try files.symlink_metadata(binding.configuration) map_err fs_error
+ if not info.is_file or info.is_symlink or info.size>65536{return result.err("Saved model configuration is not an ordinary bounded file")}
+ let raw:bytes=try files.read_limited(binding.configuration,65536) map_err read_error
+ let content:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("Saved model configuration is not UTF-8")}}
+ if content!=str.view(record.configuration){return result.err("Saved model configuration changed; review defaults")}
+ result.ok(record)
+}

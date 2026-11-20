@@ -1,0 +1,64 @@
+module stemair.hybrid.multi_layout
+import std.float as fp
+pub type Band=struct{start:u64,count:u64,left:u64,right:u64}
+// Python round on the bounded positive/negative geometry expressions used by
+// the original frequency split. No ambient floating-point rounding mode.
+fn even(value:f64)->i64 effects {}{
+ let low:f64=fp.floor(value)
+ let integer:i64=cast.sat(low)
+ let fraction:f64=value-low
+ if fraction>0.5 or (fraction==0.5 and integer%2!=0){return integer+1}
+ integer
+}
+pub fn validate(ratios:view<f64>)->result<unit,string> effects {alloc}{
+ if view.len(ratios)==0 or view.len(ratios)>16{return result.err("Invalid frequency split ratio count")}
+ var previous:f64=0.0
+ var i:u64=0
+ loop{if i==view.len(ratios){break}
+  let value:f64=view.get(ratios,i)
+  if not fp.is_finite(value) or value<=previous or value>=1.0{return result.err("Invalid frequency split ratio order")}
+  previous=value
+  i+=1}
+ result.ok(())
+}
+pub fn encoder(frequencies:u64,ratios:view<f64>,kernel:u64,stride:u64)->result<array<Band>,string> effects {alloc}{
+ let _=try validate(ratios)
+ if frequencies==0 or frequencies>1048576 or kernel==0 or kernel>1024 or stride==0 or stride>kernel{return result.err("Invalid frequency encoder split geometry")}
+ var out:array<Band>=[]
+ var start:i64=0
+ let pad:i64=cast.wrap(kernel/4)
+ let k:i64=cast.wrap(kernel)
+ let step:i64=cast.wrap(stride)
+ let full:i64=cast.wrap(frequencies)
+ var i:u64=0
+ loop{if i>view.len(ratios){break}
+  var limit:i64=full
+  if i<view.len(ratios){
+   limit=even(cast.float(frequencies)*view.get(ratios,i))
+   let length:i64=limit-start+(if start==0{pad}else{0})
+   let frames:i64=even((cast.float(length)-cast.float(kernel))/cast.float(stride)+1.0)
+   limit=start+(frames-1)*step+k-(if start==0{pad}else{0})}
+  if start<0 or limit<=start or limit>full{return result.err("Frequency encoder split is empty or out of range")}
+  let count:u64=cast.wrap(limit-start)
+  let left:u64=if start==0{cast.wrap(pad)}else{0}
+  let right:u64=if i==view.len(ratios){cast.wrap(pad)}else{0}
+  if count+left+right<kernel{return result.err("Frequency encoder split is shorter than its kernel")}
+  array.push(out,Band{start:cast.wrap(start),count:count,left:left,right:right})
+  start=limit-k+step
+  i+=1}
+ result.ok(out)
+}
+pub fn decoder(frequencies:u64,ratios:view<f64>)->result<array<Band>,string> effects {alloc}{
+ let _=try validate(ratios)
+ if frequencies==0 or frequencies>1048576{return result.err("Invalid frequency decoder split geometry")}
+ var out:array<Band>=[]
+ var start:u64=0
+ var i:u64=0
+ loop{if i>view.len(ratios){break}
+  let limit:u64=if i==view.len(ratios){frequencies}else{cast.wrap(even(cast.float(frequencies)*view.get(ratios,i)))}
+  if limit<=start or limit>frequencies{return result.err("Frequency decoder split is empty or out of range")}
+  array.push(out,Band{start:start,count:limit-start,left:0,right:0})
+  start=limit
+  i+=1}
+ result.ok(out)
+}

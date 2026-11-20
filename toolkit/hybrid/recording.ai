@@ -1,0 +1,108 @@
+module stemair.hybrid.recording
+import "config.ai" as config
+import "network.ai" as network
+import "retained_session.ai" as retained
+import "frontend.ai" as frontend
+import "device.ai" as device
+import "../recording_audio.ai" as audio
+import "../recording_shifts.ai" as shifts
+import "../recording_moments.ai" as moments
+import "../audio_normalization.ai" as normalization
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "../ops.ai" as host
+import std.tensor as tensor
+
+// Explicit caller resource policy, independent of the requested shift count.
+pub type Limits=struct{max_frontends:u64}
+fn add_length(lengths:ref<array<u64>>,length:u64,limits:ref<Limits>)->result<unit,string> effects {alloc}{
+ if length==0{return result.err("Empty scheduled transform extent")}
+ var i:u64=0
+ loop{if i==array.len(lengths){break}
+  if array.get(lengths,i)==length{return result.ok(())}
+  i+=1}
+ if array.len(lengths)>=limits.max_frontends{return result.err("Scheduled transform geometries exceed the explicit caller resource budget")}
+ array.push(lengths,length)
+ result.ok(())
+}
+pub fn prepare_work(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>,runtime:str,length:u64,c:ref<config.Config>,group:ref<shifts.Group>,limits:ref<Limits>)->result<retained.Work,string> effects {alloc,ffi,gpu}{
+ let transform:frontend.Limits=retained.model_limits(n)
+ prepare_work_with_limits(context,stream,n,runtime,length,c,group,limits,transform)
+}
+pub fn prepare_work_with_limits(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>,runtime:str,length:u64,c:ref<config.Config>,group:ref<shifts.Group>,limits:ref<Limits>,transform:ref<frontend.Limits>)->result<retained.Work,string> effects {alloc,ffi,gpu}{
+ let _=try config.validate(c)
+ if length==0 or length>134217728 or limits.max_frontends==0{return result.err("Invalid complete recording extent or transform resource policy")}
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{n.constructor.kwargs.segment*44100}
+ let stride:u64=if c.split{cast.sat((1.0-c.overlap)*cast.float(size))}else{length}
+ if stride==0{return result.err("Recording overlap leaves no stride")}
+ var lengths:array<u64>=[]
+ let count:u64=if group.shifted{array.len(group.offsets)}else{1}
+ var s:u64=0
+ loop{if s==count{break}
+  let offset:u64=if group.shifted{array.get(group.offsets,s)}else{0}
+  if offset>22050{return result.err("Scheduled transform offset exceeds the original range")}
+  let frames:u64=if group.shifted{length+22050-offset}else{length}
+  if not c.split{let _=try add_length(lengths,frames,limits)}else{
+   var at:u64=0
+   loop{if at>=frames{break}
+    let _=try add_length(lengths,if frames-at<size{frames-at}else{size},limits)
+    at+=stride}}
+  s+=1}
+ if array.len(lengths)==0{return result.err("Scheduled recording has no transform geometry")}
+ let _=try preflight(n,array.view(lengths),transform)
+ var work:retained.Work=try retained.prepare_work_with_limits(context,stream,n,runtime,array.get(lengths,0),transform)
+ work.length=length
+ var i:u64=1
+ loop{if i==array.len(lengths){break}
+  let f:frontend.State=if n.constructor.kwargs.cac{try frontend.create_sources_with_limits(context,stream,runtime,n.spectral.base.n,n.spectral.base.hop,array.get(lengths,i),n.spectral.old,array.len(n.constructor.kwargs.sources),transform)}else{try frontend.create_magnitude_sources_with_limits(context,stream,runtime,n.spectral.base.n,n.spectral.base.hop,array.get(lengths,i),n.spectral.old,array.len(n.constructor.kwargs.sources),transform)}
+  array.push(work.additional,device.Frontend{retained:option.some(f)})
+  i+=1}
+ result.ok(work)
+}
+fn preflight(n:ref<network.Network>,lengths:view<u64>,limits:ref<frontend.Limits>)->result<unit,string> effects {alloc}{
+ let _=try if n.constructor.kwargs.cac{frontend.preflight_lengths(n.spectral.base.n,n.spectral.base.hop,lengths,n.spectral.old,array.len(n.constructor.kwargs.sources),limits)}else{frontend.preflight_magnitude_lengths(n.spectral.base.n,n.spectral.base.hop,lengths,n.spectral.old,array.len(n.constructor.kwargs.sources),limits)}
+ result.ok(())
+}
+// The retained checkpoint stays in State. Work/tensors are released before the
+// caller's per-request context closes, on both success and callback failure.
+fn scheduled_hybrid_predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<retained.State>,input:ref<tensor.Tensor>,cancel:str)->result<host.Tensor,string> effects {alloc,gpu,fs.meta}{
+ retained.retained_predict(context,stream,parameters,s,input,cancel)
+}
+fn scheduled_hybrid_length(s:ref<retained.State>,length:u64)->result<u64,string> effects {alloc}{retained.retained_length(s,length)}
+pub fn separate_once(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<retained.State>,runtime:str,c:ref<config.Config>,schedule:ref<shifts.Schedule>,input:view<f32>,cancel:str,progress:str,limits:ref<Limits>)->result<array<f32>,string> effects {alloc,ffi,gpu,fs.meta,fs.write}{
+ let transform:frontend.Limits=retained.model_limits(struct.borrow(s,field=network))
+ separate_once_with_limits(context,stream,parameters,s,runtime,c,schedule,input,cancel,progress,limits,transform)
+}
+pub fn separate_once_with_limits(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<retained.State>,runtime:str,c:ref<config.Config>,schedule:ref<shifts.Schedule>,input:view<f32>,cancel:str,progress:str,limits:ref<Limits>,transform:ref<frontend.Limits>)->result<array<f32>,string> effects {alloc,ffi,gpu,fs.meta,fs.write}{
+ if array.len(s.gpu)!=0{return result.err("Previous hybrid GPU work was not released")}
+ if view.len(input)<4 or view.len(input)%2!=0{return result.err("Expected complete stereo recording")}
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{s.network.constructor.kwargs.segment*44100}
+ let _=try shifts.require_geometry(schedule,shifts.Family.Outer,view.len(input)/2,c.split,size,c.overlap)
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let prepared:normalization.Prepared=try moments.prepare(input,2)
+ if prepared.scale==0.0{return result.ok(num.zeros(2*array.len(s.network.constructor.kwargs.sources)*prepared.frames))}
+ let group:shifts.Group=try shifts.next_group(schedule)
+ let work:retained.Work=try prepare_work_with_limits(context,stream,struct.borrow(s,field=network),runtime,prepared.frames,c,group,limits,transform)
+ array.push(s.gpu,work)
+ let output:result<array<f32>,string>=audio.separate_prepared_group_sources(context,stream,parameters,s,c,schedule,size,array.len(s.network.constructor.kwargs.sources),prepared,group,cancel,progress,scheduled_hybrid_predict,scheduled_hybrid_length)
+ s.gpu=[]
+ if result.is_ok(output){s.requests+=1}
+ output
+}
+
+// No normalization, restoration or source permutation inside a bag member.
+pub fn separate_normalized_group_once(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<retained.State>,runtime:str,c:ref<config.Config>,schedule:ref<shifts.Schedule>,preparation:normalization.Prepared own,group:ref<shifts.Group>,cancel:str,progress:str,limits:ref<Limits>,transform:ref<frontend.Limits>)->result<array<f32>,string> effects {alloc,ffi,gpu,fs.meta,fs.write}{
+ if array.len(s.gpu)!=0{return result.err("Previous hybrid GPU work was not released")}
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{s.network.constructor.kwargs.segment*44100}
+ // The caller has already drawn this member's outer group. The unused-schedule
+ // validator applies before that draw; this entry requires exactly one group.
+ if schedule.groups!=1 or schedule.forwards!=0 or schedule.request.family!=shifts.Family.Outer or schedule.request.frames!=preparation.frames or schedule.request.split!=c.split or schedule.plan.segment!=size or schedule.request.overlap!=c.overlap{return result.err("Prepared outer group differs from the active hybrid schedule")}
+ if group.divisor!=(if schedule.request.count==0{1}else{schedule.request.count}) or group.shifted!=(schedule.request.count!=0) or array.len(group.offsets)!=schedule.plan.offsets_per_group{return result.err("Prepared hybrid offset group differs from the active request")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let work:retained.Work=try prepare_work_with_limits(context,stream,struct.borrow(s,field=network),runtime,preparation.frames,c,group,limits,transform)
+ array.push(s.gpu,work)
+ let output:result<array<f32>,string>=audio.separate_normalized_group_sources(context,stream,parameters,s,c,schedule,size,array.len(s.network.constructor.kwargs.sources),preparation,group,cancel,progress,scheduled_hybrid_predict,scheduled_hybrid_length)
+ s.gpu=[]
+ if result.is_ok(output){s.requests+=1}
+ output
+}

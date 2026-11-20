@@ -1,0 +1,20 @@
+module stemair.reference_mastering_job
+import "../toolkit/reference_mastering_protocol.ai" as protocol
+import "../toolkit/model_cache.ai" as cache
+import "reference_mastering_application.ai" as application
+import "job.ai" as job
+import std.codec as codec
+import std.text as text
+pub type Work=struct{retained:option<cache.Cache>,request:protocol.Request,directory:string}
+pub fn run(work:Work own)->job.Completed effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ var value:Work=work
+ var outcome:application.Outcome=application.run(struct.borrow(value,field=request))
+ let retained:option<cache.Cache>=struct.replace(value,option.none(),field=retained)
+ let ok:bool=str.len(outcome.error)==0
+ var message:string=string.copy(outcome.error)
+ var report:string=""
+ match outcome.report{none=>{},some(result)=>{
+  report=match protocol.Report_encode(result){ok(raw)=>raw,err(problem)=>codec.describe(problem)}
+  if ok{message=text.concat("Reference mastering complete: ",text.concat(string.from_int(result.completed),text.concat(" written, ",text.concat(string.from_int(result.skipped)," skipped"))))}}}
+ job.Completed{retained:retained,ok:ok,message:message,directory:string.copy(value.directory),queue_report:option.none(),mastering_report:report}
+}

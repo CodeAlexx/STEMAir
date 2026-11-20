@@ -1,0 +1,60 @@
+{
+  "engine": "mask",
+  "sample_rate": 44100,
+  "bins": 768,
+  "channels": 16,
+  "levels": 4,
+  "branches": 5,
+  "window": 512,
+  "tta": false,
+  "aggression": 0.05,
+  "primary_foreground": false,
+  "pre_filter_start": 740,
+  "pre_filter_stop": 768,
+  "targets": [
+    "instrumental",
+    "vocals"
+  ],
+  "bands": [
+    {
+      "sample_rate": 11025,
+      "n_fft": 1024,
+      "hop": 128,
+      "crop_start": 0,
+      "crop_stop": 186,
+      "low_start": 37,
+      "low_stop": 73
+    },
+    {
+      "sample_rate": 11025,
+      "n_fft": 512,
+      "hop": 128,
+      "crop_start": 4,
+      "crop_stop": 185,
+      "high_start": 36,
+      "high_stop": 18,
+      "low_start": 93,
+      "low_stop": 185
+    },
+    {
+      "sample_rate": 22050,
+      "n_fft": 512,
+      "hop": 256,
+      "crop_start": 46,
+      "crop_stop": 186,
+      "high_start": 93,
+      "high_stop": 46,
+      "low_start": 164,
+      "low_stop": 186
+    },
+    {
+      "sample_rate": 44100,
+      "n_fft": 768,
+      "hop": 512,
+      "crop_start": 121,
+      "crop_stop": 382,
+      "high_start": 138,
+      "high_stop": 123
+    }
+  ]
+}

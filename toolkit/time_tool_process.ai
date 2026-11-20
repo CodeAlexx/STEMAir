@@ -1,0 +1,160 @@
+module stemair.time_tool_process
+import "control.ai" as control
+import std.files as files
+import std.path as path
+import std.process as proc
+import std.text as text
+import std.system as system
+
+pub type Dependency=struct{path:string,sha256:string} derive codec(strict)
+pub type Tool=struct{executable:string="",sha256:string="",version:string="3.1.2",dependencies:array<Dependency>,
+ timeout_ms:u64=300000,termination_grace_ms:u64=200} derive codec(strict)
+pub type Recipe=struct{operation:string="tempo",value:f64=2.0,normalize:bool=false,tool:Tool} derive codec(strict)
+pub type ChildFailure=struct{code:i32,detail:string}
+pub type Error=enum{Invalid(string),Identity(string),Launch(string),Io(string),Cancelled,Timeout,OutputLimit,Child(ChildFailure)}
+pub type Captured=struct{stdout:bytes,stderr:bytes,pid:u64,stdout_truncated:bool,stderr_truncated:bool}
+pub fn message(error:Error own)->string effects {alloc} {
+ match error{
+  Invalid(detail)=>text.concat("Invalid external time processor settings: ",detail),
+  Identity(detail)=>text.concat("External time processor identity refused: ",detail),
+  Launch(detail)=>text.concat("Cannot start external time processor: ",detail),
+  Io(detail)=>text.concat("External time processor I/O failed: ",detail),
+  Cancelled=>"External audio processing cancelled",
+  Timeout=>"External audio processing deadline reached",
+  OutputLimit=>"External audio processing exceeded the output byte bound",
+  Child(failure)=>text.concat(text.concat("External time processor failed with exit ",string.from_int(failure.code)),text.concat(": ",failure.detail)),
+ }
+}
+fn problem(error:fs.error)->Error effects {alloc} {Error.Io(string.copy(fs.error.message(error)))}
+fn identity_problem(error:fs.error)->Error effects {alloc} {Error.Identity(string.copy(fs.error.message(error)))}
+fn launch_problem(error:fs.error)->Error effects {alloc} {Error.Launch(string.copy(fs.error.message(error)))}
+pub fn valid_sha(value:str)->bool effects {} {
+ if str.len(value)!=64{return false}
+ var i:u64=0
+ loop{if i==64{break}
+  let b:u8=cast.bits(view.get(str.bytes(value),i))
+  if not((b>=48 and b<=57)or(b>=97 and b<=102)){return false}
+  i+=1}
+ true
+}
+pub fn validate(tool:ref<Tool>)->result<unit,Error> effects {alloc} {
+ if not path.is_absolute(tool.executable) or not valid_sha(tool.sha256){return result.err(Error.Invalid("Choose an absolute executable path and lowercase SHA256"))}
+ if tool.version!="3.1.2"{return result.err(Error.Invalid("Only the qualified 3.1.2 command interface is supported"))}
+ let name:string=path.basename(tool.executable)
+ if text.ends_with(name,"-r3")or text.ends_with(name,"-r3.exe")or text.ends_with(name,"-R3.EXE"){
+  return result.err(Error.Invalid("The configured executable name selects the unsupported alternate engine"))}
+ if tool.timeout_ms==0 or tool.timeout_ms>1800000 or tool.termination_grace_ms>5000{
+  return result.err(Error.Invalid("Deadline must be 1..1800000 ms and termination grace at most 5000 ms"))}
+ if array.len(tool.dependencies)>32{return result.err(Error.Invalid("At most 32 pinned runtime files may be declared"))}
+ var i:u64=0
+ loop{if i==array.len(tool.dependencies){break}
+  let dependency:ref<Dependency>=array.borrow(struct.borrow(tool,field=dependencies),i)
+  if not path.is_absolute(dependency.path) or not valid_sha(dependency.sha256){return result.err(Error.Invalid("Runtime files require absolute paths and lowercase SHA256"))}
+  i+=1}
+ result.ok(())
+}
+fn verify_file(file:str,expected:str)->result<unit,Error> effects {alloc,fs.read,fs.meta} {
+ let info:fs.meta=try files.metadata(file) map_err identity_problem
+ if not info.is_file or info.size==0 or info.size>67108864{return result.err(Error.Identity("A pinned executable/runtime file is missing, empty or exceeds 64 MiB"))}
+ let actual:string=try files.sha256(file) map_err identity_problem
+ if actual!=expected{return result.err(Error.Identity("An executable/runtime SHA256 differs from its configured identity"))}
+ result.ok(())
+}
+pub fn verify_files(tool:ref<Tool>)->result<unit,Error> effects {alloc,fs.read,fs.meta} {
+ let _=try validate(tool)
+ let _=try verify_file(tool.executable,tool.sha256)
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(tool.dependencies){break}
+  let dependency:ref<Dependency>=array.borrow(struct.borrow(tool,field=dependencies),i)
+  let _=try verify_file(dependency.path,dependency.sha256)
+  total+=try files.file_size(dependency.path) map_err identity_problem
+  if total>268435456{return result.err(Error.Identity("Pinned runtime files exceed the 256 MiB aggregate bound"))}
+  i+=1}
+ result.ok(())
+}
+fn retain(log:ref<bytes>,data:view<byte>)->bool effects {alloc} {
+ let size:u64=view.len(bytes.view(log))
+ let remaining:u64=if size<65536{65536-size}else{0}
+ let count:u64=if view.len(data)>remaining{remaining}else{view.len(data)}
+ bytes.append(log,view.slice(data,0,count))
+ count<view.len(data)
+}
+fn diagnostic(data:view<byte>)->string effects {alloc} {
+ match str.from_bytes(data){some(value)=>text.trim(value),none=>"Diagnostics contain non-UTF-8 bytes"}
+}
+fn environment(tool:ref<Tool>)->array<string> effects {alloc,env} {
+ var directories:array<string>=[path.dirname(tool.executable)]
+ var i:u64=0
+ loop{if i==array.len(tool.dependencies){break}
+  let dependency:ref<Dependency>=array.borrow(struct.borrow(tool,field=dependencies),i)
+  array.push(directories,path.dirname(dependency.path))
+  i+=1}
+ var overrides:array<string>=[]
+ if system.platform()=="windows"{proc.env_prepend_path(overrides,directories)}else{
+  proc.env_set(overrides,"LD_LIBRARY_PATH",text.join(directories,":"))
+  proc.env_set(overrides,"LD_PRELOAD","")
+  proc.env_set(overrides,"LD_AUDIT","")}
+ overrides
+}
+pub fn invoke(tool:ref<Tool>,argv:ref<array<string>>,working_directory:str,output_file:str,max_output_bytes:u64,
+ cancel:str,deadline_ns:u64)->result<Captured,Error> effects {alloc,fs.meta,process,time,env} {
+ if control.cancelled(cancel){return result.err(Error.Cancelled)}
+ if time.monotonic_ns()>=deadline_ns{return result.err(Error.Timeout)}
+ let overrides:array<string>=environment(tool)
+ var child:Child=try proc.spawn_piped_env(argv,working_directory,overrides) map_err launch_problem
+ let pid:u64=proc.child_pid(child)
+ let _=proc.close_stdin(child)
+ var stdout:bytes=bytes.copy(b"")
+ var stderr:bytes=bytes.copy(b"")
+ var out_open:bool=true
+ var err_open:bool=true
+ var out_truncated:bool=false
+ var err_truncated:bool=false
+ var failure:option<Error>=option.none()
+ loop{
+  if control.cancelled(cancel){failure=option.some(Error.Cancelled)
+   break}
+  if time.monotonic_ns()>=deadline_ns{failure=option.some(Error.Timeout)
+   break}
+  if str.len(output_file)>0{
+   match files.file_size(output_file){ok(size)=>{if size>max_output_bytes{failure=option.some(Error.OutputLimit)
+    break}},err(error)=>{if error.code!=1{failure=option.some(problem(error))
+    break}}}}
+  if out_open{
+   match proc.read_stdout(child,4096,proc.deadline_in(5)){
+    ok(data)=>{if view.len(bytes.view(data))==0{out_open=false}else{if retain(stdout,bytes.view(data)){out_truncated=true}}},
+    err(error)=>{if error.code!=10{failure=option.some(problem(error))
+      break}},}}
+  if err_open{
+   match proc.read_stderr(child,4096,proc.deadline_in(5)){
+    ok(data)=>{if view.len(bytes.view(data))==0{err_open=false}else{if retain(stderr,bytes.view(data)){err_truncated=true}}},
+    err(error)=>{if error.code!=10{failure=option.some(problem(error))
+      break}},}}
+  if not out_open and not err_open{
+   match proc.poll(child){some(_)=>{break},none=>{time.sleep_ms(1)}}}
+ }
+ let _=match failure{some(error)=>{
+   let _=proc.terminate(child,tool.termination_grace_ms)
+   let _=proc.close(child)
+   return result.err(error)},none=>()}
+ let status:result<process.status,fs.error>=proc.wait(child,deadline_ns)
+ let closed:result<process.status,fs.error>=proc.close(child)
+ let ended:process.status=try status map_err problem
+ let _=try closed map_err problem
+ if not proc.success(ended){return result.err(Error.Child(ChildFailure{code:proc.exit_code(ended),detail:diagnostic(bytes.view(stderr))}))}
+ if str.len(output_file)>0{
+  let size:u64=try files.file_size(output_file) map_err problem
+  if size>max_output_bytes{return result.err(Error.OutputLimit)}}
+ result.ok(Captured{stdout:stdout,stderr:stderr,pid:pid,stdout_truncated:out_truncated,stderr_truncated:err_truncated})
+}
+pub fn verify_version(tool:ref<Tool>,cancel:str,deadline_ns:u64)->result<unit,Error>
+ effects {alloc,fs.meta,process,time,env} {
+ let argv:array<string>=[string.copy(tool.executable),"--version"]
+ let captured:Captured=try invoke(tool,argv,path.dirname(tool.executable),"",0,cancel,deadline_ns)
+ let out:string=diagnostic(bytes.view(captured.stdout))
+ let err:string=diagnostic(bytes.view(captured.stderr))
+ if captured.stdout_truncated or captured.stderr_truncated or not((out==tool.version and err=="")or(err==tool.version and out=="")){
+  return result.err(Error.Identity("The executable reports an incompatible version"))}
+ result.ok(())
+}

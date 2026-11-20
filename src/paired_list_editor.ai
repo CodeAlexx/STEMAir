@@ -1,0 +1,59 @@
+module stemair.paired_list_editor
+import "input_selection.ai" as selection
+import "../toolkit/paired_inputs.ai" as ordered
+
+fn current(items:ref<array<string>>,selected:ref<selection.State>)->result<unit,string> effects {alloc} {
+ if array.len(items)!=selected.count{return result.err("The paired recording list changed; select its current rows")}
+ result.ok(())
+}
+fn refresh(selected:ref<selection.State>,count:u64,keep:option<u64>)->unit effects {alloc} {
+ selection.reset(selected,count)
+ match keep{none=>{},some(index)=>{if index<count{array.push(struct.borrow(selected,field=selected),index)}}}
+}
+fn nearby(index:u64,count:u64)->option<u64> effects {} {
+ if count==0{option.none()}else{option.some(if index<count{index}else{count-1})}
+}
+pub fn add(items:ref<array<string>>,selected:ref<selection.State>,incoming:ref<array<string>>,maximum:u64)->result<bool,string> effects {alloc} {
+ let _=try current(items,selected)
+ let before:u64=array.len(items)
+ let _=try ordered.add(items,incoming,maximum)
+ if array.len(items)==before{return result.ok(false)}
+ refresh(selected,array.len(items),option.none())
+ result.ok(true)
+}
+pub fn duplicate(items:ref<array<string>>,selected:ref<selection.State>,maximum:u64)->result<bool,string> effects {alloc} {
+ let index:u64=try selection.one(selected,array.len(items))
+ let _=try ordered.duplicate(items,index,maximum)
+ refresh(selected,array.len(items),option.some(index))
+ result.ok(true)
+}
+pub fn remove(items:ref<array<string>>,selected:ref<selection.State>)->result<bool,string> effects {alloc} {
+ let index:u64=try selection.one(selected,array.len(items))
+ let _=try ordered.remove(items,index)
+ refresh(selected,array.len(items),nearby(index,array.len(items)))
+ result.ok(true)
+}
+pub fn move(items:ref<array<string>>,selected:ref<selection.State>,up:bool)->result<bool,string> effects {alloc} {
+ let index:u64=try selection.one(selected,array.len(items))
+ let destination:u64=try ordered.move(items,index,up)
+ if destination==index{return result.ok(false)}
+ refresh(selected,array.len(items),option.some(destination))
+ result.ok(true)
+}
+pub fn transfer(first:ref<array<string>>,first_selection:ref<selection.State>,second:ref<array<string>>,second_selection:ref<selection.State>,maximum:u64)->result<bool,string> effects {alloc} {
+ let index:u64=try selection.one(first_selection,array.len(first))
+ let _=try current(second,second_selection)
+ let changed:bool=try ordered.transfer(first,second,index,maximum)
+ if not changed{return result.ok(false)}
+ refresh(first_selection,array.len(first),nearby(index,array.len(first)))
+ refresh(second_selection,array.len(second),option.some(array.len(second)-1))
+ result.ok(true)
+}
+pub fn clear(items:ref<array<string>>,selected:ref<selection.State>)->result<bool,string> effects {alloc} {
+ let _=try current(items,selected)
+ if array.len(items)==0{return result.ok(false)}
+ let empty:array<string>=[]
+ let _=ref.swap(items,empty)
+ refresh(selected,0,option.none())
+ result.ok(true)
+}

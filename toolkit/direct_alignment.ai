@@ -1,0 +1,254 @@
+// Retained whole-track gain candidates for the explicit no-local-window route.
+module stemair.direct_alignment
+import "typed_selection.ai" as selection
+import "recording_preparation.ai" as prep
+import "recording_resources.ai" as resources
+import "alignment_options.ai" as options
+import "control.ai" as control
+import "spectral_matching.ai" as spectral
+import std.cpu_dot as dot
+import std.float as fp
+pub type Plan=struct{decoded_bytes:u64,working_bytes:u64,candidates:u64,frames:u64,channels:u64}
+pub type Intro=struct{divisor:u64,index:u64,left_lag:i64,right_lag:i64,raw_frames:u64,promoted:bool,unique_index:u64}
+pub type Candidate=struct{intro:u64,offset:u64,promoted:bool,cost:selection.Scalar,raw_sha256:string,base_sha256:string,adjusted_sha256:string,residual_sha256:string}
+pub type Output=struct{preparation:prep.Observation,frames:u64,channels:u64,intros:array<Intro>,candidates:array<Candidate>,indices:array<u64>,parts:array<selection.Part>,unclipped:selection.Wave,residual:selection.Wave,aligned:option<selection.Wave>}
+pub type Collected=struct{preparation:prep.Observation,frames:u64,channels:u64,intros:array<Intro>,candidates:array<Candidate>,indices:array<u64>,waves:array<selection.Wave>,first:array<f32>}
+pub type SpectralOutput=struct{preparation:prep.Observation,intros:array<Intro>,candidates:array<Candidate>,indices:array<u64>,finalization:spectral.Final}
+pub fn plan_spectral(first_frames:u64,first_channels:u64,second_frames:u64,second_channels:u64,intros:options.IntroSet,gain:options.GainChoice,limits:resources.Limits)->result<Plan,string> effects {alloc} {
+ var base:Plan=try plan(first_frames,first_channels,second_frames,second_channels,intros,gain,resources.Limits{max_decoded_bytes:limits.max_decoded_bytes,max_working_bytes:18446744073709551615})
+ let geometry:spectral.Geometry=try spectral.geometry(try resources.multiply(first_frames,2),2,true,spectral.Limits{max_input_bytes:18446744073709551615,max_working_bytes:18446744073709551615})
+ let required:u64=try resources.checked_add(base.working_bytes,geometry.working_bytes)
+ if required>limits.max_working_bytes{return result.err("Spectral whole-track alignment exceeds the caller working-memory limit")}
+ base.working_bytes=required
+ result.ok(base)
+}
+pub fn plan(first_frames:u64,first_channels:u64,second_frames:u64,second_channels:u64,intros:options.IntroSet,gain:options.GainChoice,limits:resources.Limits)->result<Plan,string> effects {alloc} {
+ let prior:resources.Plan=try resources.plan(first_frames,first_channels,second_frames,second_channels,resources.Limits{max_decoded_bytes:limits.max_decoded_bytes,max_working_bytes:18446744073709551615},true)
+ let count:u64=try resources.multiply(array.len(options.intros(intros)),options.gain_steps(gain))
+ let samples:u64=try resources.multiply(first_frames,prior.channels)
+ let second:u64=try resources.multiply(second_frames,prior.channels)
+ let decoded_capacity:u64=try resources.multiply(try resources.checked_add(try resources.capacity(try resources.multiply(first_frames,first_channels)),try resources.capacity(try resources.multiply(second_frames,second_channels))),4)
+ let upmixed:u64=try resources.multiply(try resources.checked_add(samples,second),4)
+ let candidates:u64=try resources.multiply(try resources.multiply(samples,8),count)
+ let scratch:u64=try resources.multiply(samples,44)
+ let parts:u64=try resources.multiply(240,try resources.checked_add(128,try resources.multiply(count,32)))
+ let metadata:u64=try resources.checked_add(parts,try resources.multiply(count,1024))
+ let direct:u64=try resources.checked_add(try resources.checked_add(try resources.checked_add(decoded_capacity,upmixed),try resources.checked_add(candidates,scratch)),try resources.checked_add(268435456,metadata))
+ let working:u64=if prior.working_bytes>direct{prior.working_bytes}else{direct}
+ if working>limits.max_working_bytes{return result.err("Whole-track alignment exceeds the caller working-memory limit")}
+ result.ok(Plan{decoded_bytes:prior.decoded_bytes,working_bytes:working,candidates:count,frames:first_frames,channels:prior.channels})
+}
+pub fn digest(wave:ref<selection.Wave>)->string effects {alloc} {
+ let width:u64=if selection.is_wide(wave){8}else{4}
+ var raw:array<byte>=[]
+ array.reserve(raw,selection.length(wave)*width)
+ var i:u64=0
+ loop{if i==selection.length(wave){break}
+  let bits:u64=if width==8{cast.bits(selection.sample_wide(wave,i))}else{let word:u32=cast.bits(selection.sample_narrow(wave,i))
+   cast.wrap(word)}
+  var b:u64=0
+  loop{if b==width{break}
+   let word:u8=cast.wrap(bits>>(8*b))
+   array.push(raw,cast.bits(word))
+   b+=1}
+  i+=1}
+ bytes.hex(hash.sha256(array.view(raw)))
+}
+fn raw_wave(prepared:ref<prep.Matched>)->selection.Wave effects {alloc} {
+ if prepared.raw_second_promoted{
+  var values:array<f64>=[]
+  array.reserve(values,array.len(prepared.raw_second))
+  var i:u64=0
+  loop{if i==array.len(prepared.raw_second){break}
+   array.push(values,array.get(prepared.raw_second,i))
+   i+=1}
+  selection.Wave.Wide(values)
+ }else{
+  var values:array<f32>=[]
+  array.reserve(values,array.len(prepared.raw_second))
+  var i:u64=0
+  loop{if i==array.len(prepared.raw_second){break}
+   array.push(values,cast.float(array.get(prepared.raw_second,i)))
+   i+=1}
+  selection.Wave.Narrow(values)
+ }
+}
+fn scale(wave:ref<selection.Wave>,factor:f64,cancel:str)->result<selection.Wave,string> effects {alloc,fs.meta} {
+ if selection.is_wide(wave){
+  var out:array<f64>=[]
+  array.reserve(out,selection.length(wave))
+  var i:u64=0
+  loop{if i==selection.length(wave){break}
+   if i%4096==0 and control.cancelled(cancel){return result.err("Whole-track alignment cancelled")}
+   let value:f64=selection.sample_wide(wave,i)*factor
+   array.push(out,value)
+   i+=1}
+  result.ok(selection.Wave.Wide(out))
+ }else{
+  let scalar:f32=cast.float(factor)
+  var out:array<f32>=[]
+  array.reserve(out,selection.length(wave))
+  var i:u64=0
+  loop{if i==selection.length(wave){break}
+   if i%4096==0 and control.cancelled(cancel){return result.err("Whole-track alignment cancelled")}
+   let value:f32=selection.sample_narrow(wave,i)*scalar
+   array.push(out,value)
+   i+=1}
+  result.ok(selection.Wave.Narrow(out))
+ }
+}
+fn subtract(first:view<f32>,wave:ref<selection.Wave>,cancel:str)->result<selection.Wave,string> effects {alloc,fs.meta} {
+ if selection.is_wide(wave){
+  var out:array<f64>=[]
+  array.reserve(out,view.len(first))
+  var i:u64=0
+  loop{if i==view.len(first){break}
+   if i%4096==0 and control.cancelled(cancel){return result.err("Whole-track alignment cancelled")}
+   let value:f64=cast.float(view.get(first,i))-selection.sample_wide(wave,i)
+   array.push(out,value)
+   i+=1}
+  result.ok(selection.Wave.Wide(out))
+ }else{
+  var out:array<f32>=[]
+  array.reserve(out,view.len(first))
+  var i:u64=0
+  loop{if i==view.len(first){break}
+   if i%4096==0 and control.cancelled(cancel){return result.err("Whole-track alignment cancelled")}
+   let value:f32=view.get(first,i)-selection.sample_narrow(wave,i)
+   array.push(out,value)
+   i+=1}
+  result.ok(selection.Wave.Narrow(out))
+ }
+}
+fn clipped(wave:ref<selection.Wave>,cancel:str)->result<selection.Wave,string> effects {alloc,fs.meta} {
+ if selection.is_wide(wave){
+  var out:array<f64>=[]
+  array.reserve(out,selection.length(wave))
+  var i:u64=0
+  loop{if i==selection.length(wave){break}
+   if i%4096==0 and control.cancelled(cancel){return result.err("Whole-track alignment cancelled")}
+   let value:f64=selection.sample_wide(wave,i)
+   array.push(out,if value< -1.0{-1.0}else{if value>1.0{1.0}else{value}})
+   i+=1}
+  result.ok(selection.Wave.Wide(out))
+ }else{
+  var out:array<f32>=[]
+  array.reserve(out,selection.length(wave))
+  var i:u64=0
+  loop{if i==selection.length(wave){break}
+   if i%4096==0 and control.cancelled(cancel){return result.err("Whole-track alignment cancelled")}
+   let value:f32=selection.sample_narrow(wave,i)
+   array.push(out,if value< -1.0{-1.0}else{if value>1.0{1.0}else{value}})
+   i+=1}
+  result.ok(selection.Wave.Narrow(out))
+ }
+}
+// Same lag has the same unmatched length/content except NaNs defeat array_equal.
+fn repeated_source(inputs:ref<prep.Inputs>,estimate:ref<prep.Estimate>,prior:ref<prep.Estimate>)->bool effects {} {
+ let lag:i64=array.get(estimate.lags,0).samples
+ if lag!=array.get(prior.lags,0).samples{return false}
+ let shape:prep.Geometry=inputs.geometry
+ var i:u64=if lag<0{cast.wrap(-lag)}else{0}
+ loop{if i>=shape.adjusted_second_frames{break}
+  var ch:u64=0
+  loop{if ch==shape.channels{break}
+   if fp.is_nan(prep.adjusted(array.view(inputs.second),shape.other_frames,shape.channels,i,ch,shape.silence_delta)){return false}
+   ch+=1}
+  i+=1}
+ true
+}
+pub fn collect(engine:ref<dot.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,intro_set:options.IntroSet,gain:options.GainChoice,preparation:prep.Recipe,limits:resources.Limits,cancel:str,progress:str,capture:bool)->result<Collected,string>
+ effects {alloc,ffi,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Whole-track alignment cancelled")}
+ if first_channels==0 or second_channels==0 or view.len(first)%first_channels!=0 or view.len(second)%second_channels!=0{return result.err("Whole-track alignment requires complete input frames")}
+ let allocation:Plan=try plan(view.len(first)/first_channels,first_channels,view.len(second)/second_channels,second_channels,intro_set,gain,limits)
+ let _=try dot.require_threads(engine,1)
+ var inputs:prep.Inputs=try prep.prepare(engine,first,first_channels,second,second_channels,preparation,limits,cancel,progress)
+ let shape:prep.Geometry=inputs.geometry
+ let divisors:array<u64>=options.intros(intro_set)
+ var estimates:array<prep.Estimate>=[]
+ var intros:array<Intro>=[]
+ array.reserve(estimates,array.len(divisors))
+ array.reserve(intros,array.len(divisors))
+ var i:u64=0
+ loop{if i==array.len(divisors){break}
+  var estimate:prep.Estimate=try prep.estimate(engine,inputs,array.get(divisors,i),limits,cancel,progress)
+  let lag:i64=array.get(estimate.lags,0).samples
+  var index:u64=0
+  loop{if index==array.len(estimates){break}
+   let prior:ref<prep.Estimate>=array.borrow(estimates,index)
+   if repeated_source(inputs,estimate,prior){break}
+   index+=1}
+  array.push(intros,Intro{divisor:estimate.divisor,index:estimate.index,left_lag:lag,right_lag:if shape.channels==2{array.get(estimate.lags,1).samples}else{lag},raw_frames:estimate.unmatched_frames,promoted:estimate.promoted,unique_index:index})
+  if index==array.len(estimates){array.push(estimates,estimate)}
+  i+=1}
+ let factors:array<f64>=try options.gains(math,gain)
+ var waves:array<selection.Wave>=[]
+ var candidates:array<Candidate>=[]
+ var costs:array<selection.Scalar>=[]
+ array.reserve(waves,allocation.candidates)
+ array.reserve(candidates,allocation.candidates)
+ array.reserve(costs,allocation.candidates)
+ var c:u64=0
+ loop{if c==array.len(estimates){break}
+  if control.cancelled(cancel){return result.err("Whole-track alignment cancelled")}
+  control.report(progress,c,array.len(estimates))
+  let estimate:ref<prep.Estimate>=array.borrow(estimates,c)
+  var prepared:prep.Matched=try prep.materialize(inputs,estimate,limits,cancel)
+  var raw:selection.Wave=raw_wave(prepared)
+  let raw_hash:string=if capture{digest(raw)}else{string.copy("")}
+  var base:selection.Wave=try scale(raw,array.get(factors,0),cancel)
+  let base_hash:string=if capture{digest(base)}else{string.copy("")}
+  var offset:u64=0
+  loop{if offset==options.gain_steps(gain){break}
+   if control.cancelled(cancel){return result.err("Whole-track alignment cancelled")}
+   var adjusted:selection.Wave=try scale(base,array.get(factors,offset+1),cancel)
+   var residual:selection.Wave=try subtract(array.view(prepared.first),adjusted,cancel)
+   let cost:selection.Scalar=selection.abs_mean(residual,0,selection.length(residual))
+   array.push(candidates,Candidate{intro:c,offset:offset,promoted:selection.is_wide(residual),cost:cost,raw_sha256:string.copy(raw_hash),base_sha256:string.copy(base_hash),adjusted_sha256:if capture{digest(adjusted)}else{string.copy("")},residual_sha256:if capture{digest(residual)}else{string.copy("")}})
+   array.push(costs,cost)
+   array.push(waves,residual)
+   offset+=1}
+  c+=1}
+ let indices:array<u64>=selection.ordered_unique_indices(array.view(costs))
+ let observation:prep.Observation=prep.copy_observation(struct.borrow(inputs,field=observation))
+ let original:array<f32>=struct.replace(inputs,[],field=first)
+ result.ok(Collected{preparation:observation,frames:shape.frames,channels:shape.channels,intros:intros,candidates:candidates,indices:indices,waves:waves,first:original})
+}
+pub fn process(engine:ref<dot.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,intro_set:options.IntroSet,gain:options.GainChoice,preparation:prep.Recipe,save_aligned:bool,limits:resources.Limits,cancel:str,progress:str,capture:bool)->result<Output,string>
+ effects {alloc,ffi,fs.meta,fs.write} {
+ var collected:Collected=try collect(engine,math,first,first_channels,second,second_channels,intro_set,gain,preparation,limits,cancel,progress,capture)
+ let frames:u64=collected.frames
+ let channels:u64=collected.channels
+ let indices:array<u64>=struct.replace(collected,[],field=indices)
+ var selected:selection.Output=try selection.select_chunks(struct.borrow(collected,field=waves),array.view(indices),frames,channels,240,limits.max_working_bytes,cancel,progress)
+ var residual:selection.Wave=try clipped(struct.borrow(selected,field=samples),cancel)
+ var aligned:option<selection.Wave>=option.none()
+ if save_aligned{aligned=option.some(try subtract(array.view(collected.first),residual,cancel))}
+ let empty:selection.Wave=selection.Wave.Narrow([])
+ let unclipped:selection.Wave=struct.replace(selected,empty,field=samples)
+ let no_parts:array<selection.Part>=[]
+ let parts:array<selection.Part>=struct.replace(selected,no_parts,field=parts)
+ let intros:array<Intro>=struct.replace(collected,[],field=intros)
+ let candidates:array<Candidate>=struct.replace(collected,[],field=candidates)
+ result.ok(Output{preparation:prep.copy_observation(struct.borrow(collected,field=preparation)),frames:collected.frames,channels:collected.channels,intros:intros,candidates:candidates,indices:indices,parts:parts,unclipped:unclipped,residual:residual,aligned:aligned})
+}
+// Full original no-local-window candidate path followed by both spectral stages.
+pub fn process_spectral(engine:ref<dot.Engine>,math:ref<CAbiLibrary>,transform:ref<spectral.Plan>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,intro_set:options.IntroSet,gain:options.GainChoice,preparation:prep.Recipe,limits:resources.Limits,cancel:str,progress:str,capture:bool)->result<SpectralOutput,string>
+ effects {alloc,ffi,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Whole-track alignment cancelled")}
+ if first_channels==0 or second_channels==0 or view.len(first)%first_channels!=0 or view.len(second)%second_channels!=0{return result.err("Whole-track alignment requires complete input frames")}
+ let _=try plan_spectral(view.len(first)/first_channels,first_channels,view.len(second)/second_channels,second_channels,intro_set,gain,limits)
+ var collected:Collected=try collect(engine,math,first,first_channels,second,second_channels,intro_set,gain,preparation,limits,cancel,progress,capture)
+ var indices:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(collected.indices){break}
+  array.push(indices,array.get(collected.indices,i))
+  i+=1}
+ var values:array<selection.Wave>=try spectral.take_values(struct.borrow(collected,field=waves),array.view(indices))
+ let policy:spectral.Limits=spectral.Limits{max_input_bytes:limits.max_working_bytes,max_working_bytes:limits.max_working_bytes}
+ let output:spectral.Final=try spectral.finish(transform,math,array.view(collected.first),values,collected.channels,policy,cancel,progress)
+ let intros:array<Intro>=struct.replace(collected,[],field=intros)
+ let candidates:array<Candidate>=struct.replace(collected,[],field=candidates)
+ result.ok(SpectralOutput{preparation:prep.copy_observation(struct.borrow(collected,field=preparation)),intros:intros,candidates:candidates,indices:indices,finalization:output})
+}

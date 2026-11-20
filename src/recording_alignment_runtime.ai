@@ -1,0 +1,73 @@
+module stemair.recording_alignment_runtime
+import "recording_alignment_application.ai" as alignment
+import "alignment_runtime.ai" as coarse
+import std.codec as codec
+import std.files as files
+import std.json as json
+import std.path as path
+import std.system as system
+
+type Transform=struct{file:string,sha256:string}
+fn transform(root:str,windows:bool)->result<Transform,string> effects {alloc,fs.read,fs.meta} {
+ let raw:bytes=match files.read_limited(path.join(root,"licenses/cpu-fft-runtime.json"),16384){ok(value)=>value,err(_)=>{
+  return result.err("The recording alignment transform identity is unavailable")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(value)=>value,none=>{
+  return result.err("The recording alignment transform identity must be UTF-8")}}
+ var document:json.Document=match json.parse(source){ok(value)=>value,err(_)=>{
+  return result.err("The recording alignment transform identity is invalid")}}
+ let policy:codec.Policy=codec.Policy{reject_unknown:false,reject_duplicates:true}
+ var reader:codec.Reader=codec.root_reader(policy)
+ let schema:string=try codec.text_field(document,reader,"schema") map_err codec.describe
+ var hosts:codec.Reader=try codec.object_field(document,reader,"hosts",policy) map_err codec.describe
+ var host:codec.Reader=try codec.object_field(document,hosts,if windows{"windows"}else{"linux"},policy) map_err codec.describe
+ let name:string=try codec.text_field(document,host,"file") map_err codec.describe
+ let sha:string=try codec.text_field(document,host,"sha256") map_err codec.describe
+ let size:u64=try codec.u64_field(document,host,"bytes") map_err codec.describe
+ let abi:u64=try codec.u64_field(document,host,"abi") map_err codec.describe
+ let _=try codec.reader_finish(document,host) map_err codec.describe
+ let _=try codec.reader_finish(document,hosts) map_err codec.describe
+ let _=try codec.reader_finish(document,reader) map_err codec.describe
+ if schema!="native-cpu-transform-runtime-v1" or abi!=1 or size==0 or str.len(sha)!=64 or
+  name!=if windows{"air_cpu_fft.dll"}else{"libair_cpu_fft.so"}{
+  return result.err("The recording alignment transform identity is incompatible")}
+ let candidates:array<string>=[path.join(path.join(root,"runtime/cpu-fft"),name),path.join(path.join(root,"build/runtime/cpu-fft"),name)]
+ var i:u64=0
+ loop{if i==array.len(candidates){break}
+  let candidate:str=array.get(candidates,i)
+  match files.symlink_metadata(candidate){ok(info)=>{
+   if not info.is_file or info.is_symlink{return result.err("The recording alignment transform must be an ordinary library file")}
+   let actual_size:u64=match files.file_size(candidate){ok(value)=>value,err(_)=>{
+    return result.err("Cannot inspect the recording alignment transform size")}}
+   let actual_sha:string=match files.sha256(candidate){ok(value)=>value,err(_)=>{
+    return result.err("Cannot inspect the recording alignment transform identity")}}
+   if actual_size!=size or actual_sha!=sha{return result.err("The recording alignment transform differs from its pinned identity")}
+   return result.ok(Transform{file:string.copy(candidate),sha256:string.copy(sha)})
+  },err(error)=>{if error.code!=1{return result.err("Cannot inspect the recording alignment transform")}}}
+  i+=1}
+ result.err("Detailed recording alignment requires the optional CPU transform runtime")
+}
+
+// Callers choose resource budgets. Runtime discovery does not impose a duration
+// limit or substitute a development path for a missing installed library.
+pub fn settings(root:str,save_aligned:bool,encoded_limit:u64,decoded_limit:u64,working_limit:u64)->result<alignment.Settings,string>
+ effects {alloc,env,fs.read,fs.meta} {
+ if encoded_limit==0 or decoded_limit==0 or working_limit==0{return result.err("Recording alignment requires positive resource limits")}
+ let windows:bool=system.platform()=="windows"
+ let dot=try coarse.settings(root,false,save_aligned)
+ let fft:Transform=try transform(root,windows)
+ result.ok(alignment.Settings{dot_runtime:string.copy(dot.runtime),dot_sha256:string.copy(dot.runtime_sha256),
+  fft_runtime:string.copy(fft.file),fft_sha256:string.copy(fft.sha256),math_runtime:if windows{"ucrtbase.dll"}else{"libm.so.6"},
+  host_recipe:if windows{"windows-ucrt"}else{"linux-vector-roundoff"},input_limit_bytes:encoded_limit,
+  max_decoded_bytes:decoded_limit,max_working_bytes:working_limit,save_aligned:save_aligned})
+}
+
+// Compatibility record: the explicit no-window action does not use FFT/Hann.
+pub fn settings_for_windows(root:str,window_choice:str,save_aligned:bool,encoded_limit:u64,decoded_limit:u64,working_limit:u64)->result<alignment.Settings,string>
+ effects {alloc,env,fs.read,fs.meta} {
+ if window_choice!="none"{return settings(root,save_aligned,encoded_limit,decoded_limit,working_limit)}
+ if encoded_limit==0 or decoded_limit==0 or working_limit==0{return result.err("Recording alignment requires positive resource limits")}
+ let dot=try coarse.settings(root,false,save_aligned)
+ result.ok(alignment.Settings{dot_runtime:string.copy(dot.runtime),dot_sha256:string.copy(dot.runtime_sha256),
+  fft_runtime:"",fft_sha256:"",math_runtime:if system.platform()=="windows"{"ucrtbase.dll"}else{"libm.so.6"},
+  host_recipe:if system.platform()=="windows"{"windows-ucrt"}else{"linux-vector-roundoff"},input_limit_bytes:encoded_limit,max_decoded_bytes:decoded_limit,max_working_bytes:working_limit,save_aligned:save_aligned})
+}

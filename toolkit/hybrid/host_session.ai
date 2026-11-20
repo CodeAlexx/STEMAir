@@ -1,0 +1,115 @@
+module stemair.hybrid.host_session
+import "network.ai" as network
+import "host_prepared.ai" as prepared
+import "host.ai" as host
+import "host_recording.ai" as recording
+import "config.ai" as config
+import "../ops.ai" as rows
+
+import "../recording_shifts.ai" as shifts
+import "../host_recording_audio.ai" as request_recording
+import "../recording_moments.ai" as moments
+import "../audio_normalization.ai" as normalization
+import "host_transform_request.ai" as transform_request
+import "../control.ai" as control
+import "../numeric.ai" as num
+pub type Prepared=struct{backend:prepared.Backend,requests:u64=0,forward_calls:u64=0,runtime:string=""}
+pub type Lifecycle=struct{preparations:u64=0}
+pub fn prepare(n:ref<network.Network>)->result<Prepared,string> effects {alloc,fs.read} {result.ok(Prepared{backend:try if n.constructor.kwargs.cac{prepared.prepare(n)}else{prepared.prepare_magnitude(n)}})}
+pub fn prepare_once(n:ref<network.Network>,bank:ref<array<Prepared>>,state:ref<Lifecycle>)->result<unit,string> effects {alloc,fs.read} {
+ if array.len(bank)==0{array.push(bank,try prepare(n))
+  state.preparations+=1}
+ if array.len(bank)!=1{return result.err("CPU hybrid session must own exactly one retained prepared bank")}
+ result.ok(())
+}
+fn predict(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,input:ref<rows.Tensor>,cancel:str)->result<rows.Tensor,string> effects {alloc,ffi,fs.meta} {
+ let out:rows.Tensor=try host.forward(n,struct.borrow(p,field=backend),library,input,cancel)
+ p.forward_calls+=1
+ result.ok(out)
+}
+fn length_for(n:ref<network.Network>,length:u64)->result<u64,string> effects {alloc} {
+ if length==0 or length>16711680{return result.err("CPU hybrid recording segment exceeds retained graph extent")}
+ result.ok(length)
+}
+pub fn separate(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ if array.len(c.targets)!=array.len(n.constructor.kwargs.sources){return result.err("Hybrid profile target count differs from checkpoint")}
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{n.constructor.kwargs.segment*44100}
+ if not n.constructor.kwargs.cac{
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  if view.len(input)<4 or view.len(input)%2!=0{return result.err("Expected complete stereo recording")}
+  let runtime:string=string.copy(p.runtime)
+  var offsets:array<u64>=[]
+  var i:u64=0
+  loop{if i==array.len(c.shift_offsets){break}
+   array.push(offsets,array.get(c.shift_offsets,i))
+   i+=1}
+  let _=try transform_request.prepare(n,struct.borrow(p,field=backend),runtime,c,view.len(input)/2,array.view(offsets))
+  return separate_original(n,p,library,c,input,cancel,progress)}
+ let out:array<f32>=try if array.len(n.constructor.kwargs.sources)==4{recording.separate(n,p,library,c,size,input,cancel,progress,predict,length_for)}else{request_recording.separate_sources(n,p,library,c,size,array.len(n.constructor.kwargs.sources),input,cancel,progress,predict,length_for)}
+ p.requests+=1
+ result.ok(out)
+}
+
+// Explicit request schedule; legacy fixed-offset separate remains available.
+pub fn separate_scheduled(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,c:ref<config.Config>,schedule:ref<shifts.Schedule>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ if array.len(c.targets)!=array.len(n.constructor.kwargs.sources){return result.err("Hybrid profile target count differs from checkpoint")}
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{n.constructor.kwargs.segment*44100}
+ if not n.constructor.kwargs.cac{
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var source:normalization.Prepared=try moments.prepare(input,2)
+  let frames:u64=source.frames
+  let mean:f32=source.mean
+  let scale:f32=source.scale
+  let _=try shifts.require_geometry(schedule,shifts.Family.Outer,frames,c.split,size,c.overlap)
+  if scale==0.0{return result.ok(num.zeros(2*array.len(n.constructor.kwargs.sources)*frames))}
+  let group:shifts.Group=try shifts.next_group(schedule)
+  let runtime:string=string.copy(p.runtime)
+  let _=try transform_request.prepare(n,struct.borrow(p,field=backend),runtime,c,frames,array.view(group.offsets))
+  let raw:array<f32>=try request_recording.separate_normalized_group_sources(n,p,library,c,schedule,size,array.len(n.constructor.kwargs.sources),source,group,cancel,progress,predict,length_for)
+  let out:array<f32>=try normalization.restore_sources(array.view(raw),frames,array.len(n.constructor.kwargs.sources),mean,scale)
+  p.requests+=1
+  return result.ok(out)}
+ let out:array<f32>=try request_recording.separate_scheduled_sources(n,p,library,c,schedule,size,array.len(n.constructor.kwargs.sources),input,cancel,progress,predict,length_for)
+ p.requests+=1
+ result.ok(out)
+}
+
+// Explicit original magnitude route: one resident weight/product bank and
+// all requested FFT geometries are prepared before any recording callback.
+pub fn prepare_original(n:ref<network.Network>,runtime:str,lengths:view<u64>)->result<Prepared,string> effects {alloc,ffi,fs.read}{
+ var bank:prepared.Backend=try prepared.prepare_magnitude(n)
+ let _=try prepared.prepare_transform_lengths(bank,n,runtime,lengths,536870912,1073741824)
+ result.ok(Prepared{backend:bank,runtime:string.copy(runtime)})
+}
+pub fn close_original(p:ref<Prepared>)->result<unit,string> effects {alloc,ffi}{
+ prepared.close_transforms(struct.borrow(p,field=backend))
+}
+pub fn separate_original(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write}{
+ let _=try config.validate(c)
+ if n.constructor.kwargs.cac or array.len(p.backend.transforms)==0 or array.len(c.targets)!=array.len(n.constructor.kwargs.sources){return result.err("Original magnitude recording is not prepared")}
+ var source:normalization.Prepared=try moments.prepare(input,2)
+ let frames:u64=source.frames
+ let mean:f32=source.mean
+ let scale:f32=source.scale
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{n.constructor.kwargs.segment*44100}
+ let raw:array<f32>=try request_recording.separate_normalized_sources(n,p,library,c,size,array.len(n.constructor.kwargs.sources),source,cancel,progress,predict,length_for)
+ let restored:array<f32>=try normalization.restore_sources(array.view(raw),frames,array.len(n.constructor.kwargs.sources),mean,scale)
+ p.requests+=1
+ result.ok(restored)
+}
+
+// The bag owns the one outer normalization and source restoration. Magnitude
+// children retain transforms for precisely this already-drawn offset group.
+pub fn separate_normalized_group(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,c:ref<config.Config>,schedule:ref<shifts.Schedule>,preparation:normalization.Prepared own,group:ref<shifts.Group>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write}{
+ let _=try config.validate(c)
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{n.constructor.kwargs.segment*44100}
+ let sources:u64=array.len(n.constructor.kwargs.sources)
+ if array.len(c.targets)!=sources{return result.err("Hybrid profile target count differs from checkpoint")}
+ if not n.constructor.kwargs.cac{
+  let _=try transform_request.prepare(n,struct.borrow(p,field=backend),p.runtime,c,preparation.frames,array.view(group.offsets))}
+ let out:array<f32>=try request_recording.separate_normalized_group_sources<network.Network,Prepared,config.Config>(n,p,library,c,schedule,size,sources,preparation,group,cancel,progress,predict,length_for)
+ p.requests+=1
+ result.ok(out)
+}

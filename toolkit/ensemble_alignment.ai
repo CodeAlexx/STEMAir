@@ -1,0 +1,224 @@
+// Source window/intro dictionaries and chunk selection over retained decoded audio.
+module stemair.ensemble_alignment
+import "recording_alignment.ai" as core
+import "recording_preparation.ai" as prep
+import "recording_resources.ai" as resources
+import "alignment_options.ai" as options
+import "local_residual.ai" as local
+import "selection_ensemble.ai" as selection
+import "initial_polarity.ai" as initial
+import "control.ai" as control
+import "numeric.ai" as num
+import "spectral_matching.ai" as spectral
+import "typed_selection.ai" as typed
+import std.cpu_dot as dot
+import std.cpu_fft as fft
+pub type Plan=struct{working_bytes:u64,decoded_bytes:u64,local_windows:u64,candidates:u64}
+pub type Intro=struct{divisor:u64,index:u64,left_lag:i64,right_lag:i64,raw_frames:u64,promoted:bool,unique_index:u64}
+pub type Pass=struct{choice:local.WindowChoice,cost:f32,step_count:u64,steps:array<core.GainStep>,division_sha256:string,mask_sha256:string,selected_sha256:string}
+pub type Coarse=struct{intro:u64,passes:array<Pass>,window_costs:array<f32>,window_indices:array<u64>,parts:array<selection.Part>,cost:f32,selected_sha256:string}
+pub type Output=struct{frames:u64,channels:u64,decision:initial.Decision,silence_delta:i64,intros:array<Intro>,coarses:array<Coarse>,coarse_costs:array<f32>,coarse_indices:array<u64>,parts:array<selection.Part>,unclipped:array<f32>,residual:array<f32>,aligned:array<f32>}
+pub type Waves=struct{frames:u64,channels:u64,intros:array<Intro>,coarses:array<Coarse>,coarse_costs:array<f32>,coarse_indices:array<u64>,parts:array<selection.Part>,unclipped:array<f32>,residual:array<f32>,aligned:array<f32>}
+pub type PreparedOutput=struct{preparation:prep.Observation,waves:Waves}
+pub type Collected=struct{preparation:prep.Observation,frames:u64,channels:u64,intros:array<Intro>,coarses:array<Coarse>,costs:array<f32>,indices:array<u64>,waves:array<array<f32>>,first:array<f32>}
+pub type SpectralOutput=struct{preparation:prep.Observation,intros:array<Intro>,coarses:array<Coarse>,coarse_costs:array<f32>,coarse_indices:array<u64>,finalization:spectral.Final}
+pub fn plan_spectral(first_frames:u64,first_channels:u64,second_frames:u64,second_channels:u64,window_set:options.WindowSet,intro_set:options.IntroSet,gain:options.GainChoice,phase:local.PhaseChoice,limits:core.Limits,capture:bool)->result<Plan,string> effects {alloc} {
+ var base:Plan=try plan(first_frames,first_channels,second_frames,second_channels,window_set,intro_set,gain,phase,core.Limits{max_decoded_bytes:limits.max_decoded_bytes,max_working_bytes:18446744073709551615},capture)
+ let geometry:spectral.Geometry=try spectral.geometry(try resources.multiply(first_frames,2),2,true,spectral.Limits{max_input_bytes:18446744073709551615,max_working_bytes:18446744073709551615})
+ let required:u64=try resources.checked_add(base.working_bytes,geometry.working_bytes)
+ if required>limits.max_working_bytes{return result.err("Spectral window alignment exceeds the caller working-memory limit")}
+ base.working_bytes=required
+ result.ok(base)
+}
+pub fn plan(first_frames:u64,first_channels:u64,second_frames:u64,second_channels:u64,window_set:options.WindowSet,intro_set:options.IntroSet,gain:options.GainChoice,phase:local.PhaseChoice,limits:core.Limits,capture:bool)->result<Plan,string> effects {alloc} {
+ let windows:array<local.WindowChoice>=options.windows(window_set)
+ let intros:array<u64>=options.intros(intro_set)
+ let count:u64=options.gain_steps(gain)*local.phase_count(phase)
+ let policy:resources.Limits=resources.Limits{max_decoded_bytes:limits.max_decoded_bytes,max_working_bytes:18446744073709551615}
+ var base:u64=0
+ var decoded:u64=0
+ var metadata:u64=0
+ var steps:u64=0
+ var i:u64=0
+ loop{if i==array.len(windows){break}
+  let window:local.WindowChoice=array.get(windows,i)
+  let value:resources.Plan=try resources.plan_search_choices(first_frames,first_channels,second_frames,second_channels,policy,capture,local.window_frames(window),local.hop_frames(window),count,local.phase_count(phase)>2)
+  let reservation:u64=try resources.checked_add(if capture{2048}else{512},try resources.multiply(count,if capture{256}else{48}))
+  let detail:u64=try resources.multiply(value.windows,reservation)
+  let bare:u64=value.working_bytes-detail
+  if bare>base{base=bare}
+  decoded=value.decoded_bytes
+  metadata=try resources.checked_add(metadata,detail)
+  steps=try resources.checked_add(steps,value.windows)
+  i+=1}
+ let channels:u64=if first_channels==1 and second_channels==1{1}else{2}
+ let s:u64=try resources.multiply(first_frames,channels)
+ let t:u64=try resources.multiply(second_frames,channels)
+ let retained_inputs:u64=try resources.multiply(try resources.checked_add(s,t),4)
+ let retained_passes:u64=try resources.multiply(try resources.multiply(s,4),array.len(intros)+array.len(windows)+3)
+ let extra:u64=try resources.checked_add(try resources.checked_add(retained_inputs,try resources.multiply(s,12)),retained_passes)
+ let working:u64=try resources.checked_add(try resources.checked_add(base,extra),try resources.multiply(metadata,array.len(intros)))
+ if working>limits.max_working_bytes{return result.err("Ensemble alignment exceeds the caller working-memory limit")}
+ let total:u64=try resources.multiply(steps,array.len(intros))
+ result.ok(Plan{working_bytes:working,decoded_bytes:decoded,local_windows:total,candidates:try resources.multiply(total,count)})
+}
+fn digest32(values:view<f32>)->result<string,string> effects {alloc} {
+ var raw:bytes=b""
+ var start:u64=0
+ loop{if start==view.len(values){break}
+  let count:u64=if view.len(values)-start<1048576{view.len(values)-start}else{1048576}
+  let packed:dot.Buffer=try dot.pack(view.slice(values,start,start+count))
+  bytes.append(raw,bytes.view(packed.data))
+  start+=count}
+ result.ok(bytes.hex(hash.sha256(bytes.view(raw))))
+}
+fn subset(waves:ref<array<array<f32>>>,indices:view<u64>)->array<array<f32>> effects {alloc} {
+ var selected:array<array<f32>>=[]
+ var i:u64=0
+ loop{if i==view.len(indices){break}
+  let values:ref<array<f32>>=array.borrow(waves,view.get(indices,i))
+  array.push(selected,num.copy(array.view(values)))
+  i+=1}
+ selected
+}
+pub fn collect_with_preparation(engine:ref<dot.Engine>,transform:ref<fft.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,hann:local.Recipe,window_set:options.WindowSet,intro_set:options.IntroSet,gain:options.GainChoice,phase:local.PhaseChoice,preparation:prep.Recipe,limits:core.Limits,cancel:str,progress:str,capture:bool)->result<Collected,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Ensemble alignment cancelled")}
+ let _=try plan(view.len(first)/(if first_channels==0{1}else{first_channels}),first_channels,view.len(second)/(if second_channels==0{1}else{second_channels}),second_channels,window_set,intro_set,gain,phase,limits,capture)
+ var inputs:prep.Inputs=try prep.prepare(engine,first,first_channels,second,second_channels,preparation,limits,cancel,progress)
+ let shape:prep.Geometry=inputs.geometry
+ let windows:array<local.WindowChoice>=options.windows(window_set)
+ let divisors:array<u64>=options.intros(intro_set)
+ var estimates:array<prep.Estimate>=[]
+ var intros:array<Intro>=[]
+ var i:u64=0
+ loop{if i==array.len(divisors){break}
+  var estimate:prep.Estimate=try prep.estimate(engine,inputs,array.get(divisors,i),limits,cancel,progress)
+  let lag:i64=array.get(estimate.lags,0).samples
+  var index:u64=0
+  loop{if index==array.len(estimates){break}
+   let prior:ref<prep.Estimate>=array.borrow(estimates,index)
+   if array.get(prior.lags,0).samples==lag{break}
+   index+=1}
+  array.push(intros,Intro{divisor:estimate.divisor,index:estimate.index,left_lag:lag,right_lag:if shape.channels==2{array.get(estimate.lags,1).samples}else{lag},raw_frames:estimate.unmatched_frames,promoted:estimate.promoted,unique_index:index})
+  if index==array.len(estimates){array.push(estimates,estimate)}
+  i+=1}
+ var coarse_waves:array<array<f32>>=[]
+ var costs:array<f32>=[]
+ var coarses:array<Coarse>=[]
+ var c:u64=0
+ loop{if c==array.len(estimates){break}
+  let estimate:ref<prep.Estimate>=array.borrow(estimates,c)
+  var prepared:prep.Matched=try prep.materialize(inputs,estimate,limits,cancel)
+  var waves:array<array<f32>>=[]
+  var window_costs:array<f32>=[]
+  var passes:array<Pass>=[]
+  i=0
+  loop{if i==array.len(windows){break}
+   let window:local.WindowChoice=array.get(windows,i)
+   var pass:core.LocalPass=try core.process_matched_choices(transform,math,prepared,hann,window,gain,phase,limits.max_working_bytes,cancel,progress,capture)
+   let step_count:u64=array.len(pass.steps)
+   let norm:ref<local.Normalized>=struct.borrow(pass,field=normalization)
+   let cost:f32=selection.abs_mean_f32(array.view(norm.selected))
+   let division_hash:string=if capture{try digest32(array.view(norm.division))}else{string.copy("")}
+   let mask_hash:string=if capture{bytes.hex(hash.sha256(bytes.view(norm.mask)))}else{string.copy("")}
+   let selected_hash:string=if capture{try digest32(array.view(norm.selected))}else{string.copy("")}
+   let empty:array<f32>=[]
+   let wave:array<f32>=struct.replace(norm,empty,field=selected)
+   let empty_steps:array<core.GainStep>=[]
+   let steps:array<core.GainStep>=if capture{struct.replace(pass,empty_steps,field=steps)}else{[]}
+   array.push(passes,Pass{choice:window,cost:cost,step_count:step_count,steps:steps,division_sha256:division_hash,mask_sha256:mask_hash,selected_sha256:selected_hash})
+   array.push(window_costs,cost)
+   array.push(waves,wave)
+   i+=1}
+  let indices:array<u64>=selection.ordered_unique_indices(array.view(window_costs))
+  var chosen:array<array<f32>>=subset(waves,array.view(indices))
+  var selected:selection.Output=try selection.select_chunks(chosen,shape.frames,shape.channels,12,limits.max_working_bytes,cancel,progress)
+  let cost:f32=selection.abs_mean_f32(array.view(selected.samples))
+  let selected_hash:string=if capture{try digest32(array.view(selected.samples))}else{string.copy("")}
+  let empty:array<f32>=[]
+  let wave:array<f32>=struct.replace(selected,empty,field=samples)
+  let empty_parts:array<selection.Part>=[]
+  let parts:array<selection.Part>=struct.replace(selected,empty_parts,field=parts)
+  array.push(coarses,Coarse{intro:c,passes:passes,window_costs:window_costs,window_indices:indices,parts:parts,cost:cost,selected_sha256:selected_hash})
+  array.push(costs,cost)
+  array.push(coarse_waves,wave)
+  c+=1}
+ let indices:array<u64>=selection.ordered_unique_indices(array.view(costs))
+ let observation:prep.Observation=prep.copy_observation(struct.borrow(inputs,field=observation))
+ let original:array<f32>=struct.replace(inputs,[],field=first)
+ result.ok(Collected{preparation:observation,frames:shape.frames,channels:shape.channels,intros:intros,coarses:coarses,costs:costs,indices:indices,waves:coarse_waves,first:original})
+}
+pub fn process_with_preparation(engine:ref<dot.Engine>,transform:ref<fft.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,hann:local.Recipe,window_set:options.WindowSet,intro_set:options.IntroSet,gain:options.GainChoice,phase:local.PhaseChoice,preparation:prep.Recipe,limits:core.Limits,cancel:str,progress:str,capture:bool)->result<PreparedOutput,string> effects {alloc,ffi,fs.meta,fs.write} {
+ var collected:Collected=try collect_with_preparation(engine,transform,math,first,first_channels,second,second_channels,hann,window_set,intro_set,gain,phase,preparation,limits,cancel,progress,capture)
+ let indices:array<u64>=struct.replace(collected,[],field=indices)
+ var chosen:array<array<f32>>=subset(struct.borrow(collected,field=waves),array.view(indices))
+ var selected:selection.Output=try selection.select_chunks(chosen,collected.frames,collected.channels,240,limits.max_working_bytes,cancel,progress)
+ var residual:array<f32>=[]
+ var aligned:array<f32>=[]
+ array.reserve(residual,array.len(selected.samples))
+ array.reserve(aligned,array.len(selected.samples))
+ var i:u64=0
+ loop{if i==array.len(selected.samples){break}
+  if i%4096==0 and control.cancelled(cancel){return result.err("Ensemble alignment cancelled")}
+  let value:f32=array.get(selected.samples,i)
+  let clipped:f32=if value< -1.0{-1.0}else{if value>1.0{1.0}else{value}}
+  array.push(residual,clipped)
+  array.push(aligned,array.get(collected.first,i)-clipped)
+  i+=1}
+ let empty:array<f32>=[]
+ let unclipped:array<f32>=struct.replace(selected,empty,field=samples)
+ let empty_parts:array<selection.Part>=[]
+ let parts:array<selection.Part>=struct.replace(selected,empty_parts,field=parts)
+ let observation:prep.Observation=prep.copy_observation(struct.borrow(collected,field=preparation))
+ let intros:array<Intro>=struct.replace(collected,[],field=intros)
+ let coarses:array<Coarse>=struct.replace(collected,[],field=coarses)
+ let costs:array<f32>=struct.replace(collected,[],field=costs)
+ let waves:Waves=Waves{frames:collected.frames,channels:collected.channels,intros:intros,coarses:coarses,coarse_costs:costs,coarse_indices:indices,parts:parts,unclipped:unclipped,residual:residual,aligned:aligned}
+ result.ok(PreparedOutput{preparation:observation,waves:waves})
+}
+
+pub fn process_spectral_with_preparation(engine:ref<dot.Engine>,transform:ref<fft.Engine>,math:ref<CAbiLibrary>,spectral_plan:ref<spectral.Plan>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,hann:local.Recipe,window_set:options.WindowSet,intro_set:options.IntroSet,gain:options.GainChoice,phase:local.PhaseChoice,preparation:prep.Recipe,limits:core.Limits,cancel:str,progress:str,capture:bool)->result<SpectralOutput,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Ensemble alignment cancelled")}
+ if first_channels==0 or second_channels==0 or view.len(first)%first_channels!=0 or view.len(second)%second_channels!=0{return result.err("Window alignment requires complete input frames")}
+ let _=try plan_spectral(view.len(first)/first_channels,first_channels,view.len(second)/second_channels,second_channels,window_set,intro_set,gain,phase,limits,capture)
+ var collected:Collected=try collect_with_preparation(engine,transform,math,first,first_channels,second,second_channels,hann,window_set,intro_set,gain,phase,preparation,limits,cancel,progress,capture)
+ var indices:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(collected.indices){break}
+  array.push(indices,array.get(collected.indices,i))
+  i+=1}
+ var values:array<typed.Wave>=try spectral.take_narrow_values(struct.borrow(collected,field=waves),array.view(indices))
+ let policy:spectral.Limits=spectral.Limits{max_input_bytes:limits.max_working_bytes,max_working_bytes:limits.max_working_bytes}
+ let finalization:spectral.Final=try spectral.finish(spectral_plan,math,array.view(collected.first),values,collected.channels,policy,cancel,progress)
+ let observation:prep.Observation=prep.copy_observation(struct.borrow(collected,field=preparation))
+ let intros:array<Intro>=struct.replace(collected,[],field=intros)
+ let coarses:array<Coarse>=struct.replace(collected,[],field=coarses)
+ let costs:array<f32>=struct.replace(collected,[],field=costs)
+ result.ok(SpectralOutput{preparation:observation,intros:intros,coarses:coarses,coarse_costs:costs,coarse_indices:indices,finalization:finalization})
+}
+
+pub fn legacy_output(value:ref<PreparedOutput>)->result<Output,string> effects {alloc} {
+ let observed:ref<prep.Observation>=struct.borrow(value,field=preparation)
+ let decision:initial.Decision=match observed.automatic{some(item)=>item,none=>{return result.err("Legacy output requires a measured automatic decision")}}
+ let reference:bool=match struct.borrow(observed,field=reference_silence){some(_)=>true,none=>false}
+ let target:bool=match struct.borrow(observed,field=target_silence){some(_)=>true,none=>false}
+ if not reference or not target{return result.err("Legacy output requires measured silence matching")}
+ let delta:i64=observed.silence_delta
+ let waves:ref<Waves>=struct.borrow(value,field=waves)
+ let frames:u64=waves.frames
+ let channels:u64=waves.channels
+ let intros:array<Intro>=struct.replace(waves,[],field=intros)
+ let coarses:array<Coarse>=struct.replace(waves,[],field=coarses)
+ let costs:array<f32>=struct.replace(waves,[],field=coarse_costs)
+ let indices:array<u64>=struct.replace(waves,[],field=coarse_indices)
+ let parts:array<selection.Part>=struct.replace(waves,[],field=parts)
+ let unclipped:array<f32>=struct.replace(waves,[],field=unclipped)
+ let residual:array<f32>=struct.replace(waves,[],field=residual)
+ let aligned:array<f32>=struct.replace(waves,[],field=aligned)
+ result.ok(Output{frames:frames,channels:channels,decision:decision,silence_delta:delta,intros:intros,coarses:coarses,coarse_costs:costs,coarse_indices:indices,parts:parts,unclipped:unclipped,residual:residual,aligned:aligned})
+}
+pub fn process(engine:ref<dot.Engine>,transform:ref<fft.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,hann:local.Recipe,window_set:options.WindowSet,intro_set:options.IntroSet,gain:options.GainChoice,phase:local.PhaseChoice,limits:core.Limits,cancel:str,progress:str,capture:bool)->result<Output,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let preparation:prep.Recipe=prep.Recipe{polarity:prep.Polarity.Automatic,match_silence:true}
+ var value:PreparedOutput=try process_with_preparation(engine,transform,math,first,first_channels,second,second_channels,hann,window_set,intro_set,gain,phase,preparation,limits,cancel,progress,capture)
+ legacy_output(value)
+}

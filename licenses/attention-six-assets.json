@@ -1,0 +1,9 @@
+{
+  "model": "attention-six-v1",
+  "filename": "attention-six-v1.th",
+  "url": "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/5c90dfd2-34c22ccb.th",
+  "bytes": 54996327,
+  "sha256": "34c22ccb381c6f9fdbf324f04e1e2fe21aaaf293f5ded163a162697ff9a02ddd",
+  "credit": "Hybrid Transformer Demucs by Simon Rouard, Meta and collaborators",
+  "license": "MIT; attention-MIT.txt, hybrid-MIT.txt and waveform-MIT.txt"
+}

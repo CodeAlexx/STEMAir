@@ -1,0 +1,210 @@
+module stemair.device
+import "network.ai" as network
+import "weights.ai" as weights
+import "control.ai" as control
+import std.gpu as devicegpu
+import std.tensor as tensor
+import std.compute as compute
+import std.group_norm_torch as stable
+
+// Explicit opt-in recipe; existing entry points retain Current behavior.
+pub type NormalizationRecipe=enum{Current,SpatialTraining}
+pub type ActivationRecipe=enum{Current,Cuda130Erf}
+pub type MatrixRecipe=enum{CurrentLt,EagerCompat}
+pub type ComputeRecipe=struct{normalization:NormalizationRecipe,activation:ActivationRecipe,matrix:MatrixRecipe}
+pub type ConvolutionPolicy=struct{workspace_bytes:u64,deterministic:bool,allow_tf32:bool=false}
+pub type EvaluationPolicy=enum{Deferred,AfterBlock}
+
+fn problem(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+pub fn upload(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>)->result<array<tensor.Tensor>,string> effects {alloc,gpu} {
+ var out:array<tensor.Tensor>=[]
+ var i:u64=0
+ loop{if i>=array.len(n.weights.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,i)
+  var v:tensor.Tensor=try tensor.from_f32(context,stream,array.view(p.values),array.view(p.shape),tensor.DType.F32) map_err problem
+  array.push(out,v)
+  i+=1}
+ let _=try devicegpu.sync(context) map_err problem
+ result.ok(out)
+}
+fn blank(context:ref<GpuContext>,shape:view<u64>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ result.ok(try tensor.empty(context,shape,tensor.DType.F32) map_err problem)
+}
+fn convolution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,index:u64,stride:u64,pad:u64,up:bool,policy:ConvolutionPolicy)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var weight:tensor.Tensor=try tensor.view(array.borrow(parameters,index)) map_err problem
+ let co:u64=array.get(weight.dimensions,if up{1}else{0})
+ let kh:u64=array.get(weight.dimensions,2)
+ let kw:u64=array.get(weight.dimensions,3)
+ let h:u64=array.get(x.dimensions,2)
+ let w:u64=array.get(x.dimensions,3)
+ let oh:u64=if up{(h-1)*stride+kh-2*pad}else{(h+2*pad-kh)/stride+1}
+ let ow:u64=if up{(w-1)*stride+kw-2*pad}else{(w+2*pad-kw)/stride+1}
+ let dims:array<u64>=[1,co,oh,ow]
+ var output:tensor.Tensor=try blank(context,array.view(dims))
+ let bd:array<u64>=[co]
+ var bias:tensor.Tensor=try tensor.zeros(context,stream,array.view(bd),tensor.DType.F32) map_err problem
+ if up{
+  let _=try compute.conv_transpose2d_torch_f32(stream,x,weight,bias,output,stride,stride,pad,pad,1,1,1,policy.workspace_bytes,policy.deterministic,policy.allow_tf32) map_err problem
+ }else{
+  let _=try compute.conv2d_torch_f32_general(stream,x,weight,bias,output,stride,stride,pad,pad,1,1,1,policy.workspace_bytes,policy.deterministic,policy.allow_tf32) map_err problem}
+ result.ok(output)
+}
+fn activated(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,recipe:ActivationRecipe)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var out:tensor.Tensor=try blank(context,array.view(x.dimensions))
+ if recipe==ActivationRecipe.Cuda130Erf{
+  let _=try compute.gelu_erf_cuda130_f32(stream,x,out) map_err problem
+ }else{
+  let _=try compute.gelu_erf(stream,x,out) map_err problem
+ }
+ result.ok(out)
+}
+fn normalized(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,affine:network.Affine,normalizer:ref<stable.Engine>,recipe:ComputeRecipe)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var weight:tensor.Tensor=try tensor.view(array.borrow(parameters,affine.weight)) map_err problem
+ var bias:tensor.Tensor=try tensor.view(array.borrow(parameters,affine.bias)) map_err problem
+ var out:tensor.Tensor=try blank(context,array.view(x.dimensions))
+ if recipe.normalization==NormalizationRecipe.SpatialTraining{
+  // This graph has N=1. The explicit SPATIAL training recipe therefore uses
+  // unchanged [C] affine vectors, with no repeat or different model kernel.
+  if array.get(x.dimensions,0)!=1{return result.err("Spatial training recipe requires the configured single-recording graph")}
+  let channels:u64=array.get(x.dimensions,1)
+  let stats_shape:array<u64>=[channels]
+  var mean:tensor.Tensor=try blank(context,array.view(stats_shape))
+  var invstd:tensor.Tensor=try blank(context,array.view(stats_shape))
+  let _=try compute.prepare_batch_norm_training_stats_f32(stream,1,channels,array.get(x.dimensions,2),array.get(x.dimensions,3),268435456) map_err problem
+  let _=try compute.batch_norm_training_stats_f32(stream,x,weight,bias,out,mean,invstd,0.00001) map_err problem
+ }else{
+  let _=try stable.forward(normalizer,context,stream,x,weight,bias,out,array.get(x.dimensions,1),0.00001) map_err problem
+ }
+ activated(context,stream,out,recipe.activation)
+}
+fn projection(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,index:u64,recipe:MatrixRecipe)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var weight:tensor.Tensor=try tensor.view(array.borrow(parameters,index)) map_err problem
+ let channels:u64=array.get(x.dimensions,1)
+ let height:u64=array.get(x.dimensions,2)
+ let width:u64=array.get(x.dimensions,3)
+ let features:u64=array.get(weight.dimensions,0)
+ let flat:array<u64>=[channels*height,width]
+ var input:tensor.Tensor=try tensor.reshape(x,array.view(flat)) map_err problem
+ let result_shape:array<u64>=[channels*height,features]
+ var result:tensor.Tensor=try blank(context,array.view(result_shape))
+ if recipe==MatrixRecipe.EagerCompat {
+  let input_shape:array<u64>=[1,channels*height,width]
+  let weight_shape:array<u64>=[1,features,width]
+  let output_shape:array<u64>=[1,channels*height,features]
+  var a:tensor.Tensor=try tensor.reshape(input,array.view(input_shape)) map_err problem
+  var b:tensor.Tensor=try tensor.reshape(weight,array.view(weight_shape)) map_err problem
+  var output:tensor.Tensor=try tensor.reshape(result,array.view(output_shape)) map_err problem
+  let _=try compute.matmul_batched_eager_compat(stream,a,b,output,false,true) map_err problem
+ }else{
+  let _=try compute.linear(stream,input,weight,result) map_err problem
+ }
+ let shape:array<u64>=[1,channels,height,features]
+ result.ok(try tensor.reshape(result,array.view(shape)) map_err problem)
+}
+fn combined(context:ref<GpuContext>,stream:ref<GpuStream>,a:ref<tensor.Tensor>,b:ref<tensor.Tensor>,multiply:bool)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var out:tensor.Tensor=try blank(context,array.view(a.dimensions))
+ if multiply{let _=try compute.mul(stream,a,b,out) map_err problem}else{let _=try compute.add(stream,a,b,out) map_err problem}
+ result.ok(out)
+}
+fn transposed(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var view:tensor.Tensor=try tensor.transpose(x,2,3) map_err problem
+ result.ok(try tensor.contiguous(context,stream,view) map_err problem)
+}
+fn joined(context:ref<GpuContext>,stream:ref<GpuStream>,a:ref<tensor.Tensor>,b:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let ca:u64=array.get(a.dimensions,1)
+ let cb:u64=array.get(b.dimensions,1)
+ let shape:array<u64>=[1,ca+cb,array.get(a.dimensions,2),array.get(a.dimensions,3)]
+ var out:tensor.Tensor=try blank(context,array.view(shape))
+ var first:tensor.Tensor=try tensor.narrow(out,1,0,ca) map_err problem
+ let _=try tensor.copy_d2d_async(stream,a,first) map_err problem
+ var second:tensor.Tensor=try tensor.narrow(out,1,ca,cb) map_err problem
+ let _=try tensor.copy_d2d_async(stream,b,second) map_err problem
+ result.ok(out)
+}
+fn block_output(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,input:ref<tensor.Tensor>,b:network.Block,normalizer:ref<stable.Engine>,recipe:ComputeRecipe,policy:ConvolutionPolicy)->result<tensor.Tensor,string> effects {alloc,gpu} {
+  var shortcut:tensor.Tensor=try convolution(context,stream,parameters,input,b.shortcut,1,0,false,policy)
+  var a:tensor.Tensor=try normalized(context,stream,parameters,input,b.norm1,normalizer,recipe)
+  var first:tensor.Tensor=try convolution(context,stream,parameters,a,b.conv1,1,1,false,policy)
+  var norm1:tensor.Tensor=try normalized(context,stream,parameters,first,b.norm2,normalizer,recipe)
+  var small:tensor.Tensor=try projection(context,stream,parameters,norm1,b.linear1,recipe.matrix)
+  var norm2:tensor.Tensor=try normalized(context,stream,parameters,small,b.norm3,normalizer,recipe)
+  var expanded:tensor.Tensor=try projection(context,stream,parameters,norm2,b.linear2,recipe.matrix)
+  var combined:tensor.Tensor=try combined(context,stream,first,expanded,false)
+  var norm3:tensor.Tensor=try normalized(context,stream,parameters,combined,b.norm4,normalizer,recipe)
+  var second:tensor.Tensor=try convolution(context,stream,parameters,norm3,b.conv2,1,1,false,policy)
+ combined(context,stream,second,shortcut,false)
+}
+fn body(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:tensor.Tensor own,begin:u64,count:u64,cancel:str,normalizer:ref<stable.Engine>,recipe:ComputeRecipe,policy:ConvolutionPolicy,evaluation:EvaluationPolicy)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var x:tensor.Tensor=input
+ var i:u64=0
+ loop{if i>=count{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let b:network.Block=array.get(n.blocks,begin+i)
+  x=try block_output(context,stream,parameters,x,b,normalizer,recipe,policy)
+  // The helper has returned and dropped its temporary tensor owners. This
+  // non-capture completion also retires the facade's pending buffer references.
+  if evaluation==EvaluationPolicy.AfterBlock{
+   let _=try devicegpu.sync_stream(stream) map_err problem
+  }
+  i+=1}
+ result.ok(x)
+}
+pub fn forward_with_compute_convolution_and_evaluation_policy(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,packed:tensor.Tensor own,cancel:str,normalizer:ref<stable.Engine>,recipe:ComputeRecipe,policy:ConvolutionPolicy,evaluation:EvaluationPolicy)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if policy.workspace_bytes==0{return result.err("Explicit convolution policy requires a positive workspace bound")}
+ var input:tensor.Tensor=packed
+ var first:tensor.Tensor=try convolution(context,stream,parameters,input,n.first,1,0,false,policy)
+ var x:tensor.Tensor=try transposed(context,stream,first)
+ var saved:array<tensor.Tensor>=[]
+ var i:u64=0
+ loop{if i>=array.len(n.encoder){break}
+  let scale:network.Scale=array.get(n.encoder,i)
+  x=try body(context,stream,parameters,n,x,scale.begin,scale.count,cancel,normalizer,recipe,policy,evaluation)
+  var norm:tensor.Tensor=try normalized(context,stream,parameters,x,scale.norm,normalizer,recipe)
+  var down:tensor.Tensor=try convolution(context,stream,parameters,norm,scale.conv,2,0,false,policy)
+  array.push(saved,x)
+  x=down
+  i+=1}
+ x=try body(context,stream,parameters,n,x,n.middle_begin,n.middle_count,cancel,normalizer,recipe,policy,evaluation)
+ i=0
+ loop{if i>=array.len(n.decoder){break}
+  let scale:network.Scale=array.get(n.decoder,i)
+  var norm:tensor.Tensor=try normalized(context,stream,parameters,x,scale.norm,normalizer,recipe)
+  var up:tensor.Tensor=try convolution(context,stream,parameters,norm,scale.conv,2,0,true,policy)
+  var skip:tensor.Tensor=try tensor.view(array.borrow(saved,array.len(saved)-1-i)) map_err problem
+  var concat:tensor.Tensor=try joined(context,stream,up,skip)
+  x=try body(context,stream,parameters,n,concat,scale.begin,scale.count,cancel,normalizer,recipe,policy,evaluation)
+  i+=1}
+ var transposed:tensor.Tensor=try transposed(context,stream,x)
+ var gated:tensor.Tensor=try combined(context,stream,transposed,first,true)
+ var concat:tensor.Tensor=try joined(context,stream,input,gated)
+ var last:tensor.Tensor=try convolution(context,stream,parameters,concat,n.last1,1,0,false,policy)
+ var activated:tensor.Tensor=try activated(context,stream,last,recipe.activation)
+ convolution(context,stream,parameters,activated,n.last2,1,0,false,policy)
+}
+
+// Existing callers retain deferred completion and the original operation order.
+// AfterBlock is an explicit non-capture policy; stream completion errors propagate.
+pub fn forward_with_compute_and_convolution_policy(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,packed:tensor.Tensor own,cancel:str,normalizer:ref<stable.Engine>,recipe:ComputeRecipe,policy:ConvolutionPolicy)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ forward_with_compute_convolution_and_evaluation_policy(context,stream,parameters,n,packed,cancel,normalizer,recipe,policy,EvaluationPolicy.Deferred)
+}
+// Existing callers keep the historical bounded deterministic convolution recipe.
+pub fn forward_with_compute_recipe(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,packed:tensor.Tensor own,cancel:str,normalizer:ref<stable.Engine>,recipe:ComputeRecipe)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ forward_with_compute_and_convolution_policy(context,stream,parameters,n,packed,cancel,normalizer,recipe,ConvolutionPolicy{workspace_bytes:268435456,deterministic:true})
+}
+pub fn forward_with_normalizer_recipe(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,packed:tensor.Tensor own,cancel:str,normalizer:ref<stable.Engine>,recipe:NormalizationRecipe)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ forward_with_compute_recipe(context,stream,parameters,n,packed,cancel,normalizer,ComputeRecipe{normalization:recipe,activation:ActivationRecipe.Current,matrix:MatrixRecipe.CurrentLt})
+}
+
+pub fn forward_with_normalizer(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,packed:tensor.Tensor own,cancel:str,normalizer:ref<stable.Engine>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ forward_with_normalizer_recipe(context,stream,parameters,n,packed,cancel,normalizer,NormalizationRecipe.Current)
+}
+
+pub fn normalizer(context:ref<GpuContext>)->result<stable.Engine,string> effects {alloc,gpu} {
+ var held:stable.Engine=try stable.create(context) map_err problem
+ stable.set_separate_bias(held,true)
+ result.ok(held)
+}
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,packed:tensor.Tensor own,cancel:str)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var held:stable.Engine=try normalizer(context)
+ forward_with_normalizer(context,stream,parameters,n,packed,cancel,held)
+}

@@ -1,0 +1,24 @@
+module stemair.spectral_cpu_recipe
+import std.codec as codec
+import std.files as files
+import std.cpu_primitives as cpu
+pub type Recipe=struct{adapter:string,adapter_sha256:string,runtime:string,runtime_sha256:string,matrix_adapter:string,matrix_adapter_sha256:string,mkl:string,mkl_sha256:string,mkl_version:string,affine_separate:bool,owned_bytes:u64,scratch_bytes:u64,staging_bytes:u64} derive codec(strict)
+fn identity(file:str,expected:str)->result<unit,string> effects {alloc,fs.read,fs.meta}{
+ if str.len(file)==0 or str.len(expected)!=64{return result.err("Spectral CPU runtime identity is incomplete")}
+ let actual:string=match files.sha256(file){ok(v)=>v,err(_)=>{return result.err("Cannot read the selected spectral CPU runtime")}}
+ if actual!=expected{return result.err("Spectral CPU runtime differs from its qualified identity")}
+ result.ok(())
+}
+pub fn decode(raw:str)->result<Recipe,string> effects {alloc}{
+ if str.len(raw)>16384{return result.err("Spectral CPU runtime recipe exceeds its bound")}
+ let r:Recipe=try Recipe_decode(raw) map_err codec.describe
+ if r.owned_bytes==0 or r.scratch_bytes>r.owned_bytes or r.staging_bytes==0 or str.len(r.mkl_version)==0{return result.err("Invalid explicit spectral CPU resource profile")}
+ result.ok(r)
+}
+pub fn verify(r:ref<Recipe>)->result<unit,string> effects {alloc,fs.read,fs.meta}{
+ let _=try identity(r.adapter,r.adapter_sha256)
+ let _=try identity(r.runtime,r.runtime_sha256)
+ let _=try identity(r.matrix_adapter,r.matrix_adapter_sha256)
+ identity(r.mkl,r.mkl_sha256)
+}
+pub fn limits(r:ref<Recipe>)->cpu.Limits effects {}{cpu.Limits{owned_bytes:r.owned_bytes,scratch_bytes:r.scratch_bytes,staging_bytes:r.staging_bytes}}

@@ -1,0 +1,210 @@
+// Complete recording reader with explicit retained decoder/filter dependencies.
+module stemair.recording_input
+import "rate_filter.ai" as asset
+import "codec_process.ai" as tools
+import "control.ai" as control
+import std.audio as audio
+import std.sndfile as sound
+import std.signal_resample_table as rate
+import std.ffmpeg_decode as decoder
+import std.ffmpeg_audio_metadata as metadata
+import std.process as proc
+import std.files as files
+import std.path as path
+import std.text as text
+
+pub type Session=struct{decoder:sound.Engine,filter_asset:asset.Asset,filter:option<asset.Loaded>,plans:array<rate.Plan>,filter_loads:u64,filter_bytes:u64}
+pub type Options=struct{limits:audio.WavReadLimits,codec:option<tools.Tool>,scratch_directory:string,cancel_file:string,deadline_ns:u64,log_limit:u64,progress_file:string=""}
+pub type Report=struct{sound_reads:u64,sound_frames:u64,sound_closed:bool,fallbacks:u64,codec_pid:u64,codec_closed:bool,metadata_pid:u64,metadata_closed:bool,zero_retry:bool,retry_seconds:u64,source_rate:u32,source_channels:u32,source_frames:u64,frames:u64,channels:u32,temporary_removed:bool,temporary_directory:string,codec_exit_code:i64=0,codec_nonzero_accepted:bool=false} derive codec(strict)
+pub type Loaded=struct{buffer:audio.AudioBuffer,report:Report}
+// Additive complete decoded carrier for family-specific recording readers.
+// It shares the established sound-file/PCM16 fallback and resource checks,
+// while leaving rate conversion, mono policy and retry placement to the caller.
+pub fn empty_report()->Report effects {alloc} {
+ Report{sound_reads:0,sound_frames:0,sound_closed:false,fallbacks:0,codec_pid:0,codec_closed:false,metadata_pid:0,metadata_closed:false,zero_retry:false,retry_seconds:0,source_rate:0,source_channels:0,source_frames:0,frames:0,channels:0,temporary_removed:true,temporary_directory:""}
+}
+pub fn read_decoded(session:ref<Session>,input:str,seconds:option<u64>,options:ref<Options>,report:ref<Report>)->result<audio.AudioBuffer,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ if not path.is_absolute(input) or text.contains(input,"\x{00}") or options.limits.max_channels==0 or options.limits.max_channels>65535 or options.limits.max_file_bytes==0 or options.limits.max_decoded_bytes==0 or options.limits.max_frames==0 or not path.is_absolute(options.scratch_directory) or (str.len(options.cancel_file)>0 and not path.is_absolute(options.cancel_file)) or (str.len(options.progress_file)>0 and not path.is_absolute(options.progress_file)){return result.err("Invalid recording input options")}
+ let _=try stopped(options)
+ let info:fs.meta=try files.metadata(input) map_err fs_error
+ if not info.is_file or info.size>options.limits.max_file_bytes{return result.err("Recording encoded file exceeds its selected limit")}
+ let decoded:audio.AudioBuffer=try decode(session,input,seconds,options,report)
+ report.source_rate=decoded.rate
+ report.source_channels=cast.wrap(decoded.channels)
+ report.source_frames=audio.num_frames(decoded)
+ result.ok(decoded)
+}
+pub fn inspect_decoded_source(input:str,options:ref<Options>,report:ref<Report>)->result<metadata.Info,string>
+ effects {alloc,fs.read,fs.meta,process,time} {
+ let tool:tools.Tool=match options.codec{none=>{return result.err("Choose the qualified codec for recording duration inspection")},some(value)=>tools.Tool{path:string.copy(value.path),sha256:string.copy(value.sha256)}}
+ inspect(input,tool,options,report)
+}
+fn fs_error(e:fs.error)->string effects {alloc} {string.copy(fs.error.message(e))}
+fn sound_error(e:sound.Failure)->string effects {alloc} {var detail:sound.Failure=e
+ sound.describe(detail)}
+pub fn open(tool:ref<sound.Tool>,filter:asset.Asset own)->result<Session,string> effects {alloc,fs.read,fs.meta,ffi} {
+ result.ok(Session{decoder:try sound.open(tool) map_err sound_error,filter_asset:filter,filter:option.none(),plans:[],filter_loads:0,filter_bytes:0})
+}
+pub fn close(session:Session own)->unit effects {ffi} {()}
+fn stopped(options:ref<Options>)->result<unit,string> effects {alloc,fs.meta,time} {
+ if time.monotonic_ns()>=options.deadline_ns{return result.err("Recording input deadline reached")}
+ if control.cancelled(options.cancel_file){return result.err("Recording input cancelled")}
+ result.ok(())
+}
+fn clean(directory:str)->bool effects {alloc,fs.write} {
+ if not result.is_ok(files.remove(path.join(directory,"decoded.wav"))){return false}
+ result.is_ok(files.remove(directory))
+}
+fn inspect(input:str,tool:ref<tools.Tool>,options:ref<Options>,report:ref<Report>)->result<metadata.Info,string> effects {alloc,fs.read,fs.meta,process,time} {
+ let selected:metadata.Options=metadata.Options{tool:metadata.Tool{path:string.copy(tool.path),sha256:string.copy(tool.sha256)},deadline_ns:options.deadline_ns,cancel_file:string.copy(options.cancel_file),max_log_bytes:options.log_limit}
+ var observed:metadata.Outcome=metadata.read(input,selected)
+ report.metadata_pid=observed.trace.pid
+ report.metadata_closed=observed.trace.closed
+ let info:metadata.Info=match struct.replace(observed,result.err(""),field=value){ok(value)=>value,err(e)=>{return result.err(e)}}
+ if not observed.trace.closed{return result.err("Recording metadata process did not close")}
+ result.ok(info)
+}
+fn decode(session:ref<Session>,input:str,seconds:option<u64>,options:ref<Options>,report:ref<Report>)->result<audio.AudioBuffer,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let selected:sound.Options=sound.Options{limits:sound.Limits{max_frames:options.limits.max_frames,max_channels:options.limits.max_channels,max_decoded_bytes:options.limits.max_decoded_bytes,chunk_frames:4096},deadline_ns:options.deadline_ns,cancel_file:string.copy(options.cancel_file)}
+ var outcome:sound.Outcome=match seconds{none=>sound.read_region(struct.borrow(session,field=decoder),input,0,18446744073709551615,selected),some(value)=>sound.read_seconds(struct.borrow(session,field=decoder),input,0,value,selected)}
+ report.sound_reads+=1
+ report.sound_frames+=outcome.trace.read_frames
+ report.sound_closed=not outcome.trace.opened or outcome.trace.closed
+ var fallback:bool=false
+ match outcome.value{ok(_)=>{},err(problem)=>{
+  if not report.sound_closed{return result.err("Recording sound-file handle did not close")}
+  match problem{Open=>{fallback=true},Read=>{fallback=true},Seek=>{fallback=true},_=>{return result.err(text.concat("Recording input: ",sound.describe(problem)))}}}}
+ if not fallback{
+  var decoded:sound.Decoded=match struct.replace(outcome,result.err(sound.Failure.InvalidRequest),field=value){ok(value)=>value,err(_)=>{return result.err("Recording samples are unavailable")}}
+  return result.ok(struct.replace(decoded,audio.AudioBuffer{samples:[],rate:44100,channels:1},field=buffer))}
+ let tool:tools.Tool=match options.codec{none=>{return result.err("Choose the qualified codec for this recording")},some(value)=>tools.Tool{path:string.copy(value.path),sha256:string.copy(value.sha256)}}
+ let _=try tools.verify(tool)
+ // The source decoder reports the first input stream, even when the decoder's
+ // default output selection chooses another stream. Preserve that carrier;
+ // never resample/downmix the selected PCM merely to match its metadata.
+ let header:metadata.Info=try inspect(input,tool,options,report)
+ if header.rate==0 or header.channels==0 or header.channels>options.limits.max_channels{return result.err("Recording input stream metadata is invalid or exceeds selected limits")}
+ let directory:string=text.concat(options.scratch_directory,text.concat("-decode-",string.from_int(report.fallbacks)))
+ let payload_limits:audio.WavReadLimits=audio.WavReadLimits{max_file_bytes:options.limits.max_file_bytes,max_frames:options.limits.max_decoded_bytes/4,max_channels:65535,max_decoded_bytes:options.limits.max_decoded_bytes}
+ let codec_options:decoder.Options=decoder.Options{executable:string.copy(tool.path),scratch_directory:string.copy(directory),rate:0,channels:0,limits:payload_limits,deadline_ns:options.deadline_ns,cancel_file:string.copy(options.cancel_file),log_limit:options.log_limit}
+ var result:decoder.Outcome=match seconds{none=>decoder.read_as(input,codec_options,decoder.SampleFormat.Pcm16),some(value)=>{
+  if value>18446744073709551615/1000000{return result.err("Recording retry duration overflows")}
+  decoder.read_region_as(input,codec_options,decoder.Region{start_us:0,duration_us:value*1000000},decoder.SampleFormat.Pcm16)}}
+ report.fallbacks+=1
+ report.codec_pid=result.trace.pid
+ report.codec_closed=result.trace.reaped
+ report.codec_exit_code=match result.trace.status{some(status)=>cast.wrap(proc.exit_code(status)),none=>0}
+ report.temporary_removed=not result.trace.scratch_created
+ report.temporary_directory=if result.trace.scratch_created{string.copy(directory)}else{""}
+ // The original fallback consumes yielded PCM even when the decoder exits
+ // nonzero. Only this opt-in reader accepts a complete, bounded owned PCM16
+ // container after successful child closure. All shared decoder defaults and
+ // resource/deadline/cancel failures keep their strict refusal behavior.
+ let nonzero:bool=match result.value{ok(_)=>false,err(problem)=>match problem{ProcessExit(_)=>true,_=>false}}
+ if nonzero and result.trace.reaped and result.trace.scratch_created{
+  match audio.read_wav_f32_limited(path.join(directory,"decoded.wav"),payload_limits){
+   err(_)=>{},ok(decoded)=>{
+    if decoded.info.subtype==audio.WavSubtype.Pcm16{
+     let _=struct.replace(result,result.ok(decoded),field=value)
+     report.codec_nonzero_accepted=true}}}}
+ match result.value{ok(_)=>{},err(_)=>{
+  if result.trace.scratch_created{let _=files.write_new_bytes(path.join(directory,"decode.stderr"),bytes.view(result.trace.stderr))}
+  return result.err(if result.trace.scratch_created{text.concat("Recording codec failed; owned diagnostics remain at ",directory)}else{"Recording codec failed before creating owned scratch"})}}
+ if not report.codec_closed{return result.err("Recording codec did not close successfully")}
+ var decoded:audio.WavRead=match struct.replace(result,result.err(decoder.Failure.InvalidRequest),field=value){ok(value)=>value,err(_)=>{return result.err("Recording codec samples are unavailable")}}
+ report.temporary_removed=clean(directory)
+ if not report.temporary_removed{return result.err(text.concat("Cannot remove owned recording decode files at ",directory))}
+ report.temporary_directory=""
+ if array.len(decoded.buffer.samples)%cast.wrap(header.channels)!=0 or array.len(decoded.buffer.samples)/cast.wrap(header.channels)>options.limits.max_frames{return result.err("Recording PCM does not form complete input-stream frames or exceeds the selected frame limit")}
+ decoded.buffer.rate=header.rate
+ decoded.buffer.channels=cast.wrap(header.channels)
+ result.ok(struct.replace(decoded,audio.AudioBuffer{samples:[],rate:44100,channels:1},field=buffer))
+}
+fn prepared(session:ref<Session>,source_rate:u32,options:ref<Options>)->result<u64,string> effects {alloc,fs.read} {
+ var i:u64=0
+ loop{if i==array.len(session.plans){break}
+  if array.borrow(session.plans,i).source_rate==source_rate{return result.ok(i)}
+  i+=1}
+ let limits:rate.Limits=rate.Limits{max_input_samples:options.limits.max_decoded_bytes/4,max_output_samples:options.limits.max_decoded_bytes/4,max_filter_values:4194304}
+ var plan:rate.Plan=if source_rate==44100{rate.Plan{source_rate:44100,target_rate:44100,ratio:1.0,scale:1.0,step:0,precision:0,table:[],delta:[]}}else{
+  match session.filter{some(_)=>{},none=>{var loaded:asset.Loaded=try asset.open(struct.borrow(session,field=filter_asset))
+   session.filter_loads+=1
+   session.filter_bytes+=loaded.bytes_read
+   session.filter=option.some(loaded)}}
+  let retained:ref<asset.Loaded>=match session.filter{some(value)=>value,none=>{return result.err("Recording rate filter is unavailable")}}
+  try rate.prepare(struct.borrow(retained,field=filter),source_rate,44100,limits)}
+ array.push(struct.borrow(session,field=plans),plan)
+ result.ok(i)
+}
+fn convert(session:ref<Session>,source:audio.AudioBuffer own,options:ref<Options>)->result<audio.AudioBuffer,string> effects {alloc,fs.read,fs.write,fs.meta,time} {
+ var input:audio.AudioBuffer=source
+ let index:u64=try prepared(session,input.rate,options)
+ let plan:ref<rate.Plan>=array.borrow(session.plans,index)
+ let limits:rate.Limits=rate.Limits{max_input_samples:options.limits.max_decoded_bytes/4,max_output_samples:options.limits.max_decoded_bytes/4,max_filter_values:4194304}
+ let geometry:rate.Geometry=try rate.geometry(plan,array.view(input.samples),cast.wrap(input.channels),limits,true)
+ if geometry.output_frames>options.limits.max_frames{return result.err("Recording resampling exceeds the selected frame limit")}
+ if input.rate==44100{return result.ok(input)}
+ var samples:array<f32>=[]
+ array.reserve(samples,geometry.output_samples)
+ var first:u64=0
+ loop{if first==geometry.output_frames{break}
+  let _=try stopped(options)
+  let count:u64=if geometry.output_frames-first<4096{geometry.output_frames-first}else{4096}
+  let block:array<f32>=try rate.render(plan,array.view(input.samples),geometry,first,count)
+  var i:u64=0
+  loop{if i==array.len(block){break}
+   array.push(samples,array.get(block,i))
+   i+=1}
+  first+=count
+  control.status(options.progress_file,"Resampling recording")}
+ result.ok(audio.AudioBuffer{samples:samples,rate:44100,channels:input.channels})
+}
+fn run(session:ref<Session>,input:str,options:ref<Options>,report:ref<Report>)->result<audio.AudioBuffer,string> effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ if not path.is_absolute(input) or text.contains(input,"\x{00}") or options.limits.max_channels==0 or options.limits.max_channels>65535 or options.limits.max_file_bytes==0 or options.limits.max_decoded_bytes==0 or options.limits.max_frames==0 or not path.is_absolute(options.scratch_directory) or (str.len(options.cancel_file)>0 and not path.is_absolute(options.cancel_file)) or (str.len(options.progress_file)>0 and not path.is_absolute(options.progress_file)){return result.err("Invalid recording input options")}
+ let _=try stopped(options)
+ let info:fs.meta=try files.metadata(input) map_err fs_error
+ if not info.is_file or info.size>options.limits.max_file_bytes{return result.err("Recording encoded file exceeds its selected limit")}
+ var raw:audio.AudioBuffer=try decode(session,input,option.none(),options,report)
+ report.source_rate=raw.rate
+ report.source_channels=cast.wrap(raw.channels)
+ report.source_frames=audio.num_frames(raw)
+ var buffer:audio.AudioBuffer=try convert(session,raw,options)
+ var zero:bool=true
+ var i:u64=0
+ loop{if i==array.len(buffer.samples){break}
+  if array.get(buffer.samples,i)!=0.0{zero=false
+   break}
+  i+=1}
+ if zero and text.ends_with(input,".mp3"){
+  let tool:tools.Tool=match options.codec{none=>{return result.err("Choose the qualified codec for silent MP3 duration inspection")},some(value)=>tools.Tool{path:string.copy(value.path),sha256:string.copy(value.sha256)}}
+  let duration:metadata.Info=try inspect(input,tool,options,report)
+  report.zero_retry=true
+  report.retry_seconds=duration.whole_seconds
+  let retry:audio.AudioBuffer=try decode(session,input,option.some(duration.whole_seconds),options,report)
+  buffer=try convert(session,retry,options)
+ }
+ if buffer.channels==1{
+  if array.len(buffer.samples)>options.limits.max_decoded_bytes/8{return result.err("Duplicated mono recording exceeds the selected decoded sample limit")}
+  var stereo:array<f32>=[]
+  array.reserve(stereo,array.len(buffer.samples)*2)
+  i=0
+  loop{if i==array.len(buffer.samples){break}
+   if i%4096==0{let _=try stopped(options)}
+   let value:f32=array.get(buffer.samples,i)
+   array.push(stereo,value)
+   array.push(stereo,value)
+   i+=1}
+  buffer=audio.AudioBuffer{samples:stereo,rate:44100,channels:2}}
+ let _=try stopped(options)
+ report.frames=audio.num_frames(buffer)
+ report.channels=cast.wrap(buffer.channels)
+ result.ok(buffer)
+}
+pub type Outcome=struct{value:result<audio.AudioBuffer,string>,report:Report}
+pub fn read(session:ref<Session>,input:str,options:ref<Options>)->Outcome effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var report:Report=Report{sound_reads:0,sound_frames:0,sound_closed:false,fallbacks:0,codec_pid:0,codec_closed:false,metadata_pid:0,metadata_closed:false,zero_retry:false,retry_seconds:0,source_rate:0,source_channels:0,source_frames:0,frames:0,channels:0,temporary_removed:true,temporary_directory:""}
+ let value:result<audio.AudioBuffer,string>=run(session,input,options,report)
+ Outcome{value:value,report:report}
+}

@@ -1,0 +1,101 @@
+module stemair.hybrid.residual
+import "../device_ops.ai" as ops
+import "../weights.ai" as weights
+import "../control.ai" as control
+import "recurrent.ai" as recurrent
+import "local_state.ai" as local_state
+import std.tensor as tensor
+import std.text as text
+
+pub type Branch=struct{expand:ops.Convolution,norm1:ops.Normalization,
+ recurrence:option<recurrent.Block>,state:option<local_state.Block>,
+ project:ops.Convolution,norm2:ops.Normalization,scale:u64}
+pub type Block=struct{channels:u64,branches:array<Branch>}
+pub type Observer<O>=struct{callback:option<fn(ref<O>,str,view<u64>,view<f32>)->result<unit,string> effects {alloc}>}
+fn observe<O>(stream:ref<GpuStream>,observer:ref<Observer<O>>,observations:ref<O>,index:u64,stage:str,value:ref<tensor.Tensor>)->result<unit,string> effects {alloc,gpu} {
+ match observer.callback{none=>result.ok(()),some(invoke)=>{
+  let name:string=text.concat(text.concat(text.concat("residual-",string.from_int(index)),"-"),stage)
+  let values:array<f32>=try tensor.to_f32(stream,value) map_err ops.error
+  invoke(observations,name,array.view(value.dimensions),array.view(values))}}
+}
+pub fn bind(w:ref<weights.Model>,base:str,channels:u64,depth:u64,with_recurrence:bool,with_state:bool)->result<Block,string> effects {alloc} {
+ bind_compressed(w,base,channels,depth,4,with_recurrence,with_state)
+}
+pub fn bind_compressed(w:ref<weights.Model>,base:str,channels:u64,depth:u64,compression:u64,with_recurrence:bool,with_state:bool)->result<Block,string> effects {alloc} {
+ if channels==0 or compression==0 or channels%compression!=0 or depth==0 or depth>8{return result.err("Invalid residual branch geometry")}
+ let hidden:u64=channels/compression
+ var branches:array<Branch>=[]
+ var i:u64=0
+ loop{if i==depth{break}
+  let prefix:string=text.concat(text.concat(base,".layers."),string.from_int(i))
+  var expand:ops.Convolution=try ops.bind_conv(w,text.concat(prefix,".0"),channels,hidden,1,3,true,false)
+  expand.dilation_w=1 << cast.wrap(i)
+  expand.pad_w=expand.dilation_w
+  var cursor:u64=3
+  var recurrence:option<recurrent.Block>=option.none()
+  var state:option<local_state.Block>=option.none()
+  if with_recurrence{
+   recurrence=option.some(try recurrent.bind(w,text.concat(text.concat(prefix,"."),string.from_int(cursor)),hidden))
+   cursor+=1}
+  if with_state{
+   state=option.some(try local_state.bind(w,text.concat(text.concat(prefix,"."),string.from_int(cursor)),hidden,4,4))
+   cursor+=1}
+  let scale_shape:array<u64>=[channels]
+  array.push(branches,Branch{expand:expand,norm1:try ops.bind_norm(w,text.concat(prefix,".1"),hidden,1),
+   recurrence:recurrence,state:state,
+   project:try ops.bind_conv(w,text.concat(text.concat(prefix,"."),string.from_int(cursor)),hidden,channels*2,1,1,true,false),
+   norm2:try ops.bind_norm(w,text.concat(text.concat(prefix,"."),string.from_int(cursor+1)),channels*2,1),
+   scale:try weights.index(w,text.concat(text.concat(text.concat(prefix,"."),string.from_int(cursor+3)),".scale"),array.view(scale_shape))})
+  i+=1}
+ result.ok(Block{channels:channels,branches:branches})
+}
+pub fn forward_observed<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ w:ref<weights.Model>,block:ref<Block>,input:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,observer:ref<Observer<O>>,observations:ref<O>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if tensor.rank(input)!=4 or array.get(input.dimensions,1)!=block.channels or array.get(input.dimensions,2)!=1{
+  return result.err("Invalid residual branch input")}
+ var x:tensor.Tensor=try tensor.view(input) map_err ops.error
+ var i:u64=0
+ loop{if i==array.len(block.branches){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let branch:Branch=array.get(block.branches,i)
+  var y:tensor.Tensor=try ops.convolution_with_policy(context,stream,parameters,x,branch.expand,state.convolution)
+  let _=try observe(stream,observer,observations,i,"expand",y)
+  y=try ops.normalize_with_execution(context,stream,parameters,y,branch.norm1,state)
+  let _=try observe(stream,observer,observations,i,"norm1",y)
+  y=try ops.gelu_with_execution(context,stream,y,state)
+  let _=try observe(stream,observer,observations,i,"gelu",y)
+  match branch.recurrence{some(r)=>{
+   var inner:recurrent.Observer<O>=recurrent.Observer<O>{callback:observer.callback}
+   let prefix:string=if option.is_some(observer.callback){text.concat("residual-",string.from_int(i))}else{""}
+   y=try recurrent.forward_observed_with_execution(context,stream,parameters,w,r,y,cancel,state,prefix,inner,observations)
+   let _=try observe(stream,observer,observations,i,"recurrence",y)},none=>{}}
+  match branch.state{some(s)=>{y=try local_state.forward_with_execution(context,stream,parameters,s,y,cancel,state)
+   let _=try observe(stream,observer,observations,i,"state",y)},none=>{}}
+  y=try ops.convolution_with_policy(context,stream,parameters,y,branch.project,state.convolution)
+  let _=try observe(stream,observer,observations,i,"project",y)
+  y=try ops.normalize_with_execution(context,stream,parameters,y,branch.norm2,state)
+  let _=try observe(stream,observer,observations,i,"norm2",y)
+  y=try ops.glu(context,stream,y)
+  let _=try observe(stream,observer,observations,i,"glu",y)
+  y=try ops.scale_channels(context,stream,parameters,y,branch.scale)
+  let _=try observe(stream,observer,observations,i,"scale",y)
+  x=try ops.add(context,stream,x,y)
+  let _=try observe(stream,observer,observations,i,"add",x)
+  i+=1}
+ result.ok(x)
+}
+pub fn forward_with_execution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ w:ref<weights.Model>,block:ref<Block>,input:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ var observations:unit=()
+ forward_observed(context,stream,parameters,w,block,input,cancel,state,observer,observations)
+}
+pub fn forward_with_convolution_policy(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ w:ref<weights.Model>,block:ref<Block>,input:ref<tensor.Tensor>,cancel:str,policy:ops.ConvolutionPolicy)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var state:ops.ExecutionState=ops.current_execution(policy)
+ forward_with_execution(context,stream,parameters,w,block,input,cancel,state)
+}
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ w:ref<weights.Model>,block:ref<Block>,input:ref<tensor.Tensor>,cancel:str)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ forward_with_convolution_policy(context,stream,parameters,w,block,input,cancel,ops.ConvolutionPolicy{})
+}

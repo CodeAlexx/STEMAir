@@ -1,0 +1,331 @@
+module stemair.mask.bands
+import "config.ai" as config
+import "../complex_spectral.ai" as spectral
+import "../resample.ai" as polyphase
+import "../sinc_resample.ai" as sinc
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import std.float as fp
+import "../channel_modes.ai" as channels
+import "../wave_channel_modes.ai" as wave_channels
+import "../high_band.ai" as high_band
+
+pub fn plans(c:ref<config.Config>)->result<array<spectral.Plan>,string> effects {alloc} {
+ var out:array<spectral.Plan>=[]
+ var i:u64=0
+ loop{if i>=array.len(c.bands){break}
+  let b:ref<config.Band>=array.borrow(c.bands,i)
+  array.push(out,try spectral.plan(b.n_fft,b.hop))
+  i+=1}
+ result.ok(out)
+}
+pub fn analyze(c:ref<config.Config>,plans:ref<array<spectral.Plan>>,input:view<f32>)->result<ops.Tensor,string> effects {alloc} {
+ var unused:option<ops.Tensor>=option.none()
+ analyze_with_high(c,plans,input,unused)
+}
+pub fn analyze_with_high(c:ref<config.Config>,plans:ref<array<spectral.Plan>>,input:view<f32>,retained:ref<option<ops.Tensor>>)->result<ops.Tensor,string> effects {alloc} {
+ var lower:array<f32>=[]
+ analyze_with_high_and_lower(c,plans,input,array.view(lower),retained)
+}
+pub fn analyze_with_high_and_lower(c:ref<config.Config>,plans:ref<array<spectral.Plan>>,input:view<f32>,lower:view<f32>,retained:ref<option<ops.Tensor>>)->result<ops.Tensor,string> effects {alloc} {
+ var wide:array<f64>=[]
+ analyze_inputs(c,plans,input,lower,array.view(wide),retained)
+}
+// Array inputs retain their F64 precision through the highest-rate transform.
+// The original band combiner then stores complex64. Polyphase lower bands
+// retain F64 through their resample and transform, as the array source does.
+pub fn analyze_wide(c:ref<config.Config>,plans:ref<array<spectral.Plan>>,input:view<f64>)->result<ops.Tensor,string> effects {alloc}{
+ if c.channel_mode!="stereo" or array.len(c.bands)==0{return result.err("Wide band analysis requires planar stereo bands")}
+ if array.borrow(c.bands,array.len(c.bands)-1).sample_rate!=c.sample_rate{return result.err("Wide band analysis requires an unchanged highest sample rate")}
+ var converted:array<f32>=[]
+ var i:u64=0
+ loop{if i==view.len(input){break}
+  if not fp.is_finite(view.get(input,i)){return result.err("Expected finite wide band input")}
+  array.push(converted,cast.float(view.get(input,i)))
+  i+=1}
+ var retained:option<ops.Tensor>=option.none()
+ var lower:array<f32>=[]
+ analyze_inputs(c,plans,array.view(converted),array.view(lower),input,retained)
+}
+fn analyze_inputs(c:ref<config.Config>,plans:ref<array<spectral.Plan>>,input:view<f32>,lower:view<f32>,wide:view<f64>,retained:ref<option<ops.Tensor>>)->result<ops.Tensor,string> effects {alloc} {
+ if view.len(lower)%2!=0 or not num.finite(lower){return result.err("Invalid lower-band recording override")}
+ let _=ref.swap(retained,option.none())
+ if array.len(plans)!=array.len(c.bands){return result.err("Missing retained band transform plans")}
+ var spectra:array<option<ops.Tensor>>=[]
+ var i:u64=0
+ loop{if i>=array.len(c.bands){break}
+  array.push(spectra,option.none())
+  i+=1}
+ var wave:array<f32>=num.copy(input)
+ var wide_wave:array<f64>=[]
+ var wide_at:u64=0
+ loop{if wide_at==view.len(wide){break}
+  array.push(wide_wave,view.get(wide,wide_at))
+  wide_at+=1}
+ var rate:u32=c.sample_rate
+ var frames:u64=18446744073709551615
+ i=array.len(c.bands)
+ loop{if i==0{break}
+  i-=1
+  let band:ref<config.Band>=array.borrow(c.bands,i)
+  if rate!=band.sample_rate{
+   if view.len(wide)>0{
+    if band.input_resample!="polyphase"{return result.err("Wide band resampling requires the qualified polyphase recipe")}
+    var p:polyphase.WidePlan=try polyphase.plan_wide(rate,band.sample_rate)
+    wide_wave=try polyphase.apply_wide(p,array.view(wide_wave),2)
+   }else{if str.view(band.input_resample)=="polyphase"{
+    var p:polyphase.Plan=try polyphase.plan(rate,band.sample_rate)
+    wave=try polyphase.apply(p,array.view(wave),2)
+   }else{
+    var p:sinc.Plan=try sinc.plan(rate,band.sample_rate)
+    wave=try sinc.apply(p,array.view(wave),2)
+   }}
+  }
+  rate=band.sample_rate
+  // Transform a separate band input: later resampling consumes the original wave.
+  var spectrum:ops.Tensor=if view.len(wide)>0{
+   let precise:spectral.WideSpectrum=try spectral.analyze_f64(array.borrow(plans,i),array.view(wide_wave))
+   var values:array<f32>=num.zeros(4*precise.bins*precise.frames)
+   var channel:u64=0
+   loop{if channel==2{break}
+    var at:u64=0
+    loop{if at==precise.bins*precise.frames{break}
+     array.set(values,2*channel*precise.bins*precise.frames+at,cast.float(array.get(precise.real,channel*precise.bins*precise.frames+at)))
+     array.set(values,(2*channel+1)*precise.bins*precise.frames+at,cast.float(array.get(precise.imaginary,channel*precise.bins*precise.frames+at)))
+     at+=1}
+    channel+=1}
+   ops.tensor(4,precise.bins,precise.frames,values)
+  }else{if c.channel_mode=="stereo"{try spectral.analyze(array.borrow(plans,i),array.view(wave))}else{
+   let selected:array<f32>=try wave_channels.analyze(array.view(wave),c.channel_mode)
+   try spectral.analyze(array.borrow(plans,i),array.view(selected))}}
+  if str.view(band.channel_mode)!="stereo"{spectrum=try channels.analyze(spectrum,band.channel_mode)}
+  if i+1==array.len(c.bands) and c.high_band!="none"{
+   let height:u64=try high_band.extent(band.n_fft/2,band.crop_stop,c.pre_filter_start,c.pre_filter_stop)
+   if height>0{let captured:ops.Tensor=try high_band.capture(spectrum,height,band.n_fft/2)
+    let _=ref.swap(retained,option.some(captured))}}
+  if spectrum.w<frames{frames=spectrum.w}
+  let _=ref.swap(array.borrow(spectra,i),option.some(spectrum))
+  // A file decoder retry happens after the original highest-band transform.
+  // Its replacement carrier feeds lower bands only.
+  if i+1==array.len(c.bands) and view.len(lower)>0{wave=num.copy(lower)}
+ }
+ var output:array<f32>=num.zeros(4*(c.bins+1)*frames)
+ var offset:u64=0
+ i=0
+ loop{if i>=array.len(c.bands){break}
+  let b:ref<config.Band>=array.borrow(c.bands,i)
+  let height:u64=b.crop_stop-b.crop_start
+  match array.borrow(spectra,i){none=>{return result.err("Band spectrum unavailable")},some(s)=>{
+   var channel:u64=0
+   loop{if channel>=4{break}
+    var f:u64=0
+    loop{if f>=height{break}
+     var t:u64=0
+     loop{if t>=frames{break}
+      array.set(output,(channel*(c.bins+1)+offset+f)*frames+t,array.get(s.data,(channel*s.h+b.crop_start+f)*s.w+t))
+      t+=1}
+     f+=1}
+    channel+=1}
+  },}
+  offset+=height
+  i+=1}
+ if c.pre_filter_start>0{
+  if str.view(c.architecture)=="recurrent" or array.len(c.bands)==1{
+   let linear:bool=str.view(c.architecture)=="recurrent"
+   var old_gain:f64=1.0
+   var f:u64=0
+   loop{if f>=c.bins+1{break}
+    var factor:f64=1.0
+    if linear{
+     if f>=c.pre_filter_stop{factor=0.0}else{
+      if f>=c.pre_filter_start{factor=1.0-cast.float(f-c.pre_filter_start+1)/cast.float(c.pre_filter_stop-c.pre_filter_start)}}
+    }else{
+     if f>=c.pre_filter_stop{factor=0.0}else{
+      if f>=c.pre_filter_start{old_gain-=1.0/cast.float(c.pre_filter_stop-c.pre_filter_start)
+       factor=old_gain}}
+    }
+    var channel:u64=0
+    loop{if channel>=4{break}
+     var t:u64=0
+     loop{if t>=frames{break}
+      let at:u64=(channel*(c.bins+1)+f)*frames+t
+      if linear{let value:f64=cast.float(array.get(output,at))
+       array.set(output,at,cast.float(value*factor))
+      }else{let rounded:f32=cast.float(factor)
+       array.set(output,at,array.get(output,at)*rounded)}
+      t+=1}
+     channel+=1}
+    f+=1}
+  }else{
+  var previous:f64=1.0
+  var f:u64=c.pre_filter_start+1
+  loop{if f>=c.pre_filter_stop{break}
+   let gain:f64=fp.pow(10.0,-cast.float(f-c.pre_filter_start)*(3.5-previous)/20.0)
+   previous=gain
+   let rounded:f32=cast.float(gain)
+   var channel:u64=0
+   loop{if channel>=4{break}
+    var t:u64=0
+    loop{if t>=frames{break}
+     let at:u64=(channel*(c.bins+1)+f)*frames+t
+     array.set(output,at,array.get(output,at)*rounded)
+     t+=1}
+    channel+=1}
+   f+=1}
+  }
+ }
+ result.ok(ops.tensor(4,c.bins+1,frames,output))
+}
+fn zeros(count:u64)->array<f64> effects {alloc} {
+ var out:array<f64>=[]
+ array.reserve(out,count)
+ var i:u64=0
+ loop{if i>=count{break}
+  array.push(out,0.0)
+  i+=1}
+ out
+}
+fn gain(real:ref<array<f64>>,imaginary:ref<array<f64>>,bins:u64,frames:u64,f:u64,value:f64)->unit effects {} {
+ var channel:u64=0
+ loop{if channel>=2{break}
+  var t:u64=0
+  loop{if t>=frames{break}
+   let at:u64=(channel*bins+f)*frames+t
+   array.set(real,at,array.get(real,at)*value)
+   array.set(imaginary,at,array.get(imaginary,at)*value)
+   t+=1}
+  channel+=1}
+ ()
+}
+fn resampled(input:array<f64> own,source:u32,target:u32)->result<array<f64>,string> effects {alloc} {
+ if source==target{return result.ok(input)}
+ var converted:array<f32>=[]
+ var i:u64=0
+ loop{if i>=array.len(input){break}
+  array.push(converted,cast.float(array.get(input,i)))
+  i+=1}
+ var p:sinc.Plan=try sinc.plan(source,target)
+ let values:array<f32>=try sinc.apply(p,array.view(converted),2)
+ var output:array<f64>=[]
+ i=0
+ loop{if i>=array.len(values){break}
+  array.push(output,cast.float(array.get(values,i)))
+  i+=1}
+ result.ok(output)
+}
+pub fn synthesize(c:ref<config.Config>,plans:ref<array<spectral.Plan>>,spectrum:ref<ops.Tensor>)->result<array<f64>,string> effects {alloc} {
+ if c.high_band!="none"{return result.err("High-band reconstruction requires the retained input path")}
+ var empty:option<ops.Tensor>=option.none()
+ synthesize_prepared(c,plans,spectrum,empty)
+}
+fn fill_high(extra:ref<option<ops.Tensor>>,real:ref<array<f64>>,imaginary:ref<array<f64>>,bins:u64,frames:u64)->unit effects {} {
+ match extra{none=>{},some(value)=>{
+  var component:u64=0
+  loop{if component==2{break}
+   var f:u64=0
+   loop{if f==value.h{break}
+    var t:u64=0
+    loop{if t==frames{break}
+     let at:u64=(component*bins+bins-1-value.h+f)*frames+t
+     array.set(real,at,cast.float(array.get(value.data,(2*component*value.h+f)*frames+t)))
+     array.set(imaginary,at,cast.float(array.get(value.data,((2*component+1)*value.h+f)*frames+t)))
+     t+=1}
+    f+=1}
+   component+=1}}}
+ ()
+}
+pub fn synthesize_with_high(c:ref<config.Config>,plans:ref<array<spectral.Plan>>,spectrum:ref<ops.Tensor>,retained:ref<option<ops.Tensor>>)->result<array<f64>,string> effects {alloc,ffi} {
+ if array.len(plans)!=array.len(c.bands) or spectrum.c!=4 or spectrum.h!=c.bins+1 or spectrum.w<2{return result.err("Invalid combined inverse spectrum")}
+ var mirrored:option<ops.Tensor>=option.none()
+ if c.high_band!="none"{
+  let last:ref<config.Band>=array.borrow(c.bands,array.len(c.bands)-1)
+  let height:u64=try high_band.extent(last.n_fft/2,last.crop_stop,c.pre_filter_start,c.pre_filter_stop)
+  if height>0{match retained{
+   none=>{return result.err("High-band reconstruction requires the retained input spectrum")},
+   some(value)=>{if value.h!=height{return result.err("Retained high-band extent differs from the profile")}
+    mirrored=option.some(try high_band.mirror(c.high_band,spectrum,value,c.pre_filter_start))}}}}
+ synthesize_prepared(c,plans,spectrum,mirrored)
+}
+fn synthesize_prepared(c:ref<config.Config>,plans:ref<array<spectral.Plan>>,spectrum:ref<ops.Tensor>,mirrored:ref<option<ops.Tensor>>)->result<array<f64>,string> effects {alloc} {
+ if array.len(plans)!=array.len(c.bands) or spectrum.c!=4 or spectrum.h!=c.bins+1 or spectrum.w<2{return result.err("Invalid combined inverse spectrum")}
+ var wave:array<f64>=[]
+ var offset:u64=0
+ var i:u64=0
+ loop{if i>=array.len(c.bands){break}
+  let b:ref<config.Band>=array.borrow(c.bands,i)
+  let bins:u64=b.n_fft/2+1
+  let frames:u64=spectrum.w
+  let height:u64=b.crop_stop-b.crop_start
+  // The reference allocates uninitialized out-of-band complex values. Define
+  // uncovered bins as zero so reconstruction is deterministic and finite.
+  var real:array<f64>=zeros(2*bins*frames)
+  var imaginary:array<f64>=zeros(2*bins*frames)
+  var channel:u64=0
+  loop{if channel>=2{break}
+   var f:u64=0
+   loop{if f>=height{break}
+    var t:u64=0
+    loop{if t>=frames{break}
+     let dst:u64=(channel*bins+b.crop_start+f)*frames+t
+     array.set(real,dst,cast.float(array.get(spectrum.data,((2*channel)*spectrum.h+offset+f)*frames+t)))
+     array.set(imaginary,dst,cast.float(array.get(spectrum.data,((2*channel+1)*spectrum.h+offset+f)*frames+t)))
+     t+=1}
+    f+=1}
+   channel+=1}
+  offset+=height
+  if i+1==array.len(c.bands){fill_high(mirrored,real,imaginary,bins,frames)}
+  if b.high_start>0{
+   if str.view(c.architecture)=="recurrent"{
+    let stop:u64=b.high_stop-1
+    var f:u64=0
+    loop{if f>=bins{break}
+     let factor:f64=if f<=stop{0.0}else{if f>b.high_start+1{1.0}else{cast.float(f-stop-1)/cast.float(b.high_start-stop)}}
+     gain(real,imaginary,bins,frames,f,factor)
+     f+=1}
+   }else{
+   var g:f64=1.0
+   let stop:u64=b.high_stop-1
+   var f:u64=b.high_start
+   loop{if f<=stop{break}
+    g-=1.0/cast.float(b.high_start-stop)
+    gain(real,imaginary,bins,frames,f,g)
+    f-=1}
+   f=0
+   loop{if f>stop{break}
+    gain(real,imaginary,bins,frames,f,0.0)
+    f+=1}
+   }
+  }
+  if i+1<array.len(c.bands) and b.low_start>0{
+   if str.view(c.architecture)=="recurrent"{
+    var f:u64=0
+    loop{if f>=bins{break}
+     let factor:f64=if f<b.low_start{1.0}else{if f>=b.low_stop{0.0}else{1.0-cast.float(f-b.low_start+1)/cast.float(b.low_stop-b.low_start)}}
+     gain(real,imaginary,bins,frames,f,factor)
+     f+=1}
+   }else{
+   var g:f64=1.0
+   var f:u64=b.low_start
+   loop{if f>=b.low_stop{break}
+    g-=1.0/cast.float(b.low_stop-b.low_start)
+    gain(real,imaginary,bins,frames,f,g)
+    f+=1}
+   loop{if f>=bins{break}
+    gain(real,imaginary,bins,frames,f,0.0)
+    f+=1}
+   }
+  }
+  var part:array<f64>=try spectral.synthesize(array.borrow(plans,i),array.view(real),array.view(imaginary),frames)
+  if c.channel_mode!="stereo"{part=try wave_channels.restore(part,c.channel_mode)}
+  if str.view(b.channel_mode)!="stereo"{part=try channels.restore(part,b.channel_mode)}
+  if i==0{wave=part}else{
+   if array.len(wave)!=array.len(part){return result.err("Reconstructed band sample grids do not align")}
+   var j:u64=0
+   loop{if j>=array.len(wave){break}
+    array.set(wave,j,array.get(wave,j)+array.get(part,j))
+    j+=1}
+  }
+  if i+1<array.len(c.bands){wave=try resampled(wave,b.sample_rate,array.borrow(c.bands,i+1).sample_rate)}
+  i+=1}
+ result.ok(wave)
+}

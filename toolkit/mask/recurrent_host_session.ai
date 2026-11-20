@@ -1,0 +1,23 @@
+module stemair.mask.recurrent_host_session
+import "config.ai" as config
+import "recurrent_network.ai" as network
+import "recurrent_host.ai" as host
+import "host_session.ai" as waveform
+import "../artifact_cleanup.ai" as cleanup
+import "../complex_spectral.ai" as spectral
+import "../ops.ai" as ops
+fn predict(n:ref<network.Network>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ host.predict(n,prepared,library,input,cancel)
+}
+pub fn separate(n:ref<network.Network>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ waveform.separate_predicted(n,prepared,library,plans,c,input,cancel,progress,predict)
+}
+pub fn separate_with_cleanup(n:ref<network.Network>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ waveform.separate_predicted_with_cleanup(n,prepared,library,plans,c,input,cancel,progress,predict,settings)
+}
+pub fn separate_wide_with_cleanup(n:ref<network.Network>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>)->result<array<f64>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ waveform.separate_predicted_wide_with_cleanup(n,prepared,library,plans,c,input,cancel,progress,predict,settings)
+}
+pub fn separate_wide_with_cleanup_and_band_input(n:ref<network.Network>,prepared:ref<host.Backend>,library:ref<CAbiLibrary>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>,lower:view<f32>)->result<array<f64>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ waveform.separate_predicted_wide_with_cleanup_and_band_input(n,prepared,library,plans,c,input,cancel,progress,predict,settings,lower)
+}

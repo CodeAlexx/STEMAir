@@ -1,0 +1,42 @@
+// Application-owned whole-library lease. The caller serializes all CPU jobs
+// and holds its entire retained model bank until restoration has completed.
+module stemair.alignment_thread_policy
+import std.cpu_dot as dot
+import std.files as files
+import std.text as text
+
+pub type Failure=struct{message:string,poison_cpu:bool}
+pub type Lease=struct{engine:dot.Engine,policy:dot.ThreadLease}
+pub fn failure(message:string own)->Failure effects {} {Failure{message:message,poison_cpu:false}}
+pub fn describe(error:Failure own)->string effects {alloc} {
+ var value:Failure=error
+ struct.replace(value,"",field=message)
+}
+fn file_error(error:fs.error)->Failure effects {alloc} {failure(string.copy(fs.error.message(error)))}
+fn policy_error(error:dot.ThreadPolicyError own)->Failure effects {alloc} {
+ var value:dot.ThreadPolicyError=error
+ let poison:bool=value.mutation_attempted and not value.restore_verified
+ Failure{message:struct.replace(value,"",field=message),poison_cpu:poison}
+}
+pub fn begin(runtime:str,sha256:str)->result<Lease,Failure> effects {alloc,fs.read,ffi} {
+ if str.len(runtime)==0 or str.len(sha256)!=64{return result.err(failure("Alignment requires an explicit pinned CPU runtime"))}
+ let actual:string=try files.sha256(runtime) map_err file_error
+ if actual!=sha256{return result.err(failure("CPU runtime bytes differ from the explicit pinned identity"))}
+ var engine:dot.Engine=try dot.open(runtime,"0.3.20","Zen") map_err failure
+ let policy:dot.ThreadLease=try dot.begin_threads_exclusive(engine,1) map_err policy_error
+ result.ok(Lease{engine:engine,policy:policy})
+}
+// No early-returning operation may intervene between begin and this call.
+pub fn end(lease:Lease own)->result<unit,Failure> effects {alloc,ffi} {
+ var active:Lease=lease
+ let policy:dot.ThreadLease=active.policy
+ let _=try dot.end_threads_exclusive(struct.borrow(active,field=engine),policy) map_err policy_error
+ result.ok(())
+}
+pub fn finish(lease:Lease own,outcome:result<unit,string> own)->result<unit,Failure> effects {alloc,ffi} {
+ let restored:result<unit,Failure>=end(lease)
+ match restored{ok(_)=>{let _=try outcome map_err failure
+  result.ok(())},err(error)=>{
+  match outcome{ok(_)=>result.err(error),err(original)=>result.err(Failure{
+   message:text.concat(original,text.concat("; ",error.message)),poison_cpu:error.poison_cpu})}}}
+}

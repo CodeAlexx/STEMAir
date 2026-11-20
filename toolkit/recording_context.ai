@@ -1,0 +1,26 @@
+module stemair.recording_context
+import "recording_inference.ai" as inference
+import "recording_shifts.ai" as shifts
+import "inference_pitch.ai" as pitch
+pub type Context=struct{enabled:bool,options:inference.Options,streams:array<inference.Stream>,limits:shifts.Limits,transform_bytes:u64=1073741824,waveform_bytes:u64=2147483648,device_index:u32=0,pitch:pitch.Settings,frequency_reference:array<f32>,snapshot_provided:bool=false}
+pub fn disabled()->Context effects {alloc} {
+ Context{enabled:false,options:inference.Options{shifts:0,split:true},streams:[],limits:shifts.Limits{max_forwards:0,max_groups:0,max_group_offsets:0,max_random_calls:0},pitch:pitch.Settings{},frequency_reference:[]}
+}
+pub fn accepted(options:inference.Options,seed:u64,limits:shifts.Limits)->result<Context,string> effects {alloc} {
+ var selected:inference.Options=options
+ let _=try inference.validate(selected)
+ if limits.max_forwards==0 or limits.max_groups==0{return result.err("Recording request requires an explicit positive caller work budget")}
+ result.ok(Context{enabled:true,options:selected,streams:[inference.stream(seed)],limits:limits,pitch:pitch.Settings{},frequency_reference:[]})
+}
+pub fn validate(c:ref<Context>)->result<unit,string> effects {alloc} {
+ let _=try pitch.validate(c.pitch)
+ if c.waveform_bytes==0 or c.waveform_bytes>9223372036854775807{return result.err("Invalid explicit waveform allocation allowance")}
+ if c.transform_bytes==0 or c.transform_bytes>9223372036854775807{return result.err("Invalid explicit transform allocation allowance")}
+ if not c.enabled{
+  if array.len(c.streams)!=0{return result.err("Disabled recording controls unexpectedly own an RNG stream")}
+  return result.ok(())}
+ let _=try inference.validate(struct.borrow(c,field=options))
+ if array.len(c.streams)!=1 or c.limits.max_forwards==0 or c.limits.max_groups==0{return result.err("Accepted recording controls have invalid ownership or work limits")}
+ if array.borrow(c.streams,0).active{return result.err("Accepted recording controls already own an active inference")}
+ result.ok(())
+}

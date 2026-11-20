@@ -1,0 +1,90 @@
+module stemair.hybrid.host_local_state
+import "network.ai" as network
+import "local_state.ai" as form
+import "host_ops.ai" as host
+import "host_prepared.ai" as prepared
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "../weights.ai" as weights
+import std.cpu_matmul as matrix
+import std.float as fp
+
+// Independent per-head matrix products use the same retained ILP64 library.
+// Transposing scores to [query,key] makes Source's key-axis softmax explicit.
+pub fn forward(n:ref<network.Network>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,block:form.Block,x:ref<host.Tensor>,cancel:str)->result<host.Tensor,string> effects {alloc,ffi,fs.meta} {
+ forward_weights(struct.borrow(n,field=weights),p,library,block,x,cancel)
+}
+pub fn forward_weights(model:ref<weights.Model>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,block:form.Block,x:ref<host.Tensor>,cancel:str)->result<host.Tensor,string> effects {alloc,ffi,fs.meta}{
+ if x.c!=block.channels or x.h!=1 or x.w==0 or x.w>p.max_local_steps or p.max_local_steps>2147483647 or p.max_local_elements>2147483647 or p.max_local_elements==0 or x.n==0 or block.heads==0 or x.n>p.max_local_elements/block.heads or x.w>p.max_local_elements/(x.n*block.heads) or x.w>p.max_local_elements/(x.n*block.heads*x.w){return result.err("CPU hybrid local-state geometry exceeds bound")}
+ let limits:matrix.Limits=matrix.Limits{max_input_bytes:p.max_matrix_input_bytes,max_output_elements:p.max_matrix_output_elements}
+ var query:host.Tensor=try prepared.convolve_weights(model,p,library,x,block.query)
+ var key:host.Tensor=try prepared.convolve_weights(model,p,library,x,block.key)
+ var decay:host.Tensor=try prepared.convolve_weights(model,p,library,x,block.decay)
+ var content:host.Tensor=try prepared.convolve_weights(model,p,library,x,block.content)
+ let features:u64=x.c/block.heads
+ let divisor:f32=fp.sqrt(cast.float(features))
+ let decay_divisor:f32=fp.sqrt(cast.float(block.decays))
+ var i:u64=0
+ loop{if i==array.len(decay.data){break}
+  array.set(decay.data,i,(1.0/(1.0+fp.exp(-array.get(decay.data,i))))/2.0)
+  i+=1}
+ var result:array<f32>=num.zeros(array.len(x.data))
+ var head:u64=0
+ loop{if head==x.n*block.heads{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let offset:u64=head*features*x.w
+  var queries:matrix.Matrix=try matrix.prepare(view.slice(array.view(query.data),offset,offset+features*x.w),features,x.w,limits)
+  var keys:matrix.Matrix=try matrix.prepare(view.slice(array.view(key.data),offset,offset+features*x.w),features,x.w,limits)
+  let dots:array<f32>=try matrix.multiply(library,keys,matrix.Operation.Transpose,queries,matrix.Operation.Identity,limits)
+  var scores:array<f32>=[]
+  array.reserve(scores,x.w*x.w)
+  var q:u64=0
+  loop{if q==x.w{break}
+   var k:u64=0
+   loop{if k==x.w{break}
+    let distance:u64=if k>q{k-q}else{q-k}
+    var penalty:f32=0.0
+    var d:u64=0
+    loop{if d==block.decays{break}
+     let number:f32=cast.float(d+1)
+     let separation:f32=cast.float(distance)
+     let kernel:f32=(-number*separation)/decay_divisor
+     penalty+=kernel*array.get(decay.data,(head*block.decays+d)*x.w+q)
+     d+=1}
+    array.push(scores,if k==q{-100.0}else{array.get(dots,k*x.w+q)/divisor+penalty})
+    k+=1}
+   q+=1}
+  // Stable dense F32 row softmax. CPU original component gates qualify its
+  // rounding separately; no GPU softmax policy or compiler kernel is reused.
+  q=0
+  loop{if q==x.w{break}
+   var maximum:f32=array.get(scores,q*x.w)
+   var k:u64=1
+   loop{if k==x.w{break}
+    let value:f32=array.get(scores,q*x.w+k)
+    if value>maximum{maximum=value}
+    k+=1}
+   var total:f32=0.0
+   k=0
+   loop{if k==x.w{break}
+    let value:f32=fp.exp(array.get(scores,q*x.w+k)-maximum)
+    array.set(scores,q*x.w+k,value)
+    total+=value
+    k+=1}
+   k=0
+   loop{if k==x.w{break}
+    array.set(scores,q*x.w+k,array.get(scores,q*x.w+k)/total)
+    k+=1}
+   q+=1}
+  var probabilities:matrix.Matrix=try matrix.prepare(array.view(scores),x.w,x.w,limits)
+  var contents:matrix.Matrix=try matrix.prepare(view.slice(array.view(content.data),offset,offset+features*x.w),features,x.w,limits)
+  let attended:array<f32>=try matrix.multiply(library,contents,matrix.Operation.Identity,probabilities,matrix.Operation.Transpose,limits)
+  i=0
+  loop{if i==features*x.w{break}
+   array.set(result,offset+i,array.get(attended,i))
+   i+=1}
+  head+=1}
+ var joined:host.Tensor=try host.make_limited(x.n,x.c,1,x.w,result,x.max_elements)
+ var projected:host.Tensor=try prepared.convolve_weights(model,p,library,joined,block.projection)
+ host.add(projected,x)
+}

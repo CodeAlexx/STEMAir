@@ -1,0 +1,37 @@
+module stemair.cpu_capability
+import "model_cache.ai" as cache
+import "recording_bag_state.ai" as bags
+// A family label alone does not establish that its retained execution state is
+// ready. Preserve existing scalar spectral/interchange routes explicitly.
+pub fn require_ready(bank:ref<cache.Cache>,index:u64)->result<unit,string> effects {alloc} {
+ let _=try cache.require_cpu_policy(bank)
+ if index>=array.len(bank.entries){return result.err("CPU member binding is out of range")}
+ let model=struct.borrow(array.borrow(bank.entries,index),field=model)
+ var ready:bool=false
+ var prepared:bool=true
+ if model.profile.kind=="recording-bundle"{
+  if array.len(model.recording_bags)==1{ready=bags.cpu_ready(array.borrow(model.recording_bags,0))}}
+ if model.profile.kind=="attention-bundle"{match model.bundle{none=>{},some(value)=>{
+  ready=array.len(value.members)>0
+  var i:u64=0
+  loop{if i==array.len(value.members){break}
+   if array.len(array.borrow(value.members,i).model.cpu)!=1{ready=false}
+   i+=1}}}}
+ if model.profile.kind=="spectral"{match model.spectral{none=>{},some(_)=>{ready=true
+  prepared=array.len(model.spectral_cpu)!=0 or array.len(model.strict_spectral_cpu)!=0
+  if array.len(model.strict_spectral_cpu)!=0 and array.len(model.strict_spectral_cpu)!=1{return result.err("Strict spectral CPU prepared bank is inconsistent")}
+  if array.len(model.spectral_cpu)!=0 and array.len(model.spectral_cpu)!=1{return result.err("Spectral CPU prepared bank is inconsistent")}}}}
+ if model.profile.kind=="exchange"{match model.exchange{none=>{},some(value)=>{ready=true
+  prepared=value.cpu_preparations!=0
+  if prepared and array.len(value.cpu)!=1{return result.err("Interchange CPU prepared bank is inconsistent")}}}}
+ if model.profile.kind=="mask"{
+  match model.mask{none=>{},some(value)=>{ready=array.len(value.cpu)==1}}
+  match model.recurrent_mask{none=>{},some(value)=>{ready=array.len(value.cpu)==1}}}
+ if model.profile.kind=="waveform"{match model.waveform{none=>{},some(value)=>{ready=array.len(value.cpu)==1}}}
+ if model.profile.kind=="temporal"{match model.temporal{none=>{},some(value)=>{ready=array.len(value.cpu)==1}}}
+ if model.profile.kind=="hybrid"{match model.hybrid{none=>{},some(value)=>{ready=array.len(value.cpu)==1}}}
+ if model.profile.kind=="residual-waveform"{match model.residual{none=>{},some(value)=>{ready=array.len(value.cpu)==1}}}
+ if model.profile.kind=="attention"{match model.attention{none=>{},some(value)=>{ready=array.len(value.cpu)==1}}}
+ if not ready or (prepared and array.len(bank.cpu)!=1){return result.err("A selected CPU model has no ready retained execution backend")}
+ result.ok(())
+}

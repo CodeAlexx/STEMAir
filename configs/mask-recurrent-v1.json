@@ -1,0 +1,13 @@
+{
+ "engine":"mask","architecture":"recurrent","recurrent_width":128,
+ "sample_rate":44100,"bins":672,"channels":48,"levels":4,"branches":5,
+ "window":512,"tta":false,"aggression":0.05,"primary_foreground":false,
+ "pre_filter_start":668,"pre_filter_stop":672,
+ "targets":["no-echo","echo"],
+ "bands":[
+  {"sample_rate":7350,"n_fft":640,"hop":80,"crop_start":0,"crop_stop":85,"low_start":25,"low_stop":53},
+  {"sample_rate":7350,"n_fft":320,"hop":80,"crop_start":4,"crop_stop":87,"high_start":25,"high_stop":12,"low_start":31,"low_stop":62},
+  {"sample_rate":14700,"n_fft":512,"hop":160,"crop_start":17,"crop_stop":216,"high_start":48,"high_stop":24,"low_start":139,"low_stop":210},
+  {"sample_rate":44100,"n_fft":960,"hop":480,"crop_start":78,"crop_stop":383,"high_start":130,"high_stop":86}
+ ]
+}

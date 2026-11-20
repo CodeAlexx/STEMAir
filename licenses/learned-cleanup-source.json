@@ -1,0 +1,22 @@
+{
+  "original_commit": "a5f88453bfb2b38b05a965bcf67727243e0cbf19",
+  "reference": "https://github.com/Anjok07/ultimatevocalremovergui",
+  "assets": [
+    {
+      "filename": "cleanup-noise-v1.pth",
+      "bytes": 17922277,
+      "sha256": "0023492fe98c406817b5253965de19ede65d1c147db015a3a428f07602e99571",
+      "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-DeNoise-Lite.pth",
+      "purpose": "Original optional per-model noise cleanup"
+    },
+    {
+      "filename": "cleanup-room-v1.pth",
+      "bytes": 223650277,
+      "sha256": "e644028ec82865dc0fe082bc6fea85a43f7c71cfe375caee2da2d154aa661ee7",
+      "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-DeEcho-DeReverb.pth",
+      "purpose": "Original optional room cleanup at eligible save points"
+    }
+  ],
+  "runtime": "Native AIR retained CPU or selected GPU route; original weights read once at helper acquisition",
+  "reference_license": "Existing original-source attribution and license notices apply; model distribution terms remain the upstream public release terms"
+}

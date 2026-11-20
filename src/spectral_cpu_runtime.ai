@@ -1,0 +1,23 @@
+module stemair.spectral_cpu_runtime
+import "../toolkit/spectral_cpu_recipe.ai" as recipe
+import std.files as files
+import std.path as path
+import std.codec as codec
+import std.system as system
+fn resolve(base:str,file:str)->string effects {alloc}{if path.is_absolute(file){string.copy(file)}else{path.join(base,file)}}
+pub fn selected(root:str)->result<string,string> effects {alloc,env,fs.read,fs.meta}{
+ let filename:str=if system.platform()=="windows"{"licenses/spectral-cpu-windows.json"}else{"licenses/spectral-cpu-linux.json"}
+ let raw:bytes=match files.read_limited(path.join(root,filename),16384){ok(v)=>v,err(_)=>{return result.err("The strict spectral CPU runtime identity is unavailable")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("The spectral CPU identity must be UTF-8")}}
+ var chosen:recipe.Recipe=try recipe.decode(source)
+ let installed:string=path.join(root,"runtime/spectral-cpu")
+ let development:string=path.join(root,"build/runtime/spectral-cpu")
+ var base:string=string.copy(development)
+ match files.symlink_metadata(installed){ok(info)=>{if not info.is_dir or info.is_symlink{return result.err("The spectral CPU runtime directory must be ordinary")}
+  base=string.copy(installed)},err(e)=>{if e.code!=1{return result.err("Cannot inspect the spectral CPU runtime directory")}}}
+ chosen.adapter=resolve(base,chosen.adapter)
+ chosen.runtime=resolve(base,chosen.runtime)
+ chosen.matrix_adapter=resolve(base,chosen.matrix_adapter)
+ chosen.mkl=resolve(base,chosen.mkl)
+ result.ok(try recipe.Recipe_encode(chosen) map_err codec.describe)
+}

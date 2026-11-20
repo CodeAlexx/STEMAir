@@ -1,0 +1,276 @@
+module stemair.recording_sample_application
+import "checked_input.ai" as checked
+import "../toolkit/codec_process.ai" as tools
+import "../toolkit/control.ai" as control
+import "../toolkit/export_audio.ai" as export
+import "../toolkit/recording_sample.ai" as sample
+import "../toolkit/rate_filter.ai" as asset
+import std.audio as audio
+import std.codec as codec
+import std.ffmpeg_probe as probe
+import std.ffmpeg_decode as decoder
+import std.signal_resample_table as rate
+import std.sndfile as sound
+import std.audio_raw_metadata as raw_header
+import std.files as files
+import std.path as path
+import std.text as text
+
+pub type Selection=struct{index:u64,path:string} derive codec(strict)
+// These identify the failing phase, not permission to remove an input row.
+// In particular Intake includes unavailable configuration/runtime resources.
+pub type FailureKind=enum{Intake,Resampling,Publication,Reporting,Cancelled,Deadline}
+pub type Failure=struct{kind:FailureKind,message:string}
+pub type Options=struct{seconds:u64,output_directory:string,input:checked.Options,probe:option<probe.Tool>,
+ max_header_bytes:u64,filter:option<asset.Asset>,resampling:rate.Limits,sndfile:option<sound.Tool>}
+pub type Row=struct{index:u64,input:string,path:string,success:bool,message:string,failure_kind:string,duration_policy:string,
+ whole_seconds:u64,start_seconds:u64,requested_seconds:u64,frames:u64,channels:u32,
+ native_header_bytes:u64,native_payload_bytes:u64,decode_kind:string,decoder_pid:u64,decoder_reaped:bool,decoder_handle_closed:bool,
+ temporary_removed:bool,temporary_directory:string,export_report:string} derive codec(strict)
+pub type Report=struct{total:u64,attempted:u64,completed:bool,cancelled:bool,message:string,rows:array<Row>,
+ filter_loads:u64,filter_bytes:u64,decoder_library_loads:u64,decoder_fallbacks:u64} derive codec(strict)
+pub type Envelope=struct{queue:bool,generation:u64,selection:array<Selection>,report:Report} derive codec(strict)
+type Session=struct{filter:option<asset.Loaded>,plan:option<rate.Plan>,decoder:option<sound.Engine>,filter_loads:u64,filter_bytes:u64,decoder_library_loads:u64,decoder_fallbacks:u64}
+type Loaded=struct{recording:audio.AudioBuffer,whole:u64,start:u64,requested:u64,policy:string,header_bytes:u64,payload_bytes:u64,
+ decode_kind:string,decoder_pid:u64,decoder_reaped:bool,decoder_handle_closed:bool,temporary_removed:bool,temporary_directory:string}
+type Timing=struct{whole:u64,rate:u32,policy:string,header_bytes:u64}
+
+fn fs_error(e:fs.error)->string effects {alloc} {string.copy(fs.error.message(e))}
+fn wav_error(e:audio.WavReadError)->string effects {alloc} {
+ match e{Io(error)=>fs_error(error),Audio(error)=>string.copy(audio.message(error)),Limit(_)=>"Recording sample exceeds the selected resource limits"}
+}
+fn stopped(options:ref<Options>)->result<unit,string> effects {alloc,fs.meta,time} {
+ if control.cancelled(options.input.cancel_file){return result.err("Recording sample export cancelled")}
+ if time.monotonic_ns()>=options.input.deadline_ns{return result.err("Recording sample deadline reached")}
+ result.ok(())
+}
+pub fn failure_kind(kind:FailureKind)->str effects {} {
+ match kind{Intake=>"intake",Resampling=>"resampling",Publication=>"publication",Reporting=>"reporting",Cancelled=>"cancelled",Deadline=>"deadline"}
+}
+fn failed(message:string own,kind:FailureKind,options:ref<Options>)->Failure effects {alloc,fs.meta,time} {
+ let actual:FailureKind=if control.cancelled(options.input.cancel_file){FailureKind.Cancelled}else{
+  if time.monotonic_ns()>=options.input.deadline_ns{FailureKind.Deadline}else{kind}}
+ Failure{kind:actual,message:message}
+}
+// The source's display parser consumes the first decimal place, after the
+// decoder has printed a duration rounded to centiseconds. Its integer part
+// therefore carries at the display boundary, unlike exact PCM header timing.
+pub fn display_whole(duration_us:u64)->result<u64,string> effects {alloc} {
+ if duration_us>18446744073709551615-5000{return result.err("Recording duration overflows display timing")}
+ result.ok(((duration_us+5000)/10000)/100)
+}
+fn probed(input:str,options:ref<Options>)->result<Timing,string> effects {alloc,fs.read,fs.meta,process,time} {
+ let tool:ref<probe.Tool>=match options.probe{some(value)=>value,none=>{return result.err("Choose the supported audio metadata probe for this recording")}}
+ let selected:probe.Options=probe.Options{tool:probe.Tool{path:string.copy(tool.path),sha256:string.copy(tool.sha256)},
+  deadline_ns:options.input.deadline_ns,cancel_file:string.copy(options.input.cancel_file),max_stdout_bytes:65536,
+  max_stderr_bytes:options.input.log_limit,max_audio_streams:16}
+ var outcome:probe.Outcome=probe.read(input,selected)
+ var info:probe.Info=match struct.replace(outcome,result.err(probe.Failure.InvalidRequest),field=value){
+  ok(value)=>value,err(problem)=>{return result.err(text.concat("Cannot inspect recording duration: ",probe.code(problem)))}}
+ if not outcome.trace.reaped{return result.err("Recording metadata process did not close successfully")}
+ if array.len(info.streams)==0{return result.err("Recording has no audio stream")}
+ // The source display reader initializes missing duration to zero after it
+ // has identified an audio stream. This is not a whole-file decode fallback.
+ let duration:u64=match info.duration_us{some(value)=>value,none=>0}
+ result.ok(Timing{whole:try display_whole(duration),rate:array.borrow(info.streams,0).rate,policy:"decoder-display",header_bytes:0})
+}
+fn raw_timing(input:str,options:ref<Options>)->result<Timing,string> effects {alloc,fs.read,fs.meta,process,time} {
+ match raw_header.read(input,options.max_header_bytes){
+  ok(info)=>result.ok(Timing{whole:info.frames/cast.wrap(info.rate),rate:info.rate,policy:"raw-header",header_bytes:info.header_bytes_read}),
+  err(error)=>match error{Unsupported=>probed(input,options),_=>result.err(text.concat("Cannot inspect raw recording header: ",raw_header.code(error)))}}
+}
+fn interval(whole:u64,seconds:u64)->result<sample.Plan,string> effects {alloc} {sample.plan(whole,1,seconds)}
+pub fn output_name(input:str,long:bool,seconds:u64)->string effects {alloc} {
+ let name:string=path.basename(input)
+ var dot:u64=str.len(name)
+ var nondot:bool=false
+ var i:u64=0
+ loop{if i==str.len(name){break}
+  let value:u8=cast.bits(view.get(str.bytes(name),i))
+  if value==46{if nondot{dot=i}}else{nondot=true}
+  i+=1}
+ let stem:string=string.copy(str.slice(name,0,dot))
+ let suffix:string=if long{text.concat("_",text.concat(string.from_int(seconds),"_second_sample.wav"))}else{"_sample.wav"}
+ text.concat(stem,suffix)
+}
+fn fallback(input:str,options:ref<Options>,ordinal:u64,timing:ref<Timing>,plan:sample.Plan)->result<Loaded,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let tool:ref<tools.Tool>=match options.input.tool{some(value)=>value,none=>{return result.err("Choose the supported audio codec for the recording decoder fallback")}}
+ let _=try tools.verify(tool)
+ let executable:string=string.copy(tool.path)
+ let scratch:string=text.concat(options.input.scratch_directory,text.concat("-sample-",string.from_int(ordinal)))
+ let selected:decoder.Options=decoder.Options{executable:executable,scratch_directory:string.copy(scratch),rate:0,channels:0,
+  limits:options.input.limits,deadline_ns:options.input.deadline_ns,cancel_file:string.copy(options.input.cancel_file),log_limit:options.input.log_limit}
+ // An empty source fallback is mono only when its raw reader yields no PCM
+ // blocks. Inspect at most a single-frame-duration prefix to distinguish that
+ // case, then discard the data. No complete-file decode is used for timing.
+ let duration:u64=if plan.requested_frames==0{(1000000+cast.wrap(timing.rate)-1)/cast.wrap(timing.rate)}else{plan.requested_frames*1000000}
+ var outcome:decoder.Outcome=decoder.read_region_as(input,selected,decoder.Region{start_us:plan.start_frame*1000000,duration_us:duration},decoder.SampleFormat.Pcm16)
+ var decoded:audio.WavRead=match struct.replace(outcome,result.err(decoder.Failure.InvalidRequest),field=value){ok(value)=>value,err(_)=>{
+  if outcome.trace.scratch_created{
+   let _=files.write_new_bytes(path.join(scratch,"decode.stdout"),bytes.view(outcome.trace.stdout))
+   let _=files.write_new_bytes(path.join(scratch,"decode.stderr"),bytes.view(outcome.trace.stderr))}
+  return result.err(text.concat("Cannot decode selected recording interval; owned diagnostics remain at ",scratch))}}
+ if not outcome.trace.reaped{return result.err(text.concat("Recording codec did not close; owned files remain at ",scratch))}
+ match files.remove(path.join(scratch,"decoded.wav")){ok(_)=>{},err(_)=>{return result.err(text.concat("Cannot remove owned decoded audio; files remain at ",scratch))}}
+ match files.remove(scratch){ok(_)=>{},err(_)=>{return result.err(text.concat("Cannot remove owned conversion directory; files remain at ",scratch))}}
+ if decoded.info.channels!=1 and decoded.info.channels!=2{return result.err("Recording samples require mono or stereo input")}
+ var recording:audio.AudioBuffer=struct.replace(decoded,audio.AudioBuffer{samples:[],rate:44100,channels:1},field=buffer)
+ if plan.requested_frames==0{recording.samples=[]
+  if decoded.info.frames==0{recording.channels=1}}
+ // The original fallback has no collected PCM blocks when the selected start
+ // lies beyond EOF. Its empty vector is mono, independent of the file channels.
+ if decoded.info.frames==0 and plan.start_frame>0{recording.channels=1}
+ result.ok(Loaded{recording:recording,whole:timing.whole,
+  start:plan.start_frame,requested:plan.requested_frames,policy:string.copy(timing.policy),header_bytes:timing.header_bytes,payload_bytes:0,
+  decode_kind:"pcm16-codec",decoder_pid:outcome.trace.pid,decoder_reaped:outcome.trace.reaped,decoder_handle_closed:false,temporary_removed:true,temporary_directory:""})
+}
+fn load(input:str,options:ref<Options>,session:ref<Session>,ordinal:u64)->result<Loaded,string> effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let _=try stopped(options)
+ match audio.open_wav_region(input,options.max_header_bytes){
+  ok(value)=>{
+   var reader:audio.WavReader=value
+   if reader.info.channels!=1 and reader.info.channels!=2{return result.err("Recording samples require mono or stereo input")}
+   let raw:bool=reader.info.container_tag==1 and reader.info.format_tag==1
+   // The original whole-file fallback reports zero for an empty WAV. The
+   // seekable header proves that case without reading a complete recording.
+   let whole:u64=if raw or reader.info.frames==0{reader.info.frames/cast.wrap(reader.info.rate)}else{
+    let timing:Timing=try probed(input,options)
+    timing.whole}
+   let plan:sample.Plan=try interval(whole,options.seconds)
+   let start:u64=plan.start_frame*cast.wrap(reader.info.rate)
+   let count:u64=plan.requested_frames*cast.wrap(reader.info.rate)
+   let limits:audio.WavRegionLimits=audio.WavRegionLimits{max_encoded_bytes:options.input.limits.max_file_bytes,
+    max_frames:options.input.limits.max_frames,max_channels:options.input.limits.max_channels,max_decoded_bytes:options.input.limits.max_decoded_bytes}
+   let recording:audio.AudioBuffer=try audio.read_wav_region(reader,start,count,limits) map_err wav_error
+   return result.ok(Loaded{recording:recording,whole:whole,start:plan.start_frame,requested:plan.requested_frames,
+    policy:if raw{"pcm-header"}else{"decoder-display"},header_bytes:reader.header_bytes_read,payload_bytes:reader.payload_bytes_read,
+    decode_kind:"native-wav",decoder_pid:0,decoder_reaped:false,decoder_handle_closed:false,temporary_removed:true,temporary_directory:""})},
+  err(problem)=>match problem{Audio(detail)=>{
+   if detail.code!=audio.ErrorCode.BadMagic and detail.code!=audio.ErrorCode.UnsupportedFormat and detail.code!=audio.ErrorCode.BadBits{
+    return result.err(string.copy(audio.message(detail)))}},
+   Io(error)=>{return result.err(fs_error(error))},Limit(_)=>{return result.err("Recording header exceeds the selected resource limit")}}
+ }
+ let timing:Timing=try raw_timing(input,options)
+ let whole:u64=timing.whole
+ let plan:sample.Plan=try interval(whole,options.seconds)
+ let absent:bool=match session.decoder{none=>true,some(_)=>false}
+ if absent{
+  let tool:ref<sound.Tool>=match options.sndfile{some(value)=>value,none=>{return result.err("Choose the qualified sound-file decoder for this recording")}}
+  let opened:sound.Engine=match sound.open(tool){ok(value)=>value,err(problem)=>{return result.err(text.concat("Cannot open sound-file decoder: ",sound.code(problem)))}}
+  session.decoder=option.some(opened)
+  session.decoder_library_loads+=1}
+ let retained:ref<sound.Engine>=match session.decoder{some(value)=>value,none=>{return result.err("Sound-file decoder is unavailable")}}
+ let selected:sound.Options=sound.Options{limits:sound.Limits{max_frames:options.input.limits.max_frames,
+  max_channels:options.input.limits.max_channels,max_decoded_bytes:options.input.limits.max_decoded_bytes,chunk_frames:4096},
+  deadline_ns:options.input.deadline_ns,cancel_file:string.copy(options.input.cancel_file)}
+ var outcome:sound.Outcome=sound.read_seconds(retained,input,plan.start_frame,plan.requested_frames,selected)
+ if outcome.trace.opened and not outcome.trace.closed{return result.err("Sound-file decoder handle did not close successfully")}
+ var decoded:sound.Decoded=match struct.replace(outcome,result.err(sound.Failure.InvalidRequest),field=value){ok(value)=>value,
+  err(problem)=>{
+   let message:string=text.concat("Cannot decode selected recording interval: ",sound.code(problem))
+   let retry:bool=match problem{Open=>true,Read=>true,Seek=>true,_=>false}
+   if retry{session.decoder_fallbacks+=1
+    return fallback(input,options,ordinal,timing,plan)}
+   return result.err(message)}}
+ if not outcome.trace.closed{return result.err("Sound-file decoder handle did not close successfully")}
+ if decoded.original.channels!=1 and decoded.original.channels!=2{return result.err("Recording samples require mono or stereo input")}
+ result.ok(Loaded{recording:struct.replace(decoded,audio.AudioBuffer{samples:[],rate:44100,channels:1},field=buffer),
+  whole:whole,start:plan.start_frame,requested:plan.requested_frames,policy:string.copy(timing.policy),header_bytes:timing.header_bytes,payload_bytes:0,
+  decode_kind:"native-sound-file",decoder_pid:0,decoder_reaped:false,decoder_handle_closed:outcome.trace.closed,temporary_removed:true,temporary_directory:""})
+}
+fn resample(source:ref<audio.AudioBuffer>,options:ref<Options>,session:ref<Session>,progress:str)->result<audio.AudioBuffer,string>
+ effects {alloc,fs.read,fs.write,fs.meta,time} {
+ if source.rate==44100{
+  var unused_filter:rate.Filter=rate.Filter{precision:0,half_window:[]}
+  var identity:rate.Plan=try rate.prepare(unused_filter,44100,44100,options.resampling)
+  let _=try rate.geometry(identity,array.view(source.samples),cast.wrap(source.channels),options.resampling,true)
+  var samples:array<f32>=[]
+  array.reserve(samples,array.len(source.samples))
+  var i:u64=0
+  loop{if i==array.len(source.samples){break}
+   if i%4096==0{let _=try stopped(options)}
+   array.push(samples,array.get(source.samples,i))
+   i+=1}
+  return result.ok(audio.AudioBuffer{samples:samples,rate:44100,channels:source.channels})}
+ let absent:bool=match session.filter{some(_)=>false,none=>true}
+ if absent{
+  let selected:ref<asset.Asset>=match options.filter{some(value)=>value,none=>{return result.err("Choose the qualified recording rate filter for this sample rate")}}
+  var loaded:asset.Loaded=try asset.open(selected)
+  session.filter_bytes+=loaded.bytes_read
+  session.filter_loads+=1
+  session.filter=option.some(loaded)}
+ let replace:bool=match session.plan{none=>true,some(value)=>value.source_rate!=source.rate}
+ if replace{
+  let retained:ref<asset.Loaded>=match session.filter{some(value)=>value,none=>{return result.err("Recording rate filter is unavailable")}}
+  session.plan=option.some(try rate.prepare(struct.borrow(retained,field=filter),source.rate,44100,options.resampling))}
+ let plan:ref<rate.Plan>=match session.plan{some(value)=>value,none=>{return result.err("Recording resampling plan is unavailable")}}
+ let geometry:rate.Geometry=try rate.geometry(plan,array.view(source.samples),cast.wrap(source.channels),options.resampling,true)
+ var samples:array<f32>=[]
+ array.reserve(samples,geometry.output_samples)
+ var first:u64=0
+ loop{if first==geometry.output_frames{break}
+  let _=try stopped(options)
+  control.status(progress,"Resampling selected recording interval")
+  let count:u64=if geometry.output_frames-first<4096{geometry.output_frames-first}else{4096}
+  let rendered:array<f32>=try rate.render(plan,array.view(source.samples),geometry,first,count)
+  var i:u64=0
+  loop{if i==array.len(rendered){break}
+   array.push(samples,array.get(rendered,i))
+   i+=1}
+  first+=count}
+ result.ok(audio.AudioBuffer{samples:samples,rate:44100,channels:source.channels})
+}
+fn one(selected:ref<Selection>,options:ref<Options>,session:ref<Session>,ordinal:u64,progress:str)->result<Row,Failure>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var loaded:Loaded=match load(selected.path,options,session,ordinal){ok(value)=>value,err(message)=>{return result.err(failed(message,FailureKind.Intake,options))}}
+ var recording:audio.AudioBuffer=match resample(struct.borrow(loaded,field=recording),options,session,progress){ok(value)=>value,err(message)=>{return result.err(failed(message,FailureKind.Resampling,options))}}
+ let target:string=path.join(options.output_directory,output_name(selected.path,loaded.whole>=options.seconds,options.seconds))
+ match stopped(options){ok(_)=>{},err(message)=>{return result.err(failed(message,FailureKind.Publication,options))}}
+ let settings:export.Settings=export.Settings{subtype:"s16",normalize:false,durable:false}
+ let actual:export.Report=match export.run_including_empty(recording,settings,target,options.input.cancel_file,progress){ok(value)=>value,err(message)=>{return result.err(failed(message,FailureKind.Publication,options))}}
+ let serialized:string=match export.Report_encode(actual){ok(value)=>value,err(error)=>{return result.err(failed(codec.describe(error),FailureKind.Reporting,options))}}
+ result.ok(Row{index:selected.index,input:string.copy(selected.path),path:target,success:true,message:"Sample exported",failure_kind:"",duration_policy:string.copy(loaded.policy),
+  whole_seconds:loaded.whole,start_seconds:loaded.start,requested_seconds:loaded.requested,frames:actual.frames,channels:actual.channels,
+  native_header_bytes:loaded.header_bytes,native_payload_bytes:loaded.payload_bytes,decode_kind:string.copy(loaded.decode_kind),
+  decoder_pid:loaded.decoder_pid,decoder_reaped:loaded.decoder_reaped,decoder_handle_closed:loaded.decoder_handle_closed,
+  temporary_removed:loaded.temporary_removed,temporary_directory:string.copy(loaded.temporary_directory),export_report:serialized})
+}
+// Only selected rows are visited. Existing outputs and foreign stages survive.
+// The caller owns list edits and model state; this module never acquires models.
+pub fn run(selection:ref<array<Selection>>,options:ref<Options>,progress:str)->Report
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var report:Report=Report{total:array.len(selection),attempted:0,completed:false,cancelled:false,message:"No recordings selected",rows:[],filter_loads:0,filter_bytes:0,decoder_library_loads:0,decoder_fallbacks:0}
+ if options.seconds<5 or options.seconds>120 or not path.is_absolute(options.output_directory){report.message="Choose a sample duration from 5 to 120 seconds and an absolute output folder"
+  return report}
+ var i:u64=0
+ loop{if i==array.len(selection){break}
+  let selected:ref<Selection>=array.borrow(selection,i)
+  if not path.is_absolute(selected.path) or (i>0 and selected.index<=array.borrow(selection,i-1).index){report.message="Selected recording rows must have ordered unique indices and absolute paths"
+   return report}
+  i+=1}
+ var session:Session=Session{filter:option.none(),plan:option.none(),decoder:option.none(),filter_loads:0,filter_bytes:0,decoder_library_loads:0,decoder_fallbacks:0}
+ i=0
+ loop{if i==array.len(selection){break}
+  match stopped(options){ok(_)=>{},err(message)=>{report.cancelled=control.cancelled(options.input.cancel_file)
+   report.message=message
+   break}}
+  let selected:ref<Selection>=array.borrow(selection,i)
+  control.status(progress,text.concat("Exporting recording sample ",string.from_int(i+1)))
+  match one(selected,options,session,i,progress){ok(row)=>array.push(report.rows,row),err(problem)=>{
+   array.push(report.rows,Row{index:selected.index,input:string.copy(selected.path),path:"",success:false,message:string.copy(problem.message),failure_kind:string.copy(failure_kind(problem.kind)),duration_policy:"",whole_seconds:0,start_seconds:0,requested_seconds:0,frames:0,channels:0,native_header_bytes:0,native_payload_bytes:0,
+    decode_kind:"",decoder_pid:0,decoder_reaped:false,decoder_handle_closed:false,temporary_removed:false,temporary_directory:"",export_report:""})}}
+  report.attempted+=1
+  i+=1}
+ report.filter_loads=session.filter_loads
+ report.filter_bytes=session.filter_bytes
+ report.decoder_library_loads=session.decoder_library_loads
+ report.decoder_fallbacks=session.decoder_fallbacks
+ if i==array.len(selection){
+  match stopped(options){ok(_)=>{report.completed=true
+   report.message="Recording sample export complete"},err(message)=>{
+   report.cancelled=control.cancelled(options.input.cancel_file)
+   report.message=message}}
+ }
+ report
+}

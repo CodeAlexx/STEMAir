@@ -1,0 +1,48 @@
+module stemair.model_panel
+import "../../AIR/toolkits/desktop/ui.ai" as desk
+import "model_catalog.ai" as catalog
+import std.codec as codec
+import std.files as files
+import std.path as path
+import std.text as text
+
+pub type State=struct{root:string,directory:string,entries:array<catalog.Entry>,selected:string}
+pub fn empty(root:str)->State effects {alloc} {State{root:string.copy(root),directory:path.join(root,"assets"),entries:[],selected:""}}
+pub fn state_name(value:catalog.Presence)->str effects {} {
+ match value{Missing=>"Missing",PresentUnverified=>"Present",Verified=>"Verified",Invalid=>"Invalid file or size"}
+}
+pub fn details(app:ref<desk.Session>,state:ref<State>)->unit effects {alloc,fs.read,fs.meta,net,time} {
+ match catalog.find(state.entries,state.selected){none=>{let _=desk.set_text(app,"catalog_details","Select an admitted profile")},some(index)=>{
+  let entry:ref<catalog.Entry>=array.borrow(state.entries,index)
+  let presence:catalog.Presence=catalog.presence(entry,state.directory,false)
+  var label:string=text.concat(catalog.label(entry.profile),text.concat(" — ",state_name(presence)))
+  string.append(label,text.concat("\n",text.concat(string.from_int(entry.asset.bytes)," bytes\n")))
+  string.append(label,path.join(state.directory,entry.asset.filename))
+  string.append(label,"\nSee included license notices for model attribution.")
+  let _=desk.set_text(app,"catalog_details",label)}}
+ ()
+}
+pub fn refresh(app:ref<desk.Session>,state:ref<State>)->result<unit,string> effects {alloc,fs.read,fs.meta,net,time,io.write} {
+ let entries:array<catalog.Entry>=try catalog.load(state.root)
+ state.entries=entries
+ var out:codec.Writer=desk.command("items","catalog_profiles")
+ codec.key(out,"items")
+ codec.begin_array(out)
+ var i:u64=0
+ loop{if i==array.len(state.entries){break}
+  let entry:ref<catalog.Entry>=array.borrow(state.entries,i)
+  codec.begin_object(out)
+  codec.field_text(out,"key",entry.profile)
+  codec.field_text(out,"icon","package-x-generic-symbolic")
+  let presence:catalog.Presence=catalog.presence(entry,state.directory,false)
+  codec.field_text(out,"label",text.concat(catalog.label(entry.profile),text.concat(" — ",state_name(presence))))
+  codec.end_object(out)
+  i+=1}
+ codec.end_array(out)
+ let _=try desk.submit(app,out)
+ let _=desk.set_text(app,"catalog_directory",state.directory)
+ if str.len(state.selected)>0{let _=desk.select(app,"catalog_profiles",state.selected)}
+ details(app,state)
+ io.write(text.concat("Models: ",text.concat(string.from_int(array.len(state.entries))," admitted profiles, offline presence refreshed\n")))
+ result.ok(())
+}

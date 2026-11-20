@@ -1,0 +1,90 @@
+module stemair.mask.recurrent_network
+import "network.ai" as common
+import "../weights.ai" as weights
+import "../recurrent.ai" as recurrent
+import std.text as text
+
+pub type Recurrent=struct{convolution:common.Convolution,layer:recurrent.Bidirectional,projection:u64,
+ projection_bias:u64,scale:u64,bias:u64,features:u64,
+ normalization_gamma:u64=0,normalization_beta:u64=0,normalization_mean:u64=0,normalization_variance:u64=0}
+pub type Base=struct{initial:common.Convolution,encoder:array<common.Pair>,branches:array<common.Convolution>,
+ bottleneck:common.Convolution,decoder:array<common.Convolution>,recurrent:Recurrent,final:common.Convolution}
+pub type Network=struct{weights:weights.Model,low1:Base,low1_tail:common.Convolution,high1:Base,
+ low2:Base,low2_tail:common.Convolution,high2:Base,full:Base,output:common.Convolution,
+ bins:u64,offset:u64=64,original_parameters:u64}
+fn key(base:str,suffix:str)->string effects {alloc} {text.concat(base,suffix)}
+fn recurrent(w:ref<weights.Model>,name:str,channels:u64,features:u64,width:u64)->result<Recurrent,string> effects {alloc} {
+ let conv:common.Convolution=try common.block(w,key(name,".conv"),channels,1,1,1,0,1)
+ let layer:recurrent.Bidirectional=try recurrent.bind(w,key(name,".lstm"),features,width/2)
+ let shape:array<u64>=[features,width]
+ let bias_shape:array<u64>=[features]
+ let projection:u64=try weights.index(w,key(name,".dense.0.weight"),array.view(shape))
+ let projection_bias:u64=try weights.index(w,key(name,".dense.0.bias"),array.view(bias_shape))
+ let norm:array<u64>=try common.affine(w,key(name,".dense.1"),features)
+ result.ok(Recurrent{convolution:conv,layer:layer,projection:projection,projection_bias:projection_bias,
+  scale:array.get(norm,0),bias:array.get(norm,1),features:features,
+  normalization_gamma:array.get(norm,2),normalization_beta:array.get(norm,3),normalization_mean:array.get(norm,4),normalization_variance:array.get(norm,5)})
+}
+fn base(w:ref<weights.Model>,name:str,input:u64,channels:u64,features:u64,recurrent_width:u64)->result<Base,string> effects {alloc} {
+ let initial:common.Convolution=try common.block(w,key(name,".enc1"),input,channels,3,1,1,1)
+ let factors:array<u64>=[2,4,6,8]
+ var encoder:array<common.Pair>=[]
+ var previous:u64=channels
+ var i:u64=0
+ loop{if i>=4{break}
+  let prefix:string=key(key(name,".enc"),str.view(string.from_int(i+2)))
+  let current:u64=channels*array.get(factors,i)
+  let first:common.Convolution=try common.block(w,key(prefix,".conv1"),previous,current,3,2,1,2)
+  let second:common.Convolution=try common.block(w,key(prefix,".conv2"),current,current,3,1,1,2)
+  array.push(encoder,common.Pair{first:first,second:second})
+  previous=current
+  i+=1}
+ let bottom:u64=8*channels
+ var branches:array<common.Convolution>=[]
+ array.push(branches,try common.block(w,key(name,".aspp.conv1.1"),bottom,bottom,1,1,0,1))
+ array.push(branches,try common.block(w,key(name,".aspp.conv2"),bottom,bottom,1,1,0,1))
+ let rates_h:array<u64>=[4,8,12]
+ let rates_w:array<u64>=[2,4,6]
+ i=0
+ loop{if i>=3{break}
+  let prefix:string=key(key(name,".aspp.conv"),str.view(string.from_int(i+3)))
+  let dh:u64=array.get(rates_h,i)
+  let dw:u64=array.get(rates_w,i)
+  var conv:common.Convolution=try common.block(w,str.view(prefix),bottom,bottom,3,1,dh,1)
+  conv.dilation=dh
+  conv.dilation_w=dw
+  conv.pad_w=dw
+  array.push(branches,conv)
+  i+=1}
+ let bottleneck:common.Convolution=try common.block(w,key(name,".aspp.bottleneck"),5*bottom,bottom,1,1,0,1)
+ var decoder:array<common.Convolution>=[]
+ let ins:array<u64>=[14,10,6]
+ let outs:array<u64>=[6,4,2]
+ i=0
+ loop{if i>=3{break}
+  let prefix:string=key(key(name,".dec"),str.view(string.from_int(4-i)))
+  array.push(decoder,try common.block(w,key(prefix,".conv1"),array.get(ins,i)*channels,array.get(outs,i)*channels,3,1,1,1))
+  i+=1}
+ let recurrence:Recurrent=try recurrent(w,key(name,".lstm_dec2"),2*channels,features,recurrent_width)
+ let final:common.Convolution=try common.block(w,key(name,".dec1.conv1"),3*channels+1,channels,3,1,1,1)
+ result.ok(Base{initial:initial,encoder:encoder,branches:branches,bottleneck:bottleneck,decoder:decoder,recurrent:recurrence,final:final})
+}
+pub fn open(path:str,channels:u64,recurrent_width:u64,bins:u64)->result<Network,string> effects {alloc,fs.read} {
+ if channels<8 or channels>128 or channels%4!=0 or recurrent_width<16 or recurrent_width>1024 or recurrent_width%4!=0 or
+  bins<64 or bins>8192 or bins%32!=0{return result.err("Invalid recurrent cascaded architecture")}
+ var w:weights.Model=try weights.open_with_counters(path,true)
+ let original:u64=array.len(w.parameters.values)
+ if original!=582{return result.err("Recurrent cascaded checkpoint parameter set mismatch")}
+ let low1:Base=try base(w,"stg1_low_band_net.0",2,channels/2,bins/4,recurrent_width)
+ let low1_tail:common.Convolution=try common.block(w,"stg1_low_band_net.1",channels/2,channels/4,1,1,0,1)
+ let high1:Base=try base(w,"stg1_high_band_net",2,channels/4,bins/4,recurrent_width/2)
+ let low2:Base=try base(w,"stg2_low_band_net.0",channels/4+2,channels,bins/4,recurrent_width)
+ let low2_tail:common.Convolution=try common.block(w,"stg2_low_band_net.1",channels,channels/2,1,1,0,1)
+ let high2:Base=try base(w,"stg2_high_band_net",channels/4+2,channels/2,bins/4,recurrent_width/2)
+ let full:Base=try base(w,"stg3_full_band_net",3*channels/4+2,channels,bins/2,recurrent_width)
+ let output:common.Convolution=try common.plain(w,"out",channels,2,1,1,0,1,1)
+ let aux_shape:array<u64>=[2,3*channels/4,1,1]
+ let _=try weights.index(w,"aux_out.weight",array.view(aux_shape))
+ result.ok(Network{weights:w,low1:low1,low1_tail:low1_tail,high1:high1,low2:low2,low2_tail:low2_tail,
+  high2:high2,full:full,output:output,bins:bins,original_parameters:original})
+}

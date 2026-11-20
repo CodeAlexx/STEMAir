@@ -1,0 +1,169 @@
+module stemair.cli_audio_policy
+import "audio_io_policy.ai" as policy
+import "checked_input.ai" as checked
+import "codec_runtime.ai" as runtime
+import "container_export.ai" as container
+import "wav_export.ai" as wav
+import "../toolkit/artifact_cleanup.ai" as cleanup
+import "mask_inference_policy.ai" as inference
+import "recording_inference_policy.ai" as recording
+import "learned_controls_policy.ai" as learned
+import "../toolkit/mask/request.ai" as mask_request
+import "../toolkit/export_audio.ai" as wave
+import "../toolkit/compressed_export.ai" as compressed
+import std.audio as audio
+import std.codec as codec
+import std.files as files
+import std.path as path
+import std.system as system
+import std.text as text
+
+// Empty choices distinguish an omitted selection from a genuine recipe conflict.
+pub type Settings=struct{application_root:string="",codec_directory:string="",audio_buffer_mib:u32=512,
+ format:string="",wav_subtype:string="",mp3_bitrate:string="",cancel_file:string="",progress_file:string="",
+ processing_sample:bool=false,sample_seconds:u64=30,sample_decoder:string="",mask_cleanup:bool=false,mask_cleanup_threshold:f64=0.2,
+ mask_tta:string="default",mask_window:u64=0,mask_aggression:i64=-1,
+ noise_reduction:bool=false,room_reduction:bool=false,room_targets:string="vocals",noise_checkpoint:string="",room_checkpoint:string="",
+ inference_pitch:bool=false,inference_semitones:string="0",match_frequency:bool=false,gpu_index:u32=0,recording_override:bool=false,recording_shifts:string="2",recording_split:bool=true,
+ recording_overlap:string="0.25",recording_segment:string="Default",recording_seed:string="Random"} derive codec(strict)
+// Portable launchers identify their runtime root without changing the caller's
+// working directory or replacing an explicit I/O settings selection.
+pub fn inherit_application_root(settings:ref<Settings>)->result<unit,string> effects {alloc,env}{
+ if str.len(settings.application_root)>0{return result.ok(())}
+ match env.get("STEMAIR_APP_ROOT"){none=>{},some(root)=>{
+  if str.len(root)==0 or not path.is_absolute(root){return result.err("STEMAIR_APP_ROOT must be an absolute directory")}
+  settings.application_root=string.copy(root)}}
+ result.ok(())
+}
+pub fn learned_snapshot(settings:ref<Settings>)->result<string,string> effects {alloc}{
+ let root:string=if str.len(settings.application_root)>0{string.copy(settings.application_root)}else{"."}
+ let assets:string=path.join(root,"assets")
+ let noise:string=if settings.noise_reduction and str.len(settings.noise_checkpoint)==0{path.join(assets,"cleanup-noise-v1.pth")}else{string.copy(settings.noise_checkpoint)}
+ let room:string=if settings.room_reduction and str.len(settings.room_checkpoint)==0{path.join(assets,"cleanup-room-v1.pth")}else{string.copy(settings.room_checkpoint)}
+ learned.encode(settings.noise_reduction,settings.room_reduction,settings.room_targets,noise,room)
+}
+pub fn recording_snapshot(settings:ref<Settings>)->result<string,string> effects {alloc,random} {
+ let raw:string=try recording.current_with_pitch(settings.recording_override,settings.recording_shifts,settings.recording_split,settings.recording_overlap,settings.recording_segment,settings.recording_seed,settings.inference_pitch,settings.inference_semitones,settings.match_frequency)
+ recording.accept(raw)
+}
+pub fn mask_controls(settings:ref<Settings>)->result<string,string> effects {alloc} {
+ inference.cli(settings.mask_tta,settings.mask_window,settings.mask_aggression)
+}
+pub fn request(settings:ref<Settings>,high_band:u32)->result<mask_request.Policy,string> effects {alloc} {
+ let raw:string=try mask_controls(settings)
+ inference.resolve(high_band,settings.mask_cleanup,settings.mask_cleanup_threshold,raw)
+}
+pub fn budget_choice(value:u32)->result<u32,string> effects {alloc} {
+ if value==256{return result.ok(0)}
+ if value==512{return result.ok(1)}
+ if value==1024{return result.ok(2)}
+ if value==2048{return result.ok(3)}
+ result.err("Audio buffer limit must be 256, 512, 1024 or 2048 MiB")
+}
+pub fn format_choice(value:str)->result<u32,string> effects {alloc} {
+ if value=="" or value=="wav"{return result.ok(0)}
+ if value=="flac"{return result.ok(1)}
+ if value=="mp3"{return result.ok(2)}
+ result.err("Choose wav, flac or mp3 output")
+}
+pub fn kind(value:str)->result<audio.WavSubtype,string> effects {alloc} {
+ if value==""{return wave.subtype("f32")}
+ wave.subtype(value)
+}
+pub fn working_choice(value:audio.WavSubtype)->u32 effects {} {
+ match value{PcmU8=>0,Pcm16=>1,Pcm24=>2,Pcm32=>3,Float32=>4,Float64=>5}
+}
+pub fn bitrate_choice(value:str)->result<u32,string> effects {alloc} {
+ if value=="96k"{return result.ok(0)}
+ if value=="128k"{return result.ok(1)}
+ if value=="160k"{return result.ok(2)}
+ if value=="224k"{return result.ok(3)}
+ if value=="256k"{return result.ok(4)}
+ if value=="" or value=="320k"{return result.ok(5)}
+ result.err("Choose 96k, 128k, 160k, 224k, 256k or 320k MP3 bitrate")
+}
+pub fn validate(settings:ref<Settings>)->result<unit,string> effects {alloc} {
+ let _=try recording.current_with_pitch(settings.recording_override,settings.recording_shifts,settings.recording_split,settings.recording_overlap,settings.recording_segment,settings.recording_seed,settings.inference_pitch,settings.inference_semitones,settings.match_frequency)
+ let _=try mask_controls(settings)
+ let _=try learned_snapshot(settings)
+ var cleanup_request:cleanup.Settings=cleanup.Settings{enabled:settings.mask_cleanup,threshold:settings.mask_cleanup_threshold}
+ let _=try cleanup.validate(cleanup_request)
+ if settings.sample_seconds<5 or settings.sample_seconds>120{return result.err("Enter a whole sample duration from 5 to 120 seconds")}
+ let _=try budget_choice(settings.audio_buffer_mib)
+ let _=try format_choice(settings.format)
+ let _=try kind(settings.wav_subtype)
+ let _=try bitrate_choice(settings.mp3_bitrate)
+ if str.len(settings.application_root)>0 and not path.is_absolute(settings.application_root){return result.err("Application root must be absolute")}
+ if str.len(settings.codec_directory)>0 and not path.is_absolute(settings.codec_directory){return result.err("Audio codec tools folder must be absolute")}
+ result.ok(())
+}
+fn read_error(e:files.ReadError)->string effects {alloc} {match e{Io(v)=>string.copy(fs.error.message(v)),TooLarge=>"I/O settings exceed 16 KiB"}}
+fn io_error(e:fs.error)->string effects {alloc} {string.copy(fs.error.message(e))}
+pub fn read(file:str)->result<Settings,string> effects {alloc,fs.read} {
+ let bytes:bytes=try files.read_limited(file,16384) map_err read_error
+ let raw:str=match str.from_bytes(bytes.view(bytes)){some(v)=>v,none=>{return result.err("I/O settings must be UTF-8")}}
+ let settings:Settings=try Settings_decode(raw) map_err codec.describe
+ let _=try validate(settings)
+ result.ok(settings)
+}
+// Preserve relative path components (including symlink-sensitive ..); only anchor the CWD.
+pub fn absolute(file:str)->result<string,string> effects {alloc,fs.read} {
+ if path.is_absolute(file){return result.ok(string.copy(file))}
+ return result.ok(text.concat(try files.cwd() map_err io_error,text.concat("/",file)))
+}
+pub fn absolute_optional(file:str)->result<string,string> effects {alloc,fs.read} {
+ if str.len(file)==0{return result.ok("")}
+ absolute(file)
+}
+pub fn input_paths(values:ref<array<string>>)->result<array<string>,string> effects {alloc,fs.read} {
+ var output:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(values){break}
+  array.push(output,try absolute(array.get(values,i)))
+  i+=1}
+ result.ok(output)
+}
+pub fn root(settings:ref<Settings>)->result<string,string> effects {alloc,fs.read} {
+ if str.len(settings.application_root)>0{return result.ok(string.copy(settings.application_root))}
+ result.ok(try files.cwd() map_err io_error)
+}
+pub fn input(settings:ref<Settings>,directory:str,cancel:str)->result<checked.Options,string> effects {alloc,env,fs.read,time} {
+ let _=try validate(settings)
+ let absolute:string=if path.is_absolute(directory){path.normalize(directory)}else{path.join(try files.cwd() map_err io_error,directory)}
+ let scratch:string=path.join(absolute,text.concat(".audio-input-",text.concat(string.from_int(system.process_id()),text.concat("-",string.from_int(time.monotonic_ns())))))
+ var selected:checked.Options=try policy.input(try root(settings),settings.codec_directory,try budget_choice(settings.audio_buffer_mib),scratch,try absolute_optional(cancel))
+ selected.source_library=string.copy(settings.sample_decoder)
+ result.ok(selected)
+}
+pub fn limits(settings:ref<Settings>,encoded:bool)->result<compressed.Limits,string> effects {alloc} {
+ policy.output(try budget_choice(settings.audio_buffer_mib),encoded)
+}
+pub fn plan(settings:ref<Settings>)->result<container.Plan,string> effects {alloc,env,fs.read,fs.meta} {
+ let _=try validate(settings)
+ let selected:audio.WavSubtype=try kind(settings.wav_subtype)
+ let format:u32=try format_choice(settings.format)
+ let recipe:string=try runtime.settings(try root(settings),settings.codec_directory,format,working_choice(selected),try bitrate_choice(settings.mp3_bitrate))
+ if format==0{return result.ok(container.wav_plan(selected))}
+ let codec_settings:compressed.Settings=try compressed.Settings_decode(recipe) map_err codec.describe
+ let selected_plan:container.Plan=try container.compressed_plan(selected,codec_settings)
+ container.with_limits(selected_plan,try limits(settings,true))
+}
+pub fn recipe_choices(settings:ref<Settings>,format:str,subtype:str,bitrate:str)->result<unit,string> effects {alloc} {
+ let _=try validate(settings)
+ if str.len(settings.format)>0 and settings.format!=format{return result.err("Explicit I/O output format conflicts with the export recipe")}
+ if str.len(settings.wav_subtype)>0{
+  let selected:audio.WavSubtype=try kind(settings.wav_subtype)
+  let recipe:audio.WavSubtype=try wave.subtype(subtype)
+  if selected!=recipe{return result.err("Explicit I/O WAV subtype conflicts with the export recipe")}}
+ if format=="mp3" and str.len(settings.mp3_bitrate)>0 and settings.mp3_bitrate!=bitrate{return result.err("Explicit I/O MP3 bitrate conflicts with the export recipe")}
+ result.ok(())
+}
+pub fn failure(log:ref<container.Journal>,problem:str)->string effects {alloc} {
+ if array.len(log.artifacts)==0{return string.copy(problem)}
+ text.concat(problem,text.concat("; published audio files: ",string.from_int(array.len(log.artifacts))))
+}
+pub fn journal(log:ref<container.Journal>)->unit effects {alloc,io.write} {
+ if array.len(log.artifacts)>0 or str.len(log.failure)>0{
+  match container.encode_journal(log){ok(raw)=>{io.ewrite(text.concat(raw,"\n"))},err(_)=>{}}}
+ ()
+}

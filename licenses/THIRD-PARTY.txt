@@ -1,0 +1,10 @@
+STEMAir asset and runtime notices
+
+The application's source is covered by the root LICENSE. Model architectures,
+trained checkpoints and optional runtime components retain their own notices
+and credits in this directory. The source license does not replace those terms.
+
+The compact checkpoint is included unchanged with its original asset identity
+and credit in mask-small-assets.json. Other model weights and native runtime
+libraries are acquired separately. Compatibility identifiers remain unchanged
+where needed to read original checkpoint files.

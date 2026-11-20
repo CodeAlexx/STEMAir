@@ -1,0 +1,133 @@
+module stemair.learned_cleanup_waves
+import "model_cache.ai" as cache
+import "learned_cleanup.ai" as core
+import "learned_cleanup_request.ai" as request
+import "audio_result.ai" as audio
+import "typed_source_wave.ai" as source
+import std.text as text
+import "typed_audio_math.ai" as math
+
+type Noise=struct{index:u64,complement:bool}
+fn noise_plan(kind:str,waves:ref<array<source.Wave>>)->option<Noise> effects {}{
+ if kind=="exchange" and array.len(waves)==2{
+  let name:str=array.borrow(waves,0).target
+  return option.some(Noise{index:0,complement:name=="instrumental" or str.starts_with(name,"no_")})}
+ if kind=="spectral" and array.len(waves)>1{
+  match source.find(waves,"instrumental"){none=>{},some(_)=>{
+   match source.find(waves,"vocals"){none=>{},some(i)=>{return option.some(Noise{index:i,complement:false})}}}}
+ }
+ option.none()
+}
+pub fn subtract(master:ref<audio.Samples>,stem:ref<audio.Samples>,limits:source.Limits)->result<audio.Samples,string> effects {alloc}{
+ let _=try audio.validate(master)
+ let _=try audio.validate(stem)
+ let count:u64=audio.count(master)
+ if count!=audio.count(stem) or count%2!=0{return result.err("Learned residual requires matching planar stereo extents")}
+ if count>limits.max_working_bytes/24{return result.err("Learned residual exceeds working-byte bound")}
+ let wide:bool=master.precision==audio.Precision.Float64 or stem.precision==audio.Precision.Float64
+ var out:audio.Samples=if wide{audio.from_wide([])}else{audio.from_single([])}
+ var i:u64=0
+ loop{if i==count{break}
+  if wide{array.push(out.wide,source.value(master,i)-source.value(stem,i))}else{array.push(out.single,array.get(master.single,i)-array.get(stem.single,i))}
+  i+=1}
+ result.ok(out)
+}
+fn input_for(plan:Noise,waves:ref<array<source.Wave>>,master:ref<audio.Samples>,limits:source.Limits)->result<audio.Samples,string> effects {alloc}{
+ let selected:ref<audio.Samples>=struct.borrow(array.borrow(waves,plan.index),field=samples)
+ if plan.complement{subtract(master,selected,limits)}else{source.copy(selected,limits)}
+}
+fn finish_noise(kind:str,plan:Noise,waves:ref<array<source.Wave>>,master:ref<audio.Samples>,clean:audio.Samples own,limits:source.Limits)->result<unit,string> effects {alloc}{
+ var held:audio.Samples=clean
+ let primary:audio.Samples=if plan.complement{try subtract(master,held,limits)}else{held}
+ let residual:audio.Samples=try subtract(master,primary,limits)
+ let frames:u64=try source.frames(primary)
+ let selected:ref<source.Wave>=array.borrow(waves,plan.index)
+ selected.samples=primary
+ selected.frames=frames
+ let other:u64=if kind=="exchange"{1}else{match source.find(waves,"instrumental"){some(i)=>i,none=>{return result.err("Spectral instrumental output disappeared")}}}
+ let secondary:ref<source.Wave>=array.borrow(waves,other)
+ secondary.samples=residual
+ secondary.frames=frames
+ result.ok(())
+}
+pub fn noise_cpu(bank:ref<cache.Cache>,kind:str,waves:ref<array<source.Wave>>,master:ref<audio.Samples>,limits:source.Limits,cancel:str)->result<unit,string> effects {alloc,ffi,fs.meta}{
+ let settings:request.Settings=cache.learned_settings(bank)
+ if not settings.noise{return result.ok(())}
+ let plan:Noise=match noise_plan(kind,waves){none=>{return result.ok(())},some(v)=>v}
+ var input:audio.Samples=try input_for(plan,waves,master,limits)
+ var output:core.Output=try cache.apply_learned_cpu(bank,core.Kind.Noise,input,cancel)
+ finish_noise(kind,plan,waves,master,struct.replace(output,audio.from_single([]),field=primary),limits)
+}
+pub fn noise_gpu(bank:ref<cache.Cache>,kind:str,waves:ref<array<source.Wave>>,master:ref<audio.Samples>,limits:source.Limits,cancel:str)->result<unit,string> effects {alloc,gpu,fs.meta}{
+ let settings:request.Settings=cache.learned_settings(bank)
+ if not settings.noise{return result.ok(())}
+ let plan:Noise=match noise_plan(kind,waves){none=>{return result.ok(())},some(v)=>v}
+ var input:audio.Samples=try input_for(plan,waves,master,limits)
+ var output:core.Output=try cache.apply_learned_gpu(bank,core.Kind.Noise,input,cancel)
+ finish_noise(kind,plan,waves,master,struct.replace(output,audio.from_single([]),field=primary),limits)
+}
+pub fn room_target(settings:ref<request.Settings>,target:str,ensemble:bool,vocal_split:bool)->bool effects {}{
+ if not settings.room or (ensemble and not vocal_split){return false}
+ if target!="vocals" and target!="lead" and target!="backing"{return false}
+ settings.room_targets=="all" or str.view(settings.room_targets)==target
+}
+fn room_outputs(target:str,output:core.Output own)->array<source.Wave> effects {alloc}{
+ var held:core.Output=output
+ let frames:u64=held.frames
+ [source.Wave{frequency_reference:[],target:text.concat(target,"_deverbed"),samples:struct.replace(held,audio.from_single([]),field=primary),frames:frames},
+  source.Wave{frequency_reference:[],target:text.concat(target,"_reverb_only"),samples:struct.replace(held,audio.from_single([]),field=residual),frames:frames}]
+}
+pub fn room_cpu(bank:ref<cache.Cache>,target:str,input:ref<audio.Samples>,cancel:str)->result<array<source.Wave>,string> effects {alloc,ffi,fs.meta}{
+ result.ok(room_outputs(target,try cache.apply_learned_cpu(bank,core.Kind.Room,input,cancel)))
+}
+pub fn room_gpu(bank:ref<cache.Cache>,target:str,input:ref<audio.Samples>,cancel:str)->result<array<source.Wave>,string> effects {alloc,gpu,fs.meta}{
+ result.ok(room_outputs(target,try cache.apply_learned_gpu(bank,core.Kind.Room,input,cancel)))
+}
+pub fn room_saved_cpu(bank:ref<cache.Cache>,provided:array<source.Wave> own,raw:ref<array<source.Wave>>,ensemble:bool,vocal_split:bool,normalize:bool,cancel:str)->result<array<source.Wave>,string> effects {alloc,ffi,fs.meta}{
+ var originals:array<source.Wave>=provided
+ let settings:request.Settings=cache.learned_settings(bank)
+ if not settings.room{return result.ok(originals)}
+ var out:array<source.Wave>=[]
+ var i:u64=0
+ loop{if i==array.len(originals){break}
+  let original:ref<source.Wave>=array.borrow(originals,i)
+  let target:string=string.copy(original.target)
+  if room_target(settings,target,ensemble,vocal_split){
+   let at:u64=match source.find(raw,target){some(v)=>v,none=>{return result.err("Room cleanup requires the actual pre-normalization save input")}}
+   var extra:array<source.Wave>=try room_cpu(bank,target,struct.borrow(array.borrow(raw,at),field=samples),cancel)
+   var j:u64=0
+   loop{if j==array.len(extra){break}
+    let wave:ref<source.Wave>=array.borrow(extra,j)
+    let _=try math.normalize(struct.borrow(wave,field=samples),normalize)
+    let name:string=string.copy(wave.target)
+    array.push(out,source.Wave{frequency_reference:[],target:name,frames:wave.frames,samples:struct.replace(wave,audio.from_single([]),field=samples)})
+    j+=1}}
+  let reference:array<f32>=struct.replace(original,[],field=frequency_reference)
+  array.push(out,source.Wave{frequency_reference:reference,frequency_residual:original.frequency_residual,target:target,frames:original.frames,samples:struct.replace(original,audio.from_single([]),field=samples)})
+  i+=1}
+ result.ok(out)
+}
+pub fn room_saved_gpu(bank:ref<cache.Cache>,provided:array<source.Wave> own,raw:ref<array<source.Wave>>,ensemble:bool,vocal_split:bool,normalize:bool,cancel:str)->result<array<source.Wave>,string> effects {alloc,gpu,fs.meta}{
+ var originals:array<source.Wave>=provided
+ let settings:request.Settings=cache.learned_settings(bank)
+ if not settings.room{return result.ok(originals)}
+ var out:array<source.Wave>=[]
+ var i:u64=0
+ loop{if i==array.len(originals){break}
+  let original:ref<source.Wave>=array.borrow(originals,i)
+  let target:string=string.copy(original.target)
+  if room_target(settings,target,ensemble,vocal_split){
+   let at:u64=match source.find(raw,target){some(v)=>v,none=>{return result.err("Room cleanup requires the actual pre-normalization save input")}}
+   var extra:array<source.Wave>=try room_gpu(bank,target,struct.borrow(array.borrow(raw,at),field=samples),cancel)
+   var j:u64=0
+   loop{if j==array.len(extra){break}
+    let wave:ref<source.Wave>=array.borrow(extra,j)
+    let _=try math.normalize(struct.borrow(wave,field=samples),normalize)
+    let name:string=string.copy(wave.target)
+    array.push(out,source.Wave{frequency_reference:[],target:name,frames:wave.frames,samples:struct.replace(wave,audio.from_single([]),field=samples)})
+    j+=1}}
+  let reference:array<f32>=struct.replace(original,[],field=frequency_reference)
+  array.push(out,source.Wave{frequency_reference:reference,frequency_residual:original.frequency_residual,target:target,frames:original.frames,samples:struct.replace(original,audio.from_single([]),field=samples)})
+  i+=1}
+ result.ok(out)
+}

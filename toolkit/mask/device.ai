@@ -1,0 +1,230 @@
+module stemair.mask.device
+import "network.ai" as network
+import "../weights.ai" as weights
+import "../ops.ai" as ops
+import "../spatial.ai" as spatial
+import "../control.ai" as control
+import std.tensor as tensor
+import std.resize_bilinear as interpolation
+import std.compute as compute
+import std.gpu as devicegpu
+pub type ConvolutionPolicy=struct{workspace_bytes:u64=268435456,deterministic:bool=true,allow_tf32:bool=false,original_statistics:bool=false}
+
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+pub fn empty(context:ref<GpuContext>,shape:view<u64>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ result.ok(try tensor.empty(context,shape,tensor.DType.F32) map_err error)
+}
+pub fn upload(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>)->result<array<tensor.Tensor>,string> effects {alloc,gpu} {
+ var out:array<tensor.Tensor>=[]
+ var i:u64=0
+ loop{if i>=array.len(n.weights.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,i)
+  array.push(out,try tensor.from_f32(context,stream,array.view(p.values),array.view(p.shape),tensor.DType.F32) map_err error)
+  i+=1}
+ let _=try devicegpu.sync(context) map_err error
+ result.ok(out)
+}
+pub fn download(stream:ref<GpuStream>,x:ref<tensor.Tensor>)->result<ops.Tensor,string> effects {alloc,gpu} {
+ let values:array<f32>=try tensor.to_f32(stream,x) map_err error
+ result.ok(ops.tensor(array.get(x.dimensions,1),array.get(x.dimensions,2),array.get(x.dimensions,3),values))
+}
+pub fn from_host(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<ops.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let dims:array<u64>=[1,x.c,x.h,x.w]
+ result.ok(try tensor.from_f32(context,stream,array.view(x.data),array.view(dims),tensor.DType.F32) map_err error)
+}
+fn transpose(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,order:view<u64>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var permuted:tensor.Tensor=try tensor.permute(x,order) map_err error
+ result.ok(try tensor.contiguous(context,stream,permuted) map_err error)
+}
+pub fn convolve(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,c:network.Convolution)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ convolve_with_policy(context,stream,parameters,x,c,ConvolutionPolicy{})
+}
+pub fn convolve_with_policy(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,c:network.Convolution,policy:ConvolutionPolicy)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var weight:tensor.Tensor=try tensor.view(array.borrow(parameters,c.weight)) map_err error
+ let channels:u64=array.get(weight.dimensions,0)
+ let kh:u64=array.get(weight.dimensions,2)
+ let kw:u64=array.get(weight.dimensions,3)
+ let height:u64=array.get(x.dimensions,2)
+ let width:u64=array.get(x.dimensions,3)
+ let stride_w:u64=if c.stride_w==0{c.stride}else{c.stride_w}
+ let pad_w:u64=if c.pad_w==18446744073709551615{c.pad}else{c.pad_w}
+ let dilation_w:u64=if c.dilation_w==0{c.dilation}else{c.dilation_w}
+ if array.get(weight.dimensions,1)*c.groups!=array.get(x.dimensions,1){return result.err("Cascaded convolution channel mismatch")}
+ let oh:u64=(height+2*c.pad-(kh-1)*c.dilation-1)/c.stride+1
+ let ow:u64=(width+2*pad_w-(kw-1)*dilation_w-1)/stride_w+1
+ let shape:array<u64>=[array.get(x.dimensions,0),channels,oh,ow]
+ var output:tensor.Tensor=try empty(context,array.view(shape))
+ let bias_shape:array<u64>=[channels]
+ var zero:tensor.Tensor=try tensor.zeros(context,stream,array.view(bias_shape),tensor.DType.F32) map_err error
+ let _=try compute.conv2d_torch_f32_general(stream,x,weight,zero,output,c.stride,stride_w,c.pad,pad_w,c.dilation,dilation_w,c.groups,policy.workspace_bytes,policy.deterministic,policy.allow_tf32) map_err error
+ if c.normalized{
+  if policy.original_statistics{
+   if not c.statistics_ready{return result.err("Original evaluation normalization statistics were not retained")}
+   var normalized:tensor.Tensor=try empty(context,array.view(output.dimensions))
+   var gamma:tensor.Tensor=try tensor.view(array.borrow(parameters,c.normalization_gamma)) map_err error
+   var beta:tensor.Tensor=try tensor.view(array.borrow(parameters,c.normalization_beta)) map_err error
+   var mean:tensor.Tensor=try tensor.view(array.borrow(parameters,c.normalization_mean)) map_err error
+   var variance:tensor.Tensor=try tensor.view(array.borrow(parameters,c.normalization_variance)) map_err error
+   let _=try compute.batch_norm_inference_spatial_f32(stream,output,gamma,beta,mean,variance,normalized,0.00001) map_err error
+   output=normalized
+  }else{
+  var scale:tensor.Tensor=try tensor.view(array.borrow(parameters,c.scale)) map_err error
+  var bias:tensor.Tensor=try tensor.view(array.borrow(parameters,c.bias)) map_err error
+  var channels_last:tensor.Tensor=try transpose(context,stream,output,[0,2,3,1])
+  var normalized:tensor.Tensor=try empty(context,array.view(channels_last.dimensions))
+  let _=try compute.affine_last_dim(stream,channels_last,scale,bias,normalized) map_err error
+  output=try transpose(context,stream,normalized,[0,3,1,2])
+  }
+ }
+ if c.activation==1{
+  var activated:tensor.Tensor=try empty(context,array.view(output.dimensions))
+  let _=try compute.relu(stream,output,activated) map_err error
+  output=activated
+ }
+ if c.activation==2{
+  // The shared compute surface has ReLU; the source's 0.01 negative slope
+  // uses native host element arithmetic without introducing a private kernel.
+  var members:array<ops.Tensor>=[]
+  var member:u64=0
+  loop{if member==array.get(output.dimensions,0){break}
+   var host:ops.Tensor=try download_member(stream,output,member)
+   var i:u64=0
+   loop{if i>=array.len(host.data){break}
+    let value:f32=array.get(host.data,i)
+    if value<0.0{array.set(host.data,i,value*0.01)}
+    i+=1}
+   array.push(members,host)
+   member+=1}
+  output=try from_members(context,stream,members)
+ }
+ result.ok(output)
+}
+pub fn slice(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,axis:u64,start:u64,length:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if start>array.get(x.dimensions,axis) or length>array.get(x.dimensions,axis)-start{return result.err("Cascaded crop lies outside its input")}
+ var part:tensor.Tensor=try tensor.narrow(x,axis,start,length) map_err error
+ result.ok(try tensor.contiguous(context,stream,part) map_err error)
+}
+pub fn join(context:ref<GpuContext>,stream:ref<GpuStream>,a:ref<tensor.Tensor>,b:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if array.get(a.dimensions,0)!=array.get(b.dimensions,0) or array.get(a.dimensions,2)!=array.get(b.dimensions,2) or array.get(a.dimensions,3)!=array.get(b.dimensions,3){return result.err("Cascaded channel concatenation shape mismatch")}
+ let ca:u64=array.get(a.dimensions,1)
+ let cb:u64=array.get(b.dimensions,1)
+ let dims:array<u64>=[array.get(a.dimensions,0),ca+cb,array.get(a.dimensions,2),array.get(a.dimensions,3)]
+ var output:tensor.Tensor=try empty(context,array.view(dims))
+ var first:tensor.Tensor=try tensor.narrow(output,1,0,ca) map_err error
+ let _=try if array.get(a.dimensions,0)==1{tensor.copy_d2d_async(stream,a,first)}else{tensor.scatter_into(stream,a,first)} map_err error
+ var second:tensor.Tensor=try tensor.narrow(output,1,ca,cb) map_err error
+ let _=try if array.get(b.dimensions,0)==1{tensor.copy_d2d_async(stream,b,second)}else{tensor.scatter_into(stream,b,second)} map_err error
+ result.ok(output)
+}
+pub fn resize(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,height:u64,width:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var items:array<ops.Tensor>=[]
+ var i:u64=0
+ loop{if i==array.get(x.dimensions,0){break}
+  var original:ops.Tensor=try download_member(stream,x,i)
+  array.push(items,try spatial.resize_corners(original,height,width))
+  i+=1}
+ from_members(context,stream,items)
+}
+pub fn download_member(stream:ref<GpuStream>,x:ref<tensor.Tensor>,member:u64)->result<ops.Tensor,string> effects {alloc,gpu} {
+ if member>=array.get(x.dimensions,0){return result.err("Cascaded batch member outside input")}
+ var part:tensor.Tensor=try tensor.narrow(x,0,member,1) map_err error
+ download(stream,part)
+}
+pub fn from_members(context:ref<GpuContext>,stream:ref<GpuStream>,items:ref<array<ops.Tensor>>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if array.len(items)==0 or array.len(items)>4{return result.err("Cascaded batch must contain one to four members")}
+ let first:ref<ops.Tensor>=array.borrow(items,0)
+ let channels:u64=first.c
+ let height:u64=first.h
+ let width:u64=first.w
+ let dimensions:array<u64>=[array.len(items),channels,height,width]
+ var values:array<f32>=[]
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  let part:ref<ops.Tensor>=array.borrow(items,i)
+  if part.c!=channels or part.h!=height or part.w!=width{return result.err("Cascaded batch members have different geometry")}
+  var j:u64=0
+  loop{if j==array.len(part.data){break}
+   array.push(values,array.get(part.data,j))
+   j+=1}
+  i+=1}
+ result.ok(try tensor.from_f32(context,stream,array.view(values),array.view(dimensions),tensor.DType.F32) map_err error)
+}
+fn resize_prepared(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,height:u64,width:u64,resizers:ref<array<interpolation.Engine>>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if array.len(resizers)==1{return result.ok(try interpolation.apply(array.borrow(resizers,0),context,stream,x,height,width) map_err error)}
+ resize(context,stream,x,height,width)
+}
+fn base(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Base>,input:tensor.Tensor own,cancel:str,policy:ConvolutionPolicy,resizers:ref<array<interpolation.Engine>>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var x:tensor.Tensor=input
+ var skips:array<tensor.Tensor>=[]
+ var i:u64=0
+ loop{if i>=array.len(n.encoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let pair:network.Pair=array.get(n.encoder,i)
+  var skip:tensor.Tensor=try convolve_with_policy(context,stream,parameters,x,pair.first,policy)
+  x=try convolve_with_policy(context,stream,parameters,skip,pair.second,policy)
+  array.push(skips,skip)
+  i+=1}
+ var host:ops.Tensor=try download(stream,x)
+ var reduced:ops.Tensor=spatial.mean_height(host)
+ var pooled:tensor.Tensor=try from_host(context,stream,reduced)
+ let first:ref<network.Branch>=array.borrow(n.branches,0)
+ var pool:tensor.Tensor=try convolve_with_policy(context,stream,parameters,pooled,first.first,policy)
+ var concatenated:tensor.Tensor=try resize_prepared(context,stream,pool,array.get(x.dimensions,2),array.get(x.dimensions,3),resizers)
+ i=1
+ loop{if i>=array.len(n.branches){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let branch:ref<network.Branch>=array.borrow(n.branches,i)
+  var part:tensor.Tensor=try convolve_with_policy(context,stream,parameters,x,branch.first,policy)
+  match branch.second{none=>{},some(second)=>{part=try convolve_with_policy(context,stream,parameters,part,second,policy)},}
+  concatenated=try join(context,stream,concatenated,part)
+  i+=1}
+ x=try convolve_with_policy(context,stream,parameters,concatenated,n.bottleneck,policy)
+ i=0
+ loop{if i>=array.len(n.decoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var expanded:tensor.Tensor=try resize_prepared(context,stream,x,2*array.get(x.dimensions,2),2*array.get(x.dimensions,3),resizers)
+  var skip:tensor.Tensor=match array.pop(skips){some(v)=>v,none=>{return result.err("Missing cascaded encoder skip")},}
+  let width:u64=array.get(expanded.dimensions,3)
+  let source_width:u64=array.get(skip.dimensions,3)
+  if source_width<width{return result.err("Cascaded decoder exceeds its skip width")}
+  if source_width!=width{skip=try slice(context,stream,skip,3,(source_width-width)/2,width)}
+  var merged:tensor.Tensor=try join(context,stream,expanded,skip)
+  x=try convolve_with_policy(context,stream,parameters,merged,array.get(n.decoder,i),policy)
+  i+=1}
+ result.ok(x)
+}
+pub fn predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ predict_with_policy(context,stream,parameters,n,input,cancel,ConvolutionPolicy{})
+}
+pub fn predict_with_policy(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,policy:ConvolutionPolicy)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var resizers:array<interpolation.Engine>=[]
+ predict_with_spatial(context,stream,parameters,n,input,cancel,policy,resizers)
+}
+pub fn predict_with_spatial(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,policy:ConvolutionPolicy,resizers:ref<array<interpolation.Engine>>)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ let bins:u64=n.bins
+ if tensor.rank(input)!=4 or array.get(input.dimensions,0)!=1 or array.get(input.dimensions,1)!=2 or
+  array.get(input.dimensions,2)!=bins+1 or array.get(input.dimensions,3)<=2*n.offset or array.get(input.dimensions,3)%32!=0{
+  return result.err("Cascaded mask input requires bounded stereo bins and a multiple-of-32 window exceeding its context")}
+ var x:tensor.Tensor=try slice(context,stream,input,2,0,bins)
+ var low:tensor.Tensor=try slice(context,stream,x,2,0,bins/2)
+ var high:tensor.Tensor=try slice(context,stream,x,2,bins/2,bins/2)
+ var low_out:tensor.Tensor=try base(context,stream,parameters,struct.borrow(n,field=low),low,cancel,policy,resizers)
+ var high_out:tensor.Tensor=try base(context,stream,parameters,struct.borrow(n,field=high),high,cancel,policy,resizers)
+ var low_host:ops.Tensor=try download(stream,low_out)
+ var high_host:ops.Tensor=try download(stream,high_out)
+ var bands:ops.Tensor=try spatial.concatenate_height(low_host,high_host)
+ var aux1:tensor.Tensor=try from_host(context,stream,bands)
+ var joined:tensor.Tensor=try join(context,stream,x,aux1)
+ var bridge2:tensor.Tensor=try convolve_with_policy(context,stream,parameters,joined,n.bridge2,policy)
+ var aux2:tensor.Tensor=try base(context,stream,parameters,struct.borrow(n,field=second),bridge2,cancel,policy,resizers)
+ joined=try join(context,stream,joined,aux2)
+ var bridge3:tensor.Tensor=try convolve_with_policy(context,stream,parameters,joined,n.bridge3,policy)
+ var final:tensor.Tensor=try base(context,stream,parameters,struct.borrow(n,field=third),bridge3,cancel,policy,resizers)
+ var projected:tensor.Tensor=try convolve_with_policy(context,stream,parameters,final,n.output,policy)
+ var activated:tensor.Tensor=try empty(context,array.view(projected.dimensions))
+ let _=try compute.sigmoid(stream,projected,activated) map_err error
+ var mask:ops.Tensor=try download(stream,activated)
+ var edge:ops.Tensor=try spatial.slice(mask,bins-1,1,0,mask.w)
+ var extended:ops.Tensor=try spatial.concatenate_height(mask,edge)
+ spatial.slice(extended,0,bins+1,n.offset,extended.w-2*n.offset)
+}

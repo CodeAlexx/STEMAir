@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "id": "rate-filter-v1",
+  "file": "assets/rate-filter-v1.npz",
+  "bytes": 3277596,
+  "sha256": "344c4eb7d35ef9845192a506aaa5836ca243033a90e6363a9d25fc5cd12a5328",
+  "source": {
+    "repository": "https://github.com/bmcfee/resampy",
+    "revision": "1e96fa7539cc99aa9115f6cde54011c60f05c489",
+    "package": "resampy",
+    "version": "0.4.2",
+    "path": "resampy/data/kaiser_best.npz",
+    "url": "https://raw.githubusercontent.com/bmcfee/resampy/1e96fa7539cc99aa9115f6cde54011c60f05c489/resampy/data/kaiser_best.npz",
+    "license": "ISC",
+    "notice": "licenses/rate-filter-ISC.txt"
+  },
+  "format": {
+    "container": "NPZ",
+    "coefficients": "half_window.npy",
+    "elements": 409601,
+    "precision": 8192,
+    "dtype": "float64",
+    "converted": false
+  }
+}

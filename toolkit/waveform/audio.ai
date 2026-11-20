@@ -1,0 +1,289 @@
+module stemair.waveform.audio
+import "config.ai" as config
+
+
+import "resampled_audio.ai" as resampled_audio
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../audio_normalization.ai" as normalization
+import "../control.ai" as control
+import "../chunks.ai" as chunks
+import "../recording_shifts.ai" as shifts
+import std.tensor as tensor
+
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+fn segment<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,input:view<f32>,length:u64,cancel:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta} {
+ if view.len(input)!=2*length{return result.err("Waveform segment extent differs")}
+ let padded_length:u64=try length_for(n,length)
+ if padded_length<length{return result.err("Waveform valid length is smaller than input")}
+ let left:u64=(padded_length-length)/2
+ var padded:array<f32>=num.zeros(2*padded_length)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var time:u64=0
+  loop{if time==length{break}
+   array.set(padded,channel*padded_length+left+time,view.get(input,channel*length+time))
+   time+=1}
+  channel+=1}
+ let shape:array<u64>=[1,2,1,padded_length]
+ var packed:tensor.Tensor=try tensor.from_f32(context,stream,array.view(padded),array.view(shape),tensor.DType.F32) map_err error
+ var output:ops.Tensor=try predictor(context,stream,parameters,n,packed,cancel)
+ if output.c!=8 or output.w<length{return result.err("Waveform graph output geometry differs")}
+ let crop:u64=(output.w-length)/2
+ var result:array<f32>=[]
+ array.reserve(result,8*length)
+ channel=0
+ loop{if channel==8{break}
+  var time:u64=0
+  loop{if time==length{break}
+   array.push(result,array.get(output.data,channel*output.w+crop+time))
+   time+=1}
+  channel+=1}
+ result.ok(result)
+}
+fn shifted<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,c:ref<config.Config>,input:view<f32>,length:u64,cancel:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta} {
+ predict_group(context,stream,parameters,n,array.view(c.shift_offsets),array.len(c.shift_offsets),input,length,cancel,predictor,length_for)
+}
+fn predict_group<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,offsets:view<u64>,divisor_count:u64,input:view<f32>,length:u64,cancel:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta} {
+ if view.len(offsets)==0{return segment(context,stream,parameters,n,input,length,cancel,predictor,length_for)}
+ var output:array<f32>=num.zeros(8*length)
+ let half:u64=22050
+ var shift:u64=0
+ loop{if shift==view.len(offsets){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let offset:u64=view.get(offsets,shift)
+  let count:u64=length+half
+  var shifted:array<f32>=num.zeros(2*count)
+  var channel:u64=0
+  loop{if channel==2{break}
+   var time:u64=0
+   loop{if time==length{break}
+    array.set(shifted,channel*count+half-offset+time,view.get(input,channel*length+time))
+    time+=1}
+   channel+=1}
+  let predicted:array<f32>=try segment(context,stream,parameters,n,array.view(shifted),count,cancel,predictor,length_for)
+  channel=0
+  loop{if channel==8{break}
+   var time:u64=0
+   loop{if time==length{break}
+    let at:u64=channel*length+time
+    array.set(output,at,array.get(output,at)+array.get(predicted,channel*count+half-offset+time))
+    time+=1}
+   channel+=1}
+  shift+=1}
+ let divisor:f32=cast.float(divisor_count)
+ var index:u64=0
+ loop{if index==array.len(output){break}
+  array.set(output,index,array.get(output,index)/divisor)
+  index+=1}
+ result.ok(output)
+}
+pub fn separate<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ let _=try config.validate(c)
+
+ var prepared:normalization.Prepared=try normalization.prepare(input)
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let length:u64=prepared.frames
+ let mean:f32=prepared.mean
+ let scale:f32=prepared.scale
+ if scale==0.0{return result.ok(num.zeros(8*length))}
+ let normalized:array<f32>=struct.replace(prepared,[],field=samples)
+ var time:u64=0
+ if c.generation==2{
+  let segment_size:u64=config.segment_length(c)
+  let predicted:array<f32>=try resampled_audio.separate(context,stream,parameters,n,c,segment_size,array.view(normalized),cancel,progress,predictor,length_for)
+  if array.len(predicted)!=8*length{return result.err("Resampled waveform extent differs")}
+  var result:array<f32>=num.zeros(8*length)
+  var source:u64=0
+  loop{if source==4{break}
+   let original:u64=if source==0{1}else{if source==1{0}else{source}}
+   var channel:u64=0
+   loop{if channel==2{break}
+    time=0
+    loop{if time==length{break}
+     array.set(result,(source*2+channel)*length+time,array.get(predicted,(original*2+channel)*length+time)*scale+mean)
+     time+=1}
+    channel+=1}
+   source+=1}
+  if not num.finite(array.view(result)){return result.err("Non-finite waveform separation output")}
+  return result.ok(result)
+ }
+ let chunk:u64=if c.split{441000}else{length}
+ let chunks:u64=(length+chunk-1)/chunk
+ var result:array<f32>=num.zeros(8*length)
+ var offset:u64=0
+ loop{if offset==length{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let count:u64=if length-offset<chunk{length-offset}else{chunk}
+  var piece:array<f32>=[]
+  array.reserve(piece,2*count)
+  var channel:u64=0
+  loop{if channel==2{break}
+   time=0
+   loop{if time==count{break}
+    array.push(piece,array.get(normalized,channel*length+offset+time))
+    time+=1}
+   channel+=1}
+  let predicted:array<f32>=try shifted(context,stream,parameters,n,c,array.view(piece),count,cancel,predictor,length_for)
+  var source:u64=0
+  loop{if source==4{break}
+   let original:u64=if source==0{1}else{if source==1{0}else{source}}
+   channel=0
+   loop{if channel==2{break}
+    time=0
+    loop{if time==count{break}
+     array.set(result,(source*2+channel)*length+offset+time,array.get(predicted,(original*2+channel)*count+time)*scale+mean)
+     time+=1}
+    channel+=1}
+   source+=1}
+  control.report(progress,offset/chunk+1,chunks)
+  offset+=count}
+ if not num.finite(array.view(result)){return result.err("Non-finite waveform separation output")}
+ result.ok(result)
+}
+
+pub fn separate_scheduled<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,c:ref<config.Config>,schedule:ref<shifts.Schedule>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ let family:shifts.Family=if c.generation==1{shifts.Family.First}else{shifts.Family.Second}
+ let _=try shifts.require_geometry(schedule,family,view.len(input)/2,c.split,config.segment_length(c),c.overlap)
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var normalized:normalization.Prepared=try normalization.prepare(input)
+ let length:u64=normalized.frames
+ let mean:f32=normalized.mean
+ let scale:f32=normalized.scale
+ if scale==0.0{return result.ok(num.zeros(8*length))}
+ let values:array<f32>=struct.replace(normalized,[],field=samples)
+ if c.generation==2{
+  let raw:array<f32>=try resampled_audio.separate_scheduled(context,stream,parameters,n,c,schedule,config.segment_length(c),array.view(values),cancel,progress,predictor,length_for)
+  return normalization.restore(array.view(raw),length,mean,scale)}
+ let size:u64=if c.split{441000}else{length}
+ let count:u64=(length+size-1)/size
+ var raw:array<f32>=num.zeros(8*length)
+ var offset:u64=0
+ loop{if offset==length{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let frames:u64=if length-offset<size{length-offset}else{size}
+  let piece:array<f32>=try chunks.context_finite(array.view(values),2,offset,frames,frames)
+  let group:shifts.Group=try shifts.next_group(schedule)
+  let _=try shifts.reserve_group(schedule,group)
+  let predicted:array<f32>=try predict_group(context,stream,parameters,n,array.view(group.offsets),group.divisor,array.view(piece),frames,cancel,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==8{break}
+   var time:u64=0
+   loop{if time==frames{break}
+    array.set(raw,channel*length+offset+time,array.get(predicted,channel*frames+time))
+    time+=1}
+   channel+=1}
+  control.report(progress,offset/size+1,count)
+  offset+=frames}
+ normalization.restore(array.view(raw),length,mean,scale)
+}
+
+pub fn separate_prepared<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,c:ref<config.Config>,preparation:normalization.Prepared own,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ let _=try config.validate(c)
+
+ var prepared:normalization.Prepared=preparation
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let length:u64=prepared.frames
+ let mean:f32=prepared.mean
+ let scale:f32=prepared.scale
+ if scale==0.0{return result.ok(num.zeros(8*length))}
+ let normalized:array<f32>=struct.replace(prepared,[],field=samples)
+ var time:u64=0
+ if c.generation==2{
+  let segment_size:u64=config.segment_length(c)
+  let predicted:array<f32>=try resampled_audio.separate(context,stream,parameters,n,c,segment_size,array.view(normalized),cancel,progress,predictor,length_for)
+  if array.len(predicted)!=8*length{return result.err("Resampled waveform extent differs")}
+  var result:array<f32>=num.zeros(8*length)
+  var source:u64=0
+  loop{if source==4{break}
+   let original:u64=if source==0{1}else{if source==1{0}else{source}}
+   var channel:u64=0
+   loop{if channel==2{break}
+    time=0
+    loop{if time==length{break}
+     array.set(result,(source*2+channel)*length+time,array.get(predicted,(original*2+channel)*length+time)*scale+mean)
+     time+=1}
+    channel+=1}
+   source+=1}
+  if not num.finite(array.view(result)){return result.err("Non-finite waveform separation output")}
+  return result.ok(result)
+ }
+ let chunk:u64=if c.split{441000}else{length}
+ let chunks:u64=(length+chunk-1)/chunk
+ var result:array<f32>=num.zeros(8*length)
+ var offset:u64=0
+ loop{if offset==length{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let count:u64=if length-offset<chunk{length-offset}else{chunk}
+  var piece:array<f32>=[]
+  array.reserve(piece,2*count)
+  var channel:u64=0
+  loop{if channel==2{break}
+   time=0
+   loop{if time==count{break}
+    array.push(piece,array.get(normalized,channel*length+offset+time))
+    time+=1}
+   channel+=1}
+  let predicted:array<f32>=try shifted(context,stream,parameters,n,c,array.view(piece),count,cancel,predictor,length_for)
+  var source:u64=0
+  loop{if source==4{break}
+   let original:u64=if source==0{1}else{if source==1{0}else{source}}
+   channel=0
+   loop{if channel==2{break}
+    time=0
+    loop{if time==count{break}
+     array.set(result,(source*2+channel)*length+offset+time,array.get(predicted,(original*2+channel)*count+time)*scale+mean)
+     time+=1}
+    channel+=1}
+   source+=1}
+  control.report(progress,offset/chunk+1,chunks)
+  offset+=count}
+ if not num.finite(array.view(result)){return result.err("Non-finite waveform separation output")}
+ result.ok(result)
+}
+
+
+pub fn separate_scheduled_prepared<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,c:ref<config.Config>,schedule:ref<shifts.Schedule>,preparation:normalization.Prepared own,cancel:str,progress:str,
+ predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ let family:shifts.Family=if c.generation==1{shifts.Family.First}else{shifts.Family.Second}
+ let _=try shifts.require_geometry(schedule,family,preparation.frames,c.split,config.segment_length(c),c.overlap)
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var normalized:normalization.Prepared=preparation
+ let length:u64=normalized.frames
+ let mean:f32=normalized.mean
+ let scale:f32=normalized.scale
+ if scale==0.0{return result.ok(num.zeros(8*length))}
+ let values:array<f32>=struct.replace(normalized,[],field=samples)
+ if c.generation==2{
+  let raw:array<f32>=try resampled_audio.separate_scheduled(context,stream,parameters,n,c,schedule,config.segment_length(c),array.view(values),cancel,progress,predictor,length_for)
+  return normalization.restore(array.view(raw),length,mean,scale)}
+ let size:u64=if c.split{441000}else{length}
+ let count:u64=(length+size-1)/size
+ var raw:array<f32>=num.zeros(8*length)
+ var offset:u64=0
+ loop{if offset==length{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let frames:u64=if length-offset<size{length-offset}else{size}
+  let piece:array<f32>=try chunks.context_finite(array.view(values),2,offset,frames,frames)
+  let group:shifts.Group=try shifts.next_group(schedule)
+  let _=try shifts.reserve_group(schedule,group)
+  let predicted:array<f32>=try predict_group(context,stream,parameters,n,array.view(group.offsets),group.divisor,array.view(piece),frames,cancel,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==8{break}
+   var time:u64=0
+   loop{if time==frames{break}
+    array.set(raw,channel*length+offset+time,array.get(predicted,channel*frames+time))
+    time+=1}
+   channel+=1}
+  control.report(progress,offset/size+1,count)
+  offset+=frames}
+ normalization.restore(array.view(raw),length,mean,scale)
+}

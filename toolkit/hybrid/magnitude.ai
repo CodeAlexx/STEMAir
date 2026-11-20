@@ -1,0 +1,64 @@
+module stemair.hybrid.magnitude
+import "../ops.ai" as host
+import "../numeric.ai" as num
+import std.float as fp
+
+// Complex channels remain consecutive real/imaginary planes. The magnitude
+// branch has one physical channel for each complex audio channel.
+pub fn input(spectrum:ref<host.Tensor>)->result<host.Tensor,string> effects {alloc}{
+ if spectrum.c==0 or spectrum.c%2!=0 or not num.finite(array.view(spectrum.data)){return result.err("Invalid magnitude spectrum")}
+ let channels:u64=spectrum.c/2
+ let points:u64=spectrum.h*spectrum.w
+ var values:array<f32>=[]
+ array.reserve(values,channels*points)
+ var c:u64=0
+ loop{if c==channels{break}
+  var i:u64=0
+  loop{if i==points{break}
+   let real:f64=cast.float(array.get(spectrum.data,2*c*points+i))
+   let imaginary:f64=cast.float(array.get(spectrum.data,(2*c+1)*points+i))
+   array.push(values,cast.float(fp.hypot(real,imaginary)))
+   i+=1}
+  c+=1}
+ result.ok(host.tensor(channels,spectrum.h,spectrum.w,values))
+}
+
+// The zero-iteration Wiener initializer uses this sequential quadrant law,
+// rather than atan2 or normalized complex division. Its zero-pair adjustment
+// is local, preserving the caller's retained mixture spectrum.
+pub fn phase(imaginary:f32,real:f32)->f32 effects {}{
+ let pi:f32=3.1415927410125732421875
+ let x:f32=real+if real==0.0 and imaginary==0.0{1.0}else{0.0}
+ var angle:f32=fp.atan(imaginary/x)
+ angle+=if imaginary>=0.0 and x<0.0{pi}else{0.0}
+ angle-=if imaginary<0.0 and x<0.0{pi}else{0.0}
+ angle*=1.0-if imaginary>0.0 and x==0.0{1.0}else{0.0}
+ angle+=if imaginary>0.0 and x==0.0{pi/2.0}else{0.0}
+ angle*=1.0-if imaginary<0.0 and x==0.0{1.0}else{0.0}
+ angle+=if imaginary<0.0 and x==0.0{-pi/2.0}else{0.0}
+ angle
+}
+pub fn reconstruct(mixture:ref<host.Tensor>,estimates:ref<host.Tensor>,sources:u64)->result<host.Tensor,string> effects {alloc}{
+ if sources==0 or sources>8 or mixture.c==0 or mixture.c%2!=0 or estimates.c!=sources*(mixture.c/2) or
+  estimates.h!=mixture.h or estimates.w!=mixture.w or not num.finite(array.view(mixture.data)) or not num.finite(array.view(estimates.data)){
+  return result.err("Invalid zero-iteration reconstruction geometry")}
+ let channels:u64=mixture.c/2
+ let points:u64=mixture.h*mixture.w
+ var output:array<f32>=num.zeros(2*sources*channels*points)
+ var c:u64=0
+ loop{if c==channels{break}
+  var i:u64=0
+  loop{if i==points{break}
+   let angle:f32=phase(array.get(mixture.data,(2*c+1)*points+i),array.get(mixture.data,2*c*points+i))
+   let cosine:f32=fp.cos(angle)
+   let sine:f32=fp.sin(angle)
+   var source:u64=0
+   loop{if source==sources{break}
+    let amplitude:f32=array.get(estimates.data,(source*channels+c)*points+i)
+    array.set(output,(source*channels*2+c*2)*points+i,amplitude*cosine)
+    array.set(output,(source*channels*2+c*2+1)*points+i,amplitude*sine)
+    source+=1}
+   i+=1}
+  c+=1}
+ result.ok(host.tensor(sources*channels*2,mixture.h,mixture.w,output))
+}

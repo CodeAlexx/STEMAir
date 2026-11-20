@@ -1,0 +1,52 @@
+module stemair.exchange.frequency_match
+import "config.ai" as config
+import "audio.ai" as envelope
+import "../inference_pitch_output.ai" as output
+import "../spectral.ai" as spectral
+import "../spectral_device_frontend.ai" as device
+import "../ops.ai" as ops
+import "../control.ai" as control
+import std.mkl_vml as vml
+
+fn settings(original:ref<config.Config>)->result<config.Config,string> effects {alloc}{
+ var selected:config.Config=config.Config{sample_rate:original.sample_rate,n_fft:original.n_fft,hop:original.hop,frequency_bins:original.frequency_bins,frames:256,overlap_mode:"fraction",overlap:0.02,compensation:1.0,denoise:false,targets:[string.copy(array.get(original.targets,0)),string.copy(array.get(original.targets,1))]}
+ let _=try config.validate(selected)
+ result.ok(selected)
+}
+// The original frequency-match pass bypasses the network and uses a fixed
+// 256-frame, two-percent-overlap transform with its three low bins cleared.
+pub fn cpu(original:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,fs.meta,fs.write}{
+ var selected:config.Config=try settings(original)
+ var plan:spectral.Plan=spectral.plan(selected.n_fft,selected.hop,spectral.hann(selected.n_fft))
+ var state:envelope.State=try envelope.begin(selected,input)
+ loop{if state.index==state.total{break}
+  if control.cancelled(cancel){return result.err("Frequency matching cancelled")}
+  control.report(progress,state.index,state.total)
+  if envelope.intersects(state){
+   let part:array<f32>=envelope.extract(state,input)
+   var spectrum:ops.Tensor=try envelope.analyze(plan,selected,array.view(part))
+   let values:array<f32>=struct.replace(spectrum,[],field=data)
+   let filtered:array<f32>=try envelope.synthesize(plan,selected,values)
+   let _=try envelope.accumulate(state,array.view(filtered))}
+  state.index+=1}
+ control.report(progress,state.total,state.total)
+ output.primary(state)
+}
+pub fn gpu(context:ref<GpuContext>,stream:ref<GpuStream>,original:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu}{
+ var selected:config.Config=try settings(original)
+ var plan:device.Plan=try device.create(vml.default_runtime(),selected.n_fft,selected.hop,selected.frames,selected.frequency_bins,1,1)
+ let _=try device.prepare(stream,plan)
+ var state:envelope.State=try envelope.begin(selected,input)
+ loop{if state.index==state.total{break}
+  if control.cancelled(cancel){return result.err("Frequency matching cancelled")}
+  control.report(progress,state.index,state.total)
+  if envelope.intersects(state){
+   let part:array<f32>=envelope.extract(state,input)
+   var spectrum:ops.Tensor=try device.analyze(context,stream,plan,array.view(part))
+   envelope.clear_low(spectrum,selected)
+   let filtered:array<f32>=try device.synthesize(context,stream,plan,spectrum)
+   let _=try envelope.accumulate(state,array.view(filtered))}
+  state.index+=1}
+ control.report(progress,state.total,state.total)
+ output.primary(state)
+}

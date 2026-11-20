@@ -1,0 +1,40 @@
+module stemair.learned_cleanup_single
+import "../toolkit/model_cache.ai" as cache
+import "../toolkit/audio_result.ai" as audio
+import "../toolkit/typed_source_wave.ai" as source
+import "../toolkit/typed_model_result.ai" as result_model
+import "../toolkit/learned_cleanup_waves.ai" as learned
+
+pub fn enabled(bank:ref<cache.Cache>)->bool effects {alloc}{
+ let settings=cache.learned_settings(bank)
+ settings.noise or settings.room
+}
+fn names(input:ref<array<string>>)->array<string> effects {alloc}{
+ var out:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(input){break}
+  array.push(out,string.copy(array.get(input,i)))
+  i+=1}
+ out
+}
+fn raw(waves:ref<array<source.Wave>>,limits:source.Limits)->result<array<source.Wave>,string> effects {alloc}{
+ var out:array<source.Wave>=[]
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  let item:ref<source.Wave>=array.borrow(waves,i)
+  array.push(out,source.Wave{frequency_reference:try source.copy_reference(item,limits),frequency_residual:item.frequency_residual,target:string.copy(item.target),frames:item.frames,samples:try source.copy(struct.borrow(item,field=samples),limits)})
+  i+=1}
+ result.ok(out)
+}
+pub fn finish_cpu(bank:ref<cache.Cache>,kind:str,targets:ref<array<string>>,master:ref<audio.Samples>,packed:audio.Samples own,cancel:str,limits:source.Limits,reference:view<f32>)->result<array<source.Wave>,string> effects {alloc,env,ffi,fs.read,fs.meta}{
+ var output:result_model.Output=try result_model.finish_with_reference(kind,"recording",names(targets),master,packed,limits,reference)
+ let _=try learned.noise_cpu(bank,kind,struct.borrow(output,field=sources),master,limits,cancel)
+ var before:array<source.Wave>=try raw(struct.borrow(output,field=sources),limits)
+ learned.room_saved_cpu(bank,struct.replace(output,[],field=sources),before,false,false,false,cancel)
+}
+pub fn finish_gpu(bank:ref<cache.Cache>,kind:str,targets:ref<array<string>>,master:ref<audio.Samples>,packed:audio.Samples own,cancel:str,limits:source.Limits,reference:view<f32>)->result<array<source.Wave>,string> effects {alloc,env,ffi,fs.read,fs.meta,gpu}{
+ var output:result_model.Output=try result_model.finish_with_reference(kind,"recording",names(targets),master,packed,limits,reference)
+ let _=try learned.noise_gpu(bank,kind,struct.borrow(output,field=sources),master,limits,cancel)
+ var before:array<source.Wave>=try raw(struct.borrow(output,field=sources),limits)
+ learned.room_saved_gpu(bank,struct.replace(output,[],field=sources),before,false,false,false,cancel)
+}

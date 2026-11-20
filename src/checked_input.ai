@@ -1,0 +1,173 @@
+module stemair.checked_input
+import "../toolkit/codec_process.ai" as codec
+import "../toolkit/control.ai" as control
+import std.audio as audio
+import std.ffmpeg_decode as decoder
+import std.files as files
+import std.path as path
+import std.text as text
+import "../toolkit/recording_input.ai" as recording_input
+
+// Explicit caller policy. No model geometry, runtime search or global limit.
+pub type Options=struct{limits:audio.WavReadLimits,tool:option<codec.Tool>,scratch_directory:string,
+ cancel_file:string,deadline_ns:u64,log_limit:u64,source_root:string="",source_library:string=""}
+pub type Loaded=struct{recording:audio.AudioBuffer,original_wav:option<audio.WavInfo>,converted:bool,
+ temporary_removed:bool,temporary_directory:string}
+pub type PrefixFailureKind=enum{Recording,Configuration,Resource,Cancelled,Deadline,Infrastructure}
+pub type PrefixFailure=struct{kind:PrefixFailureKind,message:string}
+fn prefix_failure(kind:PrefixFailureKind,message:str)->PrefixFailure effects {alloc} {
+ PrefixFailure{kind:kind,message:string.copy(message)}
+}
+fn prefix_message(problem:PrefixFailure own)->string effects {alloc} {
+ var owned:PrefixFailure=problem
+ struct.replace(owned,"",field=message)
+}
+fn configuration_failure(message:string)->PrefixFailure effects {alloc} {prefix_failure(PrefixFailureKind.Configuration,message)}
+fn prefix_native_failure(problem:audio.WavReadError)->PrefixFailure effects {alloc} {
+ match problem{Limit(detail)=>prefix_failure(PrefixFailureKind.Resource,limit_message(detail)),
+  Io(_)=>prefix_failure(PrefixFailureKind.Recording,"Cannot read input recording"),
+  Audio(detail)=>prefix_failure(PrefixFailureKind.Recording,text.concat("Input WAV is invalid: ",audio.message(detail)))}
+}
+
+// A queue owns one absolute deadline and a distinct scratch name per item.
+pub fn queue_item(options:ref<Options>,index:u64,cancel:str)->Options effects {alloc} {
+ let selected:option<codec.Tool>=match options.tool{none=>option.none(),some(tool)=>option.some(codec.Tool{path:string.copy(tool.path),sha256:string.copy(tool.sha256)})}
+ Options{limits:options.limits,tool:selected,
+  scratch_directory:text.concat(options.scratch_directory,text.concat("-",string.from_int(index))),
+  cancel_file:string.copy(cancel),deadline_ns:options.deadline_ns,log_limit:options.log_limit,source_root:string.copy(options.source_root),source_library:string.copy(options.source_library)}
+}
+type Native=enum{Ready(audio.WavRead),Convert(option<audio.WavInfo>)}
+
+fn limit_message(detail:audio.WavReadLimit)->string effects {alloc} {
+ let name:str=match detail.kind{FileBytes=>"file bytes",Frames=>"frames",Channels=>"channels",
+  DecodedBytes=>"decoded sample bytes",SizeOverflow=>"sample extent"}
+ text.concat("Input exceeds the selected ",text.concat(name,text.concat(" limit (",text.concat(string.from_int(detail.maximum),")"))))
+}
+fn native(input:str,rate:u32,limits:audio.WavReadLimits)->result<Native,string> effects {alloc,fs.read} {
+ match audio.read_wav_f32_limited(input,limits){
+  ok(value)=>{if value.info.rate==rate and (value.info.channels==1 or value.info.channels==2){
+    return result.ok(Native.Ready(value))}
+   result.ok(Native.Convert(option.some(value.info)))},
+  err(error)=>match error{
+   Limit(detail)=>result.err(limit_message(detail)),
+   Io(_)=>result.err("Cannot read input recording"),
+   Audio(detail)=>{
+    if detail.code==audio.ErrorCode.BadMagic or detail.code==audio.ErrorCode.UnsupportedFormat or detail.code==audio.ErrorCode.BadBits{
+     result.ok(Native.Convert(option.none()))
+    }else{result.err(text.concat("Input WAV is invalid: ",audio.message(detail)))}}
+  }
+ }
+}
+fn conversion_error(problem:decoder.Failure)->string effects {alloc} {
+ string.copy(match problem{InvalidRequest=>"Invalid audio conversion request",Io(_)=>"Audio conversion file or process operation failed",
+  Cancelled=>"Audio input cancelled",Deadline=>"Audio conversion deadline reached",OutputLimit=>"Decoded audio exceeds the selected file limit",
+  ProcessExit(_)=>"Audio codec could not decode this recording",Audio(_)=>"Decoded audio is invalid or exceeds the selected limits",
+  UnexpectedFormat=>"Audio codec returned an unexpected rate, channel count or sample format"})
+}
+fn clean(directory:str)->bool effects {alloc,fs.write} {
+ if not result.is_ok(files.remove(path.join(directory,"decoded.wav"))){return false}
+ result.is_ok(files.remove(directory))
+}
+pub fn read(input:str,rate:u32,options:ref<Options>)->result<Loaded,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ if rate==0{return result.err("Requested audio sample rate must be positive")}
+ if control.cancelled(options.cancel_file){return result.err("Audio input cancelled")}
+ var inspected:Native=try native(input,rate,options.limits)
+ let original:option<audio.WavInfo>=match inspected{
+  Ready(value)=>{var ready:audio.WavRead=value
+   return result.ok(Loaded{recording:struct.replace(ready,audio.AudioBuffer{samples:[],rate:rate,channels:2},field=buffer),original_wav:option.some(ready.info),converted:false,
+   temporary_removed:true,temporary_directory:""})},Convert(info)=>info}
+ let tool:ref<codec.Tool>=match options.tool{none=>{return result.err("Choose the supported audio codec to read this format or convert its sample rate")},some(value)=>value}
+ let _=try codec.verify(tool)
+ let selected:decoder.Options=decoder.Options{executable:string.copy(tool.path),scratch_directory:string.copy(options.scratch_directory),
+  rate:rate,channels:2,limits:options.limits,deadline_ns:options.deadline_ns,cancel_file:string.copy(options.cancel_file),log_limit:options.log_limit}
+ var outcome:decoder.Outcome=decoder.read(input,selected)
+ finish_conversion(outcome,rate,original,options)
+}
+fn finish_conversion(decoded:decoder.Outcome own,rate:u32,original:option<audio.WavInfo>,options:ref<Options>)->result<Loaded,string>
+ effects {alloc,fs.write} {
+ var outcome:decoder.Outcome=decoded
+ match outcome.value{
+  err(problem)=>{
+   var message:string=conversion_error(problem)
+   if outcome.trace.scratch_created{
+    let _=files.write_new_bytes(path.join(options.scratch_directory,"decode.stdout"),bytes.view(outcome.trace.stdout))
+    let _=files.write_new_bytes(path.join(options.scratch_directory,"decode.stderr"),bytes.view(outcome.trace.stderr))
+    string.append(message,text.concat("; conversion files remain at ",options.scratch_directory))}
+   return result.err(message)},
+  ok(_)=>{},
+ }
+ var value:audio.WavRead=match struct.replace(outcome,result.err(decoder.Failure.InvalidRequest),field=value){ok(value)=>value,err(_)=>{return result.err("Decoded recording is unavailable")}}
+ let removed:bool=clean(options.scratch_directory)
+ result.ok(Loaded{recording:struct.replace(value,audio.AudioBuffer{samples:[],rate:rate,channels:2},field=buffer),original_wav:original,converted:true,temporary_removed:removed,
+  temporary_directory:if removed{""}else{string.copy(options.scratch_directory)}})
+}
+
+// Verification explicitly reads a bounded prefix. The complete-file reader
+// above keeps its original policy; this path preserves native mono/stereo and
+// asks a selected codec to preserve channels when conversion is needed.
+pub fn prefix(input:str,rate:u32,seconds:u32,max_header_bytes:u64,options:ref<Options>)->result<Loaded,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ result.ok(try prefix_classified(input,rate,seconds,max_header_bytes,options) map_err prefix_message)
+}
+// Typed failure ownership prevents list verification from removing recordings
+// when the problem is its runtime, budget, cancellation or shared deadline.
+pub fn prefix_classified(input:str,rate:u32,seconds:u32,max_header_bytes:u64,options:ref<Options>)->result<Loaded,PrefixFailure>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ if rate==0{return result.err(prefix_failure(PrefixFailureKind.Configuration,"Requested audio sample rate must be positive"))}
+ if control.cancelled(options.cancel_file){return result.err(prefix_failure(PrefixFailureKind.Cancelled,"Audio input cancelled"))}
+ if time.monotonic_ns()>=options.deadline_ns{return result.err(prefix_failure(PrefixFailureKind.Deadline,"Audio input deadline reached"))}
+ var original:option<audio.WavInfo>=option.none()
+ match audio.open_wav_region(input,max_header_bytes){
+  ok(opened)=>{
+   var reader:audio.WavReader=opened
+   original=option.some(reader.info)
+   if reader.info.rate==rate and (reader.info.channels==1 or reader.info.channels==2){
+    let duration:u64=cast.wrap(seconds)
+    let frames:u64=duration*cast.wrap(rate)
+    let limits:audio.WavRegionLimits=audio.WavRegionLimits{max_encoded_bytes:options.limits.max_file_bytes,
+     max_frames:options.limits.max_frames,max_channels:options.limits.max_channels,max_decoded_bytes:options.limits.max_decoded_bytes}
+    let recording:audio.AudioBuffer=try audio.read_wav_region(reader,0,frames,limits) map_err prefix_native_failure
+    return result.ok(Loaded{recording:recording,original_wav:original,converted:false,temporary_removed:true,temporary_directory:""})}
+  },err(problem)=>match problem{
+   Limit(detail)=>{return result.err(prefix_failure(PrefixFailureKind.Resource,limit_message(detail)))},
+   Io(_)=>{return result.err(prefix_failure(PrefixFailureKind.Recording,"Cannot read input recording"))},
+   Audio(detail)=>{if detail.code!=audio.ErrorCode.BadMagic and detail.code!=audio.ErrorCode.UnsupportedFormat and detail.code!=audio.ErrorCode.BadBits{
+    return result.err(prefix_failure(PrefixFailureKind.Recording,text.concat("Input WAV is invalid: ",audio.message(detail))))}}
+  }
+ }
+ let tool:ref<codec.Tool>=match options.tool{none=>{return result.err(prefix_failure(PrefixFailureKind.Configuration,"Choose the supported audio codec to read this format or convert its sample rate"))},some(value)=>value}
+ let _=try codec.verify(tool) map_err configuration_failure
+ let selected:decoder.Options=decoder.Options{executable:string.copy(tool.path),scratch_directory:string.copy(options.scratch_directory),
+  rate:rate,channels:0,limits:options.limits,deadline_ns:options.deadline_ns,cancel_file:string.copy(options.cancel_file),log_limit:options.log_limit}
+ let duration:u64=cast.wrap(seconds)
+ var outcome:decoder.Outcome=decoder.read_region(input,selected,decoder.Region{start_us:0,duration_us:duration*1000000})
+ let kind:PrefixFailureKind=match outcome.value{ok(_)=>PrefixFailureKind.Infrastructure,err(problem)=>match problem{
+  InvalidRequest=>PrefixFailureKind.Configuration,Io(_)=>PrefixFailureKind.Infrastructure,
+  Cancelled=>PrefixFailureKind.Cancelled,Deadline=>PrefixFailureKind.Deadline,OutputLimit=>PrefixFailureKind.Resource,
+  ProcessExit(_)=>PrefixFailureKind.Recording,UnexpectedFormat=>PrefixFailureKind.Infrastructure,
+  Audio(detail)=>match detail{Limit(_)=>PrefixFailureKind.Resource,Io(_)=>PrefixFailureKind.Infrastructure,Audio(_)=>PrefixFailureKind.Recording}}}
+ match finish_conversion(outcome,rate,original,options){ok(value)=>result.ok(value),err(message)=>result.err(prefix_failure(kind,message))}
+}
+pub fn buffer(input:str,rate:u32,options:ref<Options>)->result<audio.AudioBuffer,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ var loaded:Loaded=try read(input,rate,options)
+ if not loaded.temporary_removed{return result.err(text.concat("Cannot remove owned audio conversion files at ",loaded.temporary_directory))}
+ result.ok(struct.replace(loaded,audio.AudioBuffer{samples:[],rate:rate,channels:2},field=recording))
+}
+
+// Opt-in source-rate complete-file reader. Existing read/prefix/buffer APIs and
+// their conversion policy above remain unchanged. The caller owns one retained
+// decoder/filter session across its worker or queue and selects its identities.
+pub fn read_source(session:ref<recording_input.Session>,input:str,options:ref<Options>)->recording_input.Outcome
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var selected:recording_input.Options=recording_input.Options{limits:options.limits,
+  codec:match options.tool{none=>option.none(),some(value)=>option.some(codec.Tool{path:string.copy(value.path),sha256:string.copy(value.sha256)})},
+  scratch_directory:string.copy(options.scratch_directory),cancel_file:string.copy(options.cancel_file),deadline_ns:options.deadline_ns,log_limit:options.log_limit}
+ recording_input.read(session,input,selected)
+}
+pub fn buffer_source(session:ref<recording_input.Session>,input:str,options:ref<Options>)->result<audio.AudioBuffer,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var outcome:recording_input.Outcome=read_source(session,input,options)
+ struct.replace(outcome,result.err(""),field=value)
+}

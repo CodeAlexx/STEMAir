@@ -1,0 +1,76 @@
+module stemair.inference_pitch
+import "sinc_resample.ai" as sinc
+import "numeric.ai" as numeric
+import std.float as fp
+
+pub type Settings=struct{enabled:bool=false,semitones:f64=0.0,match_frequency:bool=false} derive codec(strict)
+pub type Prepared=struct{values:array<f32>,original_frames:u64,pitched_rate:f64,settings:Settings}
+pub fn validate(settings:Settings)->result<unit,string> effects {alloc}{
+ if not fp.is_finite(settings.semitones) or settings.semitones< -20.0 or settings.semitones>20.0{
+  return result.err("Inference pitch must be between -20 and 20 semitones")}
+ result.ok(())
+}
+fn stereo(input:view<f32>)->result<u64,string> effects {alloc}{
+ if view.len(input)==0 or view.len(input)%2!=0 or view.len(input)>317520000 or not numeric.finite(input){return result.err("Inference pitch requires bounded finite stereo audio")}
+ result.ok(view.len(input)/2)
+}
+// Preserve the fractional rate and the multiply-before-divide resampler order.
+// Normalization and model inference belong between prepare and finish.
+pub fn prepare(input:view<f32>,settings:Settings)->result<Prepared,string> effects {alloc}{
+ let _=try validate(settings)
+ let frames:u64=try stereo(input)
+ let rate:f64=if settings.enabled{44100.0*fp.pow(2.0,-settings.semitones/12.0)}else{44100.0}
+ let values:array<f32>=if settings.enabled{
+  var plan:sinc.Plan=try sinc.plan_fractional(44100.0,rate)
+  try sinc.apply(plan,input,2)
+ }else{numeric.copy(input)}
+ result.ok(Prepared{values:values,original_frames:frames,pitched_rate:rate,settings:settings})
+}
+pub fn fit(input:view<f32>,frames:u64)->result<array<f32>,string> effects {alloc}{
+ let available:u64=try stereo(input)
+ if frames==0 or frames>158760000{return result.err("Restored inference pitch exceeds its frame bound")}
+ var output:array<f32>=[]
+ array.reserve(output,frames*2)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var at:u64=0
+  loop{if at==frames{break}
+   array.push(output,if at<available{view.get(input,channel*available+at)}else{0.0})
+   at+=1}
+  channel+=1}
+ result.ok(output)
+}
+pub fn finish(input:view<f32>,prepared:ref<Prepared>)->result<array<f32>,string> effects {alloc}{
+ let _=try stereo(input)
+ if not prepared.settings.enabled{return fit(input,prepared.original_frames)}
+ let restored_rate:f64=prepared.pitched_rate*fp.pow(2.0,prepared.settings.semitones/12.0)
+ var plan:sinc.Plan=try sinc.plan_fractional(prepared.pitched_rate,restored_rate)
+ let restored:array<f32>=try sinc.apply(plan,input,2)
+ fit(array.view(restored),prepared.original_frames)
+}
+// Each source is planar stereo. The original applies the return resampler to
+// each source independently after model normalization has been restored.
+pub fn finish_sources(input:view<f32>,sources:u64,prepared:ref<Prepared>)->result<array<f32>,string> effects {alloc}{
+ if sources==0 or sources>16 or view.len(input)%(sources*2)!=0{return result.err("Inference pitch source geometry differs")}
+ let stride:u64=view.len(input)/sources
+ if prepared.original_frames>317520000/(sources*2){return result.err("Restored inference sources exceed their memory bound")}
+ var output:array<f32>=[]
+ array.reserve(output,prepared.original_frames*sources*2)
+ var source:u64=0
+ loop{if source==sources{break}
+  let restored:array<f32>=try finish(view.slice(input,source*stride,(source+1)*stride),prepared)
+  var at:u64=0
+  loop{if at==array.len(restored){break}
+   array.push(output,array.get(restored,at))
+   at+=1}
+  source+=1}
+ result.ok(output)
+}
+pub fn matched_mix(input:view<f32>,settings:Settings)->result<array<f32>,string> effects {alloc}{
+ let _=try validate(settings)
+ let _=try stereo(input)
+ if not settings.enabled or not settings.match_frequency{return result.ok(numeric.copy(input))}
+ var prepared:Prepared=try prepare(input,settings)
+ let values:array<f32>=struct.replace(prepared,[],field=values)
+ finish(array.view(values),prepared)
+}

@@ -1,0 +1,214 @@
+module stemair.exchange.plan
+import "model.ai" as model
+import "../weights.ai" as weights
+import std.table as table
+import std.text as text
+import std.float as fp
+
+pub type Operation=enum{Convolution,Relu,Transpose,Matmul,Add,TransposeConvolution,Mul,Normalization,Dense,GroupNormalization,RunningNormalization}
+pub type Node=struct{operation:Operation,inputs:array<u64>,output:u64,stride_h:u64,stride_w:u64,pad_h:u64,pad_w:u64,
+ dilation_h:u64,dilation_w:u64,groups:u64,kernel_h:u64,kernel_w:u64,permutation:array<u64>,scale:u64,bias:u64,checkpoint_arithmetic:bool=false}
+pub type Plan=struct{weights:weights.Model,nodes:array<Node>,original_parameters:u64,input:u64,output:u64,
+ values:u64,uses:array<u64>,shape:array<u64>}
+
+fn integer(n:ref<model.Node>,name:str,fallback:u64)->u64 effects {} {
+ var i:u64=0
+ loop{if i>=array.len(n.attributes){break}
+  let a:ref<model.Attribute>=array.borrow(n.attributes,i)
+  if str.view(a.name)==name{return a.integer}
+  i+=1}
+ fallback
+}
+fn scalar(n:ref<model.Node>,name:str,fallback:f32)->f32 effects {} {
+ var i:u64=0
+ loop{if i>=array.len(n.attributes){break}
+  let a:ref<model.Attribute>=array.borrow(n.attributes,i)
+  if str.view(a.name)==name{return a.scalar}
+  i+=1}
+ fallback
+}
+fn sequence(n:ref<model.Node>,name:str,fallback:view<u64>)->array<u64> effects {alloc} {
+ var out:array<u64>=[]
+ var i:u64=0
+ loop{if i>=array.len(n.attributes){break}
+  let a:ref<model.Attribute>=array.borrow(n.attributes,i)
+  if str.view(a.name)==name{
+   var j:u64=0
+   loop{if j>=array.len(a.integers){break}
+    array.push(out,array.get(a.integers,j))
+    j+=1}
+   return out}
+  i+=1}
+ i=0
+ loop{if i>=view.len(fallback){break}
+  array.push(out,view.get(fallback,i))
+  i+=1}
+ out
+}
+fn operation(name:str)->result<Operation,string> effects {alloc} {
+ if name=="Conv"{return result.ok(Operation.Convolution)}
+ if name=="Relu"{return result.ok(Operation.Relu)}
+ if name=="Transpose"{return result.ok(Operation.Transpose)}
+ if name=="MatMul"{return result.ok(Operation.Matmul)}
+ if name=="Add"{return result.ok(Operation.Add)}
+ if name=="ConvTranspose"{return result.ok(Operation.TransposeConvolution)}
+ if name=="Mul"{return result.ok(Operation.Mul)}
+ if name=="BatchNormalization"{return result.ok(Operation.Normalization)}
+ if name=="Dense"{return result.ok(Operation.Dense)}
+ if name=="GroupNormalization"{return result.ok(Operation.GroupNormalization)}
+ if name=="RunningNormalization"{return result.ok(Operation.RunningNormalization)}
+ result.err(text.concat("Unimplemented interchange operator: ",name))
+}
+fn allowed(op:Operation,name:str)->bool effects {} {
+ match op{
+  Convolution=>name=="dilations" or name=="group" or name=="kernel_shape" or name=="pads" or name=="strides",
+  Relu=>false,
+  Transpose=>name=="perm",
+  Matmul=>false,
+  Add=>false,
+  TransposeConvolution=>name=="dilations" or name=="group" or name=="kernel_shape" or name=="pads" or name=="strides" or name=="output_padding",
+  Mul=>false,
+  Normalization=>name=="epsilon" or name=="momentum" or name=="training_mode",
+  Dense=>false,
+  GroupNormalization=>name=="group",
+  RunningNormalization=>false,
+ }
+}
+fn value(parameters:ref<table.Table<weights.Parameter>>,index:u64,position:u64)->f32 effects {} {
+ array.get(array.borrow(parameters.values,index).values,position)
+}
+fn normalization(parameters:ref<table.Table<weights.Parameter>>,inputs:view<u64>,epsilon:f32,original:u64)->result<array<u64>,string> effects {alloc} {
+ if view.len(inputs)!=5 or epsilon<=0.0{return result.err("Invalid evaluation normalization")}
+ var i:u64=1
+ var channels:u64=0
+ loop{if i>=5{break}
+  let index:u64=view.get(inputs,i)
+  if index>=original{return result.err("Evaluation normalization statistics must be retained parameters")}
+  let p:ref<weights.Parameter>=array.borrow(parameters.values,index)
+  if array.len(p.shape)!=1{return result.err("Evaluation normalization parameters require one channel dimension")}
+  let length:u64=array.get(p.shape,0)
+  if i==1{channels=length}else{if channels!=length{return result.err("Evaluation normalization channel mismatch")}}
+  i+=1}
+ var scale:array<f32>=[]
+ var bias:array<f32>=[]
+ i=0
+ loop{if i>=channels{break}
+  let gamma:f32=value(parameters,view.get(inputs,1),i)
+  let beta:f32=value(parameters,view.get(inputs,2),i)
+  let mean:f32=value(parameters,view.get(inputs,3),i)
+  let variance:f32=value(parameters,view.get(inputs,4),i)
+  if variance<0.0{return result.err("Negative evaluation normalization variance")}
+  let alpha:f32=gamma/fp.sqrt(variance+epsilon)
+  let offset:f32=beta-mean*alpha
+  if not fp.is_finite(alpha) or not fp.is_finite(offset){return result.err("Non-finite prepared normalization")}
+  array.push(scale,alpha)
+  array.push(bias,offset)
+  i+=1}
+ let scale_id:u64=array.len(parameters.values)
+ let shape1:array<u64>=[channels]
+ let shape2:array<u64>=[channels]
+ let scale_key:string=text.concat("__prepared_scale_",str.view(string.from_int(scale_id)))
+ if table.contains(parameters,str.view(scale_key)){return result.err("Reserved prepared parameter name collision")}
+ let _=table.put(parameters,str.view(scale_key),weights.Parameter{shape:shape1,values:scale})
+ let bias_id:u64=array.len(parameters.values)
+ let bias_key:string=text.concat("__prepared_bias_",str.view(string.from_int(bias_id)))
+ if table.contains(parameters,str.view(bias_key)){return result.err("Reserved prepared parameter name collision")}
+ let _=table.put(parameters,str.view(bias_key),weights.Parameter{shape:shape2,values:bias})
+ result.ok([scale_id,bias_id])
+}
+pub fn prepare(source:model.Model own)->result<Plan,string> effects {alloc} {
+ var m:model.Model=source
+ var raw_nodes:array<model.Node>=struct.replace(m,[],field=nodes)
+ var parameters:weights.Model=struct.replace(m,weights.Model{parameters:table.new(),bytes_read:0,loads:0},field=weights)
+ let original:u64=array.len(parameters.parameters.values)
+ var ids:table.Table<u64>=table.new()
+ var names:array<string>=table.keys(struct.borrow(parameters,field=parameters))
+ var i:u64=0
+ loop{if i>=array.len(names){break}
+  let _=table.put(ids,array.get(names,i),i)
+  i+=1}
+ let input:u64=original
+ if table.contains(ids,str.view(m.input)){return result.err("Graph input aliases a parameter")}
+ let _=table.put(ids,str.view(m.input),input)
+ var next:u64=original+1
+ var nodes:array<Node>=[]
+ i=0
+ loop{if i>=array.len(raw_nodes){break}
+  let n:ref<model.Node>=array.borrow(raw_nodes,i)
+  let op:Operation=try operation(str.view(n.operation))
+  if not m.checkpoint_arithmetic and (op==Operation.Dense or op==Operation.GroupNormalization or op==Operation.RunningNormalization){return result.err("Checkpoint operators require an explicit constructor graph")}
+  var attribute_index:u64=0
+  loop{if attribute_index>=array.len(n.attributes){break}
+   let a:ref<model.Attribute>=array.borrow(n.attributes,attribute_index)
+   if not allowed(op,str.view(a.name)){return result.err(text.concat("Unimplemented interchange attribute: ",str.view(a.name)))}
+   let expected:u64=if str.view(a.name)=="epsilon" or str.view(a.name)=="momentum"{1}else{
+    if str.view(a.name)=="group" or str.view(a.name)=="training_mode"{2}else{7}}
+   if a.kind!=expected{return result.err("Interchange attribute has the wrong value kind")}
+   attribute_index+=1}
+  var inputs:array<u64>=[]
+  var j:u64=0
+  loop{if j>=array.len(n.inputs){break}
+   let key:str=array.get(n.inputs,j)
+   let id:u64=match table.index_of(ids,key){some(at)=>array.get(ids.values,at),none=>{return result.err(text.concat("Interchange input has no earlier definition: ",key))},}
+   array.push(inputs,id)
+   j+=1}
+  let out:string=string.copy(array.get(n.outputs,0))
+  if table.contains(ids,str.view(out)){return result.err("Duplicate interchange value definition")}
+  let strides:array<u64>=sequence(n,"strides",[1,1])
+  let pads:array<u64>=sequence(n,"pads",[0,0,0,0])
+  let dilations:array<u64>=sequence(n,"dilations",[1,1])
+  let permutation:array<u64>=sequence(n,"perm",[])
+  let kernels:array<u64>=sequence(n,"kernel_shape",[0,0])
+  let groups:u64=integer(n,"group",1)
+  if array.len(strides)!=2 or array.len(pads)!=4 or array.len(dilations)!=2 or
+    array.len(kernels)!=2 or groups==0 or groups>1048576 or
+    array.get(strides,0)==0 or array.get(strides,1)==0 or array.get(dilations,0)==0 or array.get(dilations,1)==0 or
+    array.get(strides,0)>4096 or array.get(strides,1)>4096 or array.get(dilations,0)>4096 or array.get(dilations,1)>4096 or
+    array.get(pads,0)>65536 or array.get(pads,1)>65536 or
+    array.get(pads,0)!=array.get(pads,2) or array.get(pads,1)!=array.get(pads,3){return result.err("Unsupported interchange convolution geometry")}
+  var scale_id:u64=0
+  var bias_id:u64=0
+  match op{
+   Convolution=>{if array.len(inputs)<2 or array.len(inputs)>3{return result.err("Convolution requires two or three inputs")}},
+   Relu=>{if array.len(inputs)!=1{return result.err("Activation requires one input")}},
+   Transpose=>{if array.len(inputs)!=1 or array.len(permutation)==0{return result.err("Transpose requires an explicit permutation")}},
+   Matmul=>{if array.len(inputs)!=2{return result.err("Matrix multiplication requires two inputs")}},
+   Dense=>{if array.len(inputs)<2 or array.len(inputs)>3{return result.err("Dense projection requires two or three inputs")}},
+   GroupNormalization=>{if array.len(inputs)!=3{return result.err("Group normalization requires three inputs")}},
+   RunningNormalization=>{if array.len(inputs)!=5{return result.err("Running normalization requires five inputs")}},
+   Add=>{if array.len(inputs)!=2{return result.err("Addition requires two inputs")}},
+   TransposeConvolution=>{if array.len(inputs)<2 or array.len(inputs)>3{return result.err("Transpose convolution requires two or three inputs")}
+    let extra:array<u64>=sequence(n,"output_padding",[0,0])
+    if array.len(extra)!=2 or array.get(extra,0)!=0 or array.get(extra,1)!=0{return result.err("Transpose convolution output padding is not yet admitted")}},
+   Mul=>{if array.len(inputs)!=2{return result.err("Multiplication requires two inputs")}},
+   Normalization=>{
+    if integer(n,"training_mode",0)!=0{return result.err("Training normalization is not an inference operation")}
+    let prepared:array<u64>=try normalization(struct.borrow(parameters,field=parameters),array.view(inputs),scalar(n,"epsilon",0.00001),original)
+    scale_id=array.get(prepared,0)
+    bias_id=array.get(prepared,1)
+   },}
+  let _=table.put(ids,str.view(out),next)
+  array.push(nodes,Node{operation:op,inputs:inputs,output:next,stride_h:array.get(strides,0),stride_w:array.get(strides,1),
+    pad_h:array.get(pads,0),pad_w:array.get(pads,1),dilation_h:array.get(dilations,0),dilation_w:array.get(dilations,1),
+    groups:groups,kernel_h:array.get(kernels,0),kernel_w:array.get(kernels,1),permutation:permutation,scale:scale_id,bias:bias_id,checkpoint_arithmetic:m.checkpoint_arithmetic})
+  next+=1
+  i+=1}
+ let output:u64=match table.index_of(ids,str.view(m.output)){some(at)=>array.get(ids.values,at),none=>{return result.err("Graph output is undefined")},}
+ var uses:array<u64>=[]
+ i=0
+ loop{if i>=next{break}
+  array.push(uses,0)
+  i+=1}
+ i=0
+ loop{if i>=array.len(nodes){break}
+  let n:ref<Node>=array.borrow(nodes,i)
+  var j:u64=0
+  loop{if j>=array.len(n.inputs){break}
+   let id:u64=array.get(n.inputs,j)
+   array.set(uses,id,array.get(uses,id)+1)
+   j+=1}
+  i+=1}
+ array.set(uses,output,array.get(uses,output)+1)
+ let shape:array<u64>=struct.replace(m,[],field=shape)
+ result.ok(Plan{weights:parameters,nodes:nodes,original_parameters:original,input:input,output:output,values:next,uses:uses,shape:shape})
+}

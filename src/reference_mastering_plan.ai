@@ -1,0 +1,15 @@
+module stemair.reference_mastering_plan
+import "../toolkit/reference_mastering_protocol.ai" as protocol
+import "../toolkit/export_audio.ai" as wave
+import "../toolkit/compressed_export.ai" as compressed
+import "container_export.ai" as container
+import std.audio as audio
+import std.codec as codec
+pub fn make(request:ref<protocol.Request>)->result<container.Plan,string> effects {alloc,fs.read,fs.meta}{
+ let selected:audio.WavSubtype=try wave.subtype(request.subtype)
+ if str.len(request.codec_recipe)==0{return result.ok(container.wav_plan(selected))}
+ let settings:compressed.Settings=try compressed.Settings_decode(request.codec_recipe) map_err codec.describe
+ var chosen:container.Plan=try container.compressed_plan(selected,settings)
+ chosen=try container.with_limits(chosen,compressed.Limits{max_frames:request.limits.max_frames,max_stage_bytes:request.limits.max_export_bytes,max_encoded_bytes:request.limits.max_export_bytes})
+ let _=try container.verify(chosen)
+ result.ok(chosen)}

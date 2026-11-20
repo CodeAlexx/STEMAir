@@ -1,0 +1,117 @@
+module stemair.alignment_choices
+import "../toolkit/alignment_options.ai" as options
+import "../toolkit/local_residual.ai" as local
+import "../toolkit/recording_preparation.ai" as preparation
+import std.codec as codec
+import std.files as files
+import std.float as fp
+
+pub type Recipe=struct{windows:string="0.25",intros:string="default",gain:string="medium",phase:string="unchanged",save_aligned:bool=false,initial_polarity:string="automatic",match_silence:bool=true,spectral_match:bool=false} derive codec(strict)
+pub type Selection=struct{windows:options.WindowSet,intros:options.IntroSet,gain:options.GainChoice,phase:local.PhaseChoice,preparation:preparation.Recipe}
+pub fn initial_polarity(value:str)->result<preparation.Polarity,string> effects {alloc} {
+ if value=="automatic"{return result.ok(preparation.Polarity.Automatic)}
+ if value=="positive"{return result.ok(preparation.Polarity.Positive)}
+ if value=="negative"{return result.ok(preparation.Polarity.Negative)}
+ if value=="native"{return result.ok(preparation.Polarity.Native)}
+ result.err("Choose initial alignment polarity automatic, positive, negative or native")
+}
+pub fn windows(value:str)->result<options.WindowSet,string> effects {alloc} {
+ if value=="0.0625"{return result.ok(options.WindowSet.Sixteenth)}
+ if value=="0.125"{return result.ok(options.WindowSet.Eighth)}
+ if value=="0.25"{return result.ok(options.WindowSet.Quarter)}
+ if value=="0.5"{return result.ok(options.WindowSet.Half)}
+ if value=="low"{return result.ok(options.WindowSet.LowSet)}
+ if value=="medium"{return result.ok(options.WindowSet.MediumSet)}
+ if value=="high"{return result.ok(options.WindowSet.HighSet)}
+ if value=="0.75"{return result.ok(options.WindowSet.ThreeQuarter)}
+ if value=="1"{return result.ok(options.WindowSet.One)}
+ if value=="2"{return result.ok(options.WindowSet.Two)}
+ result.err("Choose alignment windows 0.0625, 0.125, 0.25, 0.5, 0.75, 1, 2, low, medium or high")
+}
+pub fn intros(value:str)->result<options.IntroSet,string> effects {alloc} {
+ if value=="default"{return result.ok(options.IntroSet.Default)}
+ if value=="eighth"{return result.ok(options.IntroSet.Eighth)}
+ if value=="sixth"{return result.ok(options.IntroSet.Sixth)}
+ if value=="quarter"{return result.ok(options.IntroSet.Quarter)}
+ if value=="half"{return result.ok(options.IntroSet.Half)}
+ if value=="dual"{return result.ok(options.IntroSet.Dual)}
+ if value=="triple"{return result.ok(options.IntroSet.Triple)}
+ if value=="five"{return result.ok(options.IntroSet.Five)}
+ result.err("Choose alignment intros default, eighth, sixth, quarter, half, dual, triple or five")
+}
+pub fn gain(value:str)->result<options.GainChoice,string> effects {alloc} {
+ if value=="unity"{return result.ok(options.GainChoice.Unity)}
+ if value=="low"{return result.ok(options.GainChoice.Low)}
+ if value=="medium"{return result.ok(options.GainChoice.Medium)}
+ if value=="high"{return result.ok(options.GainChoice.High)}
+ if value=="very-high"{return result.ok(options.GainChoice.VeryHigh)}
+ result.err("Choose alignment gain unity, low, medium, high or very-high")
+}
+pub fn phase(value:str)->result<local.PhaseChoice,string> effects {alloc} {
+ if value=="unchanged"{return result.ok(local.PhaseChoice.Unchanged)}
+ if value=="opposite-pair"{return result.ok(local.PhaseChoice.OppositePair)}
+ if value=="90"{return result.ok(local.PhaseChoice.Degrees90)}
+ if value=="45"{return result.ok(local.PhaseChoice.Degrees45)}
+ if value=="20"{return result.ok(local.PhaseChoice.Degrees20)}
+ if value=="10"{return result.ok(local.PhaseChoice.Degrees10)}
+ if value=="1"{return result.ok(local.PhaseChoice.Degrees1)}
+ result.err("Choose local alignment phase unchanged, opposite-pair, 90, 45, 20, 10 or 1 degrees")
+}
+pub fn validate(recipe:ref<Recipe>)->result<Selection,string> effects {alloc} {
+ result.ok(Selection{windows:try windows(recipe.windows),intros:try intros(recipe.intros),gain:try gain(recipe.gain),phase:try phase(recipe.phase),preparation:preparation.Recipe{polarity:try initial_polarity(recipe.initial_polarity),match_silence:recipe.match_silence}})
+}
+// Explicit whole-track route has no local window or phase operation.
+pub type DirectSelection=struct{intros:options.IntroSet,gain:options.GainChoice,preparation:preparation.Recipe}
+pub fn validate_direct(recipe:ref<Recipe>)->result<DirectSelection,string> effects {alloc} {
+ if recipe.windows!="none"{return result.err("Choose none for whole-track alignment")}
+ let _=try phase(recipe.phase)
+ result.ok(DirectSelection{intros:try intros(recipe.intros),gain:try gain(recipe.gain),preparation:preparation.Recipe{polarity:try initial_polarity(recipe.initial_polarity),match_silence:recipe.match_silence}})
+}
+pub fn validate_any(recipe:ref<Recipe>)->result<unit,string> effects {alloc} {
+ if recipe.windows=="none"{let _=try validate_direct(recipe)}else{let _=try validate(recipe)}
+ result.ok(())
+}
+fn index(value:f64,maximum:f64)->bool effects {} {
+ fp.is_finite(value) and value>=0.0 and value<=maximum and fp.floor(value)==value
+}
+pub fn from_indices(window:f64,intro:f64,gain_choice:f64,phase_choice:f64,save:bool)->result<Recipe,string> effects {alloc} {
+ if not index(window,10.0) or not index(intro,7.0) or not index(gain_choice,4.0) or not index(phase_choice,6.0){return result.err("Choose available detailed alignment options")}
+ let window_keys:array<string>=["0.0625","0.125","0.25","0.5","low","medium","high","0.75","1","2","none"]
+ let intro_keys:array<string>=["default","eighth","sixth","quarter","half","dual","triple","five"]
+ let gain_keys:array<string>=["unity","low","medium","high","very-high"]
+ let phase_keys:array<string>=["unchanged","opposite-pair","90","45","20","10","1"]
+ result.ok(Recipe{windows:string.copy(array.get(window_keys,cast.sat(window))),intros:string.copy(array.get(intro_keys,cast.sat(intro))),gain:string.copy(array.get(gain_keys,cast.sat(gain_choice))),phase:string.copy(array.get(phase_keys,cast.sat(phase_choice))),save_aligned:save})
+}
+fn read_error(e:files.ReadError)->string effects {alloc} {
+ match e{Io(v)=>string.copy(fs.error.message(v)),TooLarge=>"Alignment choices exceed 16 KiB"}}
+pub fn read(file:str)->result<Recipe,string> effects {alloc,fs.read} {
+ let raw:bytes=try files.read_limited(file,16384) map_err read_error
+ let text:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("Alignment choices must be UTF-8")}}
+ let recipe:Recipe=try Recipe_decode(text) map_err codec.describe
+ let _=try validate_any(recipe)
+ result.ok(recipe)
+}
+pub fn from_preparation_indices(window:f64,intro:f64,gain_choice:f64,phase_choice:f64,save:bool,polarity:f64,match_silence:bool)->result<Recipe,string> effects {alloc} {
+ if not index(polarity,3.0){return result.err("Choose an available initial alignment polarity")}
+ var recipe:Recipe=try from_indices(window,intro,gain_choice,phase_choice,save)
+ let keys:array<string>=["automatic","positive","negative","native"]
+ recipe.initial_polarity=string.copy(array.get(keys,cast.sat(polarity)))
+ recipe.match_silence=match_silence
+ result.ok(recipe)
+}
+pub fn from_full_indices(window:f64,intro:f64,gain_choice:f64,phase_choice:f64,save:bool,polarity:f64,match_silence:bool,spectral_match:bool)->result<Recipe,string> effects {alloc} {
+ var recipe:Recipe=try from_preparation_indices(window,intro,gain_choice,phase_choice,save,polarity,match_silence)
+ recipe.spectral_match=spectral_match
+ result.ok(recipe)
+}
+// Only the EXACT prior canonical encoding is compatible, with this option false.
+type LegacyRecipe=struct{windows:string,intros:string,gain:string,phase:string,save_aligned:bool,initial_polarity:string,match_silence:bool} derive codec(strict)
+pub fn is_canonical(raw:str)->result<bool,string> effects {alloc} {
+ let recipe:Recipe=try Recipe_decode(raw) map_err codec.describe
+ let current:string=try Recipe_encode(recipe) map_err codec.describe
+ if str.view(current)==raw{return result.ok(true)}
+ if recipe.spectral_match{return result.ok(false)}
+ let prior:LegacyRecipe=LegacyRecipe{windows:string.copy(recipe.windows),intros:string.copy(recipe.intros),gain:string.copy(recipe.gain),phase:string.copy(recipe.phase),save_aligned:recipe.save_aligned,initial_polarity:string.copy(recipe.initial_polarity),match_silence:recipe.match_silence}
+ let legacy:string=try LegacyRecipe_encode(prior) map_err codec.describe
+ result.ok(str.view(legacy)==raw)
+}

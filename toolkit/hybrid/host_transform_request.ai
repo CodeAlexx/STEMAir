@@ -1,0 +1,50 @@
+module stemair.hybrid.host_transform_request
+import "network.ai" as network
+import "config.ai" as config
+import "host_prepared.ai" as prepared
+import "host_transform.ai" as transform
+
+fn add_length(lengths:ref<array<u64>>,length:u64)->result<unit,string> effects {alloc}{
+ var i:u64=0
+ loop{if i==array.len(lengths){break}
+  if array.get(lengths,i)==length{return result.ok(())}
+  i+=1}
+ if array.len(lengths)>=32{return result.err("CPU recording exceeds32 distinct transform geometries")}
+ array.push(lengths,length)
+ result.ok(())
+}
+// Plan the actual selected offsets once; the caller owns random traversal.
+// Identical warm requests retain their plans and resident packed weights.
+pub fn prepare(n:ref<network.Network>,bank:ref<prepared.Backend>,runtime:str,c:ref<config.Config>,frames:u64,offsets:view<u64>)->result<unit,string> effects {alloc,ffi}{
+ if str.len(runtime)==0{return result.err("Magnitude CPU recording requires its selected transform runtime")}
+ if frames==0 or frames>134217728{return result.err("Invalid complete CPU recording extent")}
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{n.constructor.kwargs.segment*44100}
+ let stride:u64=if c.split{cast.sat((1.0-c.overlap)*cast.float(size))}else{frames}
+ if stride==0{return result.err("Recording overlap leaves no stride")}
+ var lengths:array<u64>=[]
+ let count:u64=if view.len(offsets)==0{1}else{view.len(offsets)}
+ var s:u64=0
+ loop{if s==count{break}
+  let offset:u64=if view.len(offsets)==0{0}else{view.get(offsets,s)}
+  if offset>22050{return result.err("CPU transform offset exceeds the original range")}
+  let length:u64=if view.len(offsets)==0{frames}else{frames+22050-offset}
+  if not c.split{let _=try add_length(lengths,length)}else{
+   var at:u64=0
+   loop{if at>=length{break}
+    let _=try add_length(lengths,if length-at<size{length-at}else{size})
+    at+=stride}}
+  s+=1}
+ var bytes:u64=0
+ var all_present:bool=true
+ var i:u64=0
+ loop{if i==array.len(lengths){break}
+  let length:u64=array.get(lengths,i)
+  let required:u64=try transform.staging_bytes(n.constructor.kwargs.nfft,length)
+  if required>536870912 or required>1073741824-bytes{return result.err("CPU recording transform plans exceed the staging budget")}
+  bytes+=required
+  match prepared.transform_index(bank,length){none=>{all_present=false},some(_)=>{}}
+  i+=1}
+ if all_present{return result.ok(())}
+ let _=try prepared.close_transforms(bank)
+ prepared.prepare_transform_lengths(bank,n,runtime,array.view(lengths),536870912,1073741824)
+}

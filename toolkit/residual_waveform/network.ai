@@ -1,0 +1,118 @@
+module stemair.residual_waveform.network
+import "../weights.ai" as weights
+import "packed.ai" as packed
+import "../device_ops.ai" as ops
+import "../hybrid/residual.ai" as residual
+import "../windowed_sinc.ai" as sinc
+import std.pytorch_checkpoint as checkpoint
+import std.codec as codec
+import std.text as text
+
+// Serialized constructor fields remain compatible with original checkpoints.
+pub type Options=struct{sources:array<string>,audio_channels:u64=2,channels:u64=64,growth:f64=2.0,
+ depth:u64=6,rewrite:bool=true,lstm_layers:u64=0,kernel_size:u64=8,stride:u64=4,context:u64=1,
+ gelu:bool=true,glu:bool=true,norm_starts:u64=4,norm_groups:u64=4,dconv_mode:u64=1,
+ dconv_depth:u64=2,dconv_comp:u64=4,dconv_attn:u64=4,dconv_lstm:u64=4,dconv_init:f64=0.0001,
+ normalize:bool=true,resample:bool=true,rescale:f64=0.1,samplerate:u64=44100,segment:f64=40.0} derive codec(strict)
+pub type Constructor=struct{args:array<u64>,kwargs:Options} derive codec(strict)
+pub type Encoder=struct{conv:ops.Convolution,norm:option<ops.Normalization>,residual:option<u64>,
+ rewrite:option<ops.Convolution>,rewrite_norm:option<ops.Normalization>}
+pub type Decoder=struct{conv:ops.Convolution,norm:option<ops.Normalization>,residual:option<u64>,
+ rewrite:option<ops.Convolution>,rewrite_norm:option<ops.Normalization>,last:bool}
+pub type Network=struct{weights:weights.Model,constructor:Constructor,encoder:array<Encoder>,decoder:array<Decoder>,
+ residuals:array<residual.Block>,upsample:sinc.Plan,downsample:sinc.Plan}
+fn key(side:str,index:u64,part:u64)->string effects {alloc}{
+ text.concat(text.concat(text.concat(text.concat(side,"."),string.from_int(index)),"."),string.from_int(part))
+}
+fn convolution(w:ref<weights.Model>,name:str,input:u64,output:u64,kernel:u64,stride:u64,padding:u64,up:bool)->result<ops.Convolution,string> effects {alloc}{
+ var c:ops.Convolution=try ops.bind_conv(w,name,input,output,1,kernel,true,up)
+ c.stride_w=stride
+ c.pad_w=padding
+ result.ok(c)
+}
+fn norm(w:ref<weights.Model>,name:str,channels:u64,groups:u64,enabled:bool)->result<option<ops.Normalization>,string> effects {alloc}{
+ if not enabled{return result.ok(option.none())}
+ result.ok(option.some(try ops.bind_norm(w,name,channels,groups)))
+}
+pub fn open(path:str)->result<Network,string> effects {alloc,fs.read}{
+ var policy:checkpoint.Limits=checkpoint.defaults()
+ policy.root=checkpoint.Root.ModelState
+ policy.symbolic_classes=true
+ policy.opaque_metadata=true
+ policy.legacy_little_endian=true
+ var w:weights.Model=try weights.open_promoted(path,policy)
+ bind(w)
+}
+pub fn open_packed(path:str)->result<Network,string> effects {alloc,fs.read}{
+ bind(try packed.open(path))
+}
+pub fn bind(model:weights.Model own)->result<Network,string> effects {alloc}{
+ var w:weights.Model=model
+ var constructor:Constructor=try Constructor_decode(w.metadata) map_err codec.describe
+ let c:ref<Options>=struct.borrow(constructor,field=kwargs)
+ if array.len(constructor.args)!=0 or c.audio_channels!=2 or c.samplerate!=44100 or
+  c.channels!=64 or c.growth!=2.0 or c.depth!=6 or c.lstm_layers!=0 or c.kernel_size!=8 or c.stride!=4 or
+  c.context!=1 or not c.gelu or not c.glu or c.norm_groups!=4 or c.norm_starts!=4 or
+  c.dconv_mode!=1 or c.dconv_depth!=2 or c.dconv_comp!=4 or c.dconv_attn!=4 or c.dconv_lstm!=4 or
+  not c.normalize or not c.resample or array.len(c.sources)!=4{
+  return result.err("Unsupported residual waveform constructor")}
+ let names:array<string>=["drums","bass","other","vocals"]
+ var i:u64=0
+ loop{if i==4{break}
+  let actual:str=array.get(c.sources,i)
+  let expected:str=array.get(names,i)
+  if actual!=expected{return result.err("Residual waveform source order differs")}
+  i+=1}
+ var encoder:array<Encoder>=[]
+ var decoder:array<Decoder>=[]
+ var blocks:array<residual.Block>=[]
+ var input:u64=c.audio_channels
+ var channels:u64=c.channels
+ i=0
+ loop{if i==c.depth{break}
+  let normal:bool=i>=c.norm_starts
+  let conv:ops.Convolution=try convolution(w,key("encoder",i,0),input,channels,c.kernel_size,c.stride,0,false)
+  let normalization:option<ops.Normalization>=try norm(w,key("encoder",i,1),channels,c.norm_groups,normal)
+  let index:u64=array.len(blocks)
+  array.push(blocks,try residual.bind_compressed(w,key("encoder",i,3),channels,c.dconv_depth,c.dconv_comp,i>=c.dconv_lstm,i>=c.dconv_attn))
+  var rewrite:option<ops.Convolution>=option.none()
+  var rewrite_norm:option<ops.Normalization>=option.none()
+  if c.rewrite{
+   rewrite=option.some(try convolution(w,key("encoder",i,4),channels,2*channels,1,1,0,false))
+   rewrite_norm=try norm(w,key("encoder",i,5),2*channels,c.norm_groups,normal)}
+  array.push(encoder,Encoder{conv:conv,norm:normalization,residual:option.some(index),rewrite:rewrite,rewrite_norm:rewrite_norm})
+  input=channels
+  channels*=2
+  i+=1}
+ i=0
+ loop{if i==c.depth{break}
+  let level:u64=c.depth-1-i
+  channels=c.channels*(1 << cast.wrap(level))
+  let output:u64=if level==0{c.audio_channels*array.len(c.sources)}else{channels/2}
+  let normal:bool=level>=c.norm_starts
+  var rewrite:option<ops.Convolution>=option.none()
+  var rewrite_norm:option<ops.Normalization>=option.none()
+  if c.rewrite{
+   rewrite=option.some(try convolution(w,key("decoder",i,0),channels,2*channels,2*c.context+1,1,c.context,false))
+   rewrite_norm=try norm(w,key("decoder",i,1),2*channels,c.norm_groups,normal)}
+  let at:u64=if c.rewrite{3}else{0}
+  let conv:ops.Convolution=try convolution(w,key("decoder",i,at),channels,output,c.kernel_size,c.stride,0,true)
+  let normalization:option<ops.Normalization>=try norm(w,key("decoder",i,at+1),output,c.norm_groups,normal and level>0)
+  array.push(decoder,Decoder{conv:conv,norm:normalization,residual:option.none(),rewrite:rewrite,rewrite_norm:rewrite_norm,last:level==0})
+  i+=1}
+ result.ok(Network{weights:w,constructor:constructor,encoder:encoder,decoder:decoder,residuals:blocks,
+  upsample:try sinc.plan(1,2),downsample:try sinc.plan(2,1)})
+}
+pub fn valid_length(c:ref<Options>,length:u64)->result<u64,string> effects {alloc}{
+ if length==0 or length>134217728{return result.err("Residual waveform input extent exceeds limits")}
+ var value:u64=2*length
+ var i:u64=0
+ loop{if i==c.depth{break}
+  value=if value<=c.kernel_size{1}else{(value-c.kernel_size+c.stride-1)/c.stride+1}
+  i+=1}
+ i=0
+ loop{if i==c.depth{break}
+  value=(value-1)*c.stride+c.kernel_size
+  i+=1}
+ result.ok((value+1)/2)
+}

@@ -1,0 +1,32 @@
+module stemair.recording_moments
+import "audio_normalization.ai" as normalization
+import "numeric.ai" as num
+import std.cpu_moments as moments
+import std.float as fp
+// Explicit host reduction recipe. Thread partition is part of the arithmetic
+// contract even though the shared deterministic reduction executes serially.
+pub fn prepare(input:view<f32>,threads:u64)->result<normalization.Prepared,string> effects {alloc}{
+ if view.len(input)%2!=0 or view.len(input)<4 or not num.finite(input){return result.err("Waveform input must be finite stereo audio with at least two frames")}
+ let length:u64=view.len(input)/2
+ var mono:array<f32>=[]
+ array.reserve(mono,length)
+ var i:u64=0
+ loop{if i==length{break}
+  array.push(mono,(view.get(input,i)+view.get(input,length+i))/2.0)
+  i+=1}
+ let stats:moments.Moments=try moments.moments_f32_avx2_openmp(array.view(mono),threads,1)
+ if not fp.is_finite(stats.mean) or not fp.is_finite(stats.deviation){return result.err("Waveform normalization is non-finite")}
+ if stats.deviation==0.0{
+  i=0
+  loop{if i==view.len(input){break}
+   if view.get(input,i)!=0.0{return result.err("Waveform mono reference has no variance")}
+   i+=1}
+  return result.ok(normalization.Prepared{samples:[],frames:length,mean:stats.mean,scale:stats.deviation})}
+ var samples:array<f32>=[]
+ array.reserve(samples,view.len(input))
+ i=0
+ loop{if i==view.len(input){break}
+  array.push(samples,(view.get(input,i)-stats.mean)/stats.deviation)
+  i+=1}
+ result.ok(normalization.Prepared{samples:samples,frames:length,mean:stats.mean,scale:stats.deviation})
+}

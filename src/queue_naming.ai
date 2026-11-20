@@ -1,0 +1,57 @@
+module stemair.queue_naming
+import "output_naming.ai" as naming
+import "queue_config.ai" as config
+
+pub fn kind(selection:ref<naming.Selection>)->u32 effects {} {
+ match selection{Single(_)=>0,Secondary(_)=>1,ModelEnsemble(_)=>2}
+}
+pub fn accept(selection:naming.Selection own,items:ref<array<config.Item>>)->result<naming.Queue,string> effects {alloc} {
+ let _=try config.validate(items)
+ var captured:array<naming.QueueItem>=[]
+ var index:u64=0
+ loop{if index==array.len(items){break}
+  let item:ref<config.Item>=array.borrow(items,index)
+  array.push(captured,naming.QueueItem{input:string.copy(item.input),folder:string.copy(item.folder),ordinal:index+1})
+  index+=1}
+ result.ok(naming.Queue{selection:selection,items:captured})
+}
+pub fn validate(snapshot:ref<naming.Queue>)->result<unit,string> effects {alloc} {
+ if array.len(snapshot.items)==0 or array.len(snapshot.items)>4096{return result.err("Choose naming identities for between one and 4096 recordings")}
+ var items:array<config.Item>=[]
+ var index:u64=0
+ loop{if index==array.len(snapshot.items){break}
+  let item:ref<naming.QueueItem>=array.borrow(snapshot.items,index)
+  if item.ordinal==0 or item.ordinal>4096{return result.err("Queued recording numbers must be between one and 4096")}
+  var previous:u64=0
+  loop{if previous==index{break}
+   if array.borrow(snapshot.items,previous).ordinal==item.ordinal{return result.err("Queued naming identities must have distinct recording numbers")}
+   previous+=1}
+  array.push(items,config.Item{input:string.copy(item.input),folder:string.copy(item.folder)})
+  index+=1}
+ config.validate(items)
+}
+// Bind by accepted recording and output-folder identity, never the new position.
+pub fn project(snapshot:ref<naming.Queue>,items:ref<array<config.Item>>)->result<naming.Queue,string> effects {alloc} {
+ let _=try validate(snapshot)
+ let _=try config.validate(items)
+ var selected:array<naming.QueueItem>=[]
+ var index:u64=0
+ loop{if index==array.len(items){break}
+  let requested:ref<config.Item>=array.borrow(items,index)
+  var found:bool=false
+  var previous:u64=0
+  loop{if previous==array.len(snapshot.items){break}
+   let candidate:ref<naming.QueueItem>=array.borrow(snapshot.items,previous)
+   if str.view(candidate.input)==str.view(requested.input) and str.view(candidate.folder)==str.view(requested.folder){
+    array.push(selected,naming.QueueItem{input:string.copy(candidate.input),folder:string.copy(candidate.folder),ordinal:candidate.ordinal})
+    found=true
+    break}
+   previous+=1}
+  if not found{return result.err("Queued recording identity changed; accept naming settings for the current queue")}
+  index+=1}
+ result.ok(naming.Queue{selection:try naming.copy_selection(struct.borrow(snapshot,field=selection)),items:selected})
+}
+pub fn item(snapshot:ref<naming.Queue>,index:u64)->result<naming.Selection,string> effects {alloc} {
+ if index>=array.len(snapshot.items){return result.err("Queued naming identity is unavailable")}
+ naming.with_ordinal(struct.borrow(snapshot,field=selection),array.borrow(snapshot.items,index).ordinal)
+}

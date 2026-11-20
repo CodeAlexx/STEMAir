@@ -1,0 +1,40 @@
+module stemair.hybrid.session
+import "network.ai" as network
+import "retained_session.ai" as retained
+import "device.ai" as device
+import "host_session.ai" as host
+import "config.ai" as config
+import "../recording_audio.ai" as recording_audio
+import "../ops.ai" as ops
+import "../audio_normalization.ai" as normalization
+import std.tensor as tensor
+
+pub type Session=retained.State
+pub fn prepare_cpu(s:ref<retained.State>)->result<unit,string> effects {alloc,fs.read} {
+ if array.len(s.cpu)==0{array.push(s.cpu,try host.prepare(struct.borrow(s,field=network)))
+  s.cpu_preparations+=1}
+ if array.len(s.cpu)!=1{return result.err("CPU hybrid session must own one retained weight bank")}
+ result.ok(())
+}
+pub fn open(path:str,c:ref<config.Config>)->result<retained.State,string> effects {alloc,fs.read} {
+ let _=try config.validate(c)
+ let n:network.Network=try network.open(path)
+ if array.len(c.targets)!=array.len(n.constructor.kwargs.sources){return result.err("Hybrid profile target count differs from checkpoint")}
+ if n.constructor.kwargs.segment==0 or n.constructor.kwargs.segment>378{return result.err("Hybrid default segment exceeds retained graph limits")}
+ result.ok(retained.State{network:n,cpu:[],gpu:[]})
+}
+fn hybrid_predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ device.forward(context,stream,parameters,n,input,cancel)
+}
+fn hybrid_length(n:ref<network.Network>,length:u64)->result<u64,string> effects {alloc} {
+ if length==0 or length>16711680{return result.err("Hybrid chunk extent exceeds retained graph limits")}
+ result.ok(length)
+}
+pub fn separate(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{n.constructor.kwargs.segment*44100}
+ if array.len(n.constructor.kwargs.sources)==4{return recording_audio.separate(context,stream,parameters,n,c,size,input,cancel,progress,hybrid_predict,hybrid_length)}
+ recording_audio.separate_prepared_sources(context,stream,parameters,n,c,size,array.len(n.constructor.kwargs.sources),try normalization.prepare(input),cancel,progress,hybrid_predict,hybrid_length)
+}

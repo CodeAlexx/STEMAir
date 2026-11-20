@@ -1,0 +1,187 @@
+module stemair.model_settings_draft
+import "model_defaults.ai" as defaults
+import "model_catalog.ai" as catalog
+import "../toolkit/profile_edit.ai" as edit
+import "../toolkit/stem_names.ai" as names
+import "../toolkit/engine.ai" as engine
+import "../toolkit/exchange/config.ai" as exchange
+import "../toolkit/mask/config.ai" as mask
+import std.files as files
+import std.path as path
+import std.text as text
+import std.float as fp
+import std.float_format as fmt
+import std.codec as codec
+
+// A draft owns only configuration and established catalog identity, never weights.
+pub type Draft=struct{profile:string,asset_sha256:string,asset_bytes:u64,base_file:string,base_sha256:string,
+ checkpoint:string,configuration:string,kind:string,parameter_file:string,source:string,custom:bool,inverse:bool,
+ n_fft:string,frequency_bins:string,frame_exponent:string,compensation:string,lock_geometry:bool,
+ recurrent:bool,channels:string,recurrent_width:string,source_edited:bool=false,primary_label:string="",secondary_label:string="",role:u32=0,rebalance:f64=0.0}
+fn error(e:fs.error)->string effects {alloc} {string.copy(fs.error.message(e))}
+pub fn read_profile(file:str)->result<engine.Profile,string> effects {alloc,fs.read,fs.meta} {
+ let info:fs.meta=try files.symlink_metadata(file) map_err error
+ if not info.is_file or info.is_symlink or info.size>65536{return result.err("Choose an ordinary model configuration within 64 KiB")}
+ let raw:bytes=match files.read_limited(file,65536){ok(v)=>v,err(_)=>{return result.err("Cannot read model configuration within 64 KiB")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("Model configuration is not UTF-8")}}
+ engine.decode(source)
+}
+fn raw_digest(file:str)->result<string,string> effects {alloc,fs.read,fs.meta} {
+ let info:fs.meta=try files.symlink_metadata(file) map_err error
+ if not info.is_file or info.is_symlink or info.size>65536{return result.err("Bundled configuration is not an ordinary bounded file")}
+ let raw:bytes=match files.read_limited(file,65536){ok(v)=>v,err(_)=>{return result.err("Cannot read bundled configuration")}}
+ result.ok(bytes.hex(hash.sha256(bytes.view(raw))))
+}
+pub fn begin(root:str,entry:ref<catalog.Entry>,directory:str,configuration:str,checkpoint:str)->result<Draft,string> effects {alloc,fs.read,fs.meta} {
+ let base_file:string=path.join(root,entry.configuration)
+ let base:engine.Profile=try read_profile(base_file)
+ let cp:string=path.join(directory,entry.asset.filename)
+ let current:bool=path.normalize(checkpoint)==path.normalize(cp)
+ let selected:string=if current{string.copy(configuration)}else{string.copy(base_file)}
+ let active:engine.Profile=try read_profile(selected)
+ if str.view(active.kind)!=str.view(base.kind){return result.err("Selected configuration belongs to a different engine; choose its matching model")}
+ if active.kind!="exchange" and active.kind!="mask" and active.kind!="spectral"{return result.err("This engine has no source-defined model parameter editor")}
+ var draft:Draft=Draft{profile:string.copy(entry.profile),asset_sha256:string.copy(entry.asset.sha256),asset_bytes:entry.asset.bytes,
+  base_file:base_file,base_sha256:try raw_digest(base_file),checkpoint:cp,configuration:string.copy(active.identity),kind:string.copy(active.kind),
+  parameter_file:selected,source:names.display(array.get(active.targets,0)),custom:false,inverse:false,
+  n_fft:"",frequency_bins:"",frame_exponent:"",compensation:"",lock_geometry:text.ends_with(entry.asset.filename,".ckpt"),
+  recurrent:false,channels:"",recurrent_width:"",primary_label:names.display(array.get(active.targets,0)),secondary_label:if array.len(active.targets)>1{names.display(array.get(active.targets,1))}else{""}}
+ if active.kind=="exchange"{
+  var c:exchange.Config=try exchange.Config_decode(active.identity) map_err codec.describe
+  var exponent:u32=0
+  var frames:u64=c.frames
+  loop{if frames<=1{break}
+   if frames%2!=0{return result.err("The current model frame count is not a power of two")}
+   exponent+=1
+   frames/=2}
+  draft.n_fft=string.from_int(c.n_fft)
+  draft.frequency_bins=string.from_int(c.frequency_bins)
+  draft.frame_exponent=string.from_int(exponent)
+  draft.compensation=fmt.repr(c.compensation)}
+ if active.kind=="mask"{
+  var c:mask.Config=try mask.Config_decode(active.identity) map_err codec.describe
+  draft.recurrent=c.architecture=="recurrent"
+  draft.channels=string.from_int(c.channels)
+  draft.recurrent_width=string.from_int(c.recurrent_width)}
+ result.ok(draft)
+}
+fn positive(value:str,label:str)->result<u64,string> effects {alloc} {
+ let result:option<u64>=text.parse_u64(value)
+ match result{some(v)=>result.ok(v),none=>result.err(text.concat("Enter a whole number for ",label))}
+}
+fn decimal(value:str)->result<f64,string> effects {alloc} {
+ var dot:bool=false
+ var digits:u64=0
+ var i:u64=0
+ loop{if i==str.len(value){break}
+  let b:u8=cast.bits(view.get(str.bytes(value),i))
+  if b==46{if dot or i==0{return result.err("Compensation needs decimal digits with one decimal point")}
+   dot=true}else{if b<48 or b>57{return result.err("Compensation needs decimal digits with one decimal point")}
+   if dot{digits+=1}}
+  i+=1}
+ if not dot or digits==0 or digits>9{return result.err("Compensation needs one to nine fractional digits")}
+ let v:f64=match text.parse_f64(value){some(v)=>v,none=>{return result.err("Invalid compensation")}}
+ if not fp.is_finite(v){return result.err("Compensation must be finite")}
+ result.ok(v)
+}
+pub fn sources(draft:ref<Draft>)->result<names.Pair,string> effects {alloc} {
+ if not draft.source_edited{
+  let profile:engine.Profile=try engine.decode(draft.configuration)
+  let foreground:bool=if draft.kind=="mask"{var c:mask.Config=try mask.Config_decode(draft.configuration) map_err codec.describe
+   c.primary_foreground}else{names.foreground(array.get(profile.targets,0))}
+  return result.ok(names.Pair{primary:string.copy(array.get(profile.targets,0)),secondary:string.copy(array.get(profile.targets,1)),
+   primary_label:string.copy(draft.primary_label),secondary_label:string.copy(draft.secondary_label),primary_foreground:foreground})}
+ if draft.custom{return names.parse(draft.source,draft.inverse)}
+ let target:string=text.lower_ascii(text.replace(draft.source," ","_"))
+ if draft.inverse{return result.err("Inverse applies to custom source names; choose Custom or clear Inverse")}
+ names.menu(target)
+}
+pub fn validate(draft:ref<Draft>)->result<defaults.Record,string> effects {alloc,fs.read,fs.meta} {
+ let base:engine.Profile=try engine.decode(draft.configuration)
+ var labels:array<string>=[]
+ let profile:engine.Profile=if draft.kind=="spectral"{
+  if str.len(draft.parameter_file)==0{return result.err("Choose a complete native spectral configuration before saving")}
+  let selected:engine.Profile=try read_profile(draft.parameter_file)
+  let spectral:engine.Profile=try edit.spectral_profile(selected)
+  var i:u64=0
+  loop{if i==array.len(spectral.targets){break}
+   array.push(labels,names.display(array.get(spectral.targets,i)))
+   i+=1}
+  spectral
+ }else{
+  let pair:names.Pair=try sources(draft)
+  array.push(labels,string.copy(pair.primary_label))
+  array.push(labels,string.copy(pair.secondary_label))
+  if draft.kind=="exchange"{
+   let exponent:u64=try positive(draft.frame_exponent,"frame exponent")
+   if exponent>12{return result.err("Frame exponent must be between 5 and 12")}
+   let choice:edit.Exchange=edit.Exchange{n_fft:try positive(draft.n_fft,"FFT size"),frequency_bins:try positive(draft.frequency_bins,"frequency bins"),
+    frame_exponent:cast.wrap(exponent),compensation:try decimal(draft.compensation),lock_geometry:draft.lock_geometry}
+   try edit.exchange_profile(base,choice,pair)
+  }else{
+   if str.len(draft.parameter_file)==0{return result.err("Choose a native mask parameter configuration before saving")}
+   let parameters:engine.Profile=try read_profile(draft.parameter_file)
+   let choice:edit.Mask=edit.Mask{recurrent:draft.recurrent,channels:try positive(draft.channels,"network width"),recurrent_width:try positive(draft.recurrent_width,"recurrent width")}
+   if choice.channels==8 and not choice.recurrent{return result.err("Network width 8 requires the recurrent architecture")}
+   try edit.mask_profile(base,parameters,choice,pair)}}
+ if draft.role>2{return result.err("Choose Standard, Lead or Backing model role")}
+ let selected_role:names.Role=if draft.kind=="spectral"{names.Role{}}else{try names.role(array.get(profile.targets,0),draft.role==1,draft.role==2,draft.rebalance)}
+ let record:defaults.Record=defaults.Record{profile:string.copy(draft.profile),asset_sha256:string.copy(draft.asset_sha256),asset_bytes:draft.asset_bytes,
+  base_sha256:string.copy(draft.base_sha256),configuration:string.copy(profile.identity),labels:labels,role:selected_role.kind,rebalance:selected_role.rebalance}
+ let _=try defaults.validate(record)
+ result.ok(record)
+}
+pub fn selected(bindings:str,entry:ref<catalog.Entry>,root:str)->result<option<defaults.Binding>,string> effects {alloc,fs.read,fs.meta} {
+ var records:defaults.Bindings=try defaults.decode_bindings(bindings)
+ var i:u64=0
+ loop{if i==array.len(records.items){break}
+  let item:ref<defaults.Binding>=array.borrow(records.items,i)
+  if str.view(item.profile)==str.view(entry.profile) and str.view(item.asset_sha256)==str.view(entry.asset.sha256){
+   let _=try defaults.resolve(item,entry.asset.bytes,path.join(root,entry.configuration))
+   return result.ok(option.some(try defaults.Binding_decode(try defaults.Binding_encode(item) map_err codec.describe) map_err codec.describe))}
+  i+=1}
+ result.ok(option.none())
+}
+pub fn reset(value:ref<Draft>)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ value.role=0
+ value.rebalance=0.0
+ value.custom=false
+ value.inverse=false
+ if value.kind=="exchange"{
+  let base:engine.Profile=try read_profile(value.base_file)
+  var settings:exchange.Config=try exchange.Config_decode(base.identity) map_err codec.describe
+  value.n_fft=string.from_int(settings.n_fft)
+  value.frequency_bins=string.from_int(settings.frequency_bins)
+  var frames:u64=settings.frames
+  var exponent:u32=0
+  loop{if frames<=1{break}
+   if frames%2!=0{return result.err("Startup metadata does not describe a power-of-two frame count")}
+   frames/=2
+   exponent+=1}
+  value.frame_exponent=string.from_int(exponent)
+  value.compensation="1.035"
+  value.source=names.display(array.get(base.targets,0))
+  value.source_edited=true
+ }else{
+  value.parameter_file=""
+  if value.kind=="mask"{
+   value.source="Vocals"
+   value.source_edited=true
+   value.recurrent=false
+   value.channels="32"
+   value.recurrent_width="128"}}
+ result.ok(())
+}
+
+pub fn begin_selected(root:str,entry:ref<catalog.Entry>,directory:str,configuration:str,checkpoint:str,definition:str)->result<Draft,string> effects {alloc,fs.read,fs.meta} {
+ var value:Draft=try begin(root,entry,directory,configuration,checkpoint)
+ if str.len(definition)>0 and path.normalize(checkpoint)==path.normalize(value.checkpoint){
+  let saved:defaults.LoadedRecord=try defaults.inspect_published(definition)
+  if str.view(saved.record.configuration)!=str.view(value.configuration) or str.view(saved.record.asset_sha256)!=str.view(entry.asset.sha256) or saved.record.asset_bytes!=entry.asset.bytes{
+   return result.err("Selected immutable definition differs from the chosen model")}
+  value.role=saved.record.role
+  value.rebalance=saved.record.rebalance
+  value.primary_label=string.copy(array.get(saved.record.labels,0))
+  if array.len(saved.record.labels)>1{value.secondary_label=string.copy(array.get(saved.record.labels,1))}}
+ result.ok(value)
+}

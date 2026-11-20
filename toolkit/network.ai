@@ -1,0 +1,180 @@
+module stemair.network
+import "config.ai" as config
+import "weights.ai" as weights
+import "ops.ai" as ops
+import "numeric.ai" as num
+import std.text as text
+import std.float as fp
+import "control.ai" as control
+
+pub type Affine=struct{weight:u64,bias:u64}
+pub type Block=struct{norm1:Affine,conv1:u64,norm2:Affine,linear1:u64,norm3:Affine,linear2:u64,norm4:Affine,conv2:u64,shortcut:u64}
+pub type Scale=struct{begin:u64,count:u64,norm:Affine,conv:u64}
+pub type Network=struct{weights:weights.Model,first:u64,encoder:array<Scale>,middle_begin:u64,middle_count:u64,blocks:array<Block>,decoder:array<Scale>,last1:u64,last2:u64}
+
+fn key(base:str,suffix:str)->string effects {alloc} {text.concat(base,suffix)}
+fn affine(w:ref<weights.Model>,base:str,c:u64)->result<Affine,string> effects {alloc} {
+ let shape:array<u64>=[c]
+ result.ok(Affine{weight:try weights.index(w,key(base,".weight"),array.view(shape)),bias:try weights.index(w,key(base,".bias"),array.view(shape))})
+}
+fn convolution(w:ref<weights.Model>,base:str,ci:u64,co:u64,k:u64)->result<u64,string> effects {alloc} {
+ let shape:array<u64>=[co,ci,k,k]
+ weights.index(w,key(base,".weight"),array.view(shape))
+}
+fn projection(w:ref<weights.Model>,base:str,ci:u64,co:u64)->result<u64,string> effects {alloc} {
+ let shape:array<u64>=[co,ci]
+ weights.index(w,key(base,".weight"),array.view(shape))
+}
+fn blocks(w:ref<weights.Model>,out:ref<array<Block>>,base:str,ci:u64,co:u64,f:u64,bn:u64,count:u64)->result<unit,string> effects {alloc} {
+ var input:u64=ci
+ var i:u64=0
+ loop{if i>=count{break}
+  let root:string=text.concat(text.concat(base,".blocks."),str.view(string.from_int(i)))
+  let block:Block=Block{
+   norm1:try affine(w,key(root,".tfc1.0"),input),conv1:try convolution(w,key(root,".tfc1.2"),input,co,3),
+   norm2:try affine(w,key(root,".tdf.0"),co),linear1:try projection(w,key(root,".tdf.2"),f,f/bn),
+   norm3:try affine(w,key(root,".tdf.3"),co),linear2:try projection(w,key(root,".tdf.5"),f/bn,f),
+   norm4:try affine(w,key(root,".tfc2.0"),co),conv2:try convolution(w,key(root,".tfc2.2"),co,co,3),
+   shortcut:try convolution(w,key(root,".shortcut"),input,co,1)}
+  array.push(out,block)
+  input=co
+  i+=1}
+ result.ok(())
+}
+pub fn open(path:str,c:ref<config.Config>)->result<Network,string> effects {alloc,fs.read} {
+ let _=try config.validate(c)
+ var w:weights.Model=try weights.open(path)
+ let expected:u64=3+(2*c.scales+1)*c.blocks*13+6*c.scales
+ if array.len(w.parameters.values)!=expected{return result.err("Checkpoint parameter set does not match the configured spectral network")}
+ let dim:u64=4*c.bands
+ let first:u64=try convolution(w,"first_conv",dim,c.channels,1)
+ var encoder:array<Scale>=[]
+ var decoder:array<Scale>=[]
+ var all:array<Block>=[]
+ var channels:u64=c.channels
+ var f:u64=c.frequency_bins/c.bands
+ var i:u64=0
+ loop{if i>=c.scales{break}
+  let base:string=text.concat("encoder_blocks.",str.view(string.from_int(i)))
+  let begin:u64=array.len(all)
+  let _=try blocks(w,all,key(base,".tfc_tdf"),channels,channels,f,c.bottleneck,c.blocks)
+  let norm:Affine=try affine(w,key(base,".downscale.conv.0"),channels)
+  let conv:u64=try convolution(w,key(base,".downscale.conv.2"),channels,channels+c.growth,2)
+  array.push(encoder,Scale{begin:begin,count:c.blocks,norm:norm,conv:conv})
+  channels+=c.growth
+  f/=2
+  i+=1}
+ let middle_begin:u64=array.len(all)
+ let _=try blocks(w,all,"bottleneck_block",channels,channels,f,c.bottleneck,c.blocks)
+ i=0
+ loop{if i>=c.scales{break}
+  let base:string=text.concat("decoder_blocks.",str.view(string.from_int(i)))
+  let norm:Affine=try affine(w,key(base,".upscale.conv.0"),channels)
+  // Transposed convolution stores [input,output,KH,KW].
+  let conv:u64=try convolution(w,key(base,".upscale.conv.2"),channels-c.growth,channels,2)
+  channels-=c.growth
+  f*=2
+  let begin:u64=array.len(all)
+  let _=try blocks(w,all,key(base,".tfc_tdf"),2*channels,channels,f,c.bottleneck,c.blocks)
+  array.push(decoder,Scale{begin:begin,count:c.blocks,norm:norm,conv:conv})
+  i+=1}
+ let last1:u64=try convolution(w,"final_conv.0",channels+dim,channels,1)
+ let last2:u64=try convolution(w,"final_conv.2",channels,array.len(c.targets)*dim,1)
+ result.ok(Network{weights:w,first:first,encoder:encoder,middle_begin:middle_begin,middle_count:c.blocks,blocks:all,decoder:decoder,last1:last1,last2:last2})
+}
+fn conv(n:ref<Network>,x:ref<ops.Tensor>,index:u64,stride:u64,pad:u64,transpose:bool)->ops.Tensor effects {alloc} {
+ ops.conv(x,array.borrow(struct.borrow(struct.borrow(n.weights,field=parameters),field=values),index),stride,pad,transpose)
+}
+fn linear(n:ref<Network>,x:ref<ops.Tensor>,index:u64)->ops.Tensor effects {alloc} {
+ ops.linear(x,array.borrow(struct.borrow(struct.borrow(n.weights,field=parameters),field=values),index))
+}
+fn normalized(n:ref<Network>,x:ref<ops.Tensor>,a:Affine)->ops.Tensor effects {alloc} {
+ let spatial:u64=x.h*x.w
+ if spatial<2{panic "Instance normalization needs multiple spatial values"}
+ var out:array<f32>=[]
+ array.reserve(out,array.len(x.data))
+ var c:u64=0
+ loop{if c>=x.c{break}
+  let alpha:f32=array.get(array.borrow(struct.borrow(struct.borrow(n.weights,field=parameters),field=values),a.weight).values,c)
+  let beta:f32=array.get(array.borrow(struct.borrow(struct.borrow(n.weights,field=parameters),field=values),a.bias).values,c)
+  var sum:f64=0.0
+  var i:u64=0
+  loop{if i>=spatial{break}
+   sum+=cast.float(array.get(x.data,c*spatial+i))
+   i+=1}
+  let mean:f64=sum/cast.float(spatial)
+  var variance:f64=0.0
+  i=0
+  loop{if i>=spatial{break}
+   let delta:f64=cast.float(array.get(x.data,c*spatial+i))-mean
+   variance+=delta*delta
+   i+=1}
+  let inverse:f64=1.0/fp.sqrt(variance/cast.float(spatial)+0.00001)
+  i=0
+  loop{if i>=spatial{break}
+   let original:f64=cast.float(array.get(x.data,c*spatial+i))
+   let norm:f32=cast.float((original-mean)*inverse)
+   array.push(out,norm*alpha+beta)
+   i+=1}
+  c+=1}
+ let y:ops.Tensor=ops.tensor(x.c,x.h,x.w,out)
+ ops.gelu(y)
+}
+fn body(n:ref<Network>,input:ops.Tensor own,begin:u64,count:u64,cancel:str)->result<ops.Tensor,string> effects {alloc,fs.meta} {
+ var x:ops.Tensor=input
+ var i:u64=0
+ loop{if i>=count{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let b:Block=array.get(n.blocks,begin+i)
+  let shortcut:ops.Tensor=conv(n,x,b.shortcut,1,0,false)
+  let a:ops.Tensor=normalized(n,x,b.norm1)
+  let first:ops.Tensor=conv(n,a,b.conv1,1,1,false)
+  let norm1:ops.Tensor=normalized(n,first,b.norm2)
+  let small:ops.Tensor=linear(n,norm1,b.linear1)
+  let norm2:ops.Tensor=normalized(n,small,b.norm3)
+  let expanded:ops.Tensor=linear(n,norm2,b.linear2)
+  let combined:ops.Tensor=ops.combine(first,expanded,false)
+  let norm3:ops.Tensor=normalized(n,combined,b.norm4)
+  let second:ops.Tensor=conv(n,norm3,b.conv2,1,1,false)
+  x=ops.combine(second,shortcut,false)
+  i+=1}
+ result.ok(x)
+}
+// Input is packed complex channels [4*bands,F/bands,T], output keeps the
+// source-major channel order. This function performs no waveform or file I/O.
+pub fn forward(n:ref<Network>,input:ops.Tensor own)->result<ops.Tensor,string> effects {alloc,fs.meta} {
+ forward_controlled(n,input,"")
+}
+pub fn forward_controlled(n:ref<Network>,input:ops.Tensor own,cancel:str)->result<ops.Tensor,string> effects {alloc,fs.meta} {
+ var packed:ops.Tensor=input
+ let first:ops.Tensor=conv(n,packed,n.first,1,0,false)
+ var x:ops.Tensor=ops.transpose(first)
+ var saved:array<ops.Tensor>=[]
+ var i:u64=0
+ loop{if i>=array.len(n.encoder){break}
+  let scale:Scale=array.get(n.encoder,i)
+  x=try body(n,x,scale.begin,scale.count,cancel)
+  let normalized:ops.Tensor=normalized(n,x,scale.norm)
+  let down:ops.Tensor=conv(n,normalized,scale.conv,2,0,false)
+  array.push(saved,x)
+  x=down
+  i+=1}
+ x=try body(n,x,n.middle_begin,n.middle_count,cancel)
+ i=0
+ loop{if i>=array.len(n.decoder){break}
+  let scale:Scale=array.get(n.decoder,i)
+  let norm:ops.Tensor=normalized(n,x,scale.norm)
+  let up:ops.Tensor=conv(n,norm,scale.conv,2,0,true)
+  let skip:ref<ops.Tensor>=array.borrow(saved,array.len(saved)-1-i)
+  let joined:ops.Tensor=ops.concat(up,skip)
+  x=try body(n,joined,scale.begin,scale.count,cancel)
+  i+=1}
+ let transposed:ops.Tensor=ops.transpose(x)
+ let gated:ops.Tensor=ops.combine(transposed,first,true)
+ let joined:ops.Tensor=ops.concat(packed,gated)
+ let last:ops.Tensor=conv(n,joined,n.last1,1,0,false)
+ let activated:ops.Tensor=ops.gelu(last)
+ let output:ops.Tensor=conv(n,activated,n.last2,1,0,false)
+ if not num.finite(array.view(output.data)){return result.err("Non-finite separation network output")}
+ result.ok(output)
+}

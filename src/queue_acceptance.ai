@@ -1,0 +1,48 @@
+module stemair.queue_acceptance
+import "preferences.ai" as prefs
+import "desktop_naming.ai" as naming
+import "model_queue_snapshot.ai" as models
+import "queue_config.ai" as queue
+import "artifact_cleanup_policy.ai" as cleanup_policy
+import "learned_controls_policy.ai" as learned_policy
+import "../toolkit/learned_cleanup_request.ai" as learned_request
+import "mask_inference_policy.ai" as inference_policy
+import "../toolkit/artifact_cleanup.ai" as cleanup_types
+import "../toolkit/secondary_config.ai" as secondary_config
+import "../toolkit/model_ensemble_config.ai" as ensemble_config
+import std.codec as codec
+
+pub type Accepted=struct{models:string,names:string,cleanup:string="",inference:string="",learned:string=""}
+// The caller durably selects both snapshots before transferring its model bank.
+pub fn accept(state:ref<prefs.State>,configuration:str,checkpoint:str,definition:str,ensemble:ref<option<ensemble_config.Recipe>>,secondary:ref<option<secondary_config.Recipe>>,items:ref<array<queue.Item>>)->result<Accepted,string>
+ effects {alloc,fs.read,fs.meta,time} {
+ let names:string=try naming.queue(state,configuration,checkpoint,definition,ensemble,secondary,items)
+ var selected:cleanup_types.Settings=if str.len(state.queue_model_snapshot)>0{try cleanup_policy.decode(state.queue_cleanup_snapshot)}else{try cleanup_policy.current(state.cleanup_enabled,state.cleanup_threshold)}
+ let cleanup:string=try cleanup_policy.encode(selected)
+ let inference:string=if str.len(state.queue_model_snapshot)>0{string.copy(state.queue_inference_snapshot)}else{try inference_policy.current(state.mask_tta,state.mask_window,state.mask_aggression)}
+ let _=try inference_policy.decode(inference)
+ let learned:string=if str.len(state.queue_model_snapshot)>0{string.copy(state.queue_learned_snapshot)}else{try learned_policy.current(state.noise_reduction,state.room_reduction,state.room_targets,state.noise_checkpoint,state.room_checkpoint)}
+ let _=try learned_request.decode(learned)
+ if str.len(state.queue_naming_snapshot)>0{
+  if str.len(state.queue_model_snapshot)==0{return result.err("Pending naming has no accepted model settings; explicitly use current settings")}
+  var selected:models.Snapshot=try models.decode(state.queue_model_snapshot)
+  let _=try models.verify(selected)
+  return result.ok(Accepted{models:string.copy(state.queue_model_snapshot),names:names,cleanup:cleanup,inference:inference,learned:learned})
+ }
+ let ensemble_raw:string=match ensemble{some(recipe)=>try ensemble_config.Recipe_encode(recipe) map_err codec.describe,none=>""}
+ let secondary_raw:string=match secondary{some(recipe)=>try secondary_config.Recipe_encode(recipe) map_err codec.describe,none=>""}
+ var primary_configuration:string=string.copy(configuration)
+ var primary_checkpoint:string=string.copy(checkpoint)
+ var primary_definition:string=string.copy(definition)
+ match ensemble{some(recipe)=>{
+  let first:ref<ensemble_config.Model>=array.borrow(recipe.models,0)
+  primary_configuration=string.copy(first.config)
+  primary_checkpoint=string.copy(first.checkpoint)
+  primary_definition=string.copy(first.definition)},none=>match secondary{some(recipe)=>{
+   let first:ref<secondary_config.Model>=array.borrow(recipe.models,0)
+   primary_configuration=string.copy(first.config)
+   primary_checkpoint=string.copy(first.checkpoint)
+   if str.len(first.definition)>0{primary_definition=string.copy(first.definition)}},none=>{}}}
+ let accepted:string=try models.capture_selected(primary_configuration,primary_checkpoint,ensemble_raw,secondary_raw,primary_definition)
+ result.ok(Accepted{models:accepted,names:names,cleanup:cleanup,inference:inference,learned:learned})
+}

@@ -1,0 +1,173 @@
+module stemair.hybrid.host_ops
+import "../ops.ai" as host
+import "../numeric.ai" as num
+import "../weights.ai" as weights
+import "../device_ops.ai" as forms
+import std.float as fp
+
+// Dense NCHW metadata for portable host compositions; learned products use the
+// shared checked CPU convolution/matrix APIs in host_prepared.
+pub type Tensor=struct{n:u64,c:u64,h:u64,w:u64,data:array<f32>,max_elements:u64=134217728}
+pub fn shape(x:ref<Tensor>)->array<u64> effects {alloc} {[x.n,x.c,x.h,x.w]}
+pub fn extent(n:u64,c:u64,h:u64,w:u64,maximum:u64)->result<u64,string> effects {alloc}{
+ if maximum==0 or maximum>2147483647 or n==0 or c==0 or h==0 or w==0 or
+  n>maximum or c>maximum/n or h>maximum/(n*c) or w>maximum/(n*c*h){return result.err("Invalid CPU hybrid dense tensor geometry")}
+ result.ok(n*c*h*w)
+}
+pub fn make(n:u64,c:u64,h:u64,w:u64,data:array<f32> own)->result<Tensor,string> effects {alloc}{
+ make_limited(n,c,h,w,data,134217728)
+}
+pub fn make_limited(n:u64,c:u64,h:u64,w:u64,data:array<f32> own,maximum:u64)->result<Tensor,string> effects {alloc}{
+ let count:u64=try extent(n,c,h,w,maximum)
+ if array.len(data)!=count{return result.err("Invalid CPU hybrid dense tensor geometry")}
+ result.ok(Tensor{n:n,c:c,h:h,w:w,data:data,max_elements:maximum})
+}
+pub fn copy(x:ref<Tensor>)->Tensor effects {alloc} {Tensor{n:x.n,c:x.c,h:x.h,w:x.w,data:num.copy(array.view(x.data)),max_elements:x.max_elements}}
+pub fn release(x:ref<Tensor>)->unit effects {alloc} {x.data=[]
+ ()}
+pub fn zeros(x:ref<Tensor>)->Tensor effects {alloc} {Tensor{n:x.n,c:x.c,h:x.h,w:x.w,data:num.zeros(array.len(x.data)),max_elements:x.max_elements}}
+pub fn add(a:Tensor own,b:ref<Tensor>)->result<Tensor,string> effects {alloc} {
+ var x:Tensor=a
+ if x.n!=b.n or x.c!=b.c or x.h!=b.h or x.w!=b.w{return result.err("CPU hybrid addition shapes differ")}
+ var i:u64=0
+ loop{if i==array.len(x.data){break}
+  array.set(x.data,i,array.get(x.data,i)+array.get(b.data,i))
+  i+=1}
+ result.ok(x)
+}
+pub fn gelu(input:Tensor own)->Tensor effects {alloc} {
+ var x:Tensor=input
+ var flattened:host.Tensor=host.tensor(x.n*x.c*x.h,1,x.w,struct.replace(x,[],field=data))
+ var activated:host.Tensor=host.gelu(flattened)
+ x.data=struct.replace(activated,[],field=data)
+ x
+}
+pub fn glu(input:Tensor own)->result<Tensor,string> effects {alloc} {
+ var x:Tensor=input
+ if x.c%2!=0{return result.err("CPU hybrid gated channels must be even")}
+ let channels:u64=x.c/2
+ let plane:u64=x.h*x.w
+ var out:array<f32>=[]
+ array.reserve(out,x.n*channels*plane)
+ var b:u64=0
+ loop{if b==x.n{break}
+  var i:u64=0
+  loop{if i==channels*plane{break}
+   let gate:f32=1.0/(1.0+fp.exp(-array.get(x.data,(b*x.c+channels)*plane+i)))
+   array.push(out,array.get(x.data,b*x.c*plane+i)*gate)
+   i+=1}
+  b+=1}
+ make_limited(x.n,channels,x.h,x.w,out,x.max_elements)
+}
+pub fn normalize(model:ref<weights.Model>,input:Tensor own,form:option<forms.Normalization>)->result<Tensor,string> effects {alloc} {
+ var x:Tensor=input
+ let norm:forms.Normalization=match form{some(v)=>v,none=>{return result.ok(x)}}
+ if norm.groups==0 or x.c%norm.groups!=0 or x.c/norm.groups*x.h*x.w<2{return result.err("CPU hybrid normalization groups differ")}
+ let gamma_count:u64=array.len(array.borrow(model.parameters.values,norm.weight).values)
+ let beta_count:u64=array.len(array.borrow(model.parameters.values,norm.bias).values)
+ if gamma_count!=x.c or beta_count!=x.c{return result.err("CPU hybrid normalization affines differ")}
+ var ones:array<f32>=[]
+ var zero:array<f32>=[]
+ var g:u64=0
+ loop{if g==norm.groups{break}
+  array.push(ones,1.0)
+  array.push(zero,0.0)
+  g+=1}
+ var scale:weights.Parameter=weights.Parameter{shape:[norm.groups],values:ones}
+ var shift:weights.Parameter=weights.Parameter{shape:[norm.groups],values:zero}
+ var out:array<f32>=[]
+ array.reserve(out,array.len(x.data))
+ let plane:u64=x.h*x.w
+ var b:u64=0
+ loop{if b==x.n{break}
+  let values:array<f32>=num.copy(view.slice(array.view(x.data),b*x.c*plane,(b+1)*x.c*plane))
+  var grouped:host.Tensor=host.tensor(norm.groups,(x.c/norm.groups)*x.h,x.w,values)
+  let normalized:host.Tensor=host.normalize(grouped,scale,shift)
+  var i:u64=0
+  loop{if i==x.c*plane{break}
+   let gamma:f32=array.get(array.borrow(model.parameters.values,norm.weight).values,i/plane)
+   let beta:f32=array.get(array.borrow(model.parameters.values,norm.bias).values,i/plane)
+   array.push(out,array.get(normalized.data,i)*gamma+beta)
+   i+=1}
+  b+=1}
+ x.data=out
+ result.ok(x)
+}
+pub fn crop(input:Tensor own,axis:u64,start:u64,count:u64)->result<Tensor,string> effects {alloc} {
+ var x:Tensor=input
+ if (axis!=2 and axis!=3) or count==0 or (axis==2 and (start>x.h or count>x.h-start)) or (axis==3 and (start>x.w or count>x.w-start)){return result.err("CPU hybrid crop exceeds spatial extent")}
+ let oh:u64=if axis==2{count}else{x.h}
+ let ow:u64=if axis==3{count}else{x.w}
+ var out:array<f32>=[]
+ array.reserve(out,x.n*x.c*oh*ow)
+ var row:u64=0
+ loop{if row==x.n*x.c{break}
+  var y:u64=0
+  loop{if y==oh{break}
+   var t:u64=0
+   loop{if t==ow{break}
+    let sy:u64=if axis==2{start+y}else{y}
+    let st:u64=if axis==3{start+t}else{t}
+    array.push(out,array.get(x.data,(row*x.h+sy)*x.w+st))
+    t+=1}
+   y+=1}
+  row+=1}
+ make_limited(x.n,x.c,oh,ow,out,x.max_elements)
+}
+pub fn pad_right(input:Tensor own,stride:u64)->result<Tensor,string> effects {alloc} {
+ var x:Tensor=input
+ if stride==0 or stride>x.max_elements or x.h!=1{return result.err("CPU hybrid time padding geometry differs")}
+ if x.w%stride==0{return result.ok(x)}
+ let width:u64=x.w+stride-x.w%stride
+ let _=try extent(x.n,x.c,1,width,x.max_elements)
+ var out:array<f32>=[]
+ array.reserve(out,x.n*x.c*width)
+ var row:u64=0
+ loop{if row==x.n*x.c{break}
+  var t:u64=0
+  loop{if t==width{break}
+   array.push(out,if t<x.w{array.get(x.data,row*x.w+t)}else{0.0})
+   t+=1}
+  row+=1}
+ make_limited(x.n,x.c,1,width,out,x.max_elements)
+}
+pub fn fold(input:Tensor own)->result<Tensor,string> effects {alloc} {
+ var x:Tensor=input
+ var out:array<f32>=[]
+ array.reserve(out,array.len(x.data))
+ var b:u64=0
+ loop{if b==x.n{break}
+  var h:u64=0
+  loop{if h==x.h{break}
+   var c:u64=0
+   loop{if c==x.c{break}
+    var t:u64=0
+    loop{if t==x.w{break}
+     array.push(out,array.get(x.data,((b*x.c+c)*x.h+h)*x.w+t))
+     t+=1}
+    c+=1}
+   h+=1}
+  b+=1}
+ make_limited(x.n*x.h,x.c,1,x.w,out,x.max_elements)
+}
+pub fn unfold(input:Tensor own,batches:u64,frequencies:u64)->result<Tensor,string> effects {alloc} {
+ var x:Tensor=input
+ let _=try extent(batches,x.c,frequencies,x.w,x.max_elements)
+ if x.n!=batches*frequencies or x.h!=1{return result.err("CPU hybrid folded batch differs")}
+ var out:array<f32>=[]
+ array.reserve(out,array.len(x.data))
+ var b:u64=0
+ loop{if b==batches{break}
+  var c:u64=0
+  loop{if c==x.c{break}
+   var h:u64=0
+   loop{if h==frequencies{break}
+    var t:u64=0
+    loop{if t==x.w{break}
+     array.push(out,array.get(x.data,((b*frequencies+h)*x.c+c)*x.w+t))
+     t+=1}
+    h+=1}
+   c+=1}
+  b+=1}
+ make_limited(batches,x.c,frequencies,x.w,out,x.max_elements)
+}

@@ -1,0 +1,62 @@
+module stemair.audio_tools
+import "numeric.ai" as num
+import "control.ai" as control
+import "spectral_residual.ai" as residual
+import std.float as fp
+
+pub type Output=struct{values:array<f32>,frames:u64}
+pub fn valid(operation:str)->bool effects {} {operation=="combine" or operation=="mix" or operation=="reduce" or operation=="spectral-residual"}
+pub fn validate(operation:str,count:u64,value:f64)->result<unit,string> effects {alloc} {
+ if not valid(operation){return result.err("Unknown audio tool")}
+ if count<2 or count>4096{return result.err("Select between two and 4096 audio inputs")}
+ if operation!="combine" and count!=2{return result.err("Paired audio tools require exactly two inputs")}
+ if not fp.is_finite(value) or value<0.0 or value>1.0{return result.err("Audio tool amount must be between 0 and 1")}
+ result.ok(())
+}
+// Channel-major stereo. Combine starts at zero and adds in selection order.
+// Pair operations round each scalar product before adding; they do not divide
+// by a weight sum. Shorter recordings receive right-side zero padding.
+pub fn process(inputs:ref<array<array<f32>>>,operation:str,value:f64,cancel:str,progress:str)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try validate(operation,array.len(inputs),value)
+ if control.cancelled(cancel){return result.err("Audio tool cancelled")}
+ var frames:u64=0
+ var retained:u64=0
+ var i:u64=0
+ loop{if i==array.len(inputs){break}
+  let samples:ref<array<f32>>=array.borrow(inputs,i)
+  let size:u64=array.len(samples)
+  if size==0 or size%2!=0 or not num.finite(array.view(samples)){return result.err("Audio tools require finite planar stereo inputs")}
+  if size>536870912-retained{return result.err("Audio tool exceeds its retained host memory bound")}
+  retained+=size
+  if size/2>frames{frames=size/2}
+  i+=1}
+ if operation=="spectral-residual"{
+  let first:array<f32>=num.copy(array.view(array.borrow(inputs,0)))
+  let second:ref<array<f32>>=array.borrow(inputs,1)
+  var separated:residual.Output=try residual.separate(array.view(first),array.view(second),cancel,progress)
+  return result.ok(Output{values:struct.replace(separated,[],field=values),frames:separated.frames})}
+ var output:array<f32>=num.zeros(2*frames)
+ i=0
+ loop{if i==array.len(inputs){break}
+  let input:ref<array<f32>>=array.borrow(inputs,i)
+  let length:u64=array.len(input)/2
+  let weight:f32=if operation=="mix"{if i==0{cast.float(value)}else{cast.float(1.0-value)}}else{
+   if operation=="reduce" and i==0{cast.float(1.0-value)}else{1.0}}
+  var channel:u64=0
+  loop{if channel==2{break}
+   var time:u64=0
+   let extent:u64=if operation=="mix"{frames}else{length}
+   loop{if time==extent{break}
+    if time%65536==0 and control.cancelled(cancel){return result.err("Audio tool cancelled")}
+    let sample:f32=if time<length{array.get(input,channel*length+time)}else{0.0}
+    let scaled:f32=if operation=="combine"{sample}else{sample*weight}
+    let index:u64=channel*frames+time
+    array.set(output,index,if operation=="mix" and i==0{scaled}else{array.get(output,index)+scaled})
+    time+=1}
+   channel+=1}
+  control.report(progress,i+1,array.len(inputs))
+  i+=1}
+ if not num.finite(array.view(output)){return result.err("Audio tool output overflow")}
+ if control.cancelled(cancel){return result.err("Audio tool cancelled")}
+ result.ok(Output{values:output,frames:frames})
+}

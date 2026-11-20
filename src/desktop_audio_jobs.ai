@@ -1,0 +1,89 @@
+module stemair.desktop_audio_jobs
+import "job.ai" as job
+import "queue_job.ai" as queue
+import "checked_input.ai" as checked
+import "recording_sample_application.ai" as sample
+import "sample_processing_jobs.ai" as sampled
+import "output_naming.ai" as naming
+pub type RecordingAlignment=struct{work:option<job.RecordingAlignmentWork>,policy:option<checked.Options>}
+pub fn run_RecordingAlignment(request:RecordingAlignment own)->job.Completed effects {alloc,fs.read,fs.write,fs.meta,gpu,process,time,env,ffi} {
+ var r:RecordingAlignment=request
+ let policy:option<checked.Options>=struct.replace(r,option.none(),field=policy)
+ match struct.replace(r,option.none(),field=work){none=>job.Completed{retained:option.none(),ok:false,message:"Audio task payload is unavailable",queue_report:option.none()},some(work)=>match policy{
+  none=>{var w:job.RecordingAlignmentWork=work
+   job.Completed{retained:struct.replace(w,option.none(),field=retained),ok:false,message:"Audio input policy is unavailable",queue_report:option.none()}},
+  some(options)=>job.run_recording_alignment(work,options)}}
+}
+
+pub type Time=struct{work:option<job.TimeWork>,policy:option<checked.Options>,sample:option<sample.Options>}
+pub fn run_Time(request:Time own)->job.Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var r:Time=request
+ let preparation:option<sample.Options>=struct.replace(r,option.none(),field=sample)
+ let policy:option<checked.Options>=struct.replace(r,option.none(),field=policy)
+ match struct.replace(r,option.none(),field=work){none=>job.Completed{retained:option.none(),ok:false,message:"Audio task payload is unavailable",queue_report:option.none()},some(work)=>sampled.dispatch(sampled.Payload.Time(work),policy,preparation)}
+}
+pub type Alignment=struct{work:option<job.AlignmentWork>,policy:option<checked.Options>}
+pub fn run_Alignment(request:Alignment own)->job.Completed effects {alloc,fs.read,fs.write,fs.meta,gpu,process,time,env,ffi} {
+ var r:Alignment=request
+ let policy:option<checked.Options>=struct.replace(r,option.none(),field=policy)
+ match struct.replace(r,option.none(),field=work){none=>job.Completed{retained:option.none(),ok:false,message:"Audio task payload is unavailable",queue_report:option.none()},some(work)=>match policy{none=>job.run_alignment(work),some(options)=>job.run_alignment_checked(work,options)}}
+}
+pub type Pitch=struct{work:option<job.PitchWork>,policy:option<checked.Options>,sample:option<sample.Options>}
+pub fn run_Pitch(request:Pitch own)->job.Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var r:Pitch=request
+ let preparation:option<sample.Options>=struct.replace(r,option.none(),field=sample)
+ let policy:option<checked.Options>=struct.replace(r,option.none(),field=policy)
+ match struct.replace(r,option.none(),field=work){none=>job.Completed{retained:option.none(),ok:false,message:"Audio task payload is unavailable",queue_report:option.none()},some(work)=>sampled.dispatch(sampled.Payload.Pitch(work),policy,preparation)}
+}
+pub type AudioTool=struct{work:option<job.AudioToolWork>,policy:option<checked.Options>}
+pub fn run_AudioTool(request:AudioTool own)->job.Completed effects {alloc,fs.read,fs.write,fs.meta,gpu,process,time,env,ffi} {
+ var r:AudioTool=request
+ let policy:option<checked.Options>=struct.replace(r,option.none(),field=policy)
+ match struct.replace(r,option.none(),field=work){none=>job.Completed{retained:option.none(),ok:false,message:"Audio task payload is unavailable",queue_report:option.none()},some(work)=>match policy{none=>job.run_audio_tool(work),some(options)=>job.run_audio_tool_checked(work,options)}}
+}
+pub type Queue=struct{work:option<queue.Work>,policy:option<checked.Options>,sample:option<sample.Options>,naming_snapshot:string=""}
+fn refuse_queue(work:queue.Work own,policy:option<checked.Options> own,preparation:option<sample.Options> own,problem:str)->job.Completed effects {alloc} {
+ var w:queue.Work=work
+ job.Completed{retained:struct.replace(w,option.none(),field=retained),ok:false,message:string.copy(problem),queue_report:option.none()}
+}
+pub fn run_Queue(request:Queue own)->job.Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var r:Queue=request
+ let preparation:option<sample.Options>=struct.replace(r,option.none(),field=sample)
+ let policy:option<checked.Options>=struct.replace(r,option.none(),field=policy)
+ match struct.replace(r,option.none(),field=work){none=>job.Completed{retained:option.none(),ok:false,message:"Audio task payload is unavailable",queue_report:option.none()},some(work)=>{
+ if str.len(r.naming_snapshot)>0{
+  return match naming.decode_queue(r.naming_snapshot){ok(selected)=>queue.run_named(work,selected,policy,preparation),err(problem)=>refuse_queue(work,policy,preparation,problem)}
+ }
+ match preparation{
+  none=>match policy{none=>queue.run(work),some(options)=>queue.run_checked(work,options)},
+  some(selected)=>match policy{some(options)=>queue.run_sampled(work,options,selected),none=>{
+   var w:queue.Work=work
+   job.Completed{retained:struct.replace(w,option.none(),field=retained),ok:false,message:"Audio input policy is unavailable",queue_report:option.none()}}}}}}
+}
+pub type Secondary=struct{work:option<job.SecondaryWork>,policy:option<checked.Options>,sample:option<sample.Options>,naming_snapshot:string=""}
+pub fn run_Secondary(request:Secondary own)->job.Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var r:Secondary=request
+ let preparation:option<sample.Options>=struct.replace(r,option.none(),field=sample)
+ let policy:option<checked.Options>=struct.replace(r,option.none(),field=policy)
+ match struct.replace(r,option.none(),field=work){none=>job.Completed{retained:option.none(),ok:false,message:"Audio task payload is unavailable",queue_report:option.none()},some(work)=>sampled.dispatch_snapshot(sampled.Payload.Secondary(work),policy,preparation,r.naming_snapshot)}
+}
+pub type ModelEnsemble=struct{work:option<job.ModelEnsembleWork>,policy:option<checked.Options>,sample:option<sample.Options>,naming_snapshot:string=""}
+pub fn run_ModelEnsemble(request:ModelEnsemble own)->job.Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var r:ModelEnsemble=request
+ let preparation:option<sample.Options>=struct.replace(r,option.none(),field=sample)
+ let policy:option<checked.Options>=struct.replace(r,option.none(),field=policy)
+ match struct.replace(r,option.none(),field=work){none=>job.Completed{retained:option.none(),ok:false,message:"Audio task payload is unavailable",queue_report:option.none()},some(work)=>sampled.dispatch_snapshot(sampled.Payload.ModelEnsemble(work),policy,preparation,r.naming_snapshot)}
+}
+pub type Ensemble=struct{work:option<job.EnsembleWork>,policy:option<checked.Options>}
+pub fn run_Ensemble(request:Ensemble own)->job.Completed effects {alloc,fs.read,fs.write,fs.meta,gpu,process,time,env,ffi} {
+ var r:Ensemble=request
+ let policy:option<checked.Options>=struct.replace(r,option.none(),field=policy)
+ match struct.replace(r,option.none(),field=work){none=>job.Completed{retained:option.none(),ok:false,message:"Audio task payload is unavailable",queue_report:option.none()},some(work)=>match policy{none=>job.run_ensemble(work),some(options)=>job.run_ensemble_checked(work,options)}}
+}
+pub type Single=struct{work:option<job.Work>,policy:option<checked.Options>,sample:option<sample.Options>,naming_snapshot:string=""}
+pub fn run_Single(request:Single own)->job.Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var r:Single=request
+ let preparation:option<sample.Options>=struct.replace(r,option.none(),field=sample)
+ let policy:option<checked.Options>=struct.replace(r,option.none(),field=policy)
+ match struct.replace(r,option.none(),field=work){none=>job.Completed{retained:option.none(),ok:false,message:"Audio task payload is unavailable",queue_report:option.none()},some(work)=>sampled.dispatch_snapshot(sampled.Payload.Single(work),policy,preparation,r.naming_snapshot)}
+}

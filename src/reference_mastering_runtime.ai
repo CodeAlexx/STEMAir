@@ -1,0 +1,76 @@
+module stemair.reference_mastering_runtime
+import "../toolkit/reference_mastering_protocol.ai" as protocol
+import "reference_mastering_application.ai" as application
+import "reference_mastering_plan.ai" as planning
+import "recording_sample_runtime.ai" as sample_runtime
+import "alignment_runtime.ai" as dot_runtime
+import "codec_runtime.ai" as codecs
+import "audio_io_policy.ai" as audio_io
+import "wav_export.ai" as wav
+import std.files as files
+import std.path as path
+import std.text as text
+import std.system as system
+import std.process as proc
+import std.codec as codec
+import std.json as json
+
+fn installed(root:str,name:str)->result<string,string> effects {alloc,fs.meta} {
+ let candidates:array<string>=[path.join(path.join(root,"runtime/reference-mastering"),name),path.join(path.join(root,"build/runtime/reference-mastering"),name)]
+ var i:u64=0
+ loop{if i==array.len(candidates){break}
+  let candidate:str=array.get(candidates,i)
+  match files.symlink_metadata(candidate){ok(info)=>{
+   if not info.is_file or info.is_symlink{return result.err("The mastering runtime must be an ordinary file")}
+   return result.ok(string.copy(candidate))},err(problem)=>{if problem.code!=1{return result.err("Cannot inspect the mastering runtime")}}}
+  i+=1}
+ result.err("Reference mastering requires its installed native audio processor and transform runtime")
+}
+pub fn runtime(root:str,library:str,codec_directory:str)->result<protocol.Runtime,string> effects {alloc,env,fs.read,fs.meta} {
+ let windows:bool=system.platform()=="windows"
+ let bytes:bytes=match files.read_limited(path.join(root,"licenses/reference-mastering-runtime.json"),16384){ok(value)=>value,err(_)=>{return result.err("The mastering runtime identity is unavailable")}}
+ let source:str=match str.from_bytes(bytes.view(bytes)){some(value)=>value,none=>{return result.err("The mastering runtime identity must be UTF-8")}}
+ var document:json.Document=match json.parse(source){ok(value)=>value,err(_)=>{return result.err("The mastering runtime identity is invalid")}}
+ let policy:codec.Policy=codec.Policy{reject_unknown:false,reject_duplicates:true}
+ var reader:codec.Reader=codec.root_reader(policy)
+ if (try codec.text_field(document,reader,"schema") map_err codec.describe)!="native-reference-mastering-runtime-v1"{return result.err("The mastering runtime identity is unsupported")}
+ var host:codec.Reader=try codec.object_field(document,reader,if windows{"windows"}else{"linux"},policy) map_err codec.describe
+ let helper_name:string=try codec.text_field(document,host,"helper_name") map_err codec.describe
+ let helper_sha:string=try codec.text_field(document,host,"helper_sha256") map_err codec.describe
+ let fft_name:string=try codec.text_field(document,host,"fft_name") map_err codec.describe
+ let fft_sha:string=try codec.text_field(document,host,"fft_sha256") map_err codec.describe
+ let sndfile_sha:string=try codec.text_field(document,host,"sndfile_sha256") map_err codec.describe
+ let sndfile_version:string=try codec.text_field(document,host,"sndfile_version") map_err codec.describe
+ let dot_sha:string=try codec.text_field(document,host,"dot_sha256") map_err codec.describe
+ let _=try codec.reader_finish(document,host) map_err codec.describe
+ let _=try codec.reader_finish(document,reader) map_err codec.describe
+ if helper_name!=if windows{"stem-mastering.exe"}else{"stem-mastering"} or fft_name!=if windows{"air_cpu_fft.dll"}else{"libair_cpu_fft.so"}{return result.err("The mastering runtime filenames are incompatible")}
+ let decoder=match try sample_runtime.decoder(root,library){none=>{return result.err("Choose the sound-file library for reference mastering")},some(value)=>value}
+ if str.view(decoder.sha256)!=str.view(sndfile_sha) or str.view(decoder.version)!=str.view(sndfile_version){return result.err("The sound-file library identity differs from the mastering runtime")}
+ let dot=try dot_runtime.settings(root,false,false)
+ if str.view(dot.runtime_sha256)!=str.view(dot_sha){return result.err("The CPU audio library identity differs from the mastering runtime")}
+ let filter=try sample_runtime.rate_filter(root)
+ let encoder=try codecs.input_tool(root,codec_directory)
+ var selected:protocol.Runtime=protocol.Runtime{helper:protocol.Tool{path:try installed(root,helper_name),sha256:helper_sha},
+  sndfile:protocol.Tool{path:string.copy(decoder.path),sha256:sndfile_sha},sndfile_version:sndfile_version,
+  fft:protocol.Tool{path:try installed(root,fft_name),sha256:fft_sha},dot:protocol.Tool{path:string.copy(dot.runtime),sha256:dot_sha},
+  filter:protocol.Tool{path:string.copy(filter.path),sha256:string.copy(filter.sha256)},ffmpeg:match encoder{none=>protocol.Tool{path:"",sha256:""},some(value)=>protocol.Tool{path:string.copy(value.path),sha256:string.copy(value.sha256)}}}
+ let _=try protocol.verify_tool(struct.borrow(selected,field=helper))
+ let _=try protocol.verify_tool(struct.borrow(selected,field=fft))
+ let _=try protocol.verify_tool(struct.borrow(selected,field=sndfile))
+ let _=try protocol.verify_tool(struct.borrow(selected,field=dot))
+ let _=try protocol.verify_tool(struct.borrow(selected,field=filter))
+ result.ok(selected)
+}
+pub fn request(root:str,library:str,codec_directory:str,targets:ref<array<string>>,references:ref<array<string>>,directory:str,prefix:str,budget:u32,wav_choice:u32,codec_recipe:str,cancel:str,progress:str)->result<protocol.Request,string> effects {alloc,env,fs.read,fs.meta,time} {
+ let bytes:u64=try audio_io.budget(budget)
+ let selected:protocol.Runtime=try runtime(root,library,codec_directory)
+ let subtype=try wav.from_choice(wav_choice)
+ var output:protocol.Request=protocol.Request{runtime:selected,pairs:[],subtype:string.copy(wav.name(subtype)),codec_recipe:string.copy(codec_recipe),
+  work_directory:path.join(directory,text.concat(".stemair-mastering-",string.from_int(time.monotonic_ns()))),cancel:string.copy(cancel),progress:string.copy(progress),
+  deadline_ns:proc.deadline_in(86400000),limits:protocol.Limits{max_decoded_bytes:bytes,max_working_bytes:bytes*16,max_export_bytes:bytes*2+4096}}
+ let format=try planning.make(output)
+ output.pairs=try application.pairs(targets,references,directory,prefix,format)
+ let _=try protocol.validate(output)
+ result.ok(output)
+}

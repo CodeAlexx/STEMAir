@@ -1,0 +1,58 @@
+module stemair.exchange.host_session
+import "session.ai" as session
+import "host.ai" as host
+import "config.ai" as config
+import "audio.ai" as envelope
+import "plan.ai" as plan
+import "../spectral.ai" as spectral
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../weights.ai" as weights
+import "../control.ai" as control
+import "../audio_result.ai" as audio_result
+
+fn predict(graph:ref<plan.Plan>,packed:ref<ops.Tensor>,negative:bool,cancel:str)->result<array<f32>,string> effects {alloc,fs.meta} {
+ var values:array<f32>=num.copy(array.view(packed.data))
+ if negative{
+  var i:u64=0
+  loop{if i>=array.len(values){break}
+   array.set(values,i,-array.get(values,i))
+   i+=1}}
+ let input:weights.Parameter=weights.Parameter{shape:[1,packed.c,packed.h,packed.w],values:values}
+ var predicted:weights.Parameter=try host.forward(graph,input,cancel)
+ if array.len(predicted.shape)!=4 or array.get(predicted.shape,0)!=1 or array.get(predicted.shape,1)!=packed.c or
+  array.get(predicted.shape,2)!=packed.h or array.get(predicted.shape,3)!=packed.w{return result.err("Interchange graph returned the wrong spectral shape")}
+ result.ok(struct.replace(predicted,[],field=values))
+}
+pub fn separate_state(graph:ref<plan.Plan>,stft:ref<spectral.Plan>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<envelope.State,string> effects {alloc,fs.meta,fs.write} {
+ var state:envelope.State=try envelope.begin(c,input)
+ loop{if state.index>=state.total{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  control.report(progress,state.index,state.total)
+  if envelope.intersects(state){
+   let part:array<f32>=envelope.extract(state,input)
+   var packed:ops.Tensor=try envelope.analyze(stft,c,array.view(part))
+   var predicted:array<f32>=[]
+   if c.denoise{
+    let negative:array<f32>=try predict(graph,packed,true,cancel)
+    let positive:array<f32>=try predict(graph,packed,false,cancel)
+    var i:u64=0
+    loop{if i>=array.len(positive){break}
+     array.push(predicted,-array.get(negative,i)*0.5+array.get(positive,i)*0.5)
+     i+=1}
+   }else{predicted=try predict(graph,packed,false,cancel)}
+   let output:array<f32>=try envelope.synthesize(stft,c,predicted)
+   let _=try envelope.accumulate(state,array.view(output))
+  }
+  state.index+=1}
+ control.report(progress,state.total,state.total)
+ result.ok(state)
+}
+pub fn separate(graph:ref<plan.Plan>,stft:ref<spectral.Plan>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,fs.meta,fs.write} {
+ var state:envelope.State=try separate_state(graph,stft,c,input,cancel,progress)
+ envelope.finish(state,input,c.compensation)
+}
+pub fn separate_typed(graph:ref<plan.Plan>,stft:ref<spectral.Plan>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<audio_result.Samples,string> effects {alloc,fs.meta,fs.write} {
+ var state:envelope.State=try separate_state(graph,stft,c,input,cancel,progress)
+ envelope.finish_typed(state,input,c.compensation)
+}

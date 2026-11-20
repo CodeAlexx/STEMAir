@@ -1,0 +1,71 @@
+module stemair.initial_polarity
+import std.cpu_dot as dot
+import std.cpu_syrk as syrk
+import std.pairwise_sum as pairwise
+import std.float as fp
+
+pub type Decision=struct{inverted:bool,coefficient:f64,frames:u64}
+fn unavailable(frames:u64)->Decision effects {} {
+ let zero:f64=0.0
+ Decision{inverted:false,coefficient:zero/zero,frames:frames}
+}
+fn point(values:view<f32>,frames:u64,channels:u64,index:u64,combine:bool)->f32 effects {} {
+ let first:f32=view.get(values,index)
+ if not combine{return first}
+ let second:f32=if channels==1{first}else{view.get(values,frames+index)}
+ let initial:f32=0.0+first
+ let sum:f32=initial+second
+ sum/2.0
+}
+pub fn detect(engine:ref<dot.Engine>,first:view<f32>,second:view<f32>,first_channels:u64,second_channels:u64)
+ ->result<Decision,string> effects {alloc,ffi} {
+ if (first_channels!=1 and first_channels!=2) or (second_channels!=1 and second_channels!=2) or
+  view.len(first)==0 or view.len(second)==0 or view.len(first)%first_channels!=0 or view.len(second)%second_channels!=0{
+  return result.err("Automatic polarity requires nonempty planar mono or stereo inputs")}
+ let first_frames:u64=view.len(first)/first_channels
+ let second_frames:u64=view.len(second)/second_channels
+ let count:u64=if first_frames<1000{first_frames}else{1000}
+ let other:u64=if second_frames<1000{second_frames}else{1000}
+ // The source stacks both first-1000 runs for corrcoef; unequal short runs fail.
+ if count!=other{return result.err("Automatic polarity cannot compare unequal short inputs (under 1000 frames); choose unchanged or invert")}
+ if count==1{return result.ok(unavailable(count))}
+ let combine:bool=first_channels!=1 or second_channels!=1
+ var left:array<f64>=[]
+ var right:array<f64>=[]
+ var i:u64=0
+ loop{if i==count{break}
+  let a:f32=point(first,first_frames,first_channels,i,combine)
+  let b:f32=point(second,second_frames,second_channels,i,combine)
+  // Finite input stereo additions may overflow F32; the original corrcoef
+  // then produces NaN and selects no reversal.
+  if not fp.is_finite(a) or not fp.is_finite(b){return result.ok(unavailable(count))}
+  array.push(left,cast.float(a))
+  array.push(right,cast.float(b))
+  i+=1}
+ let divisor:f64=cast.float(count)
+ let first_mean:f64=pairwise.sum_f64(array.view(left))/divisor
+ let second_mean:f64=pairwise.sum_f64(array.view(right))/divisor
+ var centered:array<f64>=[]
+ array.reserve(centered,2*count)
+ i=0
+ loop{if i==count{break}
+  array.push(centered,array.get(left,i)-first_mean)
+  i+=1}
+ i=0
+ loop{if i==count{break}
+  array.push(centered,array.get(right,i)-second_mean)
+  i+=1}
+ var matrix:syrk.Matrix=try syrk.pack_f64(array.view(centered),2,count)
+ let gram:array<f64>=try syrk.gram_f64(engine,matrix)
+ let degrees:f64=cast.float(count-1)
+ let factor:f64=1.0/degrees
+ let first_variance:f64=array.get(gram,0)*factor
+ let covariance:f64=array.get(gram,1)*factor
+ let second_variance:f64=array.get(gram,3)*factor
+ if first_variance==0.0 or second_variance==0.0{return result.ok(unavailable(count))}
+ let first_scale:f64=fp.sqrt(first_variance)
+ let second_scale:f64=fp.sqrt(second_variance)
+ let normalized:f64=(covariance/first_scale)/second_scale
+ let coefficient:f64=if normalized< -1.0{-1.0}else{if normalized>1.0{1.0}else{normalized}}
+ result.ok(Decision{inverted:coefficient<0.0,coefficient:coefficient,frames:count})
+}

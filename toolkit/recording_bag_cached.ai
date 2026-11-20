@@ -1,0 +1,29 @@
+module stemair.recording_bag_cached
+import "model_cache.ai" as cache
+import "recording_context.ai" as context
+import "recording_bag_cpu.ai" as cpu
+import "recording_bag_gpu.ai" as gpu_bag
+import "recording_bag_request.ai" as request
+import "audio_result.ai" as audio
+fn limits(c:ref<context.Context>)->request.Limits effects {}{
+ request.Limits{max_waveform_bytes:c.waveform_bytes,max_frontends:65,transform_bytes:c.transform_bytes}
+}
+pub fn separate_cpu(bank:ref<cache.Cache>,index:u64,input:view<f32>,cancel:str,progress:str,controls:ref<context.Context>)->result<audio.Samples,string> effects {alloc,ffi,fs.meta,fs.write}{
+ let _=try cache.require_cpu_policy(bank)
+ if index>=array.len(bank.entries) or array.len(bank.cpu)!=1{return result.err("Recording bag requires its retained shared CPU library")}
+ let allowance:request.Limits=limits(controls)
+ let model=struct.borrow(array.borrow(bank.entries,index),field=model)
+ if model.profile.kind!="recording-bundle" or array.len(model.recording_bags)!=1{return result.err("Recording bag retained model is unavailable")}
+ var output:request.Output=try cpu.separate(array.borrow(model.recording_bags,0),struct.borrow(array.borrow(bank.cpu,0),field=library),input,controls,allowance,cancel,progress)
+ model.requests+=1
+ result.ok(audio.from_single(struct.replace(output,[],field=values)))
+}
+pub fn separate_gpu(bank:ref<cache.Cache>,index:u64,input:view<f32>,cancel:str,progress:str,controls:ref<context.Context>)->result<audio.Samples,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ if index>=array.len(bank.entries){return result.err("Recording bag model index is out of range")}
+ let allowance:request.Limits=limits(controls)
+ let model=struct.borrow(array.borrow(bank.entries,index),field=model)
+ if model.profile.kind!="recording-bundle" or array.len(model.recording_bags)!=1{return result.err("Recording bag retained model is unavailable")}
+ var output:request.Output=try gpu_bag.separate(array.borrow(model.recording_bags,0),input,controls,allowance,cancel,progress)
+ model.requests+=1
+ result.ok(audio.from_single(struct.replace(output,[],field=values)))
+}

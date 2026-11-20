@@ -1,0 +1,39 @@
+// Typed source-defined gain choices. Recipe controls remain separate from UI.
+module stemair.alignment_options
+import std.libm as libm
+import std.cabi as native
+import "local_residual.ai" as local
+pub type GainChoice=enum{Unity,Low,Medium,High,VeryHigh}
+pub fn gain_steps(choice:GainChoice)->u64 effects {} {
+ match choice{Unity=>1,Low=>8,Medium=>12,High=>25,VeryHigh=>41}
+}
+pub fn base_db(choice:GainChoice)->f64 effects {} {
+ match choice{Unity=>0.0,Low=> -4.0,Medium=> -6.0,High=> -6.0,VeryHigh=> -10.0}
+}
+pub fn offset_db(choice:GainChoice,index:u64)->result<f64,string> effects {alloc} {
+ if index>=gain_steps(choice){return result.err("Gain offset index is outside the selected recipe")}
+ let scalar:f64=cast.float(index)
+ result.ok(if choice==GainChoice.High or choice==GainChoice.VeryHigh{scalar*0.5}else{scalar})
+}
+pub fn gains(library:ref<CAbiLibrary>,choice:GainChoice)->result<array<f64>,string> effects {alloc,ffi} {
+ var values:array<f64>=[]
+ array.push(values,try libm.pow(library,10.0,base_db(choice)/20.0) map_err native.error_message)
+ var i:u64=0
+ loop{if i==gain_steps(choice){break}
+  let exponent:f64=(try offset_db(choice,i))/20.0
+  array.push(values,try libm.pow(library,10.0,exponent) map_err native.error_message)
+  i+=1}
+ result.ok(values)
+}
+pub type WindowSet=enum{Sixteenth,Eighth,Quarter,Half,LowSet,MediumSet,HighSet,ThreeQuarter,One,Two}
+pub type IntroSet=enum{Default,Eighth,Sixth,Quarter,Half,Dual,Triple,Five}
+pub fn windows(choice:WindowSet)->array<local.WindowChoice> effects {alloc} {
+ match choice{Sixteenth=>[local.WindowChoice.SixteenthSecond],Eighth=>[local.WindowChoice.EighthSecond],Quarter=>[local.WindowChoice.QuarterSecond],Half=>[local.WindowChoice.HalfSecond],
+  LowSet=>[local.WindowChoice.SixteenthSecond,local.WindowChoice.HalfSecond],
+  MediumSet=>[local.WindowChoice.SixteenthSecond,local.WindowChoice.EighthSecond,local.WindowChoice.HalfSecond],
+  HighSet=>[local.WindowChoice.SixteenthSecond,local.WindowChoice.EighthSecond,local.WindowChoice.QuarterSecond,local.WindowChoice.HalfSecond],
+  ThreeQuarter=>[local.WindowChoice.ThreeQuarterSecond],One=>[local.WindowChoice.OneSecond],Two=>[local.WindowChoice.TwoSeconds]}
+}
+pub fn intros(choice:IntroSet)->array<u64> effects {alloc} {
+ match choice{Default=>[10],Eighth=>[8],Sixth=>[6],Quarter=>[4],Half=>[2],Dual=>[1,10],Triple=>[1,10,8],Five=>[1,10,8,6,4]}
+}

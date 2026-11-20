@@ -1,0 +1,275 @@
+module stemair.queue_job
+import "mask_inference_policy.ai" as inference_policy
+import "../toolkit/learned_cleanup_request.ai" as learned_request
+import "recording_inference_policy.ai" as recording_policy
+import "../toolkit/recording_context.ai" as recording_context
+import "../toolkit/recording_state.ai" as recording_state
+import "job.ai" as job
+import "time_application.ai" as audio_time
+import "pitch_application.ai" as pitch
+import "checked_input.ai" as checked_input
+import "recording_sample_application.ai" as sample
+import "processing_sample.ai" as prepare
+import "sample_processing_jobs.ai" as sampled
+import "output_naming.ai" as naming
+import "queue_naming.ai" as named_queue
+import "queue_config.ai" as config
+import "../toolkit/model_cache.ai" as cache
+import "../toolkit/model_ensemble_config.ai" as model_config
+import "../toolkit/secondary_config.ai" as secondary_config
+import "../toolkit/control.ai" as control
+import std.codec as codec
+import std.json as json
+import std.files as files
+import std.path as path
+import std.text as text
+
+pub type Work=struct{retained:option<cache.Cache>,items:array<config.Item>,settings:string,checkpoint:string,
+ ensemble:option<model_config.Recipe>,secondary:option<secondary_config.Recipe>,directory:string,cancel:string,progress:string,use_gpu:bool,gpu_index:u32=0,application_root:string="",mask_high_band:u32=0,mask_cleanup:bool=false,mask_cleanup_threshold:f64=0.2,mask_controls:string="",learned_controls:string="",recording_controls:string="",recording_state:string="",
+ continue_on_error:bool=false,report_file:string="",wav_choice:u32=4,codec_recipe:string="",export_max_frames:u64=0,export_max_stage_bytes:u64=0,export_max_encoded_bytes:u64=0,audio_time_recipe:string="",pitch_recipe:string=""}
+fn request_offset_budget(options:ref<option<checked_input.Options>>)->u64 effects {} {
+ match options{none=>536870912,some(value)=>value.limits.max_decoded_bytes}
+}
+fn counters(kept:ref<option<cache.Cache>>,report:ref<config.Report>)->unit effects {} {
+ if array.len(report.checkpoints)==0{return ()}
+ match kept{none=>{},some(bank)=>{report.checkpoint_loads=cache.loads(bank)
+  report.bytes_read=cache.bytes_read(bank)
+  report.inference_requests=cache.requests(bank)}}
+ ()
+}
+fn record(report:ref<config.Report>,index:u64,state:str,message:str)->unit effects {alloc} {
+ let item:ref<config.Outcome>=array.borrow(report.items,index)
+ item.state=string.copy(state)
+ item.message=string.copy(message)
+ ()
+}
+fn persist(w:ref<Work>,report:ref<config.Report>)->result<unit,string> effects {alloc,fs.write} {
+ if str.len(w.report_file)==0{return result.ok(())}
+ counters(struct.borrow(w,field=retained),report)
+ let encoded:string=try config.Report_encode(report) map_err codec.describe
+ match files.write_atomic(w.report_file,text.concat(w.report_file,".tmp"),encoded){ok(_)=>result.ok(()),err(_)=>result.err("Cannot update the recording queue report")}
+}
+fn item_naming(names:ref<option<naming.Queue>>,index:u64)->result<option<naming.Selection>,string> effects {alloc} {
+ result.ok(match names{none=>option.none(),some(snapshot)=>option.some(try named_queue.item(snapshot,index))})
+}
+fn execute(w:ref<Work>,report:ref<config.Report>,exports:ref<Exports>,input_options:ref<option<checked_input.Options>>,samples:ref<option<sample.Options>>,naming_options:ref<option<naming.Queue>>)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ let _=try config.validate(struct.borrow(w,field=items))
+ let tool:bool=str.len(w.audio_time_recipe)>0 or str.len(w.pitch_recipe)>0
+ if tool{
+  if (str.len(w.audio_time_recipe)>0 and str.len(w.pitch_recipe)>0) or str.len(w.settings)>0 or str.len(w.checkpoint)>0 or match w.ensemble{some(_)=>true,none=>false} or match w.secondary{some(_)=>true,none=>false}{return result.err("Choose exactly one queue processing workflow")}
+  if str.len(w.audio_time_recipe)>0{let _=try audio_time.decode(w.audio_time_recipe)}else{let _=try pitch.decode(w.pitch_recipe)}}
+ let root:string=string.copy(w.directory)
+ let is_dir:bool=match files.is_dir(root){ok(v)=>v,err(_)=>false}
+ if not is_dir{return result.err("Queue output directory must already exist")}
+ report.use_gpu=if tool{false}else{w.use_gpu}
+ let secondary_selection:string=match w.secondary{none=>"",some(c)=>{
+  var member:u64=0
+  loop{if member==array.len(c.models){break}
+   array.push(report.configurations,string.copy(array.borrow(c.models,member).config))
+   array.push(report.checkpoints,string.copy(array.borrow(c.models,member).checkpoint))
+   member+=1}
+  try secondary_config.Recipe_encode(c) map_err codec.describe}}
+ let selection:string=match w.ensemble{none=>{
+  if str.len(secondary_selection)==0 and not tool{array.push(report.configurations,string.copy(w.settings))
+   array.push(report.checkpoints,string.copy(w.checkpoint))}
+  ""},some(c)=>{
+  var member:u64=0
+  loop{if member==array.len(c.models){break}
+   array.push(report.configurations,string.copy(array.borrow(c.models,member).config))
+   array.push(report.checkpoints,string.copy(array.borrow(c.models,member).checkpoint))
+   member+=1}
+  try model_config.Recipe_encode(c) map_err codec.describe}}
+ if str.len(selection)>0 and str.len(secondary_selection)>0{return result.err("Choose one processing workflow for the recording queue")}
+ if not tool and str.len(selection)==0 and str.len(secondary_selection)==0 and (str.len(w.settings)==0 or str.len(w.checkpoint)==0){return result.err("Choose a model for the recording queue")}
+ var i:u64=0
+ loop{if i==array.len(w.items){break}
+  let item:ref<config.Item>=array.borrow(w.items,i)
+  array.push(report.items,config.Outcome{input:string.copy(item.input),folder:string.copy(item.folder)})
+  i+=1}
+ let file:string=path.join(root,text.concat("queue-",text.concat(string.from_int(time.monotonic_ns()),".json")))
+ let initial:string=try config.Report_encode(report) map_err codec.describe
+ match files.write_new_text(file,initial){ok(_)=>{},err(_)=>{return result.err("Cannot create a new recording queue report")}}
+ w.report_file=string.copy(file)
+ report.state="running"
+ i=0
+ loop{if i==array.len(w.items){break}
+  if control.cancelled(w.cancel){report.state="cancelled"
+   return result.err("Recording queue cancelled")}
+  let input:string=string.copy(array.borrow(w.items,i).input)
+  let destination:string=path.join(root,array.borrow(w.items,i).folder)
+  match files.mkdirs(destination){ok(_)=>{},err(_)=>{
+   record(report,i,"failed","Cannot create a queued recording output folder")
+   report.failed+=1
+   if not w.continue_on_error{report.state="stopped"
+    return result.err("Cannot create a queued recording output folder")}
+   let _=try persist(w,report)
+   i+=1
+   continue}}
+  record(report,i,"running","")
+  let _=try persist(w,report)
+  if str.len(w.progress)>0{
+   let overall:string=text.concat("Recording ",text.concat(string.from_int(i+1),text.concat(" / ",text.concat(string.from_int(array.len(w.items)),text.concat(": ",path.basename(input))))))
+   let _=files.write_atomic(text.concat(w.progress,".queue"),text.concat(w.progress,".queue.tmp"),overall)
+   let _=files.write_atomic(w.progress,text.concat(w.progress,".tmp"),overall)}
+  let preparation:option<sample.Options>=match samples{none=>option.none(),some(options)=>option.some(prepare.queue_options(options,i,w.cancel))}
+  let input_policy:option<checked_input.Options>=match input_options{none=>option.none(),some(options)=>option.some(checked_input.queue_item(options,i,w.cancel))}
+  let selected_naming:option<naming.Selection>=try item_naming(naming_options,i)
+  var completed:job.Completed=if tool{
+   if str.len(w.audio_time_recipe)>0{
+    let task:job.TimeWork=job.TimeWork{retained:struct.replace(w,option.none(),field=retained),settings:try audio_time.decode(w.audio_time_recipe),input:input,output:destination,cancel:string.copy(w.cancel),progress:string.copy(w.progress),wav_choice:w.wav_choice,codec_recipe:string.copy(w.codec_recipe),export_max_frames:w.export_max_frames,export_max_stage_bytes:w.export_max_stage_bytes,export_max_encoded_bytes:w.export_max_encoded_bytes}
+    sampled.dispatch(sampled.Payload.Time(task),input_policy,preparation)
+   }else{
+    let task:job.PitchWork=job.PitchWork{retained:struct.replace(w,option.none(),field=retained),settings:try pitch.decode(w.pitch_recipe),input:input,output:destination,cancel:string.copy(w.cancel),progress:string.copy(w.progress),wav_choice:w.wav_choice,codec_recipe:string.copy(w.codec_recipe),export_max_frames:w.export_max_frames,export_max_stage_bytes:w.export_max_stage_bytes,export_max_encoded_bytes:w.export_max_encoded_bytes}
+    sampled.dispatch(sampled.Payload.Pitch(task),input_policy,preparation)}
+  }else{if str.len(secondary_selection)>0{
+   let settings:secondary_config.Recipe=try secondary_config.Recipe_decode(secondary_selection) map_err codec.describe
+   let cancel:string=string.copy(w.cancel)
+   let progress:string=string.copy(w.progress)
+   let gpu:bool=w.use_gpu
+   let codec_recipe:string=string.copy(w.codec_recipe)
+   let task:job.SecondaryWork=job.SecondaryWork{retained:struct.replace(w,option.none(),field=retained),settings:settings,input:input,
+    output:destination,cancel:cancel,progress:progress,use_gpu:gpu,gpu_index:w.gpu_index,application_root:string.copy(w.application_root),mask_controls:string.copy(w.mask_controls),learned_controls:string.copy(w.learned_controls),recording_controls:string.copy(w.recording_controls),recording_state:string.copy(w.recording_state),mask_high_band:w.mask_high_band,mask_cleanup:w.mask_cleanup,mask_cleanup_threshold:w.mask_cleanup_threshold,wav_choice:w.wav_choice,codec_recipe:codec_recipe,export_max_frames:w.export_max_frames,export_max_stage_bytes:w.export_max_stage_bytes,export_max_encoded_bytes:w.export_max_encoded_bytes}
+   sampled.dispatch_selected(sampled.Payload.Secondary(task),input_policy,preparation,selected_naming)
+  }else{if str.len(selection)==0{
+   let settings:string=string.copy(w.settings)
+   let checkpoint:string=string.copy(w.checkpoint)
+   let cancel:string=string.copy(w.cancel)
+   let progress:string=string.copy(w.progress)
+   let gpu:bool=w.use_gpu
+   let codec_recipe:string=string.copy(w.codec_recipe)
+   let task:job.Work=job.Work{retained:struct.replace(w,option.none(),field=retained),settings:settings,checkpoint:checkpoint,input:input,
+    output:destination,cancel:cancel,progress:progress,use_gpu:gpu,gpu_index:w.gpu_index,application_root:string.copy(w.application_root),mask_controls:string.copy(w.mask_controls),learned_controls:string.copy(w.learned_controls),recording_controls:string.copy(w.recording_controls),recording_state:string.copy(w.recording_state),mask_high_band:w.mask_high_band,mask_cleanup:w.mask_cleanup,mask_cleanup_threshold:w.mask_cleanup_threshold,wav_choice:w.wav_choice,codec_recipe:codec_recipe,export_max_frames:w.export_max_frames,export_max_stage_bytes:w.export_max_stage_bytes,export_max_encoded_bytes:w.export_max_encoded_bytes}
+   sampled.dispatch_selected(sampled.Payload.Single(task),input_policy,preparation,selected_naming)
+  }else{
+   let settings:model_config.Recipe=try model_config.Recipe_decode(selection) map_err codec.describe
+   let cancel:string=string.copy(w.cancel)
+   let progress:string=string.copy(w.progress)
+   let gpu:bool=w.use_gpu
+   let codec_recipe:string=string.copy(w.codec_recipe)
+   let task:job.ModelEnsembleWork=job.ModelEnsembleWork{retained:struct.replace(w,option.none(),field=retained),settings:settings,
+    input:input,output:destination,cancel:cancel,progress:progress,use_gpu:gpu,gpu_index:w.gpu_index,application_root:string.copy(w.application_root),mask_controls:string.copy(w.mask_controls),learned_controls:string.copy(w.learned_controls),recording_controls:string.copy(w.recording_controls),recording_state:string.copy(w.recording_state),mask_high_band:w.mask_high_band,mask_cleanup:w.mask_cleanup,mask_cleanup_threshold:w.mask_cleanup_threshold,wav_choice:w.wav_choice,codec_recipe:codec_recipe,export_max_frames:w.export_max_frames,export_max_stage_bytes:w.export_max_stage_bytes,export_max_encoded_bytes:w.export_max_encoded_bytes}
+   sampled.dispatch_selected(sampled.Payload.ModelEnsemble(task),input_policy,preparation,selected_naming)}}}
+  if not tool{w.recording_state=string.copy(completed.recording_state)}
+  w.retained=struct.replace(completed,option.none(),field=retained)
+  let _=try absorb(exports,completed.export_report)
+  if completed.ok{record(report,i,"complete","")
+   report.succeeded+=1
+  }else{
+   if control.cancelled(w.cancel){record(report,i,"cancelled",completed.message)
+    report.state="cancelled"
+    return result.err("Recording queue cancelled")}
+   if str.starts_with(completed.message,"Recording: "){record(report,i,"skipped",completed.message)
+    report.skipped+=1
+   }else{record(report,i,"failed",completed.message)
+    report.failed+=1
+    if not w.continue_on_error{report.state="stopped"
+     return result.err(string.copy(completed.message))}}}
+  let _=try persist(w,report)
+  i+=1}
+ report.state="complete"
+ result.ok(())
+}
+fn bind_naming(w:ref<Work>,context:option<naming.Queue> own)->result<option<naming.Queue>,string> effects {alloc} {
+ result.ok(match context{none=>option.none(),some(value)=>{
+  var snapshot:naming.Queue=value
+  if str.len(w.audio_time_recipe)>0 or str.len(w.pitch_recipe)>0{return result.err("Model naming settings cannot be applied to an audio tool queue")}
+  let secondary:bool=match w.secondary{none=>false,some(_)=>true}
+  let ensemble:bool=match w.ensemble{none=>false,some(_)=>true}
+  if secondary and ensemble{return result.err("Choose one processing workflow for the recording queue")}
+  let expected:u32=if secondary{1}else{if ensemble{2}else{0}}
+  if named_queue.kind(struct.borrow(snapshot,field=selection))!=expected{return result.err("Naming settings do not match the recording queue workflow")}
+  option.some(try named_queue.project(snapshot,struct.borrow(w,field=items)))}})
+}
+fn run_impl(work:Work own,options:option<checked_input.Options> own,preparation:option<sample.Options> own,context:option<naming.Queue> own)->job.Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var w:Work=work
+ var input_options:option<checked_input.Options>=options
+ var samples:option<sample.Options>=preparation
+ match learned_request.decode(w.learned_controls){ok(_)=>{},err(problem)=>{
+  return job.Completed{retained:struct.replace(w,option.none(),field=retained),ok:false,message:problem,queue_report:option.none()}}}
+ match inference_policy.resolve(w.mask_high_band,w.mask_cleanup,w.mask_cleanup_threshold,w.mask_controls){ok(_)=>{},err(problem)=>{
+  return job.Completed{retained:struct.replace(w,option.none(),field=retained),ok:false,message:problem,queue_report:option.none()}}}
+ let recording_budget:u64=request_offset_budget(input_options)
+ var accepted_recording:recording_context.Context=match recording_policy.resolve(w.recording_controls,recording_budget){ok(value)=>value,err(problem)=>{
+  return job.Completed{retained:struct.replace(w,option.none(),field=retained),ok:false,message:problem,queue_report:option.none()}}}
+ match recording_state.restore(accepted_recording,w.recording_state){ok(_)=>{},err(problem)=>{
+  return job.Completed{retained:struct.replace(w,option.none(),field=retained),ok:false,message:problem,queue_report:option.none()}}}
+ // Refuse invalid output recipes before queue-report creation or bank transfer.
+ match job.export_plan_limited(w.wav_choice,w.codec_recipe,w.export_max_frames,w.export_max_stage_bytes,w.export_max_encoded_bytes){ok(_)=>{},err(problem)=>{
+  let exports:Exports=Exports{artifacts:[],attempted:"",failure:string.copy(problem)}
+  let raw:string=match encode_exports(exports){ok(value)=>value,err(_)=>""}
+  return job.Completed{retained:struct.replace(w,option.none(),field=retained),ok:false,message:problem,queue_report:option.none(),export_report:raw}}}
+ var naming_options:option<naming.Queue>=match bind_naming(w,context){ok(value)=>value,err(problem)=>{
+  return job.Completed{retained:struct.replace(w,option.none(),field=retained),ok:false,message:problem,queue_report:option.none()}}}
+ var report:config.Report=config.Report{items:[],configurations:[],checkpoints:[],use_gpu:w.use_gpu and str.len(w.audio_time_recipe)==0 and str.len(w.pitch_recipe)==0}
+ var exports:Exports=Exports{artifacts:[],attempted:"",failure:""}
+ let outcome:result<unit,string>=execute(w,report,exports,input_options,samples,naming_options)
+ var ok:bool=result.is_ok(outcome) and report.failed==0 and report.skipped==0
+ let detail:string=match outcome{ok(_)=>"",err(e)=>{if str.view(report.state)!="cancelled"{report.state="stopped"}
+  e}}
+ if str.len(detail)>0 and str.len(exports.failure)==0{exports.failure=string.copy(detail)
+  exports.attempted=""}
+ let saved:result<unit,string>=persist(w,report)
+ if not result.is_ok(saved){ok=false}
+ var message:string=text.concat("Recording queue: ",text.concat(string.from_int(report.succeeded),text.concat(" complete, ",text.concat(string.from_int(report.skipped),text.concat(" skipped, ",text.concat(string.from_int(report.failed)," failed."))))))
+ if str.len(detail)>0{string.append(message,text.concat(" ",detail))}
+ match saved{ok(_)=>{},err(e)=>{string.append(message,text.concat(" ",e))
+  if str.len(exports.failure)==0{exports.failure=string.copy(e)
+   exports.attempted=string.copy(w.report_file)}}}
+ if str.len(w.report_file)>0{string.append(message,text.concat(" Report: ",w.report_file))}
+ if str.len(w.progress)>0{let _=files.remove(text.concat(w.progress,".queue"))
+  let _=files.remove(text.concat(w.progress,".queue.tmp"))}
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ let directory:string=if report.succeeded>0 or array.len(exports.artifacts)>0{string.copy(w.directory)}else{""}
+ let export_report:string=match encode_exports(exports){ok(raw)=>raw,err(problem)=>{
+  ok=false
+  string.append(message,text.concat(" Cannot serialize queue export reports: ",problem))
+  ""}}
+ if not ok and array.len(exports.artifacts)>0{string.append(message,text.concat(" ",text.concat(string.from_int(array.len(exports.artifacts))," audio files published.")))}
+ job.Completed{recording_state:string.copy(w.recording_state),retained:retained,ok:ok,message:message,queue_report:option.some(report),directory:directory,export_report:export_report}
+}
+
+pub fn run(work:Work own)->job.Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_impl(work,option.none(),option.none(),option.none())
+}
+pub fn run_checked(work:Work own,options:checked_input.Options own)->job.Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_impl(work,option.some(options),option.none(),option.none())
+}
+pub fn run_sampled(work:Work own,options:checked_input.Options own,preparation:sample.Options own)->job.Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_impl(work,option.some(options),option.some(preparation),option.none())
+}
+pub fn run_named(work:Work own,context:naming.Queue own,options:option<checked_input.Options> own,preparation:option<sample.Options> own)->job.Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_impl(work,options,preparation,option.some(context))
+}
+
+// Keep original report lexemes; queue aggregation never invents child records.
+type Exports=struct{artifacts:array<string>,attempted:string,failure:string}
+fn report_text(document:ref<json.Document>,key:str)->result<string,string> effects {alloc} {
+ let at:u64=match json.get(document,0,key){some(v)=>v,none=>{return result.err("Worker export report field is absent")}}
+ match json.as_string(document,at){some(v)=>result.ok(v),none=>result.err("Worker export report text field is invalid")}
+}
+fn absorb(exports:ref<Exports>,raw:str)->result<unit,string> effects {alloc} {
+ if str.len(raw)==0{return result.ok(())}
+ var document:json.Document=try json.parse(raw) map_err json.message
+ let attempted:string=try report_text(document,"attempted")
+ let failure:string=try report_text(document,"failure")
+ let list:u64=match json.get(document,0,"artifacts"){some(v)=>v,none=>{return result.err("Worker export report artifacts are absent")}}
+ let token:json.Token=match json.token(document,list){some(v)=>v,none=>{return result.err("Worker export report artifacts are invalid")}}
+ if token.kind!=json.Kind.Array{return result.err("Worker export report artifacts must be an array")}
+ let count:u64=match json.len(document,list){some(v)=>v,none=>{return result.err("Worker export report array extent is invalid")}}
+ var at:u64=0
+ loop{if at==count{break}
+  let index:u64=match json.at(document,list,at){some(v)=>v,none=>{return result.err("Worker export artifact is absent")}}
+  let item:json.Token=match json.token(document,index){some(v)=>v,none=>{return result.err("Worker export artifact is invalid")}}
+  if item.kind!=json.Kind.Object{return result.err("Worker export artifact must be an object")}
+  array.push(exports.artifacts,string.copy(str.slice(document.source,item.start,item.end)))
+  at+=1}
+ // Keep failure and its own target paired across continue-on-error successes.
+ if str.len(failure)>0{exports.failure=failure
+  exports.attempted=attempted}else{if str.len(exports.failure)==0{exports.attempted=attempted}}
+ result.ok(())
+}
+fn encode_exports(exports:ref<Exports>)->result<string,string> effects {alloc} {
+ let keys:array<string>=["artifacts","attempted","failure"]
+ let values:array<string>=[try json.encode_array(exports.artifacts) map_err json.message,json.quote(exports.attempted),json.quote(exports.failure)]
+ result.ok(try json.encode_object(keys,values) map_err json.message)
+}

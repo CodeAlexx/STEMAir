@@ -1,0 +1,185 @@
+// Independent complete-file reader for an explicit analysis-band rate/method.
+// File decoding and owned fallback are shared with recording_input.
+module stemair.band_recording_input
+import "recording_input.ai" as decoded
+import "rate_filter.ai" as asset
+import "resample.ai" as polyphase
+import "control.ai" as control
+import std.audio as audio
+import std.audio_rate as native
+import std.signal_resample_table as table
+import std.sndfile as sound
+import std.float as fp
+import std.text as text
+pub type Rule=struct{rate:u32,method:string}
+type Planned=struct{method:string,plan:table.Plan}
+pub type Session=struct{decoder:decoded.Session,fast_asset:asset.Asset,best:option<asset.Loaded>,fast:option<asset.Loaded>,plans:array<Planned>,runtime:option<native.Runtime>,native:option<native.Engine>,filter_loads:u64,filter_bytes:u64}
+pub type Loaded=struct{highest:audio.AudioBuffer,lower:option<audio.AudioBuffer>,report:decoded.Report}
+pub fn valid(rule:ref<Rule>)->bool effects {} {
+ rule.rate>=1000 and rule.rate<=192000 and (rule.method=="sinc_best" or rule.method=="sinc_medium" or rule.method=="sinc_fastest" or rule.method=="kaiser_best" or rule.method=="kaiser_fast" or rule.method=="polyphase")
+}
+pub fn open(tool:ref<sound.Tool>,best:asset.Asset own,fast:asset.Asset own,runtime:option<native.Runtime> own)->result<Session,string> effects {alloc,ffi,fs.read,fs.meta}{
+ result.ok(Session{decoder:try decoded.open(tool,best),fast_asset:fast,best:option.none(),fast:option.none(),plans:[],runtime:runtime,native:option.none(),filter_loads:0,filter_bytes:0})
+}
+pub fn close(session:Session own)->result<unit,string> effects {alloc,ffi}{
+ var owned:Session=session
+ match struct.replace(owned,option.none(),field=native){none=>result.ok(()),some(engine)=>native.close(engine)}
+}
+fn stopped(options:ref<decoded.Options>)->result<unit,string> effects {alloc,fs.meta,time}{
+ if time.monotonic_ns()>=options.deadline_ns{return result.err("Band recording deadline reached")}
+ if control.cancelled(options.cancel_file){return result.err("Band recording cancelled")}
+ result.ok(())
+}
+fn selected_stereo(input:audio.AudioBuffer own,options:ref<decoded.Options>)->result<audio.AudioBuffer,string> effects {alloc,fs.meta,time}{
+ var source:audio.AudioBuffer=input
+ if source.channels<=2{return result.ok(source)}
+ let frames:u64=audio.num_frames(source)
+ var first_two:array<f32>=[]
+ array.reserve(first_two,frames*2)
+ var i:u64=0
+ loop{if i==frames{break}
+  if i%4096==0{let _=try stopped(options)}
+  array.push(first_two,array.get(source.samples,i*cast.wrap(source.channels)))
+  array.push(first_two,array.get(source.samples,i*cast.wrap(source.channels)+1))
+  i+=1}
+ // The original band analysis independently uses channels zero and one.
+ result.ok(audio.AudioBuffer{samples:first_two,rate:source.rate,channels:2})
+}
+fn prepared(session:ref<Session>,rate:u32,rule:ref<Rule>,options:ref<decoded.Options>)->result<u64,string> effects {alloc,fs.read}{
+ var i:u64=0
+ loop{if i==array.len(session.plans){break}
+  let entry:ref<Planned>=array.borrow(session.plans,i)
+  if str.view(entry.method)==str.view(rule.method) and entry.plan.source_rate==rate and entry.plan.target_rate==rule.rate{return result.ok(i)}
+  i+=1}
+ let fast:bool=rule.method=="kaiser_fast"
+ if fast{
+  match session.fast{some(_)=>{},none=>{var loaded:asset.Loaded=try asset.open(struct.borrow(session,field=fast_asset))
+   session.filter_loads+=1
+   session.filter_bytes+=loaded.bytes_read
+   session.fast=option.some(loaded)}}
+ }else{
+  match session.best{some(_)=>{},none=>{var loaded:asset.Loaded=try asset.open(struct.borrow(struct.borrow(session,field=decoder),field=filter_asset))
+   session.filter_loads+=1
+   session.filter_bytes+=loaded.bytes_read
+   session.best=option.some(loaded)}}}
+ let limits:table.Limits=table.Limits{max_input_samples:options.limits.max_decoded_bytes/4,max_output_samples:options.limits.max_decoded_bytes/4,max_filter_values:500000}
+ let plan:table.Plan=if fast{match session.fast{some(value)=>try table.prepare(struct.borrow(value,field=filter),rate,rule.rate,limits),none=>{return result.err("Fast rate filter is unavailable")}}}else{match session.best{some(value)=>try table.prepare(struct.borrow(value,field=filter),rate,rule.rate,limits),none=>{return result.err("Rate filter is unavailable")}}}
+ array.push(session.plans,Planned{method:string.copy(rule.method),plan:plan})
+ result.ok(i)
+}
+fn convert(session:ref<Session>,source:audio.AudioBuffer own,rule:ref<Rule>,options:ref<decoded.Options>)->result<audio.AudioBuffer,string> effects {alloc,ffi,fs.read,fs.meta,time}{
+ var input:audio.AudioBuffer=try selected_stereo(source,options)
+ let frames:u64=audio.num_frames(input)
+ if frames==0{return result.err("The band recording has no samples")}
+ let ratio:f64=cast.float(rule.rate)/cast.float(input.rate)
+ let extent:f64=fp.ceil(cast.float(frames)*ratio)
+ if not fp.is_finite(extent) or extent>cast.float(options.limits.max_frames){return result.err("Band recording output exceeds its frame limit")}
+ let count:u64=cast.sat(extent)
+ let channels:u64=cast.wrap(input.channels)
+ if count>options.limits.max_decoded_bytes/4/channels{return result.err("Band recording output exceeds its decoded sample limit")}
+ var i:u64=0
+ loop{if i==array.len(input.samples){break}
+  if i%4096==0{let _=try stopped(options)}
+  let value:f32=array.get(input.samples,i)
+  if not fp.is_finite(value){return result.err("Band recording samples must be finite")}
+  i+=1}
+ if input.rate==rule.rate{return result.ok(input)}
+ var values:array<f32>=[]
+ if rule.method=="kaiser_best" or rule.method=="kaiser_fast"{
+  let index:u64=try prepared(session,input.rate,rule,options)
+  let plan:ref<table.Plan>=struct.borrow(array.borrow(session.plans,index),field=plan)
+  let limits:table.Limits=table.Limits{max_input_samples:options.limits.max_decoded_bytes/4,max_output_samples:options.limits.max_decoded_bytes/4,max_filter_values:500000}
+  let geometry:table.Geometry=try table.geometry(plan,array.view(input.samples),channels,limits,true)
+  array.reserve(values,geometry.output_samples)
+  var first:u64=0
+  loop{if first==geometry.output_frames{break}
+   let _=try stopped(options)
+   let block:array<f32>=try table.render(plan,array.view(input.samples),geometry,first,if geometry.output_frames-first<4096{geometry.output_frames-first}else{4096})
+   i=0
+   loop{if i==array.len(block){break}
+    array.push(values,array.get(block,i))
+    i+=1}
+   first+=array.len(block)/channels}
+ }else{if rule.method=="polyphase"{
+  // Existing qualified rational FIR takes planar samples; conversion only
+  // changes layout, never introduces a pre-resample at a common master rate.
+  var planar:array<f32>=[]
+  var channel:u64=0
+  loop{if channel==channels{break}
+   i=0
+   loop{if i==frames{break}
+    array.push(planar,array.get(input.samples,i*channels+channel))
+    i+=1}
+   channel+=1}
+  var plan:polyphase.Plan=try polyphase.plan(input.rate,rule.rate)
+  let rendered:array<f32>=try polyphase.apply(plan,array.view(planar),channels)
+  i=0
+  loop{if i==count{break}
+   channel=0
+   loop{if channel==channels{break}
+    array.push(values,array.get(rendered,channel*count+i))
+    channel+=1}
+   i+=1}
+ }else{
+  match session.native{some(_)=>{},none=>{
+   let runtime:ref<native.Runtime>=match session.runtime{some(value)=>value,none=>{return result.err("Choose the qualified native audio rate runtime")}}
+   session.native=option.some(try native.open(runtime))}}
+  let engine:ref<native.Engine>=match session.native{some(value)=>value,none=>{return result.err("Native audio rate runtime is unavailable")}}
+  let converter:native.Converter=if rule.method=="sinc_best"{native.Converter.SincBest}else{if rule.method=="sinc_medium"{native.Converter.SincMedium}else{native.Converter.SincFastest}}
+  let budget:u64=options.limits.max_decoded_bytes
+  if budget>18446744073709551615/4{return result.err("Band recording workspace extent overflows")}
+  let selected:native.Options=native.Options{limits:native.Limits{max_input_samples:budget/4,max_output_samples:budget/4,max_working_bytes:4*budget,max_channels:2},deadline_ns:options.deadline_ns,cancel_file:string.copy(options.cancel_file)}
+  var rendered:native.Converted=try native.apply(engine,array.view(input.samples),cast.wrap(input.channels),ratio,converter,selected)
+  values=struct.replace(rendered,[],field=samples)
+  loop{if array.len(values)>=count*channels{break}
+   array.push(values,0.0)}
+ }}
+ let _=try stopped(options)
+ if array.len(values)!=count*channels{return result.err("Band recording resampler returned a different extent")}
+ result.ok(audio.AudioBuffer{samples:values,rate:rule.rate,channels:input.channels})
+}
+fn stereo(source:audio.AudioBuffer own,options:ref<decoded.Options>)->result<audio.AudioBuffer,string> effects {alloc,fs.meta,time}{
+ var input:audio.AudioBuffer=source
+ if input.channels==2{return result.ok(input)}
+ if array.len(input.samples)>options.limits.max_decoded_bytes/8{return result.err("Duplicated band recording exceeds its decoded sample limit")}
+ var values:array<f32>=[]
+ array.reserve(values,2*array.len(input.samples))
+ var i:u64=0
+ loop{if i==array.len(input.samples){break}
+  if i%4096==0{let _=try stopped(options)}
+  array.push(values,array.get(input.samples,i))
+  array.push(values,array.get(input.samples,i))
+  i+=1}
+ result.ok(audio.AudioBuffer{samples:values,rate:input.rate,channels:2})
+}
+pub fn read(session:ref<Session>,input:str,rule:ref<Rule>,options:ref<decoded.Options>)->result<Loaded,string> effects {alloc,ffi,fs.read,fs.write,fs.meta,process,time}{
+ if not valid(rule){return result.err("Unknown analysis-band recording rate or method")}
+ var report:decoded.Report=decoded.empty_report()
+ let raw:audio.AudioBuffer=try decoded.read_decoded(struct.borrow(session,field=decoder),input,option.none(),options,report)
+ let source_rate:u32=report.source_rate
+ let source_channels:u32=report.source_channels
+ let source_frames:u64=report.source_frames
+ var highest:audio.AudioBuffer=try convert(session,raw,rule,options)
+ var zero:bool=true
+ var i:u64=0
+ loop{if i==array.len(highest.samples){break}
+  if array.get(highest.samples,i)!=0.0{zero=false
+   break}
+  i+=1}
+ var lower:option<audio.AudioBuffer>=option.none()
+ if zero and text.ends_with(input,".mp3"){
+  let info=try decoded.inspect_decoded_source(input,options,report)
+  report.zero_retry=true
+  report.retry_seconds=info.whole_seconds
+  let raw_retry:audio.AudioBuffer=try decoded.read_decoded(struct.borrow(session,field=decoder),input,option.some(info.whole_seconds),options,report)
+  let retry_rule:Rule=Rule{rate:rule.rate,method:"kaiser_best"}
+  lower=option.some(try stereo(try convert(session,raw_retry,retry_rule,options),options))}
+ // The original highest-band STFT precedes retry; only lower bands use it.
+ highest=try stereo(highest,options)
+ report.source_rate=source_rate
+ report.source_channels=source_channels
+ report.source_frames=source_frames
+ report.frames=audio.num_frames(highest)
+ report.channels=cast.wrap(highest.channels)
+ result.ok(Loaded{highest:highest,lower:lower,report:report})
+}

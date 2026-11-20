@@ -1,0 +1,84 @@
+module stemair.recording_cpu
+import "engine.ai" as engine
+import "recording_inference.ai" as inference
+import "recording_shifts.ai" as shifts
+import "audio_result.ai" as audio
+import "waveform/config.ai" as early_config
+import "waveform/host_session.ai" as waveform
+import "temporal/host_session.ai" as temporal
+import "residual_waveform/config.ai" as residual_config
+import "residual_waveform/session.ai" as residual
+import "hybrid/config.ai" as hybrid_config
+import "hybrid/host_session.ai" as hybrid
+import "attention/config.ai" as attention_config
+import "attention/host_session.ai" as attention
+import std.codec as codec
+pub type Output=struct{samples:audio.Samples,observation:inference.Observation}
+pub fn supported(kind:str)->bool effects {} {kind=="waveform" or kind=="temporal" or kind=="residual-waveform" or kind=="hybrid" or kind=="attention"}
+fn complete(s:ref<engine.Loaded>,stream:ref<inference.Stream>,schedule:ref<shifts.Schedule>,options:ref<inference.Options>,outcome:result<array<f32>,string> own)->result<Output,string> effects {alloc} {
+ let observation:inference.Observation=inference.finish(stream,schedule,options)
+ match outcome{err(e)=>result.err(e),ok(values)=>{
+  s.requests+=1
+  result.ok(Output{samples:audio.from_single(values),observation:observation})}}
+}
+// No network/config identity mutation, repacking or checkpoint access. Even an
+// error returns the actually consumed RNG state to the accepted request stream.
+pub fn separate(s:ref<engine.Loaded>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str,options:ref<inference.Options>,stream:ref<inference.Stream>,limits:shifts.Limits)->result<Output,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try inference.validate(options)
+ if view.len(input)<4 or view.len(input)%2!=0{return result.err("Recording controls require complete stereo frames")}
+ if s.profile.kind=="waveform" or s.profile.kind=="temporal"{
+  var c:early_config.Config=try early_config.Config_decode(s.profile.identity) map_err codec.describe
+  c.split=options.split
+  c.overlap=if c.generation==1{0.25}else{options.overlap}
+  let _=try early_config.validate(c)
+  let family:shifts.Family=if c.generation==1{shifts.Family.First}else{shifts.Family.Second}
+  if s.profile.kind=="waveform"{
+   match s.waveform{none=>{return result.err("Waveform model session unavailable")},some(value)=>{
+    if array.len(value.cpu)!=1{return result.err("Recording controls require the retained prepared waveform backend")}
+    var schedule:shifts.Schedule=try inference.begin(stream,options,family,view.len(input)/2,early_config.segment_length(c),limits)
+    let outcome:result<array<f32>,string>=waveform.separate_scheduled(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,c,schedule,input,cancel,progress)
+    return complete(s,stream,schedule,options,outcome)}}
+  }else{
+   match s.temporal{none=>{return result.err("Temporal model session unavailable")},some(value)=>{
+    if array.len(value.cpu)!=1{return result.err("Recording controls require the retained prepared temporal backend")}
+    var schedule:shifts.Schedule=try inference.begin(stream,options,family,view.len(input)/2,early_config.segment_length(c),limits)
+    let outcome:result<array<f32>,string>=temporal.separate_scheduled(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,c,schedule,input,cancel,progress)
+    return complete(s,stream,schedule,options,outcome)}}
+  }
+ }
+ if s.profile.kind=="residual-waveform"{
+  var c:residual_config.Config=try residual_config.Config_decode(s.profile.identity) map_err codec.describe
+  c.split=options.split
+  c.overlap=options.overlap
+  let _=try residual_config.validate(c)
+  match s.residual{none=>{return result.err("Residual waveform session unavailable")},some(value)=>{
+   var schedule:shifts.Schedule=try inference.begin(stream,options,shifts.Family.Outer,view.len(input)/2,residual.segment(value,c),limits)
+   let outcome:result<array<f32>,string>=residual.separate_cpu_scheduled(value,library,c,schedule,input,cancel,progress)
+   return complete(s,stream,schedule,options,outcome)}}
+ }
+ if s.profile.kind=="hybrid"{
+  var c:hybrid_config.Config=try hybrid_config.Config_decode(s.profile.identity) map_err codec.describe
+  c.split=options.split
+  c.overlap=options.overlap
+  let _=try hybrid_config.validate(c)
+  match s.hybrid{none=>{return result.err("Hybrid model session unavailable")},some(value)=>{
+   if array.len(value.cpu)!=1{return result.err("Recording controls require the retained prepared hybrid backend")}
+   let segment:u64=if c.segment_samples!=0{c.segment_samples}else{value.network.constructor.kwargs.segment*44100}
+   var schedule:shifts.Schedule=try inference.begin(stream,options,shifts.Family.Outer,view.len(input)/2,segment,limits)
+   let outcome:result<array<f32>,string>=hybrid.separate_scheduled(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,c,schedule,input,cancel,progress)
+   return complete(s,stream,schedule,options,outcome)}}
+ }
+ if s.profile.kind=="attention"{
+  var c:attention_config.Config=try attention_config.Config_decode(s.profile.identity) map_err codec.describe
+  c.split=options.split
+  c.overlap=options.overlap
+  let _=try attention_config.validate(c)
+  match s.attention{none=>{return result.err("Attention model session unavailable")},some(value)=>{
+   if array.len(value.cpu)!=1{return result.err("Recording controls require the retained prepared attention backend")}
+   let segment:u64=if c.segment_samples!=0{c.segment_samples}else{value.network.training_length}
+   var schedule:shifts.Schedule=try inference.begin(stream,options,shifts.Family.Outer,view.len(input)/2,segment,limits)
+   let outcome:result<array<f32>,string>=attention.separate_scheduled(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,c,schedule,input,cancel,progress)
+   return complete(s,stream,schedule,options,outcome)}}
+ }
+ result.err("Recording controls require a qualified recording model family")
+}

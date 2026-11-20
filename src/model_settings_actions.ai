@@ -1,0 +1,76 @@
+module stemair.model_settings_actions
+import "../../AIR/toolkits/desktop/ui.ai" as desk
+import "model_settings_panel.ai" as panel
+import "model_settings_draft.ai" as draft
+import "model_settings_session.ai" as session
+import "model_defaults.ai" as defaults
+import "model_panel.ai" as catalog_panel
+import "model_catalog.ai" as catalog
+import "preferences.ai" as preferences
+import "../toolkit/model_cache.ai" as cache
+import std.json as json
+import std.path as path
+import std.text as text
+
+pub fn handles(id:str,kind:str)->bool effects {} {
+ if kind=="change" or kind=="dialog"{return str.starts_with(id,"model_editor_")}
+ kind=="action" and (id=="model_edit" or id=="model_restore" or str.starts_with(id,"model_editor_"))
+}
+// Caller supplies the already captured pending model snapshot before any selection change.
+pub fn receive(app:ref<desk.Session>,editor:ref<panel.State>,catalog_state:ref<catalog_panel.State>,state:ref<preferences.State>,
+ retained:ref<option<cache.Cache>>,event:ref<json.Document>,root:str,file:str,temporary:str,previous:ref<string>,
+ dirty:ref<bool>,writable:bool,pending_snapshot:str,busy:bool)->result<unit,string> effects {alloc, ffi, gpu, fs.meta, fs.read, fs.write, net, time} {
+ if busy{return result.err("Wait for the current job before editing model settings")}
+ let id:string=desk.field(event,"id")
+ let kind:string=desk.field(event,"event")
+ if kind=="change" or kind=="dialog"{
+  if not desk.boolean(event,"cancelled"){
+   let _=panel.change(editor,event)
+   if id=="model_editor_source" or id=="model_editor_custom" or id=="model_editor_inverse" or id=="model_editor_role"{panel.role_controls(app,editor)}
+   if kind=="dialog"{let _=desk.set_text(app,id,desk.field(event,"value"))}}
+  return result.ok(())}
+ if id=="model_editor_cancel"{panel.close(app,editor)
+  let _=desk.set_text(app,"catalog_status","Editing cancelled; selection and loaded models unchanged")
+  return result.ok(())}
+ if id=="model_editor_choose"{
+  let _=desk.dialog(app,"model_editor_parameters","open","Choose native model parameter configuration","",path.join(root,"configs"))
+  return result.ok(())}
+ if id=="model_editor_reset"{
+  match editor.draft{none=>{},some(value)=>{let _=try draft.reset(value)}}
+  panel.display(app,editor)
+  let _=desk.set_text(app,"model_editor_status","Source dialog defaults restored to the draft. Choose any required native parameter configuration before validation; checkpoint admission is separate.")
+  return result.ok(())}
+ if id=="model_editor_validate" or id=="model_editor_save"{
+  let record:defaults.Record=try panel.validate(editor)
+  if id=="model_editor_validate"{
+   let _=desk.set_text(app,"model_editor_status","Configuration validated. A different checkpoint architecture still requires loader admission.")
+   return result.ok(())}
+  if not writable{return result.err("Save or restore desktop preferences explicitly before applying model defaults")}
+  let saved:string=match editor.draft{none=>{return result.err("Open a model parameter draft first")},some(value)=>{
+   try session.save_use(state,retained,file,temporary,previous,path.join(path.dirname(file),"model-settings"),record,
+    value.base_file,value.checkpoint,pending_snapshot,"")}}
+  ref.swap(previous,saved)
+  ref.swap(dirty,false)
+  let _=desk.set_text(app,"settings",state.settings)
+  let _=desk.set_text(app,"checkpoint",state.checkpoint)
+  panel.close(app,editor)
+  let _=desk.set_text(app,"catalog_status","Model defaults saved and selected; loaded session ended. Models load on the next job. Pending queue definitions are unchanged.")
+  return result.ok(())}
+ let index:u64=match catalog.find(catalog_state.entries,catalog_state.selected){some(v)=>v,none=>{return result.err("Select an admitted model first")}}
+ let entry:ref<catalog.Entry>=array.borrow(catalog_state.entries,index)
+ if id=="model_edit"{
+  panel.open(app,editor,try draft.begin_selected(root,entry,catalog_state.directory,state.settings,state.checkpoint,state.model_definition))
+  return result.ok(())}
+ if id=="model_restore"{
+  if not writable{return result.err("Save or restore desktop preferences explicitly before restoring model defaults")}
+  let saved:string=try session.restore(state,retained,file,temporary,previous,entry.profile,entry.asset.sha256,path.join(root,entry.configuration),
+   path.join(catalog_state.directory,entry.asset.filename),pending_snapshot)
+  ref.swap(previous,saved)
+  ref.swap(dirty,false)
+  let _=desk.set_text(app,"settings",state.settings)
+  let _=desk.set_text(app,"checkpoint",state.checkpoint)
+  panel.close(app,editor)
+  let _=desk.set_text(app,"catalog_status","Bundled defaults restored; loaded session ended. Models load on the next job.")
+  return result.ok(())}
+ result.err("Unknown model editor action")
+}

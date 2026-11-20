@@ -1,0 +1,61 @@
+module stemair.recording_sample_panel
+import "input_selection.ai" as selection
+import "queue_config.ai" as queue
+import "recording_sample_application.ai" as sample
+import std.text as text
+
+fn indices(state:ref<selection.State>,count:u64)->result<array<u64>,string> effects {alloc} {
+ if state.count!=count{return result.err("The input list changed; select its current rows")}
+ if array.len(state.selected)==0{return result.err("Select recordings to create samples")}
+ var result:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(state.selected){break}
+  let index:u64=array.get(state.selected,i)
+  if index>=count or (i>0 and index<=array.get(state.selected,i-1)){return result.err("Selected recording rows must be current, unique and ordered")}
+  array.push(result,index)
+  i+=1}
+ result.ok(result)
+}
+pub fn audio(state:ref<selection.State>,inputs:ref<array<string>>)->result<array<sample.Selection>,string> effects {alloc} {
+ let selected:array<u64>=try indices(state,array.len(inputs))
+ var result:array<sample.Selection>=[]
+ var i:u64=0
+ loop{if i==array.len(selected){break}
+  let index:u64=array.get(selected,i)
+  array.push(result,sample.Selection{index:index,path:string.copy(array.get(inputs,index))})
+  i+=1}
+ result.ok(result)
+}
+pub fn queued(state:ref<selection.State>,inputs:ref<array<queue.Item>>)->result<array<sample.Selection>,string> effects {alloc} {
+ let selected:array<u64>=try indices(state,array.len(inputs))
+ var result:array<sample.Selection>=[]
+ var i:u64=0
+ loop{if i==array.len(selected){break}
+  let index:u64=array.get(selected,i)
+  array.push(result,sample.Selection{index:index,path:string.copy(array.borrow(inputs,index).input)})
+  i+=1}
+ result.ok(result)
+}
+pub fn successes(report:ref<sample.Report>)->u64 effects {} {
+ var count:u64=0
+ var i:u64=0
+ loop{if i==array.len(report.rows){break}
+  if array.borrow(report.rows,i).success{count+=1}
+  i+=1}
+ count
+}
+pub fn summary(report:ref<sample.Report>)->string effects {alloc} {
+ let prefix:string=text.concat("Created ",text.concat(string.from_int(successes(report)),text.concat(" of ",text.concat(string.from_int(report.total)," recording samples. "))))
+ text.concat(prefix,report.message)
+}
+pub fn details(envelope:ref<sample.Envelope>)->string effects {alloc} {
+ let report:ref<sample.Report>=struct.borrow(envelope,field=report)
+ var text:string=summary(report)
+ var i:u64=0
+ loop{if i==array.len(report.rows){break}
+  let row:ref<sample.Row>=array.borrow(report.rows,i)
+  text=text.concat(text,text.concat("\n",text.concat(string.from_int(row.index+1),text.concat(". ",text.concat(row.input," — ")))))
+  text=text.concat(text,if row.success{string.copy(row.path)}else{text.concat(row.failure_kind,text.concat(": ",row.message))})
+  i+=1}
+ text
+}

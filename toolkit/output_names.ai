@@ -1,0 +1,64 @@
+module stemair.output_names
+import std.text as text
+
+// Pure naming policy. Callers own paths, clocks, publication and model state.
+pub type Request=struct{recording:string,model:string,ordinal:u64,timestamp:u64,
+ testing:bool=false,ensemble:bool=false,append_model:bool=false,model_folder:bool=false} derive codec(strict)
+pub type Layout=struct{base:string,subdirectory:string} derive codec(strict)
+pub fn component(value:str)->bool effects {} {
+ if str.len(value)==0 or value=="." or value==".."{return false}
+ var i:u64=0
+ loop{if i==str.len(value){break}
+  let b:byte=view.get(str.bytes(value),i)
+  if b==0 or b==47 or b==92{return false}
+  i+=1}
+ true
+}
+// Final extension removal preserves leading dots and removes a trailing dot,
+// matching the recording-sample naming policy already used by the application.
+pub fn recording_stem(filename:str)->result<string,string> effects {alloc} {
+ if not component(filename){return result.err("Choose a recording filename without path separators")}
+ var dot:u64=str.len(filename)
+ var nondot:bool=false
+ var i:u64=0
+ loop{if i==str.len(filename){break}
+  let b:byte=view.get(str.bytes(filename),i)
+  if b==46{if nondot{dot=i}}else{nondot=true}
+  i+=1}
+ result.ok(string.copy(str.slice(filename,0,dot)))
+}
+pub fn separation(request:ref<Request>)->result<Layout,string> effects {alloc} {
+ if request.ordinal==0{return result.err("Recording numbers begin at one")}
+ let stem:string=try recording_stem(request.recording)
+ if (request.ensemble or request.append_model or request.model_folder) and not component(request.model){return result.err("Choose a model label without path separators")}
+ var base:string=text.concat(string.from_int(request.ordinal),text.concat("_",stem))
+ if request.testing and not request.ensemble{base=text.concat(string.from_int(request.timestamp),text.concat("_",base))}
+ if request.ensemble or request.append_model{base=text.concat(base,text.concat("_",request.model))}
+ let folder:string=if request.model_folder and not request.ensemble{text.concat(request.model,text.concat("/",stem))}else{""}
+ result.ok(Layout{base:base,subdirectory:folder})
+}
+pub fn ensemble_base(member_base:str,model:str)->result<string,string> effects {alloc} {
+ if not component(member_base) or not component(model){return result.err("Choose a complete ensemble member name and model label")}
+ result.ok(text.replace(member_base,text.concat("_",model),""))
+}
+pub fn ensemble_output(base:str,ensemble_label:str,default_label:bool,append_label:bool,testing:bool,timestamp:u64,stem:str)->result<string,string> effects {alloc} {
+ if not component(base) or not component(stem) or (append_label and not default_label and not component(ensemble_label)){return result.err("Choose ensemble output labels without path separators")}
+ let label:string=if default_label{"Ensembled"}else{text.replace(ensemble_label," ","_")}
+ let suffix:string=if append_label{text.concat("_",label)}else{""}
+ let prefix:string=if testing{text.concat(string.from_int(timestamp),"_")}else{""}
+ result.ok(text.concat(prefix,text.concat(base,text.concat(suffix,text.concat("_(",text.concat(stem,")"))))))
+}
+pub fn stem_output(base:str,stem:str)->result<string,string> effects {alloc} {
+ if not component(base) or not component(stem){return result.err("Choose output names without path separators")}
+ result.ok(text.concat(base,text.concat("_(",text.concat(stem,")"))))
+}
+pub fn split_output(base:str,stem:str,split:str)->result<string,string> effects {alloc} {
+ if not component(base) or not component(stem) or not component(split){return result.err("Choose vocal output names without path separators")}
+ let plain:string=text.replace(base,"_(Vocals)","")
+ stem_output(plain,text.concat(stem,text.concat("_",split)))
+}
+pub fn sample_output(recording:str,long:bool,seconds:u64)->result<string,string> effects {alloc} {
+ let stem:string=try recording_stem(recording)
+ let suffix:string=if long{text.concat("_",text.concat(string.from_int(seconds),"_second_sample.wav"))}else{"_sample.wav"}
+ result.ok(text.concat(stem,suffix))
+}

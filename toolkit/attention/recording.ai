@@ -1,0 +1,32 @@
+module stemair.attention.recording
+import "config.ai" as config
+import "retained_session.ai" as retained
+import "../recording_audio.ai" as audio
+import "../recording_shifts.ai" as shifts
+import "../recording_moments.ai" as moments
+import "../audio_normalization.ai" as normalization
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "../ops.ai" as host
+import std.tensor as tensor
+fn scheduled_attention_predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<retained.State>,input:ref<tensor.Tensor>,cancel:str)->result<host.Tensor,string> effects {alloc,gpu,fs.meta}{
+ retained.predict(context,stream,parameters,s,input,cancel)
+}
+fn scheduled_attention_length(s:ref<retained.State>,length:u64)->result<u64,string> effects {alloc}{retained.valid_length(s,length)}
+pub fn separate_once(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<retained.State>,runtime:str,c:ref<config.Config>,schedule:ref<shifts.Schedule>,sources:u64,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,gpu,fs.meta,fs.write}{
+ let _=try config.validate(c)
+ if array.len(s.gpu)!=0{return result.err("Previous attention GPU work was not released")}
+ if view.len(input)<4 or view.len(input)%2!=0{return result.err("Expected complete stereo recording")}
+ if sources<2 or sources>18446744073709551615/2 or view.len(input)/2>18446744073709551615/(2*sources){return result.err("Attention source-count extent overflows")}
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{s.network.training_length}
+ let _=try shifts.require_geometry(schedule,shifts.Family.Outer,view.len(input)/2,c.split,size,c.overlap)
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let prepared:normalization.Prepared=try moments.prepare(input,2)
+ if prepared.scale==0.0{return result.ok(num.zeros(2*sources*prepared.frames))}
+ let work:retained.Work=try retained.prepare_work(context,stream,struct.borrow(s,field=network),runtime,prepared.frames)
+ array.push(s.gpu,work)
+ let output:result<array<f32>,string>=audio.separate_prepared_scheduled_sources(context,stream,parameters,s,c,schedule,size,sources,prepared,cancel,progress,scheduled_attention_predict,scheduled_attention_length)
+ s.gpu=[]
+ if result.is_ok(output){s.requests+=1}
+ output
+}

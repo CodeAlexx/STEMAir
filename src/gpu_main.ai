@@ -1,0 +1,39 @@
+module stemair.gpu_main
+import "cli_audio_policy.ai" as policy
+import "cli_audio_gpu.ai" as audio
+import "catalog_main.ai" as catalog
+import "recording_sample_cli.ai" as samples
+import "paired_alignment_cli.ai" as paired
+import "reference_mastering_cli.ai" as mastering
+import std.text as text
+fn fail(problem:str)->i32 effects {alloc,io.write} {io.ewrite(text.concat(problem,"\n"))
+ 1}
+fn dispatch(args:view<str>,settings:ref<policy.Settings>)->i32 effects {alloc,gpu,env,fs.read,fs.write,fs.meta,process,time,net,random,ffi,io.write} {
+ match policy.inherit_application_root(settings){err(problem)=>{return fail(problem)},ok(_)=>{}}
+ if view.len(args)==1 or view.get(args,1)=="help" or view.get(args,1)=="--help"{
+  io.write("StemAIR GPU CLI (in development)\n")
+  io.write("  stem-air-gpu [--io-settings FILE] CONFIG CHECKPOINT INPUT OUTPUT_DIRECTORY\n")
+  io.write("  stem-air-gpu [--io-settings FILE] separate CONFIG CHECKPOINT INPUT OUTPUT_DIRECTORY\n")
+  io.write("  stem-air-gpu [--io-settings FILE] secondary|model-ensemble RECIPE INPUT OUTPUT_DIRECTORY\n")
+  io.write("  stem-air-gpu [--io-settings FILE] queue RECIPE OUTPUT_DIRECTORY\n")
+  io.write("  stem-air-gpu [--io-settings FILE] sample-recordings RECIPE OUTPUT_DIRECTORY (CPU audio route)\n")
+  io.write("  stem-air-gpu [--io-settings FILE] pair-align ALIGNMENT_RECIPE PAIRS_JSON OUTPUT_DIRECTORY (CPU audio route)\n")
+  io.write("  stem-air-gpu [--io-settings FILE] master TARGET REFERENCE OUTPUT_DIRECTORY (CPU audio route)\n")
+  io.write("  stem-air-gpu [--io-settings FILE] master-pairs PAIRS_JSON OUTPUT_DIRECTORY (CPU audio route)\n")
+  io.write("I/O settings: noise_reduction, room_reduction, room_targets (vocals/lead/backing/all), noise_checkpoint and room_checkpoint select optional learned cleanup.\n")
+  io.write("Audio utilities and models list/verify/acquire use their CPU routes. I/O settings select checked audio buffers and WAV/FLAC/MP3 output.\n")
+  return 0}
+ if view.get(args,1)=="sample-recordings"{return match samples.run(args,settings){ok(code)=>code,err(problem)=>fail(problem)}}
+ if view.get(args,1)=="pair-align"{return match paired.run(args,settings){ok(code)=>code,err(problem)=>fail(problem)}}
+ if view.get(args,1)=="master" or view.get(args,1)=="master-pairs"{return match mastering.run(args,settings){ok(code)=>code,err(problem)=>fail(problem)}}
+ if view.get(args,1)=="models"{return catalog.main(view.slice(args,1,view.len(args)))}
+ match audio.run(args,settings){ok(code)=>code,err(problem)=>fail(problem)}
+}
+pub fn main(args:view<str>)->i32 effects {alloc,gpu,env,fs.read,fs.write,fs.meta,process,time,net,random,ffi,io.write} {
+ var settings:policy.Settings=policy.Settings{}
+ if view.len(args)>1 and view.get(args,1)=="--io-settings"{
+  if view.len(args)<4{return fail("Use stem-air-gpu --io-settings FILE ACTION ...")}
+  settings=match policy.read(view.get(args,2)){ok(v)=>v,err(e)=>{return fail(e)}}
+  return dispatch(view.slice(args,2,view.len(args)),settings)}
+ dispatch(args,settings)
+}

@@ -1,0 +1,104 @@
+module stemair.channel_statistics
+import "ops.ai" as ops
+import "numeric.ai" as num
+import std.float as fp
+
+pub type Kind=enum{Channel,Global,Time}
+pub fn prelu(input:ops.Tensor own,slope:f32)->result<ops.Tensor,string> effects {alloc} {
+ if not fp.is_finite(slope){return result.err("Non-finite learned negative slope")}
+ var x:ops.Tensor=input
+ var i:u64=0
+ loop{if i==array.len(x.data){break}
+  let value:f32=array.get(x.data,i)
+  if value<0.0{array.set(x.data,i,value*slope)}
+  i+=1}
+ result.ok(x)
+}
+// Source order: gamma * (value - mean) / sqrt(variance + epsilon) + beta.
+// Global statistics reduce channels to F32 first, then spatial positions to
+// F32. Centered squares also preserve that two-stage rounding boundary.
+pub fn normalize(input:ops.Tensor own,gamma:view<f32>,beta:view<f32>,kind:Kind,epsilon:f32)->result<ops.Tensor,string> effects {alloc} {
+ var x:ops.Tensor=input
+ let plane:u64=x.h*x.w
+ if x.c==0 or plane==0 or view.len(gamma)!=x.c or view.len(beta)!=x.c or
+  epsilon<=0.0 or not fp.is_finite(epsilon) or not num.finite(array.view(x.data)){
+  return result.err("Invalid normalization geometry or values")}
+ var means:array<f32>=[]
+ var variances:array<f32>=[]
+ if kind==Kind.Time{
+  var channel:u64=0
+  loop{if channel==x.c{break}
+   var sum:f64=0.0
+   var time:u64=0
+   loop{if time==plane{break}
+    sum+=cast.float(array.get(x.data,channel*plane+time))
+    time+=1}
+   let mean:f32=cast.float(sum/cast.float(plane))
+   var variance:f64=0.0
+   time=0
+   loop{if time==plane{break}
+    let difference:f64=cast.float(array.get(x.data,channel*plane+time))-cast.float(mean)
+    variance+=difference*difference
+    time+=1}
+   array.push(means,mean)
+   array.push(variances,cast.float(variance/cast.float(plane)))
+   channel+=1}
+ }else{
+  var time:u64=0
+  loop{if time==plane{break}
+   var sum:f64=0.0
+   var channel:u64=0
+   loop{if channel==x.c{break}
+    sum+=cast.float(array.get(x.data,channel*plane+time))
+    channel+=1}
+   array.push(means,cast.float(sum/cast.float(x.c)))
+   time+=1}
+  if kind==Kind.Global{
+   var sum:f64=0.0
+   time=0
+   loop{if time==plane{break}
+    sum+=cast.float(array.get(means,time))
+    time+=1}
+   let mean:f32=cast.float(sum/cast.float(plane))
+   means=[mean]
+   var sum_variance:f64=0.0
+   time=0
+   loop{if time==plane{break}
+    var column:f64=0.0
+    var channel:u64=0
+    loop{if channel==x.c{break}
+     let difference:f32=array.get(x.data,channel*plane+time)-mean
+     let square:f32=difference*difference
+     column+=cast.float(square)
+     channel+=1}
+    let variance:f32=cast.float(column/cast.float(x.c))
+    sum_variance+=cast.float(variance)
+    time+=1}
+   array.push(variances,cast.float(sum_variance/cast.float(plane)))
+  }else{
+   time=0
+   loop{if time==plane{break}
+    let mean:f32=array.get(means,time)
+    var sum:f64=0.0
+    var channel:u64=0
+    loop{if channel==x.c{break}
+     let difference:f64=cast.float(array.get(x.data,channel*plane+time))-cast.float(mean)
+     sum+=difference*difference
+     channel+=1}
+    array.push(variances,cast.float(sum/cast.float(x.c)))
+    time+=1}}
+ }
+ var channel:u64=0
+ loop{if channel==x.c{break}
+  var time:u64=0
+  loop{if time==plane{break}
+   let statistics:u64=if kind==Kind.Global{0}else{if kind==Kind.Time{channel}else{time}}
+   let centered:f32=array.get(x.data,channel*plane+time)-array.get(means,statistics)
+   let denominator:f32=fp.sqrt(array.get(variances,statistics)+epsilon)
+   let scaled:f32=view.get(gamma,channel)*centered
+   array.set(x.data,channel*plane+time,scaled/denominator+view.get(beta,channel))
+   time+=1}
+  channel+=1}
+ if not num.finite(array.view(x.data)){return result.err("Non-finite normalized values")}
+ result.ok(x)
+}

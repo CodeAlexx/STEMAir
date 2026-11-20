@@ -1,0 +1,186 @@
+module stemair.cli_audio_cpu_queue
+import "cli_audio_cpu.ai" as cpu
+import "../toolkit/recording_context.ai" as recording_context
+import "time_application.ai" as audio_time
+import "pitch_application.ai" as pitch
+import "artifact_cleanup_policy.ai" as cleanup_policy
+import "../toolkit/mask/request.ai" as mask_request
+import "cli_audio_policy.ai" as io_policy
+import "cli_processing_sample.ai" as sample_input
+import "checked_input.ai" as checked
+import "container_export.ai" as container
+import "queue_config.ai" as config
+import "secondary_application.ai" as secondary_app
+import "model_ensemble_application.ai" as model_app
+import "../toolkit/secondary_config.ai" as secondary
+import "../toolkit/model_ensemble_config.ai" as models
+import "../toolkit/model_cache.ai" as cache
+import "../toolkit/control.ai" as control
+import std.codec as codec
+import std.files as files
+import std.json as json
+import std.path as path
+import std.text as text
+
+pub type Outcome=struct{ok:bool,report:config.Report,report_file:string,export_report:string,message:string}
+type Exports=struct{artifacts:array<string>,attempted:string="",failure:string=""}
+fn error(e:fs.error)->string effects {alloc} {string.copy(fs.error.message(e))}
+fn record(report:ref<config.Report>,index:u64,state:str,message:str)->unit effects {alloc} {
+ let row:ref<config.Outcome>=array.borrow(report.items,index)
+ row.state=string.copy(state)
+ row.message=string.copy(message)
+ ()
+}
+fn update(bank:ref<cache.Cache>,report:ref<config.Report>)->unit effects {} {
+ if array.len(report.checkpoints)==0{return ()}
+ report.checkpoint_loads=cache.loads(bank)
+ report.bytes_read=cache.bytes_read(bank)
+ report.inference_requests=cache.requests(bank)
+ ()
+}
+fn persist(bank:ref<cache.Cache>,report:ref<config.Report>,file:str)->result<unit,string> effects {alloc,fs.write} {
+ update(bank,report)
+ let raw:string=try config.Report_encode(report) map_err codec.describe
+ let _=try files.write_atomic(file,text.concat(file,".tmp"),raw) map_err error
+ result.ok(())
+}
+fn absorb(exports:ref<Exports>,log:ref<container.Journal>)->result<unit,string> effects {alloc} {
+ let raw:string=try container.encode_journal(log)
+ var doc:json.Document=try json.parse(raw) map_err json.message
+ let list:u64=match json.get(doc,0,"artifacts"){none=>{return result.err("Queue export artifacts are absent")},some(v)=>v}
+ let count:u64=match json.len(doc,list){none=>{return result.err("Queue export artifacts are invalid")},some(v)=>v}
+ var i:u64=0
+ loop{if i==count{break}
+  let at:u64=match json.at(doc,list,i){none=>{return result.err("Queue export artifact is absent")},some(v)=>v}
+  let token:json.Token=match json.token(doc,at){none=>{return result.err("Queue export artifact is invalid")},some(v)=>v}
+  array.push(exports.artifacts,string.copy(str.slice(doc.source,token.start,token.end)))
+  i+=1}
+ if str.len(log.failure)>0{exports.failure=string.copy(log.failure)
+  exports.attempted=string.copy(log.attempted)}else{if str.len(exports.failure)==0{exports.attempted=string.copy(log.attempted)}}
+ result.ok(())
+}
+fn encode(exports:ref<Exports>)->result<string,string> effects {alloc} {
+ let keys:array<string>=["artifacts","attempted","failure"]
+ let values:array<string>=[try json.encode_array(exports.artifacts) map_err json.message,json.quote(exports.attempted),json.quote(exports.failure)]
+ result.ok(try json.encode_object(keys,values) map_err json.message)
+}
+pub fn summary(value:ref<Outcome>)->result<string,string> effects {alloc} {
+ let keys:array<string>=["ok","report","report_file","exports","message"]
+ let values:array<string>=[if value.ok{"true"}else{"false"},try config.Report_encode(struct.borrow(value,field=report)) map_err codec.describe,
+  json.quote(value.report_file),string.copy(value.export_report),json.quote(value.message)]
+ result.ok(try json.encode_object(keys,values) map_err json.message)
+}
+fn item(bank:ref<cache.Cache>,selection:ref<config.Plan>,second:str,ensemble:str,tool:str,settings:ref<io_policy.Settings>,input:str,output:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:checked.Options own,recording:ref<recording_context.Context>)->result<unit,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, random, time} {
+ var owned:checked.Options=options
+ let root:string=try io_policy.root(settings)
+ let _=try files.mkdirs(output) map_err error
+ let sample_progress:string=string.copy(settings.progress_file)
+ var prepared:sample_input.Input=try sample_input.open(settings,input,owned,sample_progress)
+ let outcome:result<unit,string>=prepared_item(bank,selection,second,ensemble,tool,settings,prepared.path,output,plan,log,owned,root,recording)
+ sample_input.finish(prepared,outcome)
+}
+fn prepared_item(bank:ref<cache.Cache>,selection:ref<config.Plan>,second:str,ensemble:str,tool:str,settings:ref<io_policy.Settings>,input:str,output:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:checked.Options own,root:str,recording:ref<recording_context.Context>)->result<unit,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, random, time} {
+ var owned:checked.Options=options
+ if str.len(selection.audio_time)>0{
+  let value:audio_time.Settings=try audio_time.decode(tool)
+  var policy:option<checked.Options>=option.some(owned)
+  let _=try audio_time.run_with_input_to(value,input,output,settings.cancel_file,settings.progress_file,plan,log,policy)
+  return result.ok(())}
+ if str.len(selection.pitch)>0{
+  let value:pitch.Settings=try pitch.decode(tool)
+  var policy:option<checked.Options>=option.some(owned)
+  return pitch.run_with_input_to(value,input,output,settings.cancel_file,settings.progress_file,plan,log,policy)}
+ var request:mask_request.Policy=try io_policy.request(settings,0)
+ if str.len(second)>0{var value:secondary.Recipe=try secondary.Recipe_decode(second) map_err codec.describe
+  return cpu.secondary_prepared_controlled(bank,value,input,output,settings.cancel_file,settings.progress_file,plan,log,owned,root,request,recording)}
+ if str.len(ensemble)>0{var value:models.Recipe=try models.Recipe_decode(ensemble) map_err codec.describe
+  return cpu.ensemble_prepared_controlled(bank,value,input,output,settings.cancel_file,settings.progress_file,plan,log,owned,root,request,recording)}
+ cpu.single_prepared_controlled(bank,selection.config,selection.checkpoint,input,output,settings.cancel_file,settings.progress_file,plan,log,owned,root,request,recording)
+}
+pub fn run(bank:ref<cache.Cache>,selection:ref<config.Plan>,settings:ref<io_policy.Settings>,directory:str,
+ plan:ref<container.Plan>,options:ref<checked.Options>)->result<Outcome,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, random, time} {
+ var recording:recording_context.Context=recording_context.disabled()
+ run_controlled(bank,selection,settings,directory,plan,options,recording)
+}
+
+pub fn run_controlled(bank:ref<cache.Cache>,selection:ref<config.Plan>,settings:ref<io_policy.Settings>,directory:str,
+ plan:ref<container.Plan>,options:ref<checked.Options>,recording:ref<recording_context.Context>)->result<Outcome,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, random, time} {
+ let _=try config.validate(struct.borrow(selection,field=items))
+ let _=try container.verify(plan)
+ let _=try container.require_directory(directory)
+ let _=try config.validate_selection(selection)
+ let tool:string=if str.len(selection.audio_time)>0{
+  let value:audio_time.Settings=try audio_time.read(selection.audio_time)
+  try audio_time.encode(value)
+ }else{if str.len(selection.pitch)>0{
+  let value:pitch.Settings=try pitch.read(selection.pitch)
+  try pitch.Settings_encode(value) map_err codec.describe
+ }else{""}}
+ if str.len(tool)==0{let learned:string=try io_policy.learned_snapshot(settings)
+  let _=try cache.select_learned(bank,learned)}
+ var second:string=""
+ var ensemble:string=""
+ var report:config.Report=config.Report{items:[],configurations:[],checkpoints:[],use_gpu:false}
+ if str.len(selection.secondary)>0{var value:secondary.Recipe=try secondary_app.read(selection.secondary)
+  second=try secondary.Recipe_encode(value) map_err codec.describe
+  var i:u64=0
+  loop{if i==array.len(value.models){break}
+   array.push(report.configurations,string.copy(array.borrow(value.models,i).config))
+   array.push(report.checkpoints,string.copy(array.borrow(value.models,i).checkpoint))
+   i+=1}}
+ if str.len(selection.ensemble)>0{var value:models.Recipe=try model_app.read(selection.ensemble)
+  ensemble=try models.Recipe_encode(value) map_err codec.describe
+  var i:u64=0
+  loop{if i==array.len(value.models){break}
+   array.push(report.configurations,string.copy(array.borrow(value.models,i).config))
+   array.push(report.checkpoints,string.copy(array.borrow(value.models,i).checkpoint))
+   i+=1}}
+ if str.len(tool)==0 and str.len(selection.ensemble)==0 and str.len(selection.secondary)==0{
+  array.push(report.configurations,string.copy(selection.config))
+  array.push(report.checkpoints,string.copy(selection.checkpoint))}
+ var index:u64=0
+ loop{if index==array.len(selection.items){break}
+  let item:ref<config.Item>=array.borrow(selection.items,index)
+  array.push(report.items,config.Outcome{input:string.copy(item.input),folder:string.copy(item.folder)})
+  index+=1}
+ let file:string=path.join(directory,text.concat("queue-",text.concat(string.from_int(time.monotonic_ns()),".json")))
+ update(bank,report)
+ let _=try files.write_new_text(file,try config.Report_encode(report) map_err codec.describe) map_err error
+ var exports:Exports=Exports{artifacts:[]}
+ report.state="running"
+ index=0
+ loop{if index==array.len(selection.items){break}
+  if control.cancelled(settings.cancel_file){report.state="cancelled"
+   exports.failure="Recording queue cancelled"
+   break}
+  let input:string=string.copy(array.borrow(selection.items,index).input)
+  let output:string=path.join(directory,array.borrow(selection.items,index).folder)
+  var log:container.Journal=container.empty_journal()
+  var input_options:checked.Options=checked.queue_item(options,index,try io_policy.absolute_optional(settings.cancel_file))
+  record(report,index,"running","")
+  let _=try persist(bank,report,file)
+  let completed:result<unit,string>=item(bank,selection,second,ensemble,tool,settings,input,output,plan,log,input_options,recording)
+  match completed{ok(_)=>{record(report,index,"complete","")
+   report.succeeded+=1},err(problem)=>{
+   if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+   if control.cancelled(settings.cancel_file){record(report,index,"cancelled",problem)
+    report.state="cancelled"}else{
+    if str.starts_with(problem,"Recording: "){record(report,index,"skipped",problem)
+     report.skipped+=1}else{record(report,index,"failed",problem)
+     report.failed+=1
+     if not selection.continue_on_error{report.state="stopped"}}}}}
+  let _=try absorb(exports,log)
+  let _=try persist(bank,report,file)
+  if report.state=="stopped" or report.state=="cancelled"{break}
+  index+=1}
+ if report.state=="running"{report.state="complete"}
+ let _=try persist(bank,report,file)
+ let message:string=text.concat("Recording queue: ",text.concat(string.from_int(report.succeeded),text.concat(" complete, ",text.concat(string.from_int(report.skipped),text.concat(" skipped, ",text.concat(string.from_int(report.failed)," failed"))))))
+ result.ok(Outcome{ok:report.state=="complete" and report.failed==0 and report.skipped==0,report:report,report_file:file,export_report:try encode(exports),message:message})
+}

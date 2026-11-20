@@ -1,0 +1,36 @@
+// MIT application/helper protocol; contains no mastering DSP implementation.
+module stemair.reference_mastering_protocol
+import "codec_process.ai" as child
+import "export_audio.ai" as wave
+import std.codec as codec
+import std.path as path
+import std.text as text
+pub type Pair=struct{target:string,reference:string,output:string} derive codec(strict)
+pub type Tool=struct{path:string,sha256:string} derive codec(strict)
+pub type Runtime=struct{helper:Tool,sndfile:Tool,sndfile_version:string,fft:Tool,dot:Tool,filter:Tool,ffmpeg:Tool} derive codec(strict)
+pub type Limits=struct{max_input_frames:u64=172800000,max_decoded_bytes:u64=536870912,max_frames:u64=39690000,max_fft:u64=67108864,max_working_bytes:u64=2147483648,max_export_bytes:u64=1073741824} derive codec(strict)
+pub type Request=struct{runtime:Runtime,pairs:array<Pair>,subtype:string="s16",codec_recipe:string="",work_directory:string,cancel:string="",progress:string="",deadline_ns:u64,limits:Limits} derive codec(strict)
+pub type Row=struct{target:string,reference:string,output:string,status:string,error:string,frames:u64,target_fallback:bool,reference_fallback:bool,export_report:string} derive codec(strict)
+pub type Report=struct{version:u32=1,backend:string="native-reference-mastering",rows:array<Row>,completed:u64,skipped:u64,failed:u64,stopped:bool,work_directory:string,temporary_removed:bool} derive codec(strict)
+pub fn verify_tool(tool:ref<Tool>)->result<unit,string> effects {alloc,fs.read,fs.meta}{
+ var selected:child.Tool=child.Tool{path:string.copy(tool.path),sha256:string.copy(tool.sha256)}
+ child.verify(selected)}
+pub fn copy_pair(pair:ref<Pair>)->Pair effects {alloc}{
+ Pair{target:string.copy(pair.target),reference:string.copy(pair.reference),output:string.copy(pair.output)}}
+pub fn validate(request:ref<Request>)->result<unit,string> effects {alloc}{
+ let _=try wave.subtype(request.subtype)
+ if array.len(request.pairs)==0 or array.len(request.pairs)>1000{return result.err("Mastering requires 1..1000 ordered target/reference pairs")}
+ if not path.is_absolute(request.work_directory) or (str.len(request.cancel)>0 and not path.is_absolute(request.cancel)) or (str.len(request.progress)>0 and not path.is_absolute(request.progress)){return result.err("Mastering work/control paths must be absolute")}
+ if request.limits.max_input_frames==0 or request.limits.max_decoded_bytes<16 or request.limits.max_frames<=4096 or request.limits.max_frames>39690000 or request.limits.max_fft==0 or request.limits.max_fft>67108864 or request.limits.max_working_bytes<65536 or request.limits.max_export_bytes<44{return result.err("Mastering selected resources are invalid")}
+ var i:u64=0
+ loop{if i==array.len(request.pairs){break}
+  let item:ref<Pair>=array.borrow(request.pairs,i)
+  if not path.is_absolute(item.target) or not path.is_absolute(item.reference) or not path.is_absolute(item.output) or text.contains(item.target,"\x{00}") or text.contains(item.reference,"\x{00}") or text.contains(item.output,"\x{00}"){return result.err("Mastering pair paths must be absolute and contain no zero byte")}
+  if str.view(item.output)==str.view(item.target) or str.view(item.output)==str.view(item.reference){return result.err("Mastering output cannot replace an input")}
+  var j:u64=0
+  loop{if j==i{break}
+   let previous:ref<Pair>=array.borrow(request.pairs,j)
+   if text.lower_ascii(item.output)==text.lower_ascii(previous.output){return result.err("Mastering output paths must be distinct")}
+   j+=1}
+  i+=1}
+ result.ok(())}

@@ -1,0 +1,39 @@
+module stemair.attention.bundle_session
+import "bundle.ai" as bundle
+import "bundle_config.ai" as config
+import std.files as files
+import std.path as path
+import std.yaml as yaml
+import std.json as json
+import std.codec as codec
+import std.float as fp
+
+fn error(e:fs.error)->string effects {alloc}{string.copy(fs.error.message(e))}
+pub fn open(file:str,c:ref<config.Config>)->result<bundle.State,string> effects {alloc,fs.read}{
+ let _=try config.validate(c)
+ let content:bytes=match files.read_limited(file,65536){ok(v)=>v,err(_)=>{return result.err("Cannot read bounded bundle definition")}}
+ let raw:str=match str.from_bytes(bytes.view(content)){some(v)=>v,none=>{return result.err("Bundle definition is not UTF-8")}}
+ let document:json.Document=try yaml.parse(raw) map_err yaml.message
+ var definition:config.Definition=try config.definition(json.stringify(document))
+ let _=try config.validate_definition(c,definition)
+ var state:bundle.State=bundle.State{members:[]}
+ var i:u64=0
+ loop{if i==array.len(definition.models){break}
+  let identity:ref<config.Identity>=array.borrow(c.members,i)
+  let signature:str=array.get(definition.models,i)
+  if signature!=str.view(struct.borrow(identity,field=signature)){return result.err("Bundle model order differs from pinned identities")}
+  var weights:array<f64>=[]
+  match definition.weights{none=>{
+   var j:u64=0
+   loop{if j==array.len(c.model.targets){break}
+    array.push(weights,1.0)
+    j+=1}},some(rows)=>{
+   let row:ref<array<f64>>=array.borrow(rows,i)
+   var j:u64=0
+   loop{if j==array.len(row){break}
+    array.push(weights,array.get(row,j))
+    j+=1}}}
+  let _=try bundle.append(state,path.join(path.dirname(file),identity.filename),struct.borrow(c,field=model),array.view(weights))
+  i+=1}
+ result.ok(state)
+}

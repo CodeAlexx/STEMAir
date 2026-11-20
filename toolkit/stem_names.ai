@@ -1,0 +1,89 @@
+module stemair.stem_names
+import std.text as text
+import std.float as fp
+
+// Pure source naming/role policy. Model buffers, paths and session state stay with callers.
+pub type Pair=struct{primary:string,secondary:string,primary_label:string,secondary_label:string,primary_foreground:bool} derive codec(strict)
+pub type Role=struct{kind:u32=0,rebalance:f64=0.0} derive codec(strict)
+fn title(value:str)->string effects {alloc} {
+ if str.len(value)==0{return ""}
+ text.concat(text.upper_ascii(str.slice(value,0,1)),text.lower_ascii(str.slice(value,1,str.len(value))))
+}
+pub fn display(target:str)->string effects {alloc} {
+ if target=="vocals"{return "Vocals"}
+ if target=="instrumental"{return "Instrumental"}
+ if target=="wind_inst"{return "Wind Inst"}
+ if target=="primary"{return "Primary Stem"}
+ if target=="secondary"{return "Secondary Stem"}
+ if target=="lead"{return "Lead Vocals"}
+ if target=="backing"{return "Backing Vocals"}
+ if str.starts_with(target,"no_"){return text.concat("No ",display(str.slice(target,3,str.len(target))))}
+ title(target)
+}
+// Source file suffixes differ from the human vocal-split messages.
+pub fn output_label(target:str)->string effects {alloc} {
+ if target=="lead"{return "lead_only"}
+ if target=="backing"{return "backing_only"}
+ if target=="instrumental_with_lead"{return "with_lead_vocals"}
+ if target=="instrumental_with_backing"{return "with_backing_vocals"}
+ display(target)
+}
+pub fn complement(target:str)->string effects {alloc} {
+ if target=="vocals"{return "instrumental"}
+ if target=="instrumental"{return "vocals"}
+ if target=="lead"{return "backing"}
+ if target=="backing"{return "lead"}
+ if target=="primary"{return "secondary"}
+ if target=="secondary"{return "primary"}
+ if str.starts_with(target,"no_"){return string.copy(str.slice(target,3,str.len(target)))}
+ text.concat("no_",target)
+}
+pub fn foreground(target:str)->bool effects {} {
+ target=="vocals" or target=="other" or target=="bass" or target=="drums" or target=="guitar" or target=="piano" or
+ target=="synthesizer" or target=="strings" or target=="woodwinds" or target=="brass" or target=="wind_inst"
+}
+pub fn pair(primary:str)->Pair effects {alloc} {
+ let secondary:string=complement(primary)
+ Pair{primary:string.copy(primary),secondary:secondary,primary_label:display(primary),secondary_label:display(secondary),primary_foreground:foreground(primary)}
+}
+fn canonical(label:str)->string effects {alloc} {
+ text.lower_ascii(text.replace(label," ","_"))
+}
+fn source_pair(label:str)->Pair effects {alloc} {
+ let other:string=if label=="Vocals"{"Instrumental"}else{if label=="Instrumental"{"Vocals"}else{
+  if text.contains(label,"No "){text.replace(label,"No ","")}else{text.concat("No ",label)}}}
+ let active:bool=label=="Vocals" or label=="Other" or label=="Bass" or label=="Drums" or label=="Guitar" or label=="Piano" or
+  label=="Synthesizer" or label=="Strings" or label=="Woodwinds" or label=="Brass" or label=="Wind Inst"
+ Pair{primary:canonical(label),secondary:canonical(other),primary_label:string.copy(label),secondary_label:other,primary_foreground:active}
+}
+pub fn menu(target:str)->result<Pair,string> effects {alloc} {
+ if target!="instrumental" and not foreground(target){return result.err("Choose a conventional source name")}
+ result.ok(source_pair(display(target)))
+}
+// The original custom dialog capitalizes even its exceptional two-word name.
+// Keep exact labels: custom "Wind Inst" -> "Wind inst" is not the menu entry.
+pub fn parse(value:str,inverse:bool)->result<Pair,string> effects {alloc} {
+ if str.len(value)==0 or str.len(value)>25{return result.err("Enter a source name with one to twenty-five letters")}
+ let exceptional:bool=value=="Wind Inst"
+ var i:u64=0
+ loop{if i==str.len(value){break}
+  if not exceptional and not text.ascii_is_alpha(view.get(str.bytes(value),i)){return result.err("Source names use letters; Wind Inst is the supported two-word name")}
+  i+=1}
+ let label:string=title(value)
+ let primary:string=if inverse{if label=="Vocals"{"Instrumental"}else{if label=="Instrumental"{"Vocals"}else{text.concat("No ",label)}}}else{string.copy(label)}
+ result.ok(source_pair(primary))
+}
+pub fn role(primary:str,lead:bool,backing:bool,rebalance:f64)->result<Role,string> effects {alloc} {
+ if lead and backing{return result.err("Choose either a lead or a backing model role")}
+ if not fp.is_finite(rebalance) or rebalance<0.0 or rebalance>0.9{return result.err("Backing rebalance must be between zero and 0.9")}
+ if primary!="vocals" and primary!="instrumental"{return result.ok(Role{})}
+ result.ok(Role{kind:if backing{2}else{if lead{1}else{0}},rebalance:if backing{rebalance}else{0.0}})
+}
+pub fn split_pair(primary:str,choice:ref<Role>)->result<Pair,string> effects {alloc} {
+ if (primary!="vocals" and primary!="instrumental") or choice.kind==0 or choice.kind>2{
+  return result.err("A vocal splitter needs a vocal/instrumental model with a lead or backing role")}
+ if not fp.is_finite(choice.rebalance) or choice.rebalance<0.0 or choice.rebalance>0.9 or (choice.kind!=2 and choice.rebalance!=0.0){return result.err("Invalid vocal model role")}
+ let backing:bool=choice.kind==2
+ let first:str=if primary=="vocals"{if backing{"backing"}else{"lead"}}else{if backing{"lead"}else{"backing"}}
+ result.ok(pair(first))
+}

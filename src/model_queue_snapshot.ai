@@ -1,0 +1,156 @@
+module stemair.model_queue_snapshot
+import "../toolkit/engine.ai" as engine
+import "../toolkit/model_ensemble_config.ai" as ensemble
+import "../toolkit/secondary_config.ai" as secondary
+import "model_defaults.ai" as defaults
+import std.files as files
+import std.path as path
+import std.codec as codec
+
+// A pending input list is independent of the editable current model selection.
+pub type Guard=struct{configuration:string,sha256:string} derive codec(strict)
+pub type Snapshot=struct{version:u32=1,settings:string,checkpoint:string,ensemble:string,secondary:string,guards:array<Guard>,model_definition:string="",definition_sha256:string=""} derive codec(strict)
+fn fs_error(e:fs.error)->string effects {alloc} {string.copy(fs.error.message(e))}
+fn absolute(file:str)->result<string,string> effects {alloc,fs.read} {
+ if str.len(file)==0{return result.err("Pending queue has an empty model configuration")}
+ if path.is_absolute(file){return result.ok(path.normalize(file))}
+ result.ok(path.normalize(path.join(try files.cwd() map_err fs_error,file)))
+}
+fn source(file:str)->result<string,string> effects {alloc,fs.read,fs.meta} {
+ let info:fs.meta=try files.symlink_metadata(file) map_err fs_error
+ if not info.is_file or info.is_symlink or info.size>65536{return result.err("Pending queue configuration must be an ordinary file within 64 KiB")}
+ let raw:bytes=match files.read_limited(file,65536){ok(v)=>v,err(_)=>{return result.err("Cannot read pending queue configuration within 64 KiB")}}
+ let content:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("Pending queue configuration is not UTF-8")}}
+ result.ok(string.copy(content))
+}
+fn definition(file:str,configuration:str)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ if str.len(file)==0{return result.ok(())}
+ let accepted:defaults.LoadedRecord=try defaults.inspect_published(file)
+ let profile:engine.Profile=try engine.decode(try source(configuration))
+ if str.view(accepted.record.configuration)!=str.view(profile.identity){return result.err("Pending model definition differs from its accepted configuration")}
+ result.ok(())
+}
+fn add_guard(guards:ref<array<Guard>>,file:str)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ let resolved:string=try absolute(file)
+ var i:u64=0
+ loop{if i==array.len(guards){break}
+  if str.view(array.borrow(guards,i).configuration)==str.view(resolved){return result.ok(())}
+  i+=1}
+ if array.len(guards)>=512{return result.err("Pending model snapshot exceeds its configuration count")}
+ let raw:string=try source(resolved)
+ let _=try engine.decode(raw)
+ array.push(guards,Guard{configuration:resolved,sha256:defaults.digest(raw)})
+ result.ok(())
+}
+fn add_secondary(guards:ref<array<Guard>>,raw:str)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ if str.len(raw)==0{return result.ok(())}
+ if str.len(raw)>1048576{return result.err("Pending secondary recipe exceeds 1 MiB")}
+ var recipe:secondary.Recipe=try secondary.Recipe_decode(raw) map_err codec.describe
+ var i:u64=0
+ loop{if i==array.len(recipe.models){break}
+  let _=try add_guard(guards,array.borrow(recipe.models,i).config)
+  i+=1}
+ result.ok(())
+}
+fn resolved_secondary(raw:str)->result<string,string> effects {alloc, fs.meta, fs.read} {
+ if str.len(raw)==0{return result.ok("")}
+ if str.len(raw)>1048576{return result.err("Pending secondary recipe exceeds 1 MiB")}
+ var recipe:secondary.Recipe=try secondary.Recipe_decode(raw) map_err codec.describe
+ var i:u64=0
+ loop{if i==array.len(recipe.models){break}
+  let model:ref<secondary.Model>=array.borrow(recipe.models,i)
+  model.config=try absolute(model.config)
+  model.checkpoint=try absolute(model.checkpoint)
+  if str.len(model.definition)>0{model.definition=try absolute(model.definition)
+   let _=try definition(model.definition,model.config)}
+  i+=1}
+ result.ok(try secondary.Recipe_encode(recipe) map_err codec.describe)
+}
+pub fn validate(value:ref<Snapshot>)->result<unit,string> effects {alloc} {
+ if value.version!=1 or array.len(value.guards)==0 or array.len(value.guards)>512 or str.len(value.settings)==0 or str.len(value.checkpoint)==0 or
+  str.len(value.ensemble)>1048576 or str.len(value.secondary)>1048576{return result.err("Pending model snapshot exceeds its version or bounds")}
+ if str.len(value.ensemble)>0{let _=try ensemble.Recipe_decode(value.ensemble) map_err codec.describe}
+ if str.len(value.secondary)>0{let _=try secondary.Recipe_decode(value.secondary) map_err codec.describe}
+ if str.len(value.model_definition)>0{
+  if not path.is_absolute(value.model_definition) or not defaults.valid_digest(value.definition_sha256){return result.err("Pending model definition identity is incomplete")}}
+ else{if str.len(value.definition_sha256)>0{return result.err("Pending definition digest has no selected record")}}
+ var i:u64=0
+ loop{if i==array.len(value.guards){break}
+  let guard:ref<Guard>=array.borrow(value.guards,i)
+  if not path.is_absolute(guard.configuration) or not defaults.valid_digest(guard.sha256){return result.err("Pending model configuration identity is incomplete")}
+  var j:u64=0
+  loop{if j==i{break}
+   if str.view(array.borrow(value.guards,j).configuration)==str.view(guard.configuration){return result.err("Duplicate pending model configuration")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn decode(raw:str)->result<Snapshot,string> effects {alloc} {
+ if str.len(raw)>3145728{return result.err("Pending model snapshot exceeds 3 MiB")}
+ var value:Snapshot=try Snapshot_decode(raw) map_err codec.describe
+ let _=try validate(value)
+ result.ok(value)
+}
+pub fn capture(settings:str,checkpoint:str,ensemble_raw:str,secondary_raw:str)->result<string,string> effects {alloc,fs.read,fs.meta} {
+ capture_selected(settings,checkpoint,ensemble_raw,secondary_raw,"")
+}
+pub fn capture_selected(settings:str,checkpoint:str,ensemble_raw:str,secondary_raw:str,definition:str)->result<string,string> effects {alloc,fs.read,fs.meta} {
+ var value:Snapshot=Snapshot{settings:try absolute(settings),checkpoint:try absolute(checkpoint),ensemble:"",secondary:try resolved_secondary(secondary_raw),guards:[]}
+ let _=try add_guard(struct.borrow(value,field=guards),settings)
+ let _=try add_secondary(struct.borrow(value,field=guards),value.secondary)
+ if str.len(ensemble_raw)>0{
+  if str.len(ensemble_raw)>1048576{return result.err("Pending ensemble recipe exceeds 1 MiB")}
+  var recipe:ensemble.Recipe=try ensemble.Recipe_decode(ensemble_raw) map_err codec.describe
+  var i:u64=0
+  loop{if i==array.len(recipe.models){break}
+   let member:ref<ensemble.Model>=array.borrow(recipe.models,i)
+   member.config=try absolute(member.config)
+   member.checkpoint=try absolute(member.checkpoint)
+   if str.len(member.definition)>0{member.definition=try absolute(member.definition)
+    let _=try definition(member.definition,member.config)}
+   member.processing=try resolved_secondary(member.processing)
+   let _=try add_guard(struct.borrow(value,field=guards),member.config)
+   let _=try add_secondary(struct.borrow(value,field=guards),member.processing)
+   i+=1}
+  value.ensemble=try ensemble.Recipe_encode(recipe) map_err codec.describe}
+ if str.len(definition)>0{
+  let file:string=try absolute(definition)
+  let selected:defaults.LoadedRecord=try defaults.inspect_published(file)
+  if defaults.digest(selected.record.configuration)!=str.view(array.borrow(value.guards,0).sha256){return result.err("Selected definition differs from the pending model configuration")}
+  value.model_definition=file
+  value.definition_sha256=string.copy(selected.sha256)}
+ let _=try validate(value)
+ result.ok(try Snapshot_encode(value) map_err codec.describe)
+}
+pub fn verify(value:ref<Snapshot>)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ let _=try validate(value)
+ var i:u64=0
+ loop{if i==array.len(value.guards){break}
+  let guard:ref<Guard>=array.borrow(value.guards,i)
+  let raw:string=try source(guard.configuration)
+  if defaults.digest(raw)!=str.view(guard.sha256){return result.err("A pending queue model configuration changed; explicitly use current settings or restore its original file")}
+  i+=1}
+ if str.len(value.model_definition)>0{
+  let selected:defaults.LoadedRecord=try defaults.inspect_published(value.model_definition)
+  if str.view(selected.sha256)!=str.view(value.definition_sha256){return result.err("Pending model definition changed; restore it or explicitly use current settings")}}
+ let _=try verify_secondary(value.secondary)
+ if str.len(value.ensemble)>0{
+  var ensemble:ensemble.Recipe=try ensemble.Recipe_decode(value.ensemble) map_err codec.describe
+  i=0
+  loop{if i==array.len(ensemble.models){break}
+   let member:ref<ensemble.Model>=array.borrow(ensemble.models,i)
+   let _=try definition(member.definition,member.config)
+   let _=try verify_secondary(member.processing)
+   i+=1}}
+ result.ok(())
+}
+fn verify_secondary(raw:str)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ if str.len(raw)==0{return result.ok(())}
+ var recipe:secondary.Recipe=try secondary.Recipe_decode(raw) map_err codec.describe
+ var i:u64=0
+ loop{if i==array.len(recipe.models){break}
+  let member:ref<secondary.Model>=array.borrow(recipe.models,i)
+  let _=try definition(member.definition,member.config)
+  i+=1}
+ result.ok(())
+}

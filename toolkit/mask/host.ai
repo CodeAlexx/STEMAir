@@ -1,0 +1,160 @@
+module stemair.mask.host
+import "network.ai" as network
+import "../weights.ai" as weights
+import "../ops.ai" as ops
+import "../spatial.ai" as spatial
+import "../control.ai" as control
+import std.cpu_conv2d as convolution
+import std.float as fp
+import std.cabi as native
+import std.system as system
+
+
+pub type Backend=struct{weights:array<option<convolution.Prepared>>,parameters:u64,bytes:u64}
+pub fn prepare(parameters:ref<weights.Model>)->result<Backend,string> effects {alloc,fs.read} {
+ var required:u64=1073741824
+ var j:u64=0
+ loop{if j==array.len(parameters.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(parameters.parameters.values,j)
+  if array.len(p.shape)==4{if array.len(p.values)>(18446744073709551615-required)/8{return result.err("CPU preparation extent overflows")}
+   required+=8*array.len(p.values)}
+  j+=1}
+ let memory:system.Memory=match system.memory(){ok(v)=>v,err(_)=>{return result.err("Cannot query memory for retained CPU convolution")}}
+ if required>memory.available_bytes{return result.err("Not enough host memory for retained CPU weights and bounded convolution workspace; release other models")}
+ var prepared:array<option<convolution.Prepared>>=[]
+ var count:u64=0
+ var bytes:u64=0
+ var i:u64=0
+ loop{if i==array.len(parameters.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(parameters.parameters.values,i)
+  if array.len(p.shape)==4{
+   let weight:convolution.Prepared=try convolution.prepare(array.view(p.values),array.view(p.shape))
+   count+=1
+   bytes+=4*array.len(p.values)
+   array.push(prepared,option.some(weight))
+  }else{array.push(prepared,option.none())}
+  i+=1}
+ result.ok(Backend{weights:prepared,parameters:count,bytes:bytes})
+}
+fn parameter(parameters:ref<weights.Model>,id:u64,channel:u64)->f32 effects {} {array.get(array.borrow(parameters.parameters.values,id).values,channel)}
+fn convolve(parameters:ref<weights.Model>,prepared:ref<Backend>,library:ref<CAbiLibrary>,x:ref<ops.Tensor>,c:network.Convolution)->result<ops.Tensor,string> effects {alloc,ffi} {
+ convolve_with_workspace(parameters,prepared,library,x,c,67108864)
+}
+// Caller-owned lowering limit in F32 elements; existing callers keep their limit.
+pub fn convolve_with_workspace(parameters:ref<weights.Model>,prepared:ref<Backend>,library:ref<CAbiLibrary>,x:ref<ops.Tensor>,c:network.Convolution,columns:u64)->result<ops.Tensor,string> effects {alloc,ffi} {
+ let p:ref<convolution.Prepared>=match array.borrow(prepared.weights,c.weight){some(v)=>v,none=>{return result.err("CPU convolution weight was not prepared at session open")}}
+ let shape:array<u64>=[1,x.c,x.h,x.w]
+ let options:convolution.Options=convolution.Options{groups:c.groups,stride_height:c.stride,stride_width:if c.stride_w==0{c.stride}else{c.stride_w},
+  padding_height:c.pad,padding_width:if c.pad_w==18446744073709551615{c.pad}else{c.pad_w},
+  dilation_height:c.dilation,dilation_width:if c.dilation_w==0{c.dilation}else{c.dilation_w}}
+ let geometry:convolution.Geometry=try convolution.geometry(array.view(shape),array.view(p.shape),options)
+ var output:array<f32>=try convolution.convolve_blas(library,array.view(x.data),array.view(shape),p,[],options,columns)
+ let plane:u64=geometry.output_height*geometry.output_width
+ if c.normalized{
+  var channel:u64=0
+  loop{if channel==geometry.output_channels{break}
+   let scale:f32=parameter(parameters,c.scale,channel)
+   let bias:f32=parameter(parameters,c.bias,channel)
+   var i:u64=0
+   loop{if i==plane{break}
+    let at:u64=channel*plane+i
+    array.set(output,at,array.get(output,at)*scale+bias)
+    i+=1}
+   channel+=1}}
+ var i:u64=0
+ loop{if i==array.len(output){break}
+  let value:f32=array.get(output,i)
+  if value<0.0{if c.activation==1{array.set(output,i,0.0)}else{if c.activation==2{array.set(output,i,value*0.01)}}}
+  i+=1}
+ result.ok(ops.tensor(geometry.output_channels,geometry.output_height,geometry.output_width,output))
+}
+fn slice(x:ref<ops.Tensor>,axis:u64,start:u64,length:u64)->result<ops.Tensor,string> effects {alloc} {
+ if axis==2{return spatial.slice(x,start,length,0,x.w)}
+ if axis==3{return spatial.slice(x,0,x.h,start,length)}
+ result.err("Unsupported host crop axis")
+}
+fn join(a:ref<ops.Tensor>,b:ref<ops.Tensor>)->result<ops.Tensor,string> effects {alloc} {
+ if a.h!=b.h or a.w!=b.w{return result.err("Cascaded channel concatenation shape mismatch")}
+ var output:array<f32>=[]
+ array.reserve(output,array.len(a.data)+array.len(b.data))
+ var i:u64=0
+ loop{if i==array.len(a.data){break}
+  array.push(output,array.get(a.data,i))
+  i+=1}
+ i=0
+ loop{if i==array.len(b.data){break}
+  array.push(output,array.get(b.data,i))
+  i+=1}
+ result.ok(ops.tensor(a.c+b.c,a.h,a.w,output))
+}
+fn resize(x:ref<ops.Tensor>,height:u64,width:u64)->result<ops.Tensor,string> effects {alloc} {spatial.resize_corners(x,height,width)}
+fn base<P>(parameters:ref<weights.Model>,prepared:ref<P>,library:ref<CAbiLibrary>,n:ref<network.Base>,input:ops.Tensor own,cancel:str,invoke:fn(ref<weights.Model>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,network.Convolution)->result<ops.Tensor,string> effects {alloc,ffi})->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ var x:ops.Tensor=input
+ var skips:array<ops.Tensor>=[]
+ var i:u64=0
+ loop{if i>=array.len(n.encoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let pair:network.Pair=array.get(n.encoder,i)
+  var skip:ops.Tensor=try invoke(parameters,prepared,library,x,pair.first)
+  x=try invoke(parameters,prepared,library,skip,pair.second)
+  array.push(skips,skip)
+  i+=1}
+ var pooled:ops.Tensor=spatial.mean_height(x)
+ let first:ref<network.Branch>=array.borrow(n.branches,0)
+ var pool:ops.Tensor=try invoke(parameters,prepared,library,pooled,first.first)
+ var concatenated:ops.Tensor=try resize(pool,x.h,x.w)
+ i=1
+ loop{if i>=array.len(n.branches){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let branch:ref<network.Branch>=array.borrow(n.branches,i)
+  var part:ops.Tensor=try invoke(parameters,prepared,library,x,branch.first)
+  match branch.second{none=>{},some(second)=>{part=try invoke(parameters,prepared,library,part,second)},}
+  concatenated=try join(concatenated,part)
+  i+=1}
+ x=try invoke(parameters,prepared,library,concatenated,n.bottleneck)
+ i=0
+ loop{if i>=array.len(n.decoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var expanded:ops.Tensor=try resize(x,2*x.h,2*x.w)
+  var skip:ops.Tensor=match array.pop(skips){some(v)=>v,none=>{return result.err("Missing cascaded encoder skip")},}
+  let width:u64=expanded.w
+  let source_width:u64=skip.w
+  if source_width<width{return result.err("Cascaded decoder exceeds its skip width")}
+  if source_width!=width{skip=try slice(skip,3,(source_width-width)/2,width)}
+  var merged:ops.Tensor=try join(expanded,skip)
+  x=try invoke(parameters,prepared,library,merged,array.get(n.decoder,i))
+  i+=1}
+ result.ok(x)
+}
+pub fn predict_with_convolution<P>(n:ref<network.Network>,prepared:ref<P>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str,invoke:fn(ref<weights.Model>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,network.Convolution)->result<ops.Tensor,string> effects {alloc,ffi})->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ let bins:u64=n.bins
+ let parameters:ref<weights.Model>=struct.borrow(n,field=weights)
+ if input.c!=2 or input.h!=bins+1 or input.w<=2*n.offset or input.w%32!=0{
+  return result.err("Cascaded mask input requires bounded stereo bins and a multiple-of-32 window exceeding its context")}
+ var x:ops.Tensor=try slice(input,2,0,bins)
+ var low:ops.Tensor=try slice(x,2,0,bins/2)
+ var high:ops.Tensor=try slice(x,2,bins/2,bins/2)
+ var low_out:ops.Tensor=try base(parameters,prepared,library,struct.borrow(n,field=low),low,cancel,invoke)
+ var high_out:ops.Tensor=try base(parameters,prepared,library,struct.borrow(n,field=high),high,cancel,invoke)
+ var aux1:ops.Tensor=try spatial.concatenate_height(low_out,high_out)
+ var joined:ops.Tensor=try join(x,aux1)
+ var bridge2:ops.Tensor=try invoke(parameters,prepared,library,joined,n.bridge2)
+ var aux2:ops.Tensor=try base(parameters,prepared,library,struct.borrow(n,field=second),bridge2,cancel,invoke)
+ joined=try join(joined,aux2)
+ var bridge3:ops.Tensor=try invoke(parameters,prepared,library,joined,n.bridge3)
+ var final:ops.Tensor=try base(parameters,prepared,library,struct.borrow(n,field=third),bridge3,cancel,invoke)
+ var projected:ops.Tensor=try invoke(parameters,prepared,library,final,n.output)
+ var mask:ops.Tensor=projected
+ var at:u64=0
+ loop{if at==array.len(mask.data){break}
+  let value:f32=array.get(mask.data,at)
+  array.set(mask.data,at,1.0/(1.0+fp.exp(-value)))
+  at+=1}
+ var edge:ops.Tensor=try spatial.slice(mask,bins-1,1,0,mask.w)
+ var extended:ops.Tensor=try spatial.concatenate_height(mask,edge)
+ spatial.slice(extended,0,bins+1,n.offset,extended.w-2*n.offset)
+}
+
+pub fn predict(n:ref<network.Network>,prepared:ref<Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ predict_with_convolution(n,prepared,library,input,cancel,convolve)
+}

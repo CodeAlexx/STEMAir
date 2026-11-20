@@ -1,0 +1,54 @@
+module stemair.input_selection
+import std.text as text
+import std.json as json
+
+pub type State=struct{generation:u64,count:u64,selected:array<u64>}
+pub fn empty()->State effects {alloc} {State{generation:0,count:0,selected:[]}}
+pub fn reset(state:ref<State>,count:u64)->unit effects {alloc} {
+ state.generation+=1
+ state.count=count
+ state.selected=[]
+}
+pub fn key(state:ref<State>,index:u64)->string effects {alloc} {
+ text.concat(string.from_int(state.generation),text.concat(":",string.from_int(index)))
+}
+pub fn index(state:ref<State>,encoded:str)->result<u64,string> effects {alloc} {
+ let fields:array<string>=text.split(encoded,":")
+ if array.len(fields)!=2{return result.err("Invalid selection row key")}
+ let generation:u64=match text.parse_u64(array.get(fields,0)){some(value)=>value,none=>{return result.err("Invalid selection generation")}}
+ let value:u64=match text.parse_u64(array.get(fields,1)){some(value)=>value,none=>{return result.err("Invalid selection row number")}}
+ if generation!=state.generation or value>=state.count{return result.err("The input list changed; select its current rows")}
+ result.ok(value)
+}
+pub fn one(state:ref<State>,count:u64)->result<u64,string> effects {alloc} {
+ if count!=state.count{return result.err("The input list changed; select its current rows")}
+ if array.len(state.selected)!=1{return result.err("Select one recording to open")}
+ result.ok(array.get(state.selected,0))
+}
+pub fn receive(state:ref<State>,event:ref<json.Document>)->result<unit,string> effects {alloc} {
+ let values:u64=match json.get(event,0,"values"){some(value)=>value,none=>{return result.err("Selection has no row keys")}}
+ let token:json.Token=match json.token(event,values){some(value)=>value,none=>{return result.err("Selection has no row keys")}}
+ if token.kind!=json.Kind.Array{return result.err("Selection row keys must be an array")}
+ var selected:array<u64>=[]
+ var i:u64=0
+ loop{let at:u64=match json.at(event,values,i){some(value)=>value,none=>{break}}
+  let encoded:string=match json.as_string(event,at){some(value)=>value,none=>{return result.err("Selection row key must be text")}}
+  let row:u64=try index(state,encoded)
+  if i>0 and row<=array.get(selected,i-1){return result.err("Selection rows must be unique and ordered")}
+  array.push(selected,row)
+  i+=1}
+ state.selected=selected
+ result.ok(())
+}
+pub fn retained(state:ref<State>,count:u64,keep:bool)->result<array<u64>,string> effects {alloc} {
+ if count!=state.count{return result.err("The input list changed; select its current rows")}
+ var result:array<u64>=[]
+ var i:u64=0
+ var selected:u64=0
+ loop{if i==count{break}
+  let chosen:bool=selected<array.len(state.selected) and array.get(state.selected,selected)==i
+  if chosen{selected+=1}
+  if chosen==keep{array.push(result,i)}
+  i+=1}
+ result.ok(result)
+}

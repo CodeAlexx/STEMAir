@@ -1,0 +1,96 @@
+module stemair.wav_export
+import "../toolkit/export_audio.ai" as writer
+import std.audio as audio
+import std.files as files
+import std.json as json
+import std.text as text
+
+// Public UI choice contract:0 U8,1 PCM16,2 PCM24,3 PCM32,4 F32,5 F64.
+pub fn from_choice(choice:u32)->result<audio.WavSubtype,string> effects {alloc} {
+ if choice==0{return result.ok(audio.WavSubtype.PcmU8)}
+ if choice==1{return result.ok(audio.WavSubtype.Pcm16)}
+ if choice==2{return result.ok(audio.WavSubtype.Pcm24)}
+ if choice==3{return result.ok(audio.WavSubtype.Pcm32)}
+ if choice==4{return result.ok(audio.WavSubtype.Float32)}
+ if choice==5{return result.ok(audio.WavSubtype.Float64)}
+ result.err("Choose one of the six WAV subtypes")
+}
+pub fn name(kind:audio.WavSubtype)->str effects {} {
+ match kind{PcmU8=>"u8",Pcm16=>"s16",Pcm24=>"s24",Pcm32=>"s32",Float32=>"f32",Float64=>"f64"}
+}
+pub fn label(kind:audio.WavSubtype)->str effects {} {
+ match kind{PcmU8=>"PCM_U8",Pcm16=>"PCM_16",Pcm24=>"PCM_24",Pcm32=>"PCM_32",Float32=>"FLOAT",Float64=>"DOUBLE"}
+}
+fn failure(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+pub fn preflight_file(file:str)->result<unit,string> effects {alloc,fs.meta} {
+ let entries:array<string>=[string.copy(file),text.concat(file,".export")]
+ var i:u64=0
+ loop{if i==2{break}
+  match files.symlink_metadata(array.get(entries,i)){ok(_)=>{return result.err("An output or foreign export stage already exists; existing files are preserved")},err(e)=>{if e.code!=1{return result.err("Cannot inspect formatted output path")}}}
+  i+=1}
+ result.ok(())
+}
+// Pure shared layout operation. Callers retain their existing shape checks.
+pub fn interleave(values:view<f32>,frames:u64,channels:u64)->array<f32> effects {alloc} {
+ var samples:array<f32>=[]
+ array.reserve(samples,frames*channels)
+ var frame:u64=0
+ loop{if frame==frames{break}
+  var channel:u64=0
+  loop{if channel==channels{break}
+   array.push(samples,view.get(values,channel*frames+frame))
+   channel+=1}
+  frame+=1}
+ samples
+}
+pub fn buffer_planar(values:view<f32>,rate:u32,frames:u64,channels:u64)->result<audio.AudioBuffer,string> effects {alloc} {
+ if channels==0 or channels>65535 or frames==0 or frames>view.len(values)/channels or frames*channels!=view.len(values){return result.err("Wrong formatted output waveform extent")}
+ result.ok(audio.AudioBuffer{samples:interleave(values,frames,channels),rate:rate,channels:cast.wrap(channels)})
+}
+pub fn write_buffer(file:str,buffer:ref<audio.AudioBuffer>,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ write_buffer_controlled(file,buffer,kind,"","")
+}
+pub fn write_buffer_controlled(file:str,buffer:ref<audio.AudioBuffer>,kind:audio.WavSubtype,cancel:str,progress:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ // DSP/normalization has already happened. Never normalize a second time.
+ let settings:writer.Settings=writer.Settings{subtype:string.copy(name(kind)),normalize:false}
+ let report:writer.Report=try writer.run(buffer,settings,file,cancel,progress)
+ if not report.staging_removed{return result.err(text.concat("WAV published; export staging remains at ",report.staging_path))}
+ result.ok(())
+}
+pub fn write_planar(file:str,rate:u32,values:view<f32>,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ if view.len(values)==0 or view.len(values)%2!=0{return result.err("Wrong output waveform extent")}
+ let buffer:audio.AudioBuffer=try buffer_planar(values,rate,view.len(values)/2,2)
+ write_buffer(file,buffer,kind)
+}
+// Shared lossless JSON token spans preserve every old numeric/string value.
+pub fn metadata(raw:str,kind:audio.WavSubtype)->result<string,string> effects {alloc} {
+ var document:json.Document=try json.parse(raw) map_err json.message
+ let root:json.Token=match json.token(document,0){some(v)=>v,none=>{return result.err("Missing formatted output metadata")}}
+ if root.kind!=json.Kind.Object{return result.err("Formatted output metadata must be an object")}
+ var keys:array<string>=[]
+ var values:array<string>=[]
+ var cursor:u64=json.first_member(document,0)
+ loop{
+  let member:json.Member=match json.member(document,0,cursor){some(v)=>v,none=>{break}}
+  let key:string=match json.as_string(document,member.name){some(v)=>v,none=>{return result.err("Invalid formatted metadata key")}}
+  if key=="wav_subtype" or key=="container"{return result.err("Formatted output metadata already has an encoding")}
+  let token:json.Token=match json.token(document,member.value){some(v)=>v,none=>{return result.err("Invalid formatted metadata value")}}
+  array.push(keys,key)
+  array.push(values,string.copy(str.slice(document.source,token.start,token.end)))
+  cursor=member.next}
+ array.push(keys,"container")
+ array.push(values,json.quote("wav"))
+ array.push(keys,"wav_subtype")
+ array.push(values,json.quote(label(kind)))
+ result.ok(try json.encode_object(keys,values) map_err json.message)
+}
+pub fn write_metadata(file:str,raw:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let encoded:string=try metadata(raw,kind)
+ let stage:string=text.concat(file,".export")
+ var sink:files.Sink=try files.sink_create(file,stage) map_err failure
+ match files.sink_write(sink,str.bytes(encoded)){ok(_)=>{},err(e)=>{let _=files.sink_discard(sink)
+  return result.err(text.concat(failure(e),text.concat("; inspect export staging at ",stage)))}}
+ let published:files.Publication=match files.sink_publish_new(sink,false){ok(v)=>v,err(e)=>{return result.err(text.concat(failure(e),text.concat("; inspect export staging at ",stage)))}}
+ if not published.temporary_removed{return result.err(text.concat("Metadata published; export staging remains at ",published.temporary))}
+ result.ok(())
+}

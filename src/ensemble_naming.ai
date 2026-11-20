@@ -1,0 +1,52 @@
+module stemair.ensemble_naming
+import "output_naming.ai" as naming
+import "container_export.ai" as container
+import "../toolkit/output_names.ai" as names
+import "../toolkit/model_ensemble_config.ai" as config
+import std.text as text
+
+pub fn member_context(context:ref<naming.Ensemble>,index:u64)->result<naming.Context,string> effects {alloc} {
+ if index>=array.len(context.members){return result.err("Choose one naming context for each ensemble member")}
+ var selected:naming.Context=try naming.copy(struct.borrow(array.borrow(context.members,index),field=main))
+ selected.ordinal=context.main.ordinal
+ selected.timestamp=context.main.timestamp
+ selected.testing=false
+ selected.append_model=true
+ selected.model_folder=false
+ result.ok(selected)
+}
+pub fn targets(options:ref<config.Options>)->array<string> effects {alloc} {
+ var selected:array<string>=[]
+ var index:u64=0
+ loop{if index==array.len(options.outputs){break}
+  array.push(selected,string.copy(array.borrow(options.outputs,index).target))
+  index+=1}
+ selected
+}
+pub fn select(input:str,directory:str,context:ref<naming.Ensemble>,options:ref<config.Options>,format:ref<container.Plan>)->result<naming.Selected,string> effects {alloc} {
+ if array.len(context.members)<2{return result.err("Choose naming contexts for at least two ensemble members")}
+ var output_targets:array<string>=targets(options)
+ var final_context:naming.Context=try naming.copy(struct.borrow(context,field=main))
+ final_context.testing=false
+ final_context.append_model=false
+ final_context.model_folder=false
+ var selected:naming.Selected=try naming.select(input,directory,final_context,output_targets,format)
+ var last:naming.Context=try member_context(context,array.len(context.members)-1)
+ let member_layout:names.Layout=try naming.layout(input,last)
+ let base:string=try names.ensemble_base(member_layout.base,last.model)
+ var index:u64=0
+ loop{if index==array.len(output_targets){break}
+  let label:string=naming.label(struct.borrow(context,field=main),array.get(output_targets,index))
+  array.set(selected.plan.source_names,index,try names.ensemble_output(base,context.label,context.default_label,context.append_label,context.main.testing,context.main.timestamp,label))
+  index+=1}
+ let _=try container.validate(struct.borrow(selected,field=plan))
+ if options.keep_members{
+  index=0
+  loop{if index==array.len(context.members){break}
+   var member:naming.Context=try member_context(context,index)
+   var output:naming.Selected=try naming.select(input,directory,member,output_targets,format)
+   let key:string=text.concat("members/model-",string.from_int(index+1))
+   selected.plan=try container.with_scope_names(struct.borrow(selected,field=plan),key,struct.borrow(struct.borrow(output,field=plan),field=source_names))
+   index+=1}}
+ result.ok(selected)
+}

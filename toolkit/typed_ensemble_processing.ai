@@ -1,0 +1,208 @@
+module stemair.typed_ensemble_processing
+import "audio_result.ai" as audio
+import "typed_source_wave.ai" as wave
+import "typed_secondary_cache.ai" as retained
+import "typed_secondary.ai" as secondary
+import "secondary.ai" as plan
+import "secondary_config.ai" as recipe
+import "ensemble_processing.ai" as legacy
+import "typed_model_ensemble.ai" as ensemble
+import "model_ensemble_config.ai" as config
+
+pub type Limits=struct{max_retained_bytes:u64,max_working_bytes:u64,allow_provisional_spectral:bool=false}
+pub type Prediction=struct{member:u64,key:string,sources:array<wave.Wave>,write_order:array<string>,input:audio.Samples}
+pub type Recording=struct{predictions:array<Prediction>,sources:array<Prediction>,master_bytes:u64,held_bytes:u64}
+pub type Output=struct{combined:ensemble.Output,processed:array<secondary.Output>}
+pub fn work(limits:Limits)->wave.Limits effects {} {wave.Limits{max_working_bytes:limits.max_working_bytes,allow_provisional_spectral:limits.allow_provisional_spectral}}
+pub fn bytes(samples:ref<audio.Samples>)->result<u64,string> effects {alloc} {
+ let _=try audio.validate(samples)
+ let width:u64=if samples.precision==audio.Precision.Float64{8}else{4}
+ if audio.count(samples)>18446744073709551615/width{return result.err("Processed ensemble byte extent overflows")}
+ result.ok(width*audio.count(samples))
+}
+pub fn checked_add(a:u64,b:u64)->result<u64,string> effects {alloc} {
+ if a>18446744073709551615-b{return result.err("Processed ensemble byte extent overflows")}
+ result.ok(a+b)
+}
+pub fn wave_bytes(waves:ref<array<wave.Wave>>)->result<u64,string> effects {alloc} {
+ let _=try wave.validate(waves)
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  total=try checked_add(total,try bytes(struct.borrow(array.borrow(waves,i),field=samples)))
+  total=try checked_add(total,try wave.reference_bytes(array.borrow(waves,i)))
+  i+=1}
+ result.ok(total)
+}
+fn prediction_bytes(item:ref<Prediction>)->result<u64,string> effects {alloc} {
+ checked_add(try wave_bytes(struct.borrow(item,field=sources)),try bytes(struct.borrow(item,field=input)))
+}
+pub fn extent(cache:ref<Recording>)->result<u64,string> effects {alloc} {
+ var total:u64=try checked_add(cache.master_bytes,cache.held_bytes)
+ var i:u64=0
+ loop{if i==array.len(cache.predictions){break}
+  total=try checked_add(total,try prediction_bytes(array.borrow(cache.predictions,i)))
+  i+=1}
+ i=0
+ loop{if i==array.len(cache.sources){break}
+  total=try checked_add(total,try prediction_bytes(array.borrow(cache.sources,i)))
+  i+=1}
+ result.ok(total)
+}
+pub fn room(cache:ref<Recording>,additional:u64,limits:Limits)->result<unit,string> effects {alloc} {
+ let total:u64=try checked_add(try extent(cache),additional)
+ if total>limits.max_retained_bytes{return result.err("Processed ensemble exceeds its retained sample-byte limit")}
+ if total>limits.max_working_bytes{return result.err("Processed ensemble exceeds its working sample-byte limit")}
+ result.ok(())
+}
+pub fn empty(input:ref<audio.Samples>,limits:Limits)->result<Recording,string> effects {alloc} {
+ let frames:u64=try wave.frames(input)
+ if frames==0{return result.err("Processed ensemble requires a stereo recording")}
+ var cache:Recording=Recording{predictions:[],sources:[],master_bytes:try bytes(input),held_bytes:0}
+ let _=try room(cache,0,limits)
+ result.ok(cache)
+}
+pub fn copy_waves(waves:ref<array<wave.Wave>>,limits:Limits)->result<array<wave.Wave>,string> effects {alloc} {
+ let _=try wave.validate(waves)
+ var out:array<wave.Wave>=[]
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  let w:ref<wave.Wave>=array.borrow(waves,i)
+  array.push(out,wave.Wave{frequency_reference:try wave.copy_reference(w,work(limits)),frequency_residual:w.frequency_residual,target:string.copy(w.target),samples:try wave.copy(struct.borrow(w,field=samples),work(limits)),frames:w.frames})
+  i+=1}
+ result.ok(out)
+}
+fn names(values:ref<array<string>>)->array<string> effects {alloc} {
+ var out:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(values){break}
+  array.push(out,string.copy(array.get(values,i)))
+  i+=1}
+ out
+}
+pub fn find(cache:ref<Recording>,member:u64,key:str)->option<u64> effects {} {
+ var i:u64=0
+ loop{if i==array.len(cache.predictions){break}
+  let p:ref<Prediction>=array.borrow(cache.predictions,i)
+  if p.member==member and str.view(p.key)==key{return option.some(i)}
+  i+=1}
+ option.none()
+}
+fn source_index(cache:ref<Recording>,member:u64)->option<u64> effects {} {
+ var i:u64=0
+ loop{if i==array.len(cache.sources){break}
+  if array.borrow(cache.sources,i).member==member{return option.some(i)}
+  i+=1}
+ option.none()
+}
+pub fn store(cache:ref<Recording>,member:u64,key:str,sources:array<wave.Wave> own,order:array<string> own,input:audio.Samples own,limits:Limits)->result<u64,string> effects {alloc} {
+ if option.is_some(find(cache,member,key)){return result.err("An ensemble input context was predicted twice")}
+ // Reuse the canonical secondary carrier's source/write-order validation.
+ var checked:retained.State=retained.empty()
+ let _=try retained.push_sources(checked,member,sources,order,"recording",retained.Limits{max_retained_bytes:limits.max_retained_bytes})
+ let p:ref<retained.Prediction>=array.borrow(checked.predictions,0)
+ var value:Prediction=Prediction{member:member,key:string.copy(key),sources:struct.replace(p,[],field=sources),write_order:struct.replace(p,[],field=write_order),input:input}
+ let _=try wave.frames(struct.borrow(value,field=input))
+ let _=try room(cache,try prediction_bytes(value),limits)
+ let at:u64=array.len(cache.predictions)
+ array.push(cache.predictions,value)
+ result.ok(at)
+}
+fn restore_prediction(capacity:u64,cached:ref<Prediction>,master:audio.Samples own,stage:ref<plan.Stage>,state:ref<retained.State>,capture:bool,limits:Limits)->result<unit,string> effects {alloc} {
+ var held_master:audio.Samples=master
+ let before:u64=try retained.extent(state,retained.Limits{max_retained_bytes:limits.max_retained_bytes})
+ let extra:u64=try checked_add(try wave_bytes(struct.borrow(cached,field=sources)),if capture{try bytes(held_master)}else{0})
+ if (try checked_add(before,extra))>capacity{return result.err("Processed ensemble restore exceeds its selected sample-byte limit")}
+ let sources:array<wave.Wave>=try copy_waves(struct.borrow(cached,field=sources),limits)
+ let _=try retained.push_sources(state,stage.model,sources,names(struct.borrow(cached,field=write_order)),stage.source,retained.Limits{max_retained_bytes:limits.max_retained_bytes})
+ if capture{let _=try retained.capture(state,stage.model,stage.source,held_master,retained.Limits{max_retained_bytes:limits.max_retained_bytes})}
+ result.ok(())
+}
+pub fn restore(cache:ref<Recording>,index:u64,stage:ref<plan.Stage>,state:ref<retained.State>,capture:bool,limits:Limits)->result<unit,string> effects {alloc} {
+ if index>=array.len(cache.predictions){return result.err("Cached ensemble context is unavailable")}
+ let _=try room(cache,0,limits)
+ let used:u64=try extent(cache)
+ let available:u64=if limits.max_retained_bytes<limits.max_working_bytes{limits.max_retained_bytes-used}else{limits.max_working_bytes-used}
+ let master_size:u64=if capture{try bytes(struct.borrow(array.borrow(cache.predictions,index),field=input))}else{0}
+ if master_size>available{return result.err("Captured master exceeds the available ensemble byte limit")}
+ let master:audio.Samples=if capture{try wave.copy(struct.borrow(array.borrow(cache.predictions,index),field=input),work(limits))}else{audio.from_single([])}
+ let member:u64=array.borrow(cache.predictions,index).member
+ if stage.source=="recording"{
+  match source_index(cache,member){none=>{},some(at)=>{
+   return restore_prediction(available,array.borrow(cache.sources,at),master,stage,state,capture,limits)}}}
+ restore_prediction(available,array.borrow(cache.predictions,index),master,stage,state,capture,limits)
+}
+pub fn publish_source(cache:ref<Recording>,member:u64,state:ref<retained.State>,c:ref<recipe.Recipe>,limits:Limits)->result<unit,string> effects {alloc} {
+ let used:u64=try retained.extent(state,retained.Limits{max_retained_bytes:limits.max_retained_bytes})
+ // primary() can copy every stage while combining a preprocessor destination.
+ let _=try room(cache,try checked_add(used,used),limits)
+ var primary:array<wave.Wave>=try secondary.primary(state,c,work(limits))
+ var order:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(primary){break}
+  array.push(order,string.copy(array.borrow(primary,i).target))
+  i+=1}
+ let value:Prediction=Prediction{member:member,key:"source",sources:primary,write_order:order,input:audio.from_single([])}
+ match source_index(cache,member){none=>array.push(cache.sources,value),some(at)=>array.set(cache.sources,at,value)}
+ let _=try room(cache,used,limits)
+ result.ok(())
+}
+pub fn export_feedback(cache:ref<Recording>,member:u64,c:ref<recipe.Recipe>,output:ref<secondary.Output>,limits:Limits)->result<unit,string> effects {alloc} {
+ let at:u64=match source_index(cache,member){none=>{return result.ok(())},some(v)=>v}
+ let cached:ref<Prediction>=array.borrow(cache.sources,at)
+ var i:u64=0
+ loop{if i==array.len(output.stems){break}
+  let stem:ref<wave.Wave>=array.borrow(output.stems,i)
+  if not option.is_some(plan.adjustment(c,stem.target)){
+   match wave.find(struct.borrow(cached,field=sources),stem.target){none=>{},some(index)=>{
+    let destination:ref<wave.Wave>=array.borrow(cached.sources,index)
+    if destination.frames!=stem.frames{return result.err("Cached native stem extent differs from its export")}
+    // Source writes into the original destination dtype; never widen its cache.
+    let _=try wave.assign(struct.borrow(destination,field=samples),0,struct.borrow(stem,field=samples),work(limits))
+   }}}
+  i+=1}
+ result.ok(())
+}
+pub fn output_bytes(output:ref<secondary.Output>)->result<u64,string> effects {alloc} {
+ var total:u64=try wave_bytes(struct.borrow(output,field=stems))
+ var i:u64=0
+ loop{if i==array.len(output.saved){break}
+  total=try checked_add(total,try wave_bytes(struct.borrow(array.borrow(output.saved,i),field=sources)))
+  i+=1}
+ i=0
+ loop{if i==array.len(output.inputs){break}
+  total=try checked_add(total,try bytes(struct.borrow(array.borrow(output.inputs,i),field=samples)))
+  i+=1}
+ result.ok(total)
+}
+pub fn append(cache:ref<Recording>,acc:ref<ensemble.Accumulator>,c:ref<config.Options>,output:ref<secondary.Output>,limits:Limits,cancel:str)->result<unit,string> effects {alloc,fs.meta} {
+ var selected:array<wave.Wave>=[]
+ var required:u64=0
+ var i:u64=0
+ loop{if i==array.len(c.outputs){break}
+  let name:string=legacy.name(array.borrow(c.outputs,i))
+  let at:u64=match wave.find(struct.borrow(output,field=stems),name){none=>{return result.err("Processed ensemble member is missing a requested stem")},some(v)=>v}
+  let w:ref<wave.Wave>=array.borrow(output.stems,at)
+  let count:u64=audio.count(struct.borrow(w,field=samples))
+  if count>18446744073709551615/40{return result.err("Processed ensemble conversion workspace overflows")}
+  required=try checked_add(required,40*count)
+  i+=1}
+ let _=try room(cache,try checked_add(required,try output_bytes(output)),limits)
+ i=0
+ var retained_bytes:u64=0
+ loop{if i==array.len(c.outputs){break}
+  let name:string=legacy.name(array.borrow(c.outputs,i))
+  let at:u64=match wave.find(struct.borrow(output,field=stems),name){none=>{return result.err("Processed stem disappeared")},some(v)=>v}
+  let w:ref<wave.Wave>=array.borrow(output.stems,at)
+  // Accumulator expects target labels even for no_<target> selections.
+  let samples:audio.Samples=try wave.copy(struct.borrow(w,field=samples),work(limits))
+  retained_bytes=try checked_add(retained_bytes,4*audio.count(samples))
+  if c.keep_members{retained_bytes=try checked_add(retained_bytes,try bytes(samples))}
+  array.push(selected,wave.Wave{frequency_reference:[],target:string.copy(array.borrow(c.outputs,i).target),samples:samples,frames:w.frames})
+  i+=1}
+ if c.keep_members{retained_bytes=try checked_add(retained_bytes,try output_bytes(output))}
+ let _=try room(cache,retained_bytes,limits)
+ let _=try ensemble.push_processed(acc,c,selected,cancel)
+ cache.held_bytes=try checked_add(cache.held_bytes,retained_bytes)
+ result.ok(())
+}

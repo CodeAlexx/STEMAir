@@ -1,0 +1,67 @@
+module stemair.input_list_panel
+import "../../AIR/toolkits/desktop/ui.ai" as desk
+import "input_selection.ai" as selection
+import "queue_config.ai" as queue
+import std.codec as codec
+import std.text as text
+
+pub type State=struct{audio:selection.State,queue:selection.State}
+pub fn empty()->State effects {alloc} {State{audio:selection.empty(),queue:selection.empty()}}
+pub fn audio(app:ref<desk.Session>,state:ref<selection.State>,inputs:ref<array<string>>)->unit effects {alloc,net,time} {
+ selection.reset(state,array.len(inputs))
+ var out:codec.Writer=desk.command("items","ensemble_rows")
+ codec.key(out,"items")
+ codec.begin_array(out)
+ var i:u64=0
+ loop{if i==array.len(inputs){break}
+  codec.begin_object(out)
+  codec.field_text(out,"key",selection.key(state,i))
+  codec.field_text(out,"label",text.concat(string.from_int(i+1),text.concat(". ",array.get(inputs,i))))
+  codec.field_text(out,"icon","audio-x-generic-symbolic")
+  codec.end_object(out)
+  i+=1}
+ codec.end_array(out)
+ let _=desk.submit(app,out)
+ let _=desk.set_text(app,"ensemble_inputs",text.concat(string.from_int(array.len(inputs))," audio inputs"))
+ ()
+}
+pub fn queued(app:ref<desk.Session>,state:ref<selection.State>,inputs:ref<array<queue.Item>>)->unit effects {alloc,net,time} {
+ selection.reset(state,array.len(inputs))
+ var out:codec.Writer=desk.command("items","queue_rows")
+ codec.key(out,"items")
+ codec.begin_array(out)
+ var i:u64=0
+ loop{if i==array.len(inputs){break}
+  let item:ref<queue.Item>=array.borrow(inputs,i)
+  codec.begin_object(out)
+  codec.field_text(out,"key",selection.key(state,i))
+  codec.field_text(out,"label",text.concat(item.folder,text.concat(" — ",item.input)))
+  codec.field_text(out,"icon","audio-x-generic-symbolic")
+  codec.end_object(out)
+  i+=1}
+ codec.end_array(out)
+ let _=desk.submit(app,out)
+ let _=desk.set_text(app,"queue_inputs",text.concat(string.from_int(array.len(inputs))," recordings pending"))
+ ()
+}
+pub fn edit_audio(state:ref<selection.State>,inputs:ref<array<string>>,keep:bool)->result<unit,string> effects {alloc} {
+ let indices:array<u64>=try selection.retained(state,array.len(inputs),keep)
+ var next:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(indices){break}
+  array.push(next,string.copy(array.get(inputs,array.get(indices,i))))
+  i+=1}
+ let _=ref.swap(inputs,next)
+ result.ok(())
+}
+pub fn edit_queue(state:ref<selection.State>,inputs:ref<array<queue.Item>>,keep:bool)->result<unit,string> effects {alloc} {
+ let indices:array<u64>=try selection.retained(state,array.len(inputs),keep)
+ var next:array<queue.Item>=[]
+ var i:u64=0
+ loop{if i==array.len(indices){break}
+  let item:ref<queue.Item>=array.borrow(inputs,array.get(indices,i))
+  array.push(next,queue.Item{input:string.copy(item.input),folder:string.copy(item.folder)})
+  i+=1}
+ let _=ref.swap(inputs,next)
+ result.ok(())
+}

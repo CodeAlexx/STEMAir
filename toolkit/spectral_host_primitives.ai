@@ -1,0 +1,344 @@
+module stemair.spectral_host_primitives
+import "network.ai" as network
+import "weights.ai" as weights
+import "ops.ai" as ops
+import "numeric.ai" as num
+import "control.ai" as control
+import std.cpu_conv2d as convolution
+import std.cpu_primitives as primitives
+import std.channel_norm_cpu as channel_norm
+import std.mkl_blas as blas
+import std.cpu_matmul as matrix
+import std.cpu_transpose_conv2d as transpose
+import std.system as system
+import std.text as text
+
+type ActivationSlot=struct{channels:u64,height:u64,width:u64,plan:primitives.Activation}
+type Pack=enum{None,Dense(matrix.Matrix)}
+// Immutable owned packs are bound to the same retained Network for its lifetime.
+// Library identity/lifetime and image-global thread policy belong to the caller.
+pub type Backend=struct{slots:array<Pack>,affines:array<weights.Parameter>,parameters:u64,packs:u64,bytes:u64,runtime:primitives.Engine,plans:array<option<primitives.Plan>>,prepared_calls:u64,activations:array<ActivationSlot>,matrix_runtime:array<blas.Engine>,affine_rounding:channel_norm.AffineRounding,adapter:string,policy_valid:bool=true}
+// The owner must call close before dropping or replacing a prepared bank. The
+// shared runtime registry owns its context until this synchronous operation.
+pub fn close(bank:ref<Backend>)->result<unit,string> effects {alloc,ffi}{
+ primitives.close(struct.borrow(bank,field=runtime))}
+fn transposed(n:ref<network.Network>,id:u64)->bool effects {} {
+ var i:u64=0
+ loop{if i==array.len(n.decoder){break}
+  if array.borrow(n.decoder,i).conv==id{return true}
+  i+=1}
+ false
+}
+pub fn prepare(n:ref<network.Network>,adapter:str)->result<Backend,string> effects {alloc, ffi, fs.read} {
+ prepare_with_limits(n,adapter,primitives.Limits{owned_bytes:1073741824,scratch_bytes:67108864,staging_bytes:536870912})}
+pub fn prepare_with_limits(n:ref<network.Network>,adapter:str,limits:primitives.Limits)->result<Backend,string> effects {alloc,ffi,fs.read}{
+ var thread_guard:primitives.ThreadScope=try primitives.enter_threads(adapter,2)
+ let prepared:result<Backend,string>=prepare_scoped(n,adapter,limits)
+ let restored:result<unit,string>=primitives.leave_threads(thread_guard)
+ match restored{err(e)=>{match prepared{ok(value)=>{var made:Backend=value
+   let _=close(made)},err(_)=>{}}
+  return result.err(text.concat("CPU preparation thread restoration failed: ",e))},ok(_)=>{}}
+ prepared
+}
+fn prepare_scoped(n:ref<network.Network>,adapter:str,limits:primitives.Limits)->result<Backend,string> effects {alloc,ffi,fs.read}{
+ var bytes:u64=0
+ var count:u64=0
+ var i:u64=0
+ loop{if i==array.len(n.weights.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,i)
+  if array.len(p.shape)==1 or array.len(p.shape)==2{
+   if array.len(p.values)>(18446744073709551615-bytes)/4{return result.err("Retained spectral pack extent overflows")}
+   bytes+=4*array.len(p.values)
+   if array.len(p.shape)!=1{count+=1}}
+  i+=1}
+ let memory:system.Memory=match system.memory(){ok(v)=>v,err(_)=>{return result.err("Cannot query memory for retained spectral preparation")}}
+ if bytes>9223372036317904895 or 1073741824+2*bytes>memory.available_bytes{return result.err("Not enough host RAM for retained spectral packs and bounded graph workspace")}
+ var plans:array<option<primitives.Plan>>=[]
+ var slots:array<Pack>=[]
+ var affines:array<weights.Parameter>=[]
+ i=0
+ loop{if i==array.len(n.weights.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,i)
+  let pack:Pack=if array.len(p.shape)==2{
+   Pack.Dense(try matrix.prepare(array.view(p.values),array.get(p.shape,0),array.get(p.shape,1),matrix.Limits{}))
+  }else{Pack.None}
+  array.push(slots,pack)
+  array.push(plans,option.none())
+  if array.len(p.shape)==1{array.push(affines,weights.Parameter{shape:[array.len(p.values)],values:num.copy(array.view(p.values))})}else{array.push(affines,weights.Parameter{shape:[],values:[]})}
+  i+=1}
+ // All fallible AIR packing precedes context creation, preventing an orphaned
+ // vendor context on a parameter-validation failure.
+ var runtime:primitives.Engine=try primitives.open(adapter,"3.7.1",2,limits)
+ result.ok(Backend{slots:slots,affines:affines,parameters:array.len(n.weights.parameters.values),packs:count,bytes:bytes,runtime:runtime,plans:plans,prepared_calls:0,activations:[],matrix_runtime:[],affine_rounding:channel_norm.AffineRounding.Separate,adapter:string.copy(adapter)})
+}
+fn convolution(n:ref<network.Network>,bank:ref<Backend>,library:ref<CAbiLibrary>,x:ref<ops.Tensor>,id:u64,stride:u64,pad:u64,up:bool)->result<ops.Tensor,string> effects {alloc,ffi} {
+ if id>=array.len(bank.slots){return result.err("Spectral convolution pack index exceeds retained bank")}
+ let shape:array<u64>=[1,x.c,x.h,x.w]
+ var bias:array<f32>=[]
+ if up{
+  if stride!=2 or pad!=0{return result.err("Spectral transpose geometry differs from retained source operation")}
+  if not option.is_some(array.get(bank.plans,id)){
+   let original:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,id)
+   let made:primitives.Plan=try primitives.prepare_transpose(struct.borrow(bank,field=runtime),array.view(shape),array.view(original.values),array.view(original.shape),array.view(bias),1,transpose.Options{stride_height:2,stride_width:2})
+   array.set(bank.plans,id,option.some(made))
+   bank.prepared_calls+=1}
+  var chosen:primitives.Plan=match array.get(bank.plans,id){some(p)=>p,none=>{return result.err("Missing retained CPU transposed convolution")}}
+  if chosen.geometry.input_channels!=x.c or chosen.geometry.height!=x.h or chosen.geometry.width!=x.w{return result.err("Prepared spectral primitive input geometry changed")}
+ let out:array<f32>=try primitives.convolve(struct.borrow(bank,field=runtime),chosen,array.view(x.data))
+  return result.ok(ops.tensor(chosen.geometry.output_channels,chosen.geometry.output_height,chosen.geometry.output_width,out))}
+ let weight:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,id)
+ let options:convolution.Options=convolution.Options{stride_height:stride,stride_width:stride,padding_height:pad,padding_width:pad}
+ let g:convolution.Geometry=try convolution.geometry(array.view(shape),array.view(weight.shape),options)
+ if not option.is_some(array.get(bank.plans,id)){
+  let original:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,id)
+  let made:primitives.Plan=try primitives.prepare(struct.borrow(bank,field=runtime),array.view(shape),array.view(original.values),array.view(original.shape),array.view(bias),options)
+  array.set(bank.plans,id,option.some(made))
+  bank.prepared_calls+=1}
+ var chosen:primitives.Plan=match array.get(bank.plans,id){some(p)=>p,none=>{return result.err("Missing retained CPU convolution")}}
+ if chosen.geometry.input_channels!=x.c or chosen.geometry.height!=x.h or chosen.geometry.width!=x.w{return result.err("Prepared spectral primitive input geometry changed")}
+ let out:array<f32>=try primitives.convolve(struct.borrow(bank,field=runtime),chosen,array.view(x.data))
+ result.ok(ops.tensor(g.output_channels,g.output_height,g.output_width,out))
+}
+pub fn prepare_with_matrix(n:ref<network.Network>,adapter:str,mkl:str,version:str)->result<Backend,string> effects {alloc,ffi,fs.read}{
+ let matrix:blas.Engine=try blas.open(mkl,version)
+ var p:Backend=try prepare(n,adapter)
+ array.push(p.matrix_runtime,matrix)
+ result.ok(p)}
+pub fn prepare_with_recipe(n:ref<network.Network>,adapter:str,mkl:str,version:str,rounding:channel_norm.AffineRounding)->result<Backend,string> effects {alloc,ffi,fs.read}{
+ var p:Backend=try prepare_with_matrix(n,adapter,mkl,version)
+ p.affine_rounding=rounding
+ result.ok(p)}
+pub fn prepare_with_profile(n:ref<network.Network>,adapter:str,mkl:str,version:str,rounding:channel_norm.AffineRounding,limits:primitives.Limits)->result<Backend,string> effects {alloc,ffi,fs.read}{
+ let matrix:blas.Engine=try blas.open(mkl,version)
+ var p:Backend=try prepare_with_limits(n,adapter,limits)
+ array.push(p.matrix_runtime,matrix)
+ p.affine_rounding=rounding
+ result.ok(p)}
+pub fn prepare_explicit(n:ref<network.Network>,adapter:str,matrix_adapter:str,mkl:str,version:str,rounding:channel_norm.AffineRounding,limits:primitives.Limits)->result<Backend,string> effects {alloc,ffi,fs.read}{
+ let matrix:blas.Engine=try blas.open_adapter(matrix_adapter,mkl,version)
+ var p:Backend=try prepare_with_limits(n,adapter,limits)
+ array.push(p.matrix_runtime,matrix)
+ p.affine_rounding=rounding
+ result.ok(p)
+}
+fn matrix_linear(engines:ref<array<blas.Engine>>,slots:ref<array<Pack>>,id:u64,activation:ref<matrix.Matrix>)->result<array<f32>,string> effects {alloc,ffi}{
+ let weight:ref<matrix.Matrix>=match array.borrow(slots,id){Dense(p)=>p,_=>{return result.err("Spectral projection weight was not prepared")}}
+ let initial:array<f32>=[]
+ blas.multiply_accumulate(array.borrow(engines,0),activation,matrix.Operation.Identity,weight,matrix.Operation.Transpose,array.view(initial),0.0,matrix.Limits{})}
+fn linear(bank:ref<Backend>,library:ref<CAbiLibrary>,x:ref<ops.Tensor>,id:u64)->result<ops.Tensor,string> effects {alloc,ffi} {
+ if id>=array.len(bank.slots){return result.err("Spectral projection pack index exceeds retained bank")}
+ if array.len(bank.matrix_runtime)==1{
+  var activation:matrix.Matrix=try matrix.prepare(array.view(x.data),x.c*x.h,x.w,matrix.Limits{})
+  let out:array<f32>=try matrix_linear(struct.borrow(bank,field=matrix_runtime),struct.borrow(bank,field=slots),id,activation)
+  return result.ok(ops.tensor(x.c,x.h,array.len(out)/(x.c*x.h),out))}
+ let weight:ref<matrix.Matrix>=match array.borrow(bank.slots,id){Dense(p)=>p,_=>{return result.err("Spectral projection weight was not prepared")}}
+ if weight.columns!=x.w{return result.err("Spectral projection input differs from retained weight")}
+ var activation:matrix.Matrix=try matrix.prepare(array.view(x.data),x.c*x.h,x.w,matrix.Limits{})
+ let out:array<f32>=try matrix.multiply(library,activation,matrix.Operation.Identity,weight,matrix.Operation.Transpose,matrix.Limits{})
+ result.ok(ops.tensor(x.c,x.h,weight.rows,out))
+}
+fn activated(bank:ref<Backend>,x:ref<ops.Tensor>)->result<ops.Tensor,string> effects {alloc,ffi}{
+ var index:u64=0
+ loop{if index==array.len(bank.activations){break}
+  var p:ActivationSlot=array.get(bank.activations,index)
+  if p.channels==x.c and p.height==x.h and p.width==x.w{break}
+  index+=1}
+ if index==array.len(bank.activations){
+  let shape:array<u64>=[1,x.c,x.h,x.w]
+  let made:primitives.Activation=try primitives.prepare_gelu(struct.borrow(bank,field=runtime),array.view(shape))
+  array.push(bank.activations,ActivationSlot{channels:x.c,height:x.h,width:x.w,plan:made})}
+ var p:ActivationSlot=array.get(bank.activations,index)
+ let out:array<f32>=try primitives.gelu(struct.borrow(bank,field=runtime),struct.borrow(p,field=plan),array.view(x.data))
+ result.ok(ops.tensor(x.c,x.h,x.w,out))}
+// Startup-only shape traversal. It creates exactly the plans the unchanged
+// forward consumes, without allocating a waveform or executing learned math.
+type Shape=struct{c:u64,h:u64,w:u64}
+fn plan_convolution(n:ref<network.Network>,bank:ref<Backend>,x:Shape,id:u64,stride:u64,pad:u64,up:bool)->result<Shape,string> effects {alloc,ffi}{
+ if id>=array.len(bank.plans){return result.err("Spectral startup parameter index exceeds network")}
+ let shape:array<u64>=[1,x.c,x.h,x.w]
+ let bias:array<f32>=[]
+ if not option.is_some(array.get(bank.plans,id)){
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,id)
+  let made:primitives.Plan=if up{
+   try primitives.prepare_transpose(struct.borrow(bank,field=runtime),array.view(shape),array.view(p.values),array.view(p.shape),array.view(bias),1,transpose.Options{stride_height:2,stride_width:2})
+  }else{try primitives.prepare(struct.borrow(bank,field=runtime),array.view(shape),array.view(p.values),array.view(p.shape),array.view(bias),convolution.Options{stride_height:stride,stride_width:stride,padding_height:pad,padding_width:pad})}
+  array.set(bank.plans,id,option.some(made))
+  bank.prepared_calls+=1}
+ let p:primitives.Plan=match array.get(bank.plans,id){some(v)=>v,none=>{return result.err("Spectral startup plan missing")}}
+ if p.geometry.input_channels!=x.c or p.geometry.height!=x.h or p.geometry.width!=x.w{return result.err("Spectral startup plan geometry differs")}
+ result.ok(Shape{c:p.geometry.output_channels,h:p.geometry.output_height,w:p.geometry.output_width})
+}
+fn plan_activation(bank:ref<Backend>,x:Shape)->result<unit,string> effects {alloc,ffi}{
+ var i:u64=0
+ loop{if i==array.len(bank.activations){break}
+  let p:ref<ActivationSlot>=array.borrow(bank.activations,i)
+  if p.channels==x.c and p.height==x.h and p.width==x.w{return result.ok(())}
+  i+=1}
+ let shape:array<u64>=[1,x.c,x.h,x.w]
+ let made:primitives.Activation=try primitives.prepare_gelu(struct.borrow(bank,field=runtime),array.view(shape))
+ array.push(bank.activations,ActivationSlot{channels:x.c,height:x.h,width:x.w,plan:made})
+ result.ok(())
+}
+fn plan_linear(n:ref<network.Network>,x:Shape,id:u64)->result<Shape,string> effects {alloc}{
+ let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,id)
+ if array.len(p.shape)!=2 or array.get(p.shape,1)!=x.w{return result.err("Spectral startup projection geometry differs")}
+ result.ok(Shape{c:x.c,h:x.h,w:array.get(p.shape,0)})
+}
+fn plan_body(n:ref<network.Network>,bank:ref<Backend>,input:Shape,begin:u64,count:u64)->result<Shape,string> effects {alloc,ffi}{
+ var x:Shape=input
+ var i:u64=0
+ loop{if i==count{break}
+  let b:network.Block=array.get(n.blocks,begin+i)
+  let shortcut:Shape=try plan_convolution(n,bank,x,b.shortcut,1,0,false)
+  let _=try plan_activation(bank,x)
+  let first:Shape=try plan_convolution(n,bank,x,b.conv1,1,1,false)
+  let _=try plan_activation(bank,first)
+  let small:Shape=try plan_linear(n,first,b.linear1)
+  let _=try plan_activation(bank,small)
+  let expanded:Shape=try plan_linear(n,small,b.linear2)
+  if expanded.c!=first.c or expanded.h!=first.h or expanded.w!=first.w{return result.err("Spectral startup residual geometry differs")}
+  let _=try plan_activation(bank,first)
+  let second:Shape=try plan_convolution(n,bank,first,b.conv2,1,1,false)
+  if second.c!=shortcut.c or second.h!=shortcut.h or second.w!=shortcut.w{return result.err("Spectral startup shortcut geometry differs")}
+  x=second
+  i+=1}
+ result.ok(x)
+}
+fn plan_geometry(n:ref<network.Network>,bank:ref<Backend>,packed:Shape)->result<unit,string> effects {alloc,ffi}{
+ let first:Shape=try plan_convolution(n,bank,packed,n.first,1,0,false)
+ var x:Shape=Shape{c:first.c,h:first.w,w:first.h}
+ var saved:array<Shape>=[]
+ var i:u64=0
+ loop{if i==array.len(n.encoder){break}
+  let scale:network.Scale=array.get(n.encoder,i)
+  x=try plan_body(n,bank,x,scale.begin,scale.count)
+  let _=try plan_activation(bank,x)
+  let down:Shape=try plan_convolution(n,bank,x,scale.conv,2,0,false)
+  array.push(saved,x)
+  x=down
+  i+=1}
+ x=try plan_body(n,bank,x,n.middle_begin,n.middle_count)
+ i=0
+ loop{if i==array.len(n.decoder){break}
+  let scale:network.Scale=array.get(n.decoder,i)
+  let _=try plan_activation(bank,x)
+  let up:Shape=try plan_convolution(n,bank,x,scale.conv,2,0,true)
+  let skip:Shape=array.get(saved,array.len(saved)-1-i)
+  if up.h!=skip.h or up.w!=skip.w{return result.err("Spectral startup concatenation geometry differs")}
+  x=try plan_body(n,bank,Shape{c:up.c+skip.c,h:up.h,w:up.w},scale.begin,scale.count)
+  i+=1}
+ let transposed:Shape=Shape{c:x.c,h:x.w,w:x.h}
+ if transposed.c!=first.c or transposed.h!=first.h or transposed.w!=first.w or packed.h!=first.h or packed.w!=first.w{return result.err("Spectral startup final geometry differs")}
+ let last:Shape=try plan_convolution(n,bank,Shape{c:packed.c+first.c,h:packed.h,w:packed.w},n.last1,1,0,false)
+ let _=try plan_activation(bank,last)
+ let _=try plan_convolution(n,bank,last,n.last2,1,0,false)
+ result.ok(())
+}
+pub fn prepare_geometry(n:ref<network.Network>,bank:ref<Backend>,channels:u64,height:u64,width:u64)->result<unit,string> effects {alloc,ffi}{
+ if not bank.policy_valid{return result.err("CPU primitive policy restoration previously failed")}
+ var thread_guard:primitives.ThreadScope=try primitives.enter_threads(bank.adapter,2)
+ let planned:result<unit,string>=plan_geometry(n,bank,Shape{c:channels,h:height,w:width})
+ let restored:result<unit,string>=primitives.leave_threads(thread_guard)
+ match restored{err(e)=>{bank.policy_valid=false
+  return result.err(text.concat("CPU startup thread restoration failed: ",e))},ok(_)=>{}}
+ planned
+}
+fn normalized(n:ref<network.Network>,bank:ref<Backend>,x:ref<ops.Tensor>,a:network.Affine)->result<ops.Tensor,string> effects {alloc,ffi} {
+ let scale:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,a.weight)
+ let bias:ref<weights.Parameter>=array.borrow(bank.affines,a.bias)
+ var normalized:channel_norm.Output=try channel_norm.training_with_rounding(array.view(x.data),1,x.c,x.h*x.w,array.view(scale.values),array.view(bias.values),0.00001,bank.affine_rounding)
+ var tensor:ops.Tensor=ops.tensor(x.c,x.h,x.w,struct.replace(normalized,[],field=values))
+ activated(bank,tensor)
+}
+// Drop only already-consumed activation storage. Shape fields are not read
+// again; no numerical operation or retained parameter/pack is changed.
+fn release(x:ref<ops.Tensor>)->unit effects {alloc} {x.data=[]
+ ()}
+fn body(n:ref<network.Network>,bank:ref<Backend>,library:ref<CAbiLibrary>,input:ops.Tensor own,begin:u64,count:u64,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ var x:ops.Tensor=input
+ var i:u64=0
+ loop{if i==count{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let b:network.Block=array.get(n.blocks,begin+i)
+  var shortcut:ops.Tensor=try convolution(n,bank,library,x,b.shortcut,1,0,false)
+  var a:ops.Tensor=try normalized(n,bank,x,b.norm1)
+  release(x)
+  var first:ops.Tensor=try convolution(n,bank,library,a,b.conv1,1,1,false)
+  release(a)
+  var norm1:ops.Tensor=try normalized(n,bank,first,b.norm2)
+  var small:ops.Tensor=try linear(bank,library,norm1,b.linear1)
+  release(norm1)
+  var norm2:ops.Tensor=try normalized(n,bank,small,b.norm3)
+  release(small)
+  var expanded:ops.Tensor=try linear(bank,library,norm2,b.linear2)
+  release(norm2)
+  var combined:ops.Tensor=ops.combine(first,expanded,false)
+  release(first)
+  release(expanded)
+  var norm3:ops.Tensor=try normalized(n,bank,combined,b.norm4)
+  release(combined)
+  var second:ops.Tensor=try convolution(n,bank,library,norm3,b.conv2,1,1,false)
+  release(norm3)
+  x=ops.combine(second,shortcut,false)
+  release(second)
+  release(shortcut)
+  i+=1}
+ result.ok(x)
+}
+pub fn forward(n:ref<network.Network>,bank:ref<Backend>,library:ref<CAbiLibrary>,input:ops.Tensor own,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ if not bank.policy_valid{return result.err("CPU primitive policy restoration previously failed")}
+ var thread_guard:primitives.ThreadScope=try primitives.enter_threads(bank.adapter,2)
+ let output:result<ops.Tensor,string>=forward_scoped(n,bank,library,input,cancel)
+ let restored:result<unit,string>=primitives.leave_threads(thread_guard)
+ match restored{err(e)=>{bank.policy_valid=false
+  return result.err(text.concat("CPU inference thread restoration failed: ",e))},ok(_)=>{}}
+ output
+}
+fn forward_scoped(n:ref<network.Network>,bank:ref<Backend>,library:ref<CAbiLibrary>,input:ops.Tensor own,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ if bank.parameters!=array.len(n.weights.parameters.values) or array.len(bank.slots)!=bank.parameters{return result.err("Prepared spectral bank differs from its retained network")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var packed:ops.Tensor=input
+ var first:ops.Tensor=try convolution(n,bank,library,packed,n.first,1,0,false)
+ var x:ops.Tensor=ops.transpose(first)
+ var saved:array<ops.Tensor>=[]
+ var i:u64=0
+ loop{if i==array.len(n.encoder){break}
+  let scale:network.Scale=array.get(n.encoder,i)
+  x=try body(n,bank,library,x,scale.begin,scale.count,cancel)
+  var norm:ops.Tensor=try normalized(n,bank,x,scale.norm)
+  let down:ops.Tensor=try convolution(n,bank,library,norm,scale.conv,2,0,false)
+  release(norm)
+  array.push(saved,x)
+  x=down
+  i+=1}
+ x=try body(n,bank,library,x,n.middle_begin,n.middle_count,cancel)
+ i=0
+ loop{if i==array.len(n.decoder){break}
+  let scale:network.Scale=array.get(n.decoder,i)
+  var norm:ops.Tensor=try normalized(n,bank,x,scale.norm)
+  release(x)
+  var up:ops.Tensor=try convolution(n,bank,library,norm,scale.conv,2,0,true)
+  release(norm)
+  var skip:ops.Tensor=ref.swap(array.borrow(saved,array.len(saved)-1-i),ops.Tensor{c:0,h:0,w:0,data:[]})
+  let joined:ops.Tensor=ops.concat(up,skip)
+  release(up)
+  release(skip)
+  x=try body(n,bank,library,joined,scale.begin,scale.count,cancel)
+  i+=1}
+ var transposed:ops.Tensor=ops.transpose(x)
+ release(x)
+ var gated:ops.Tensor=ops.combine(transposed,first,true)
+ release(transposed)
+ release(first)
+ var joined:ops.Tensor=ops.concat(packed,gated)
+ release(packed)
+ release(gated)
+ var last:ops.Tensor=try convolution(n,bank,library,joined,n.last1,1,0,false)
+ release(joined)
+ var activated:ops.Tensor=try activated(bank,last)
+ release(last)
+ let output:ops.Tensor=try convolution(n,bank,library,activated,n.last2,1,0,false)
+ release(activated)
+ if not num.finite(array.view(output.data)){return result.err("Non-finite separation network output")}
+ result.ok(output)
+}

@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "purpose": "Pinned sound-file C ABI for Source-compatible recording input, samples and mastering",
+  "distribution": "Explicit pinned runtime staging requires the matching source capsule and codec notices described by licenses/sound-file-redistribution.json",
+  "notice": "licenses/sound-file-LGPL-2.1.txt",
+  "notice_sha256": "ad01ea5cd2755f6048383c8d54c88459cd6fcb17757c5c8892f8c5ea060f6140",
+  "windows": {
+    "original_runtime": "SoundFile 0.11.0 bundled libsndfile 1.1.0, Windows x86_64",
+    "filename": "libsndfile_64bit.dll",
+    "bytes": 2277888,
+    "sha256": "6f445d58488ac3b8a7a9b05f4ae4ba2bd894f8a1a20e82a91532dabf7e3a65a7",
+    "version_string": "libsndfile-1.1.0",
+    "wide_paths": true,
+    "source_repository": "https://github.com/libsndfile/libsndfile",
+    "source_revision": "ea3ac90e98c6a98cd52cae39010446fba368a2e3",
+    "source_header": "include/sndfile.h.in",
+    "source_header_sha256": "833e2d50b41b17cf103dc1c36ad6e72f1a147c7c39f33daf5ac874fb93766adc",
+    "imports": [
+      "KERNEL32.dll",
+      "VCRUNTIME140.dll",
+      "Windows Universal CRT API sets"
+    ],
+    "redistribution_boundary": "Exact upstream binary identified; complete matching codec source archives, patch fingerprints, build recipe and notices are supplied by the redistribution capsule. No bit-reproducible old CI image is claimed."
+  },
+  "linux": {
+    "original_runtime": "SoundFile 0.11.0 with Ubuntu system libsndfile 1.2.2, WSL x86_64",
+    "resolved_filename": "libsndfile.so.1.0.37",
+    "sha256": "dd944b9bf1d06df6bb1c4f730fdcb3321d114aace43f66560ece7eeb726ed1c4",
+    "version_string": "libsndfile-1.2.2",
+    "wide_paths": false,
+    "source_repository": "https://github.com/libsndfile/libsndfile",
+    "source_revision": "72f6af15e8f85157bd622ed45b979025828b7001",
+    "source_header": "include/sndfile.h",
+    "source_header_sha256": "5cd6a865d05c0e78dbfe3fe3ac67191c875dda1727e5dc0c1021978767b49f9c",
+    "package": "libsndfile1 1.2.2-4",
+    "dependencies": [
+      "libFLAC.so.14",
+      "libvorbis.so.0",
+      "libvorbisenc.so.2",
+      "libopus.so.0",
+      "libogg.so.0",
+      "libmpg123.so.0",
+      "libmp3lame.so.0",
+      "libm.so.6",
+      "libmvec.so.1",
+      "libc.so.6",
+      "system loader"
+    ],
+    "redistribution_boundary": "Exact Ubuntu binary matches the package whose upstream source and Debian patches are supplied. Codec/glibc dependencies remain external host requirements."
+  },
+  "license": "LGPL-2.1; reference API is wrapped independently through existing std.cabi"
+}

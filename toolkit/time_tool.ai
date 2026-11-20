@@ -1,0 +1,158 @@
+module stemair.time_tool
+import "time_tool_process.ai" as transport
+import "control.ai" as control
+import "numeric.ai" as num
+import std.audio as audio
+import std.files as files
+import std.float as fp
+import std.path as path
+import std.process as proc
+import std.text as text
+
+pub type Action=enum{Tempo(f64),Pitch(f64)}
+pub type Output=struct{buffer:audio.AudioBuffer,bypassed:bool,children:u64,temporary_removed:bool,work_directory:string}
+pub type Failure=struct{error:transport.Error,temporary_removed:bool,work_directory:string}
+pub fn describe(failure:Failure own)->string effects {alloc} {
+ var owned:Failure=failure
+ let error:transport.Error=struct.replace(owned,transport.Error.Cancelled,field=error)
+ let detail:string=transport.message(error)
+ if owned.temporary_removed{return detail}
+ text.concat(detail,text.concat("; owned temporary audio remains at ",owned.work_directory))
+}
+pub fn validate(action:Action)->result<unit,transport.Error> effects {alloc} {
+ match action{
+  Tempo(value)=>{if not fp.is_finite(value) or value<=0.0 or value>10.0{
+   return result.err(transport.Error.Invalid("Tempo must be greater than zero and at most 10"))}},
+  Pitch(value)=>{if not fp.is_finite(value) or value< -10.0 or value>10.0{
+   return result.err(transport.Error.Invalid("Pitch must be between -10 and 10 semitones"))}},
+ }
+ result.ok(())
+}
+pub fn identity(action:Action)->bool effects {} {
+ match action{Tempo(value)=>value==1.0,Pitch(value)=>value==0.0}
+}
+pub fn value(action:Action)->f64 effects {} {match action{Tempo(v)=>v,Pitch(v)=>v}}
+pub fn operation(action:Action)->string effects {alloc} {match action{Tempo(_)=>"tempo",Pitch(_)=>"pitch-preserve-duration"}}
+fn source_valid(source:ref<audio.AudioBuffer>,action:Action)->result<unit,transport.Error> effects {alloc} {
+ let _=try validate(action)
+ if source.rate!=44100 or(source.channels!=1 and source.channels!=2){
+  return result.err(transport.Error.Invalid("External audio processing requires native 44100-Hz mono or stereo WAV audio"))}
+ let count:u64=array.len(source.samples)
+ let channels:u64=cast.wrap(source.channels)
+ let frames:u64=audio.num_frames(source)
+ if count%channels!=0 or frames==0 or frames>8388608 or not num.finite(array.view(source.samples)){
+  return result.err(transport.Error.Invalid("Input must contain 1..8388608 complete finite frames"))}
+ let expected:f64=match action{Tempo(rate)=>fp.ceil(cast.float(frames)/rate),Pitch(_)=>cast.float(frames)}
+ if not fp.is_finite(expected) or expected>8388608.0{
+  return result.err(transport.Error.Invalid("Requested duration exceeds the 8388608-frame output bound"))}
+ result.ok(())
+}
+fn error_text(error:fs.error)->transport.Error effects {alloc} {transport.Error.Io(string.copy(fs.error.message(error)))}
+fn audio_error(error:audio.Error)->transport.Error effects {alloc} {transport.Error.Io(audio.message(error))}
+fn cleanup(directory:str)->bool effects {alloc,fs.write} {
+ let names:array<string>=["channel-1-input.wav","channel-1-output.wav","channel-2-input.wav","channel-2-output.wav"]
+ var cleaned:bool=true
+ var i:u64=0
+ loop{if i==4{break}
+  match files.remove(path.join(directory,array.get(names,i))){ok(_)=>{},err(error)=>{if error.code!=1{cleaned=false}}}
+  i+=1}
+ if not result.is_ok(files.remove(directory)){cleaned=false}
+ cleaned
+}
+fn mono(source:ref<audio.AudioBuffer>,channel:u64)->audio.AudioBuffer effects {alloc} {
+ let frames:u64=audio.num_frames(source)
+ let channels:u64=cast.wrap(source.channels)
+ var values:array<f32>=[]
+ array.reserve(values,frames)
+ var i:u64=0
+ loop{if i==frames{break}
+  array.push(values,array.get(source.samples,i*channels+if channels==1{0}else{channel}))
+  i+=1}
+ audio.AudioBuffer{samples:values,rate:44100,channels:1}
+}
+fn load_output(file:str)->result<audio.AudioBuffer,transport.Error> effects {alloc,fs.read} {
+ let raw:bytes=match files.read_limited(file,16842752){ok(value)=>value,err(_)=>{return result.err(transport.Error.Io("Cannot read bounded external PCM16 output"))}}
+ let info:audio.WavInfo=try audio.inspect_wav(bytes.view(raw)) map_err audio_error
+ if info.subtype!=audio.WavSubtype.Pcm16 or info.rate!=44100 or info.channels!=1{
+  return result.err(transport.Error.Io("External processor output must be complete PCM16 mono WAV at 44100 Hz"))}
+ let buffer:audio.AudioBuffer=try audio.decode_wav(bytes.view(raw)) map_err audio_error
+ if audio.num_frames(buffer)>8388608{return result.err(transport.Error.OutputLimit)}
+ result.ok(buffer)
+}
+fn run_channels(tool:ref<transport.Tool>,source:ref<audio.AudioBuffer>,action:Action,directory:str,cancel:str,progress:str,deadline_ns:u64)
+ ->result<audio.AudioBuffer,transport.Error> effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ let _=try transport.verify_files(tool)
+ let _=try transport.verify_version(tool,cancel,deadline_ns)
+ var outputs:array<audio.AudioBuffer>=[]
+ var channel:u64=0
+ loop{if channel==2{break}
+  if control.cancelled(cancel){return result.err(transport.Error.Cancelled)}
+  let number:string=string.from_int(channel+1)
+  let prefix:string=text.concat("channel-",number)
+  let input_name:string=text.concat(prefix,"-input.wav")
+  let output_name:string=text.concat(prefix,"-output.wav")
+  let input_path:string=path.join(directory,input_name)
+  let output_path:string=path.join(directory,output_name)
+  let input:audio.AudioBuffer=mono(source,channel)
+  let encoded:bytes=try audio.encode_wav_as(input,audio.WavSubtype.Pcm16) map_err audio_error
+  let _=try files.write_new_bytes(input_path,bytes.view(encoded)) map_err error_text
+  let option:string=match action{Tempo(_)=>"--tempo",Pitch(_)=>"--pitch"}
+  let argv:array<string>=[string.copy(tool.executable),"-q",option,string.from_float(value(action)),string.copy(input_name),string.copy(output_name)]
+  control.status(progress,text.concat("Processing channel ",text.concat(number," / 2")))
+  let _=try transport.invoke(tool,argv,directory,output_path,16842752,cancel,deadline_ns)
+  let output:audio.AudioBuffer=try load_output(output_path)
+  array.push(outputs,output)
+  channel+=1}
+ let second:audio.AudioBuffer=match array.pop(outputs){some(buffer)=>buffer,none=>{panic "second audio channel missing"}}
+ let first:audio.AudioBuffer=match array.pop(outputs){some(buffer)=>buffer,none=>{panic "first audio channel missing"}}
+ let n1:u64=audio.num_frames(first)
+ let n2:u64=audio.num_frames(second)
+ if n1==1 and n2==1{
+  // The original per-channel wrapper squeezes singletons to scalars;
+  // stacking those scalars exports a one-dimensional, two-frame mono WAV.
+  return result.ok(audio.AudioBuffer{samples:[array.get(first.samples,0),array.get(second.samples,0)],rate:44100,channels:1})}
+ if n1==1 or n2==1{return result.err(transport.Error.Io("External channel shapes cannot be stacked after a single-sample result"))}
+ let frames:u64=if n1>n2{n1}else{n2}
+ if frames==0{return result.err(transport.Error.Io("External processor produced no samples"))}
+ var combined:array<f32>=[]
+ array.reserve(combined,frames*2)
+ var i:u64=0
+ loop{if i==frames{break}
+  array.push(combined,if i<n1{array.get(first.samples,i)}else{0.0})
+  array.push(combined,if i<n2{array.get(second.samples,i)}else{0.0})
+  i+=1}
+ result.ok(audio.AudioBuffer{samples:combined,rate:44100,channels:2})
+}
+pub fn process(tool:ref<transport.Tool>,source:ref<audio.AudioBuffer>,action:Action,normalize:bool,work_directory:str,cancel:str,progress:str)
+ ->result<Output,Failure> effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ let valid:result<unit,transport.Error>=source_valid(source,action)
+ let _=match valid{err(error)=>{return result.err(Failure{error:error,temporary_removed:true,work_directory:""})},ok(_)=>()}
+ if control.cancelled(cancel){return result.err(Failure{error:transport.Error.Cancelled,temporary_removed:true,work_directory:""})}
+ if identity(action){
+  var values:array<f32>=[]
+  array.reserve(values,audio.num_frames(source)*2)
+  let frames:u64=audio.num_frames(source)
+  let channels:u64=cast.wrap(source.channels)
+  var i:u64=0
+  loop{if i==frames{break}
+   array.push(values,array.get(source.samples,i*channels))
+   array.push(values,array.get(source.samples,i*channels+if channels==1{0}else{1}))
+   i+=1}
+  let normalized:result<unit,string>=num.normalize_peak(values,normalize)
+  let _=match normalized{err(detail)=>{return result.err(Failure{error:transport.Error.Invalid(detail),temporary_removed:true,work_directory:""})},ok(_)=>()}
+  control.report(progress,1,1)
+  return result.ok(Output{buffer:audio.AudioBuffer{samples:values,rate:44100,channels:2},bypassed:true,children:0,temporary_removed:true,work_directory:""})}
+ let tool_valid:result<unit,transport.Error>=transport.validate(tool)
+ let _=match tool_valid{err(error)=>{return result.err(Failure{error:error,temporary_removed:true,work_directory:""})},ok(_)=>()}
+ if not path.is_absolute(work_directory){return result.err(Failure{error:transport.Error.Invalid("A new absolute private work directory is required"),temporary_removed:true,work_directory:""})}
+ let made:result<unit,fs.error>=files.create_dir(work_directory)
+ let _=match made{err(error)=>{return result.err(Failure{error:error_text(error),temporary_removed:true,work_directory:""})},ok(_)=>()}
+ let deadline_ns:u64=proc.deadline_in(tool.timeout_ms)
+ let executed:result<audio.AudioBuffer,transport.Error>=run_channels(tool,source,action,work_directory,cancel,progress,deadline_ns)
+ let removed:bool=cleanup(work_directory)
+ let buffer:audio.AudioBuffer=match executed{ok(value)=>value,err(error)=>{return result.err(Failure{error:error,temporary_removed:removed,work_directory:string.copy(work_directory)})}}
+ if control.cancelled(cancel){return result.err(Failure{error:transport.Error.Cancelled,temporary_removed:removed,work_directory:string.copy(work_directory)})}
+ // Processed samples came back through PCM16 and therefore have peak <=1.
+ control.report(progress,1,1)
+ result.ok(Output{buffer:buffer,bypassed:false,children:3,temporary_removed:removed,work_directory:string.copy(work_directory)})
+}

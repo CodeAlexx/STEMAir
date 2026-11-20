@@ -1,0 +1,218 @@
+module stemair.waveform.device
+import "network.ai" as network
+import "../weights.ai" as weights
+import "../ops.ai" as ops
+import "../control.ai" as control
+import "../recurrent_device.ai" as recurrent_device
+import "../recurrent_vendor.ai" as recurrent_vendor
+import "../windowed_sinc_device.ai" as sinc_device
+import "../windowed_sinc.ai" as sinc
+import std.tensor as tensor
+import std.compute as compute
+import std.gpu as devicegpu
+import std.text as text
+
+pub type Observer<O>=struct{callback:option<fn(ref<O>,str,view<u64>,view<f32>)->result<unit,string> effects {alloc}>}
+pub type Backend=struct{recurrent:recurrent_vendor.State}
+pub fn prepare(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>,workspace_limit:u64,packed_limit:u64)->result<Backend,string> effects {alloc,gpu}{
+ var state:recurrent_vendor.State=recurrent_vendor.empty(workspace_limit)
+ let _=try recurrent_vendor.prepare(state,context,stream,struct.borrow(n,field=weights),array.view(n.layers),packed_limit)
+ result.ok(Backend{recurrent:state})
+}
+fn observe<O>(stream:ref<GpuStream>,value:ref<tensor.Tensor>,name:str,observer:ref<Observer<O>>,state:ref<O>)->result<unit,string> effects {alloc,gpu}{
+ match observer.callback{none=>result.ok(()),some(invoke)=>{
+  let raw:array<f32>=try tensor.to_f32(stream,value) map_err error
+  invoke(state,name,array.view(value.dimensions),array.view(raw))}}
+}
+
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+fn empty(context:ref<GpuContext>,shape:view<u64>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ result.ok(try tensor.empty(context,shape,tensor.DType.F32) map_err error)
+}
+pub fn upload(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>)->result<array<tensor.Tensor>,string> effects {alloc,gpu} {
+ var out:array<tensor.Tensor>=try upload_weights(context,stream,n)
+ if n.options.resample{
+  array.push(out,try upload_coefficient(context,stream,struct.borrow(n,field=upsample_plan)))
+  array.push(out,try upload_coefficient(context,stream,struct.borrow(n,field=downsample_plan)))}
+ let _=try devicegpu.sync(context) map_err error
+ result.ok(out)
+}
+pub fn upload_coefficient(context:ref<GpuContext>,stream:ref<GpuStream>,p:ref<sinc.Plan>)->result<tensor.Tensor,string> effects {alloc,gpu}{sinc_device.upload(context,stream,p)}
+pub fn upload_weights(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>)->result<array<tensor.Tensor>,string> effects {alloc,gpu}{
+ var out:array<tensor.Tensor>=[]
+ var index:u64=0
+ loop{if index==array.len(n.weights.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,index)
+  array.push(out,try tensor.from_f32(context,stream,array.view(p.values),array.view(p.shape),tensor.DType.F32) map_err error)
+  index+=1}
+ result.ok(out)
+}
+fn convolution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ x:ref<tensor.Tensor>,c:network.Convolution,workspace_bytes:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var original:tensor.Tensor=try tensor.view(array.borrow(parameters,c.weight)) map_err error
+ let shape:array<u64>=[array.get(original.dimensions,0),array.get(original.dimensions,1),1,array.get(original.dimensions,2)]
+ var weight:tensor.Tensor=try tensor.reshape(original,array.view(shape)) map_err error
+ let width:u64=array.get(x.dimensions,3)
+ let kernel:u64=array.get(weight.dimensions,3)
+ if not c.up and width<kernel{return result.err("Waveform convolution input is too short")}
+ let channels:u64=array.get(weight.dimensions,if c.up{1}else{0})
+ let output_width:u64=if c.up{(width-1)*c.stride+kernel}else{(width-kernel)/c.stride+1}
+ let output_shape:array<u64>=[1,channels,1,output_width]
+ var output:tensor.Tensor=try empty(context,array.view(output_shape))
+ if c.up{
+  let _=try compute.conv_transpose2d_torch_f32(stream,x,weight,array.borrow(parameters,c.bias),output,1,c.stride,0,0,1,1,1,workspace_bytes,false,true) map_err error
+ }else{
+  let _=try compute.conv2d_torch_f32_general(stream,x,weight,array.borrow(parameters,c.bias),output,1,c.stride,0,0,1,1,1,workspace_bytes,false,true) map_err error}
+ result.ok(output)
+}
+fn relu(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var output:tensor.Tensor=try empty(context,array.view(x.dimensions))
+ let _=try compute.relu(stream,x,output) map_err error
+ result.ok(output)
+}
+fn contiguous_slice(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,axis:u64,start:u64,count:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var view:tensor.Tensor=try tensor.narrow(x,axis,start,count) map_err error
+ result.ok(try tensor.contiguous(context,stream,view) map_err error)
+}
+fn glu(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let channels:u64=array.get(x.dimensions,1)
+ if channels%2!=0{return result.err("Waveform gated channels must be even")}
+ var value:tensor.Tensor=try contiguous_slice(context,stream,x,1,0,channels/2)
+ var gate:tensor.Tensor=try contiguous_slice(context,stream,x,1,channels/2,channels/2)
+ var activated:tensor.Tensor=try empty(context,array.view(gate.dimensions))
+ let _=try compute.sigmoid(stream,gate,activated) map_err error
+ var output:tensor.Tensor=try empty(context,array.view(value.dimensions))
+ let _=try compute.mul(stream,value,activated,output) map_err error
+ result.ok(output)
+}
+fn transpose(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,order:view<u64>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var view:tensor.Tensor=try tensor.permute(x,order) map_err error
+ result.ok(try tensor.contiguous(context,stream,view) map_err error)
+}
+fn recurrence(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,x:ref<tensor.Tensor>,cancel:str)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ let time:u64=array.get(x.dimensions,3)
+ let features:u64=array.get(x.dimensions,1)
+ var packed:tensor.Tensor=try transpose(context,stream,x,[0,2,3,1])
+ let data:array<f32>=try tensor.to_f32(stream,packed) map_err error
+ var rows:ops.Tensor=ops.tensor(1,time,features,data)
+ var index:u64=0
+ loop{if index==array.len(n.layers){break}
+  let layer= array.get(n.layers,index)
+  rows=try recurrent_device.forward(context,stream,parameters,struct.borrow(n,field=weights),layer,rows,cancel)
+  index+=1}
+ let shape:array<u64>=[time,rows.w]
+ var input:tensor.Tensor=try tensor.from_f32(context,stream,array.view(rows.data),array.view(shape),tensor.DType.F32) map_err error
+ let output_shape:array<u64>=[time,features]
+ var projected:tensor.Tensor=try empty(context,array.view(output_shape))
+ var projection_weight:tensor.Tensor=try tensor.view(array.borrow(parameters,n.projection_weight)) map_err error
+ var projection_bias:tensor.Tensor=try tensor.view(array.borrow(parameters,n.projection_bias)) map_err error
+ let _=try compute.linear_bias(stream,input,projection_weight,projection_bias,projected) map_err error
+ let expanded_shape:array<u64>=[1,1,time,features]
+ var expanded:tensor.Tensor=try tensor.reshape(projected,array.view(expanded_shape)) map_err error
+ transpose(context,stream,expanded,[0,3,1,2])
+}
+pub fn recurrence_prepared(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,backend:ref<Backend>,n:ref<network.Network>,x:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu}{
+ let time:u64=array.get(x.dimensions,3)
+ let features:u64=array.get(x.dimensions,1)
+ var permuted:tensor.Tensor=try transpose(context,stream,x,[3,0,1,2])
+ let source_shape:array<u64>=[time,1,features]
+ var input:tensor.Tensor=try tensor.reshape(permuted,array.view(source_shape)) map_err error
+ var raw:tensor.Tensor=try recurrent_vendor.forward(struct.borrow(backend,field=recurrent),context,stream,array.get(n.layers,0).forward.input,input)
+ let rows:array<u64>=[time,2*features]
+ var flat:tensor.Tensor=try tensor.reshape(raw,array.view(rows)) map_err error
+ let output_shape:array<u64>=[time,features]
+ var projected:tensor.Tensor=try empty(context,array.view(output_shape))
+ var weight:tensor.Tensor=try tensor.view(array.borrow(parameters,n.projection_weight)) map_err error
+ var bias:tensor.Tensor=try tensor.view(array.borrow(parameters,n.projection_bias)) map_err error
+ let _=try compute.linear_bias_eager_f32(stream,flat,weight,bias,projected,1048576) map_err error
+ let expanded_shape:array<u64>=[1,1,time,features]
+ var expanded:tensor.Tensor=try tensor.reshape(projected,array.view(expanded_shape)) map_err error
+ transpose(context,stream,expanded,[0,3,1,2])
+}
+pub fn forward_backend_observed<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,backends:ref<array<Backend>>,observer:ref<Observer<O>>,observations:ref<O>)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if tensor.rank(input)!=4 or array.get(input.dimensions,0)!=1 or
+  array.get(input.dimensions,1)!=n.options.audio_channels or array.get(input.dimensions,2)!=1{
+  return result.err("Invalid waveform input tensor")}
+ // Larger public widths need the original preferred convolution plans.
+ // Previously qualified light64/48 and compact4 retain their 256 MiB ceiling.
+ let workspace_bytes:u64=if (n.options.generation==2 and n.options.channels==64) or (n.options.generation==1 and n.options.channels==100){1073741824}else{268435456}
+ var x:tensor.Tensor=try tensor.view(input) map_err error
+ if option.is_some(observer.callback){let _=try observe(stream,x,"input",observer,observations)}
+ if n.options.resample{
+  // The source's disabled normalization still divides by (1 + 1e-5).
+  var divisor:tensor.Tensor=try tensor.full(context,stream,array.view(x.dimensions),1.00001,tensor.DType.F32) map_err error
+  var normalized:tensor.Tensor=try empty(context,array.view(x.dimensions))
+  let _=try compute.div(stream,x,divisor,normalized) map_err error
+  let kernel:u64=array.len(n.weights.parameters.values)
+  x=try sinc_device.apply(context,stream,struct.borrow(n,field=upsample_plan),array.borrow(parameters,kernel),normalized)
+  if option.is_some(observer.callback){let _=try observe(stream,x,"upsampled",observer,observations)}
+ }
+ var saved:array<tensor.Tensor>=[]
+ var index:u64=0
+ loop{if index==array.len(n.encoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let block:network.Block=array.get(n.encoder,index)
+  var first:tensor.Tensor=try convolution(context,stream,parameters,x,block.first,workspace_bytes)
+  var activated:tensor.Tensor=try relu(context,stream,first)
+  var rewritten:tensor.Tensor=try convolution(context,stream,parameters,activated,block.rewrite,workspace_bytes)
+  x=try glu(context,stream,rewritten)
+  if option.is_some(observer.callback){let _=try observe(stream,x,text.concat("encoder-",string.from_int(index)),observer,observations)}
+  array.push(saved,try tensor.view(x) map_err error)
+  index+=1}
+ if option.is_some(observer.callback){let _=try observe(stream,x,"recurrent-input",observer,observations)}
+ x=try if array.len(backends)==0{recurrence(context,stream,parameters,n,x,cancel)}else{recurrence_prepared(context,stream,parameters,array.borrow(backends,0),n,x)}
+ if option.is_some(observer.callback){let _=try observe(stream,x,"recurrent-output",observer,observations)}
+ index=0
+ loop{if index==array.len(n.decoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var skip:tensor.Tensor=match array.pop(saved){some(v)=>v,none=>{return result.err("Waveform skip state is missing")},}
+  let width:u64=array.get(x.dimensions,3)
+  let skip_width:u64=array.get(skip.dimensions,3)
+  if skip_width<width{return result.err("Waveform skip is shorter than decoder input")}
+  var cropped:tensor.Tensor=try contiguous_slice(context,stream,skip,3,(skip_width-width)/2,width)
+  var joined:tensor.Tensor=try empty(context,array.view(x.dimensions))
+  let _=try compute.add(stream,x,cropped,joined) map_err error
+  let block:network.Block=array.get(n.decoder,index)
+  if index==4 and option.is_some(observer.callback){let _=try observe(stream,joined,"decoder-4-joined",observer,observations)}
+  var rewritten:tensor.Tensor=try convolution(context,stream,parameters,joined,block.rewrite,workspace_bytes)
+  if index==4 and option.is_some(observer.callback){let _=try observe(stream,rewritten,"decoder-4-rewrite",observer,observations)}
+  var activated:tensor.Tensor=try glu(context,stream,rewritten)
+  if index==4 and option.is_some(observer.callback){let _=try observe(stream,activated,"decoder-4-glu",observer,observations)}
+  x=try convolution(context,stream,parameters,activated,block.first,workspace_bytes)
+  if index==4 and option.is_some(observer.callback){let _=try observe(stream,x,"decoder-4-transpose",observer,observations)}
+  if index+1<array.len(n.decoder){x=try relu(context,stream,x)}
+  if option.is_some(observer.callback){let _=try observe(stream,x,text.concat("decoder-",string.from_int(index)),observer,observations)}
+  index+=1}
+ if n.options.resample{
+  let kernel:u64=array.len(n.weights.parameters.values)+1
+  x=try sinc_device.apply(context,stream,struct.borrow(n,field=downsample_plan),array.borrow(parameters,kernel),x)
+  if option.is_some(observer.callback){let _=try observe(stream,x,"downsampled",observer,observations)}
+ }
+ let channels:u64=array.get(x.dimensions,1)
+ let width:u64=array.get(x.dimensions,3)
+ let output:array<f32>=try tensor.to_f32(stream,x) map_err error
+ result.ok(ops.tensor(channels,1,width,output))
+}
+// Historical manual recurrence remains observable for preserved failure receipts.
+pub fn forward_legacy_observed<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,observer:ref<Observer<O>>,observations:ref<O>)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta}{
+ var empty:array<Backend>=[]
+ forward_backend_observed(context,stream,parameters,n,input,cancel,empty,observer,observations)
+}
+pub fn forward_prepared(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,backends:ref<array<Backend>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta}{
+ if array.len(backends)!=1{return result.err("Waveform GPU recurrence requires one retained startup bank")}
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ var state:unit=()
+ forward_backend_observed(context,stream,parameters,n,input,cancel,backends,observer,state)
+}
+pub fn forward_observed<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,observer:ref<Observer<O>>,observations:ref<O>)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta}{
+ var backends:array<Backend>=[]
+ array.push(backends,try prepare(context,stream,n,4294967296,2147483648))
+ forward_backend_observed(context,stream,parameters,n,input,cancel,backends,observer,observations)
+}
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta}{
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ var state:unit=()
+ forward_observed(context,stream,parameters,n,input,cancel,observer,state)
+}

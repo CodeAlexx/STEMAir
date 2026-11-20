@@ -1,0 +1,9 @@
+{
+  "model": "residual-waveform-v1",
+  "filename": "residual-waveform-v1.th",
+  "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/9a6b4851-03af0aa6.th",
+  "bytes": 267602121,
+  "sha256": "03af0aa64af2c4f0795659c265fdead238fab31c064a8a4b5b051c1b22c8ad48",
+  "credit": "Demucs by Alexandre Defossez, Facebook AI Research and Meta Platforms",
+  "license": "MIT; waveform-MIT.txt and hybrid-MIT.txt"
+}

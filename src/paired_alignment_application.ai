@@ -1,0 +1,104 @@
+module stemair.paired_alignment_application
+import "paired_config.ai" as config
+import "alignment_choices.ai" as choices
+import "recording_alignment_application.ai" as alignment
+import "ensemble_alignment_io.ai" as execute
+import "checked_input.ai" as checked
+import "container_export.ai" as container
+import "../toolkit/control.ai" as control
+import std.codec as codec
+import std.files as files
+import std.path as path
+import std.text as text
+
+pub type Outcome=struct{ok:bool,report:config.Report,report_file:string,message:string}
+fn file_error(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+fn persist(report:ref<config.Report>,file:str)->result<unit,string> effects {alloc,fs.write} {
+ let raw:string=try config.Report_encode(report) map_err codec.describe
+ let _=try files.write_atomic(file,text.concat(file,".tmp"),raw) map_err file_error
+ result.ok(())
+}
+fn record(report:ref<config.Report>,index:u64,state:str,message:str)->unit effects {alloc} {
+ let row:ref<config.Outcome>=array.borrow(struct.borrow(report,field=items),index)
+ row.state=string.copy(state)
+ row.message=string.copy(message)
+ ()
+}
+fn process(settings:ref<alignment.Settings>,recipe:ref<choices.Recipe>,selection:ref<config.Plan>,report:ref<config.Report>,file:str,
+ directory:str,cancel:str,progress:str,plan:ref<container.Plan>,options:ref<checked.Options>)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ report.state="running"
+ var index:u64=0
+ loop{if index==array.len(selection.items){break}
+  if control.cancelled(cancel){report.state="cancelled"
+   return result.err("Paired alignment cancelled")}
+  let item:ref<config.Item>=array.borrow(struct.borrow(selection,field=items),index)
+  let first:str=item.first
+  let second:str=item.second
+  if first==second{
+   record(report,index,"skipped","Both inputs refer to the same recording")
+   report.skipped+=1
+   let _=try persist(report,file)
+   index+=1
+   continue}
+  let target:string=path.join(directory,item.folder)
+  record(report,index,"running","")
+  let _=try persist(report,file)
+  control.status(progress,text.concat("Recording pair ",text.concat(string.from_int(index+1),text.concat(" / ",string.from_int(array.len(selection.items))))))
+  var log:container.Journal=container.empty_journal()
+  var input:checked.Options=checked.queue_item(options,index,cancel)
+  let ready:result<unit,fs.error>=files.mkdirs(target)
+  if not result.is_ok(ready){
+   record(report,index,"failed","Cannot create a paired recording output folder")
+   report.failed+=1
+  }else{
+   let result=execute.run_guarded(settings,recipe,first,second,target,cancel,progress,plan,log,input)
+   match result{ok(_)=>{record(report,index,"complete","")
+    report.succeeded+=1},err(error)=>{
+    report.poison_cpu=report.poison_cpu or error.poison_cpu
+    if control.cancelled(cancel){record(report,index,"cancelled",error.message)
+     report.state="cancelled"}else{
+     record(report,index,"failed",error.message)
+     report.failed+=1}
+    if str.len(log.failure)==0{container.record_failure(log,"",error.message)}}}
+   let row:ref<config.Outcome>=array.borrow(struct.borrow(report,field=items),index)
+   row.exports=try container.encode_journal(log)
+  }
+  let _=try persist(report,file)
+  if report.state=="cancelled"{return result.err("Paired alignment cancelled")}
+  if report.poison_cpu{report.state="stopped"
+   return result.err("CPU runtime policy was not restored; further CPU work is refused")}
+  if array.borrow(struct.borrow(report,field=items),index).state=="failed" and not selection.continue_on_error{
+   report.state="stopped"
+   return result.err("Paired alignment stopped after a failed pair")}
+  index+=1}
+ report.state="complete"
+ result.ok(())
+}
+// The application caller serializes CPU work and retains its whole model bank.
+// A poisoned CPU policy must be propagated to that bank before any later job.
+pub fn run(settings:ref<alignment.Settings>,recipe:ref<choices.Recipe>,selection:ref<config.Plan>,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,options:ref<checked.Options>)->result<Outcome,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ let _=try config.validate(struct.borrow(selection,field=items))
+ let _=try choices.validate_any(recipe)
+ let _=try container.verify(plan)
+ let _=try container.require_directory(directory)
+ if control.cancelled(cancel){return result.err("Paired alignment cancelled")}
+ var report:config.Report=config.Report{items:[],recipe:try choices.Recipe_encode(recipe) map_err codec.describe,directory:string.copy(directory)}
+ var index:u64=0
+ loop{if index==array.len(selection.items){break}
+  let item:ref<config.Item>=array.borrow(struct.borrow(selection,field=items),index)
+  array.push(report.items,config.Outcome{first:string.copy(item.first),second:string.copy(item.second),folder:string.copy(item.folder)})
+  index+=1}
+ let file:string=path.join(directory,text.concat("paired-alignment-",text.concat(string.from_int(time.monotonic_ns()),".json")))
+ let _=try files.write_new_text(file,try config.Report_encode(report) map_err codec.describe) map_err file_error
+ let outcome:result<unit,string>=process(settings,recipe,selection,report,file,directory,cancel,progress,plan,options)
+ var ok:bool=result.is_ok(outcome) and report.failed==0
+ var message:string=match outcome{ok(_)=>"Paired alignment complete",err(error)=>{
+  if report.state!="cancelled"{report.state="stopped"}
+  error}}
+ match persist(report,file){ok(_)=>{},err(error)=>{ok=false
+  string.append(message,text.concat("; report update failed: ",error))}}
+ result.ok(Outcome{ok:ok,report:report,report_file:file,message:message})
+}

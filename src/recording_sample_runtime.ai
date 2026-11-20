@@ -1,0 +1,37 @@
+module stemair.recording_sample_runtime
+import "recording_sample_application.ai" as application
+import "audio_io_policy.ai" as audio_io
+import "codec_runtime.ai" as codecs
+import "sound_file_runtime.ai" as identities
+import "../toolkit/rate_filter.ai" as filter
+import "../toolkit/recording_sample.ai" as sample
+import std.ffmpeg_probe as probe
+import std.signal_resample_table as rate
+import std.sndfile as sound
+import std.files as files
+import std.path as path
+import std.codec as codec
+import std.json as json
+import std.system as system
+import std.text as text
+
+pub fn decoder(root:str,file:str)->result<option<sound.Tool>,string> effects {alloc,env,fs.read} {
+ identities.decoder(root,file)
+}
+pub fn rate_filter(root:str)->result<filter.Asset,string> effects {alloc,fs.read} {
+ identities.rate_filter(root)
+}
+pub fn options(root:str,codec_directory:str,library:str,seconds:str,output:str,budget:u32,scratch:str,cancel:str)->result<application.Options,string>
+ effects {alloc,env,fs.read,time} {
+ let duration:u64=match text.parse_u64(seconds){some(value)=>value,none=>{return result.err("Enter a whole sample duration from 5 to 120 seconds")}}
+ let _=try sample.plan(0,44100,duration)
+ if not path.is_absolute(output){return result.err("Choose an absolute output folder for recording samples")}
+ let bytes:u64=try audio_io.budget(budget)
+ let input=try audio_io.input(root,codec_directory,budget,scratch,cancel)
+ let tool=try codecs.probe_tool(root,codec_directory)
+ let selected_probe:option<probe.Tool>=match tool{none=>option.none(),some(value)=>{
+  option.some(probe.Tool{path:string.copy(value.path),sha256:string.copy(value.sha256)})}}
+ result.ok(application.Options{seconds:duration,output_directory:string.copy(output),input:input,probe:selected_probe,
+  max_header_bytes:65536,filter:option.some(try rate_filter(root)),
+  resampling:rate.Limits{max_input_samples:bytes/4,max_output_samples:bytes/4,max_filter_values:500000},sndfile:try decoder(root,library)})
+}

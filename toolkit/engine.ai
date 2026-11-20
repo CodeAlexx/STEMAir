@@ -1,0 +1,496 @@
+module stemair.engine
+import "config.ai" as spectral_config
+import "session.ai" as spectral_session
+import "spectral_host_prepared.ai" as spectral_cpu
+import "spectral_prepared_session.ai" as spectral_prepared
+import "spectral_host_primitives.ai" as spectral_strict
+import "spectral_primitives_session.ai" as spectral_strict_session
+import "spectral_cpu_recipe.ai" as spectral_recipe
+import std.channel_norm_cpu as channel_norm
+import "exchange/config.ai" as exchange_config
+import "exchange/session.ai" as exchange_session
+import "exchange/host_session.ai" as exchange_host
+import "exchange/host_prepared_session.ai" as exchange_prepared
+import "spectral.ai" as spectral
+import "mask/config.ai" as mask_config
+import "mask/request.ai" as mask_request
+import "mask/session.ai" as mask_session
+import "mask/host_session.ai" as mask_host
+import "mask/host.ai" as mask_cpu
+import "mask/recurrent_session.ai" as recurrent_mask_session
+import "mask/recurrent_host_session.ai" as recurrent_mask_host
+import "waveform/config.ai" as waveform_config
+import "waveform/session.ai" as waveform_session
+import "waveform/host_session.ai" as waveform_host
+import "temporal/session.ai" as temporal_session
+import "temporal/host_session.ai" as temporal_host
+import "residual_waveform/config.ai" as residual_config
+import "residual_waveform/session.ai" as residual_session
+import "hybrid/config.ai" as hybrid_config
+import "hybrid/session.ai" as hybrid_session
+import "hybrid/host_session.ai" as hybrid_host
+import "attention/bundle.ai" as attention_bundle
+import "attention/bundle_config.ai" as bundle_config
+import "attention/bundle_session.ai" as bundle_session
+import "attention/config.ai" as attention_config
+import "attention/session.ai" as attention_session
+import "attention/host_session.ai" as attention_host
+import std.json as json
+import std.files as files
+import std.codec as codec
+import "audio_result.ai" as audio_result
+import "recording_bag_config.ai" as recording_bag_config
+import "recording_bag_state.ai" as recording_bag_state
+import "recording_bag_cpu.ai" as recording_bag_cpu
+import "recording_bag_request.ai" as recording_bag_request
+import "recording_context.ai" as recording_context
+
+// Profile identity and retained state contain no application paths or UI state.
+pub type Profile=struct{kind:string,identity:string,sample_rate:u32,targets:array<string>}
+pub type Loaded=struct{residual:option<residual_session.Session>,bundle:option<attention_bundle.State>,profile:Profile,spectral:option<spectral_session.Session>,exchange:option<exchange_session.Session>,mask:option<mask_session.Session>,recurrent_mask:option<recurrent_mask_session.Session>,waveform:option<waveform_session.Session>,temporal:option<temporal_session.Session>,hybrid:option<hybrid_session.Session>,attention:option<attention_session.Session>,requests:u64=0,spectral_cpu:array<spectral_cpu.Backend>,strict_spectral_cpu:array<spectral_strict.Backend>,spectral_cpu_preparations:u64=0,recording_bags:array<recording_bag_state.State>}
+fn names(input:ref<array<string>>)->array<string> effects {alloc} {
+ var out:array<string>=[]
+ var i:u64=0
+ loop{if i>=array.len(input){break}
+  array.push(out,string.copy(array.get(input,i)))
+  i+=1}
+ out
+}
+pub fn decode(raw:str)->result<Profile,string> effects {alloc} {decode_impl(raw,false)}
+pub fn decode_typed(raw:str)->result<Profile,string> effects {alloc} {decode_impl(raw,true)}
+fn decode_impl(raw:str,typed:bool)->result<Profile,string> effects {alloc} {
+ var doc:json.Document=match json.parse(raw){ok(v)=>v,err(e)=>{return result.err(json.message(e))},}
+ let kind:string=match json.get(doc,0,"engine"){
+  none=>"spectral",
+  some(at)=>match json.as_string(doc,at){some(v)=>v,none=>{return result.err("Model engine must be a string")},},}
+ if str.view(kind)=="spectral"{
+  var c:spectral_config.Config=match spectral_config.Config_decode(raw){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  let _=try spectral_config.validate(c)
+  let identity:string=match spectral_config.Config_encode(c){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  return result.ok(Profile{kind:kind,identity:identity,sample_rate:c.sample_rate,targets:names(struct.borrow(c,field=targets))})
+ }
+ if str.view(kind)=="exchange"{
+  var c:exchange_config.Config=match exchange_config.Config_decode(raw){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  let _=try if typed{exchange_config.validate_typed(c)}else{exchange_config.validate(c)}
+  let identity:string=match exchange_config.Config_encode(c){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  return result.ok(Profile{kind:kind,identity:identity,sample_rate:c.sample_rate,targets:names(struct.borrow(c,field=targets))})
+ }
+ if str.view(kind)=="mask"{
+  var c:mask_config.Config=match mask_config.Config_decode(raw){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  let _=try mask_config.validate(c)
+  let identity:string=match mask_config.Config_encode(c){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  return result.ok(Profile{kind:kind,identity:identity,sample_rate:c.sample_rate,targets:names(struct.borrow(c,field=targets))})
+ }
+ if str.view(kind)=="waveform" or str.view(kind)=="temporal"{
+  var c:waveform_config.Config=try waveform_config.Config_decode(raw) map_err codec.describe
+  let _=try waveform_config.validate(c)
+  let identity:string=try waveform_config.Config_encode(c) map_err codec.describe
+  return result.ok(Profile{kind:kind,identity:identity,sample_rate:c.sample_rate,targets:names(struct.borrow(c,field=targets))})
+ }
+ if str.view(kind)=="residual-waveform"{
+  var c:residual_config.Config=try residual_config.Config_decode(raw) map_err codec.describe
+  let _=try residual_config.validate(c)
+  let identity:string=try residual_config.Config_encode(c) map_err codec.describe
+  return result.ok(Profile{kind:kind,identity:identity,sample_rate:c.sample_rate,targets:names(struct.borrow(c,field=targets))})
+ }
+ if str.view(kind)=="hybrid"{
+  var c:hybrid_config.Config=try hybrid_config.Config_decode(raw) map_err codec.describe
+  let _=try hybrid_config.validate(c)
+  let identity:string=try hybrid_config.Config_encode(c) map_err codec.describe
+  return result.ok(Profile{kind:kind,identity:identity,sample_rate:c.sample_rate,targets:names(struct.borrow(c,field=targets))})
+ }
+ if str.view(kind)=="attention-bundle"{
+  var c:bundle_config.Config=try bundle_config.decode(raw)
+  return result.ok(Profile{kind:kind,identity:json.stringify(doc),sample_rate:c.model.sample_rate,targets:names(struct.borrow(c.model,field=targets))})
+ }
+ if str.view(kind)=="recording-bundle"{
+  var c:recording_bag_config.Config=try recording_bag_config.Config_decode(raw) map_err codec.describe
+  let _=try recording_bag_config.validate(c)
+  let identity:string=try recording_bag_config.Config_encode(c) map_err codec.describe
+  return result.ok(Profile{kind:kind,identity:identity,sample_rate:c.sample_rate,targets:names(struct.borrow(c,field=targets))})
+ }
+ if str.view(kind)=="attention"{
+  var c:attention_config.Config=try attention_config.Config_decode(raw) map_err codec.describe
+  let _=try attention_config.validate(c)
+  let identity:string=try attention_config.Config_encode(c) map_err codec.describe
+  return result.ok(Profile{kind:kind,identity:identity,sample_rate:c.sample_rate,targets:names(struct.borrow(c,field=targets))})
+ }
+ result.err("Unknown separation engine")
+}
+pub fn read(path:str)->result<Profile,string> effects {alloc,fs.read} {
+ let raw:string=match files.read_text(path){ok(v)=>v,err(_)=>{return result.err("Cannot read model configuration")},}
+ decode(str.view(raw))
+}
+pub fn read_typed(path:str)->result<Profile,string> effects {alloc,fs.read} {
+ let raw:string=match files.read_text(path){ok(v)=>v,err(_)=>{return result.err("Cannot read model configuration")},}
+ decode_typed(raw)
+}
+pub fn open(path:str,profile:Profile own)->result<Loaded,string> effects {alloc,fs.read} {
+ open_impl(path,profile,false)
+}
+pub fn open_typed(path:str,profile:Profile own)->result<Loaded,string> effects {alloc,fs.read} {
+ open_impl(path,profile,true)
+}
+// The metadata-aware cache supplies its checked unique-checkpoint intake bounds.
+// Existing single-file open APIs retain their original effects and behavior.
+pub fn open_recording_bag(path:str,profile:Profile own,limits:ref<recording_bag_state.Limits>)->result<Loaded,string> effects {alloc,fs.read,fs.meta}{
+ var p:Profile=profile
+ if p.kind!="recording-bundle"{return result.err("Expected a recording bundle profile")}
+ var c:recording_bag_config.Config=try recording_bag_config.Config_decode(p.identity) map_err codec.describe
+ let retained:recording_bag_state.State=try recording_bag_state.open(path,c,limits)
+ result.ok(Loaded{residual:option.none(),bundle:option.none(),profile:p,spectral:option.none(),exchange:option.none(),mask:option.none(),recurrent_mask:option.none(),waveform:option.none(),temporal:option.none(),hybrid:option.none(),attention:option.none(),spectral_cpu:[],strict_spectral_cpu:[],recording_bags:[retained]})
+}
+fn open_impl(path:str,profile:Profile own,typed:bool)->result<Loaded,string> effects {alloc,fs.read} {
+ var p:Profile=profile
+ if str.view(p.kind)=="spectral"{
+  let c:spectral_config.Config=match spectral_config.Config_decode(str.view(p.identity)){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  let s:spectral_session.Session=try spectral_session.open(path,c)
+  return result.ok(Loaded{recording_bags:[],residual:option.none(),strict_spectral_cpu:[],bundle:option.none(),spectral_cpu:[],profile:p,spectral:option.some(s),exchange:option.none(),mask:option.none(),recurrent_mask:option.none(),waveform:option.none(),temporal:option.none(),hybrid:option.none(),attention:option.none()})
+ }
+ if str.view(p.kind)=="exchange"{
+  let c:exchange_config.Config=match exchange_config.Config_decode(str.view(p.identity)){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  let s:exchange_session.Session=try if typed{exchange_session.open_typed(path,c)}else{exchange_session.open(path,c)}
+  return result.ok(Loaded{recording_bags:[],residual:option.none(),strict_spectral_cpu:[],bundle:option.none(),spectral_cpu:[],profile:p,spectral:option.none(),exchange:option.some(s),mask:option.none(),recurrent_mask:option.none(),waveform:option.none(),temporal:option.none(),hybrid:option.none(),attention:option.none()})
+ }
+ if str.view(p.kind)=="mask"{
+  let c:mask_config.Config=match mask_config.Config_decode(str.view(p.identity)){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  if str.view(c.architecture)=="recurrent"{
+   let s:recurrent_mask_session.Session=try recurrent_mask_session.open(path,c)
+   return result.ok(Loaded{recording_bags:[],residual:option.none(),strict_spectral_cpu:[],bundle:option.none(),spectral_cpu:[],profile:p,spectral:option.none(),exchange:option.none(),mask:option.none(),recurrent_mask:option.some(s),waveform:option.none(),temporal:option.none(),hybrid:option.none(),attention:option.none()})
+  }
+  let s:mask_session.Session=try mask_session.open(path,c)
+  return result.ok(Loaded{recording_bags:[],residual:option.none(),strict_spectral_cpu:[],bundle:option.none(),spectral_cpu:[],profile:p,spectral:option.none(),exchange:option.none(),mask:option.some(s),recurrent_mask:option.none(),waveform:option.none(),temporal:option.none(),hybrid:option.none(),attention:option.none()})
+ }
+ if str.view(p.kind)=="waveform"{
+  var c:waveform_config.Config=try waveform_config.Config_decode(str.view(p.identity)) map_err codec.describe
+  let s:waveform_session.Session=try waveform_session.open(path,c)
+  return result.ok(Loaded{recording_bags:[],residual:option.none(),strict_spectral_cpu:[],bundle:option.none(),spectral_cpu:[],profile:p,spectral:option.none(),exchange:option.none(),mask:option.none(),recurrent_mask:option.none(),waveform:option.some(s),temporal:option.none(),hybrid:option.none(),attention:option.none()})
+ }
+ if str.view(p.kind)=="temporal"{
+  var c:waveform_config.Config=try waveform_config.Config_decode(str.view(p.identity)) map_err codec.describe
+  let s:temporal_session.Session=try temporal_session.open(path,c)
+  return result.ok(Loaded{recording_bags:[],residual:option.none(),strict_spectral_cpu:[],bundle:option.none(),spectral_cpu:[],profile:p,spectral:option.none(),exchange:option.none(),mask:option.none(),recurrent_mask:option.none(),waveform:option.none(),temporal:option.some(s),hybrid:option.none(),attention:option.none()})
+ }
+ if str.view(p.kind)=="residual-waveform"{
+  var c:residual_config.Config=try residual_config.Config_decode(str.view(p.identity)) map_err codec.describe
+  let s:residual_session.Session=try residual_session.open(path,c)
+  return result.ok(Loaded{recording_bags:[],residual:option.some(s),strict_spectral_cpu:[],bundle:option.none(),spectral_cpu:[],profile:p,spectral:option.none(),exchange:option.none(),mask:option.none(),recurrent_mask:option.none(),waveform:option.none(),temporal:option.none(),hybrid:option.none(),attention:option.none()})
+ }
+ if str.view(p.kind)=="hybrid"{
+  var c:hybrid_config.Config=try hybrid_config.Config_decode(str.view(p.identity)) map_err codec.describe
+  let s:hybrid_session.Session=try hybrid_session.open(path,c)
+  return result.ok(Loaded{recording_bags:[],residual:option.none(),strict_spectral_cpu:[],bundle:option.none(),spectral_cpu:[],profile:p,spectral:option.none(),exchange:option.none(),mask:option.none(),recurrent_mask:option.none(),waveform:option.none(),temporal:option.none(),hybrid:option.some(s),attention:option.none()})
+ }
+ if str.view(p.kind)=="attention-bundle"{
+  var c:bundle_config.Config=try bundle_config.decode(p.identity)
+  let state:attention_bundle.State=try bundle_session.open(path,c)
+  return result.ok(Loaded{recording_bags:[],residual:option.none(),strict_spectral_cpu:[],bundle:option.some(state),spectral_cpu:[],profile:p,spectral:option.none(),exchange:option.none(),mask:option.none(),recurrent_mask:option.none(),waveform:option.none(),temporal:option.none(),hybrid:option.none(),attention:option.none()})
+ }
+ if str.view(p.kind)=="attention"{
+  var c:attention_config.Config=try attention_config.Config_decode(str.view(p.identity)) map_err codec.describe
+  let s:attention_session.Session=try attention_session.open(path,c)
+  return result.ok(Loaded{recording_bags:[],residual:option.none(),strict_spectral_cpu:[],bundle:option.none(),spectral_cpu:[],profile:p,spectral:option.none(),exchange:option.none(),mask:option.none(),recurrent_mask:option.none(),waveform:option.none(),temporal:option.none(),hybrid:option.none(),attention:option.some(s)})
+ }
+ result.err("Unknown separation engine")
+}
+pub fn parameter_count(s:ref<Loaded>)->u64 effects {} {
+ if array.len(s.recording_bags)==1{return recording_bag_state.parameter_count(array.borrow(s.recording_bags,0))}
+ match s.bundle{none=>{},some(v)=>{return attention_bundle.parameter_count(v)}}
+ match s.spectral{some(v)=>{return array.len(v.network.weights.parameters.values)},none=>{},}
+ match s.exchange{some(v)=>{return v.graph.original_parameters},none=>{},}
+ match s.mask{some(v)=>{return v.network.original_parameters},none=>{},}
+ match s.recurrent_mask{some(v)=>{return v.network.original_parameters},none=>{},}
+ match s.waveform{some(v)=>{return array.len(v.network.weights.parameters.values)},none=>{},}
+ match s.temporal{some(v)=>{return v.network.original_parameters},none=>{},}
+ match s.hybrid{some(v)=>{return array.len(v.network.weights.parameters.values)},none=>{},}
+ match s.residual{some(v)=>{return array.len(v.network.weights.parameters.values)},none=>{},}
+ match s.attention{some(v)=>{return array.len(v.network.weights.parameters.values)},none=>{},}
+ 0
+}
+pub fn loads(s:ref<Loaded>)->u64 effects {} {
+ if array.len(s.recording_bags)==1{return recording_bag_state.loads(array.borrow(s.recording_bags,0))}
+ match s.bundle{none=>{},some(v)=>{return attention_bundle.loads(v)}}
+ match s.spectral{some(v)=>{return v.network.weights.loads},none=>{},}
+ match s.exchange{some(v)=>{return v.graph.weights.loads},none=>{},}
+ match s.mask{some(v)=>{return v.network.weights.loads},none=>{},}
+ match s.recurrent_mask{some(v)=>{return v.network.weights.loads},none=>{},}
+ match s.waveform{some(v)=>{return v.network.weights.loads},none=>{},}
+ match s.temporal{some(v)=>{return v.network.weights.loads},none=>{},}
+ match s.hybrid{some(v)=>{return v.network.weights.loads},none=>{},}
+ match s.residual{some(v)=>{return v.network.weights.loads},none=>{},}
+ match s.attention{some(v)=>{return v.network.weights.loads},none=>{},}
+ 0
+}
+pub fn bytes_read(s:ref<Loaded>)->u64 effects {} {
+ if array.len(s.recording_bags)==1{return recording_bag_state.bytes_read(array.borrow(s.recording_bags,0))}
+ match s.bundle{none=>{},some(v)=>{return attention_bundle.bytes_read(v)}}
+ match s.spectral{some(v)=>{return v.network.weights.bytes_read},none=>{},}
+ match s.exchange{some(v)=>{return v.graph.weights.bytes_read},none=>{},}
+ match s.mask{some(v)=>{return v.network.weights.bytes_read},none=>{},}
+ match s.recurrent_mask{some(v)=>{return v.network.weights.bytes_read},none=>{},}
+ match s.waveform{some(v)=>{return v.network.weights.bytes_read},none=>{},}
+ match s.temporal{some(v)=>{return v.network.weights.bytes_read},none=>{},}
+ match s.hybrid{some(v)=>{return v.network.weights.bytes_read},none=>{},}
+ match s.residual{some(v)=>{return v.network.weights.bytes_read},none=>{},}
+ match s.attention{some(v)=>{return v.network.weights.bytes_read},none=>{},}
+ 0
+}
+pub fn separate_cpu(s:ref<Loaded>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,fs.meta,fs.write} {
+ match s.mask{none=>{},some(_)=>{return result.err("This mask engine currently requires GPU execution")},}
+ match s.recurrent_mask{none=>{},some(_)=>{return result.err("This mask engine currently requires GPU execution")},}
+ match s.waveform{none=>{},some(_)=>{return result.err("This waveform engine currently requires GPU execution")},}
+ match s.temporal{none=>{},some(_)=>{return result.err("This temporal engine currently requires GPU execution")},}
+ match s.residual{none=>{},some(_)=>{return result.err("Residual waveform CPU requires its retained prepared runtime")},}
+ match s.hybrid{none=>{},some(_)=>{return result.err("This hybrid engine currently requires GPU execution")},}
+ match s.attention{none=>{},some(_)=>{return result.err("CPU attention requires its explicit retained prepared runtime")},}
+ let identity:string=string.copy(str.view(s.profile.identity))
+ var output:array<f32>=[]
+ match s.spectral{some(v)=>{output=try spectral_session.separate_controlled(v,input,cancel,progress)},none=>{},}
+ match s.exchange{none=>{},some(v)=>{
+  var c:exchange_config.Config=match exchange_config.Config_decode(str.view(identity)){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  let _=try exchange_config.validate(c)
+  var stft:spectral.Plan=spectral.plan(c.n_fft,c.hop,spectral.hann(c.n_fft))
+  output=try exchange_host.separate(struct.borrow(v,field=graph),stft,c,input,cancel,progress)
+ },}
+ if array.len(output)==0{return result.err("Model session unavailable")}
+ s.requests+=1
+ result.ok(output)
+}
+
+pub fn separate_cpu_typed(s:ref<Loaded>,input:view<f32>,cancel:str,progress:str)->result<audio_result.Samples,string> effects {alloc,fs.meta,fs.write} {
+ let identity:string=string.copy(s.profile.identity)
+ match s.exchange{none=>{},some(v)=>{
+  var c:exchange_config.Config=try exchange_config.Config_decode(identity) map_err codec.describe
+  let _=try exchange_config.validate_typed(c)
+  var stft:spectral.Plan=spectral.plan(c.n_fft,c.hop,spectral.hann(c.n_fft))
+  let output:audio_result.Samples=try exchange_host.separate_typed(struct.borrow(v,field=graph),stft,c,input,cancel,progress)
+  s.requests+=1
+  return result.ok(output)}}
+ result.ok(audio_result.from_single(try separate_cpu(s,input,cancel,progress)))
+}
+
+fn prepare_spectral_cpu(session:ref<option<spectral_session.Session>>)->result<option<spectral_cpu.Backend>,string> effects {alloc,fs.read} {
+ match session{none=>result.ok(option.none()),some(value)=>result.ok(option.some(try spectral_cpu.prepare(struct.borrow(value,field=network))))}
+}
+fn separate_spectral_cpu(session:ref<option<spectral_session.Session>>,prepared:ref<array<spectral_cpu.Backend>>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if array.len(prepared)!=1{return result.err("CPU spectral weights were not prepared at session open")}
+ match session{none=>result.err("Spectral model session unavailable"),some(value)=>spectral_prepared.separate_loaded(value,array.borrow(prepared,0),library,input,cancel,progress)}
+}
+pub fn configure_cpu_transform(s:ref<Loaded>,runtime:str)->result<unit,string> effects {alloc}{
+ if array.len(s.recording_bags)==1{let _=try recording_bag_state.configure_cpu_transform(array.borrow(s.recording_bags,0),runtime)}
+ match s.hybrid{none=>{},some(value)=>{
+  if not value.network.constructor.kwargs.cac{
+   if str.len(runtime)==0 or array.len(value.cpu)!=1{return result.err("Magnitude CPU model requires a prepared bank and selected transform runtime")}
+   let p:ref<hybrid_host.Prepared>=array.borrow(value.cpu,0)
+   if str.len(p.runtime)!=0 and str.view(p.runtime)!=runtime{return result.err("CPU transform runtime changed; release models first")}
+   p.runtime=string.copy(runtime)}}}
+ result.ok(())
+}
+pub fn close_cpu(s:ref<Loaded>)->result<unit,string> effects {alloc,ffi}{
+ var bag:u64=0
+ loop{if bag==array.len(s.recording_bags){break}
+  let _=try recording_bag_state.close_cpu(array.borrow(s.recording_bags,bag))
+  bag+=1}
+ match s.hybrid{none=>{},some(value)=>{
+  var j:u64=0
+  loop{if j==array.len(value.cpu){break}
+   let _=try hybrid_host.close_original(array.borrow(value.cpu,j))
+   j+=1}}}
+ var i:u64=0
+ loop{if i==array.len(s.strict_spectral_cpu){break}
+  let _=try spectral_strict.close(array.borrow(s.strict_spectral_cpu,i))
+  i+=1}
+ s.strict_spectral_cpu=[]
+ result.ok(())
+}
+pub fn prepare_spectral_strict(s:ref<Loaded>,recipe:ref<spectral_recipe.Recipe>)->result<unit,string> effects {alloc,ffi,fs.read,fs.meta}{
+ if array.len(s.strict_spectral_cpu)==1{return result.ok(())}
+ if array.len(s.strict_spectral_cpu)!=0 or array.len(s.spectral_cpu)!=0{return result.err("Spectral CPU backend changed; release loaded models first")}
+ match s.spectral{none=>result.err("Spectral model session unavailable"),some(value)=>{
+  let rounding:channel_norm.AffineRounding=if recipe.affine_separate{channel_norm.AffineRounding.Separate}else{channel_norm.AffineRounding.Fused}
+  let limits= spectral_recipe.limits(recipe)
+  var made:spectral_strict.Backend=try spectral_strict.prepare_explicit(struct.borrow(value,field=network),recipe.adapter,recipe.matrix_adapter,recipe.mkl,recipe.mkl_version,rounding,limits)
+  let channels:u64=4*value.config.bands
+  let height:u64=value.config.frequency_bins/value.config.bands
+  let width:u64=value.config.frames
+  let planned:result<unit,string>=spectral_strict.prepare_geometry(struct.borrow(value,field=network),made,channels,height,width)
+  match planned{err(e)=>{let closed:result<unit,string>=spectral_strict.close(made)
+   match closed{err(problem)=>{array.push(s.strict_spectral_cpu,made)
+    return result.err(problem)},ok(_)=>{}}
+   return result.err(e)},ok(_)=>{}}
+  array.push(s.strict_spectral_cpu,made)
+  s.spectral_cpu_preparations+=1
+  result.ok(())}}
+}
+fn separate_spectral_strict(session:ref<option<spectral_session.Session>>,prepared:ref<array<spectral_strict.Backend>>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write}{
+ if array.len(prepared)!=1{return result.err("Strict spectral CPU state is not prepared")}
+ match session{none=>result.err("Spectral model session unavailable"),some(value)=>spectral_strict_session.separate_loaded(value,array.borrow(prepared,0),library,input,cancel,progress)}
+}
+fn separate_temporal_cpu(session:ref<option<temporal_session.Session>>,library:ref<CAbiLibrary>,settings:ref<waveform_config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ match session{none=>result.err("Temporal model session unavailable"),some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU temporal weights were not prepared at session open")}
+  temporal_host.separate(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,settings,input,cancel,progress)}}
+}
+fn separate_attention_cpu(session:ref<option<attention_session.Session>>,library:ref<CAbiLibrary>,settings:ref<attention_config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ match session{none=>result.err("Attention model session unavailable"),some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU attention weights were not prepared at session open")}
+  attention_host.separate(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,settings,input,cancel,progress)}}
+}
+// Resource preflight and packing of retained original tensors; no checkpoint access.
+pub fn prepare_cpu(s:ref<Loaded>)->result<unit,string> effects {alloc,fs.read} {
+ prepare_cpu_for_platform(s,"")
+}
+pub fn prepare_cpu_for_platform(s:ref<Loaded>,platform:str)->result<unit,string> effects {alloc,fs.read} {
+ if array.len(s.recording_bags)==1{return recording_bag_state.prepare_cpu(array.borrow(s.recording_bags,0),platform)}
+ if array.len(s.spectral_cpu)==0 and array.len(s.strict_spectral_cpu)==0{
+  let prepared:option<spectral_cpu.Backend>=try prepare_spectral_cpu(struct.borrow(s,field=spectral))
+  match prepared{none=>{},some(value)=>{array.push(s.spectral_cpu,value)
+   s.spectral_cpu_preparations+=1}}}
+ match s.exchange{none=>{},some(value)=>{let _=try exchange_session.prepare_cpu(value)}}
+ match s.waveform{none=>{},some(value)=>{let _=try waveform_session.prepare_cpu(value)}}
+ match s.temporal{none=>{},some(value)=>{let _=try temporal_session.prepare_cpu(value)}}
+ match s.residual{none=>{},some(value)=>{let _=try residual_session.prepare_cpu(value)}}
+ match s.hybrid{none=>{},some(value)=>{let _=try hybrid_session.prepare_cpu(value)}}
+ match s.attention{none=>{},some(value)=>{let _=try attention_session.prepare_cpu(value,platform)}}
+ match s.bundle{none=>{},some(value)=>{let _=try attention_bundle.prepare_cpu(value,platform)}}
+ match s.recurrent_mask{none=>{},some(value)=>{let _=try recurrent_mask_session.prepare_cpu(value)}}
+ match s.mask{none=>result.ok(()),some(value)=>{
+  if array.len(value.cpu)==0{array.push(value.cpu,try mask_cpu.prepare(struct.borrow(value.network,field=weights)))
+   value.cpu_preparations+=1}
+  result.ok(())}}
+}
+pub fn separate_cpu_prepared(s:ref<Loaded>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ separate_cpu_prepared_with_high_band(s,library,input,cancel,progress,mask_request.HighBand.Profile)
+}
+pub fn separate_cpu_prepared_with_high_band(s:ref<Loaded>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ separate_cpu_prepared_with_request(s,library,input,cancel,progress,high_band,mask_request.Foreground.Profile)
+}
+pub fn separate_cpu_prepared_with_request(s:ref<Loaded>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,foreground:mask_request.Foreground)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if s.profile.kind=="recording-bundle"{
+  if array.len(s.recording_bags)!=1{return result.err("Recording bundle retained state is unavailable")}
+  var controls:recording_context.Context=recording_context.disabled()
+  let limits:recording_bag_request.Limits=recording_bag_request.Limits{max_waveform_bytes:controls.waveform_bytes,max_frontends:65,transform_bytes:controls.transform_bytes}
+  var output:recording_bag_request.Output=try recording_bag_cpu.separate(array.borrow(s.recording_bags,0),library,input,controls,limits,cancel,progress)
+  s.requests+=1
+  return result.ok(struct.replace(output,[],field=values))}
+ let bundle_identity:string=string.copy(s.profile.identity)
+ match s.bundle{none=>{},some(value)=>{
+  var c:bundle_config.Config=try bundle_config.decode(bundle_identity)
+  let output:array<f32>=try attention_bundle.separate_cpu(value,library,struct.borrow(c,field=model),input,cancel,progress)
+  s.requests+=1
+  return result.ok(output)}}
+ // Copy only request configuration; the network, packed weights and plans stay owned.
+ let identity:string=string.copy(s.profile.identity)
+ if s.profile.kind=="spectral"{
+  let output:array<f32>=if array.len(s.strict_spectral_cpu)!=0{try separate_spectral_strict(struct.borrow(s,field=spectral),struct.borrow(s,field=strict_spectral_cpu),library,input,cancel,progress)}else{try separate_spectral_cpu(struct.borrow(s,field=spectral),struct.borrow(s,field=spectral_cpu),library,input,cancel,progress)}
+  s.requests+=1
+  return result.ok(output)}
+ if s.profile.kind=="temporal"{
+  var settings:waveform_config.Config=try waveform_config.Config_decode(identity) map_err codec.describe
+  let output:array<f32>=try separate_temporal_cpu(struct.borrow(s,field=temporal),library,settings,input,cancel,progress)
+  s.requests+=1
+  return result.ok(output)}
+ if s.profile.kind=="attention"{
+  var settings:attention_config.Config=try attention_config.Config_decode(identity) map_err codec.describe
+  let output:array<f32>=try separate_attention_cpu(struct.borrow(s,field=attention),library,settings,input,cancel,progress)
+  s.requests+=1
+  return result.ok(output)}
+ match s.residual{none=>{},some(value)=>{
+  var settings:residual_config.Config=try residual_config.Config_decode(identity) map_err codec.describe
+  let output:array<f32>=try residual_session.separate_cpu(value,library,settings,input,cancel,progress)
+  s.requests+=1
+  return result.ok(output)}}
+ match s.hybrid{none=>{},some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU hybrid weights were not prepared at session open")}
+  var settings:hybrid_config.Config=try hybrid_config.Config_decode(identity) map_err codec.describe
+  let _=try hybrid_config.validate(settings)
+  let output:array<f32>=try hybrid_host.separate(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,settings,input,cancel,progress)
+  s.requests+=1
+  return result.ok(output)}}
+ match s.waveform{none=>{},some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU waveform weights were not prepared at session open")}
+  var settings:waveform_config.Config=try waveform_config.Config_decode(identity) map_err codec.describe
+  let _=try waveform_config.validate(settings)
+  let output:array<f32>=try waveform_host.separate(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,settings,input,cancel,progress)
+  s.requests+=1
+  return result.ok(output)}}
+ match s.exchange{none=>{},some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU interchange weights were not prepared at session open")}
+  var settings:exchange_config.Config=try exchange_config.Config_decode(identity) map_err codec.describe
+  let _=try exchange_config.validate(settings)
+  var stft:spectral.Plan=spectral.plan(settings.n_fft,settings.hop,spectral.hann(settings.n_fft))
+  let output:array<f32>=try exchange_prepared.separate(struct.borrow(value,field=graph),array.borrow(value.cpu,0),library,stft,settings,input,cancel,progress)
+  s.requests+=1
+  return result.ok(output)}}
+ match s.recurrent_mask{none=>{},some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU recurrent mask weights were not prepared at session open")}
+  var settings:mask_config.Config=try mask_request.settings_with_foreground(identity,high_band,foreground)
+  let output:array<f32>=try recurrent_mask_host.separate(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,struct.borrow(value,field=plans),settings,input,cancel,progress)
+  s.requests+=1
+  return result.ok(output)}}
+ match s.mask{none=>separate_cpu(s,input,cancel,progress),some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU mask weights were not prepared at session open")}
+  var settings:mask_config.Config=try mask_request.settings_with_foreground(identity,high_band,foreground)
+  let output:array<f32>=try mask_host.separate(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,struct.borrow(value,field=plans),settings,input,cancel,progress)
+  s.requests+=1
+  result.ok(output)}}
+}
+// Explicit prepared execution preserves the result's actual scalar carrier.
+// Dependency-free separate_cpu[_typed] retain their existing scalar backend.
+pub fn separate_cpu_prepared_typed(s:ref<Loaded>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,foreground:mask_request.Foreground)->result<audio_result.Samples,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let mask:bool=match s.mask{none=>false,some(_)=>true}
+ let recurrent:bool=match s.recurrent_mask{none=>false,some(_)=>true}
+ if mask or recurrent{
+  var policy:mask_request.Policy=mask_request.defaults()
+  policy.high_band=high_band
+  policy.foreground=foreground
+  return separate_cpu_prepared_typed_with_policy(s,library,input,cancel,progress,policy)}
+ let identity:string=string.copy(s.profile.identity)
+ match s.exchange{none=>{},some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU interchange weights were not prepared at session open")}
+  var settings:exchange_config.Config=try exchange_config.Config_decode(identity) map_err codec.describe
+  let _=try exchange_config.validate_typed(settings)
+  var stft:spectral.Plan=spectral.plan(settings.n_fft,settings.hop,spectral.hann(settings.n_fft))
+  let output:audio_result.Samples=try exchange_prepared.separate_typed(struct.borrow(value,field=graph),array.borrow(value.cpu,0),library,stft,settings,input,cancel,progress)
+  s.requests+=1
+  return result.ok(output)}}
+ result.ok(audio_result.from_single(try separate_cpu_prepared_with_request(s,library,input,cancel,progress,high_band,foreground)))
+}
+pub fn separate_cpu_prepared_with_policy(s:ref<Loaded>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try mask_request.validate_policy(policy)
+ let identity:string=string.copy(s.profile.identity)
+ match s.recurrent_mask{none=>{},some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU recurrent mask weights were not prepared at session open")}
+  var settings:mask_config.Config=try mask_request.settings_with_policy(identity,policy)
+  let output:array<f32>=try recurrent_mask_host.separate_with_cleanup(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,struct.borrow(value,field=plans),settings,input,cancel,progress,struct.borrow(policy,field=cleanup))
+  s.requests+=1
+  return result.ok(output)}}
+ match s.mask{none=>separate_cpu_prepared_with_request(s,library,input,cancel,progress,policy.high_band,policy.foreground),some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU mask weights were not prepared at session open")}
+  var settings:mask_config.Config=try mask_request.settings_with_policy(identity,policy)
+  let output:array<f32>=try mask_host.separate_with_cleanup(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,struct.borrow(value,field=plans),settings,input,cancel,progress,struct.borrow(policy,field=cleanup))
+  s.requests+=1
+  result.ok(output)}}
+}
+pub fn separate_cpu_prepared_typed_with_policy(s:ref<Loaded>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>)->result<audio_result.Samples,string> effects {alloc,ffi,fs.meta,fs.write} {
+ var lower:array<f32>=[]
+ separate_cpu_prepared_typed_with_policy_and_band_input(s,library,input,cancel,progress,policy,array.view(lower))
+}
+pub fn separate_cpu_prepared_typed_with_policy_and_band_input(s:ref<Loaded>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,lower:view<f32>)->result<audio_result.Samples,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try mask_request.validate_policy(policy)
+ let identity:string=string.copy(s.profile.identity)
+ match s.recurrent_mask{none=>{},some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU recurrent mask weights were not prepared at session open")}
+  var settings:mask_config.Config=try mask_request.settings_with_policy(identity,policy)
+  let output:array<f64>=try recurrent_mask_host.separate_wide_with_cleanup_and_band_input(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,struct.borrow(value,field=plans),settings,input,cancel,progress,struct.borrow(policy,field=cleanup),lower)
+  s.requests+=1
+  return result.ok(audio_result.from_wide(output))}}
+ match s.mask{none=>{},some(value)=>{
+  if array.len(value.cpu)!=1{return result.err("CPU mask weights were not prepared at session open")}
+  var settings:mask_config.Config=try mask_request.settings_with_policy(identity,policy)
+  let output:array<f64>=try mask_host.separate_wide_with_cleanup_and_band_input(struct.borrow(value,field=network),array.borrow(value.cpu,0),library,struct.borrow(value,field=plans),settings,input,cancel,progress,struct.borrow(policy,field=cleanup),lower)
+  s.requests+=1
+  return result.ok(audio_result.from_wide(output))}}
+ if view.len(lower)>0{return result.err("Lower-band recording input requires a mask model")}
+ separate_cpu_prepared_typed(s,library,input,cancel,progress,policy.high_band,policy.foreground)
+}

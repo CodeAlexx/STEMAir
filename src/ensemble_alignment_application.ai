@@ -1,0 +1,50 @@
+// Full F32 local-window/introduction workflow over Root's checked decoded buffers.
+module stemair.ensemble_alignment_application
+import "recording_alignment_application.ai" as base
+import "../toolkit/ensemble_alignment.ai" as ensemble
+import "../toolkit/recording_preparation.ai" as prep
+import "../toolkit/recording_resources.ai" as resources
+import "../toolkit/alignment_options.ai" as options
+import "../toolkit/local_residual.ai" as local
+import "../toolkit/control.ai" as control
+import std.audio as audio
+import std.cpu_dot as dot
+import std.cpu_fft as fft
+import std.cabi as native
+import std.files as files
+pub type Settings=base.Settings
+fn problem(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+fn compute_impl(settings:ref<Settings>,first:ref<audio.AudioBuffer>,second:ref<audio.AudioBuffer>,windows:options.WindowSet,intros:options.IntroSet,gain:options.GainChoice,phase:local.PhaseChoice,preparation:prep.Recipe,source_threads:bool,cancel:str,progress:str,capture:bool)->result<ensemble.PreparedOutput,string>
+ effects {alloc,fs.read,fs.meta,fs.write,ffi} {
+ if control.cancelled(cancel){return result.err("Ensemble alignment cancelled")}
+ let hann:local.Recipe=try base.validate(settings)
+ if first.rate!=44100 or second.rate!=44100 or (first.channels!=1 and first.channels!=2) or (second.channels!=1 and second.channels!=2){return result.err("Ensemble alignment requires44100-Hz mono or stereo inputs")}
+ if array.len(first.samples)%cast.wrap(first.channels)!=0 or array.len(second.samples)%cast.wrap(second.channels)!=0{return result.err("Ensemble alignment requires complete interleaved frames")}
+ let limits:resources.Limits=resources.Limits{max_decoded_bytes:settings.max_decoded_bytes,max_working_bytes:settings.max_working_bytes}
+ let _=try ensemble.plan(audio.num_frames(first),cast.wrap(first.channels),audio.num_frames(second),cast.wrap(second.channels),windows,intros,gain,phase,limits,capture)
+ let dot_identity:string=try files.sha256(settings.dot_runtime) map_err problem
+ let fft_identity:string=try files.sha256(settings.fft_runtime) map_err problem
+ if dot_identity!=settings.dot_sha256 or fft_identity!=settings.fft_sha256{return result.err("CPU runtime bytes differ from the explicit pinned identities")}
+ var engine:dot.Engine=try dot.open(settings.dot_runtime,"0.3.20","Zen")
+ if source_threads{let _=try dot.require_threads(engine,1)}
+ let _=try dot.check_f64(engine)
+ var transform:fft.Engine=try fft.open(settings.fft_runtime)
+ var math:CAbiLibrary=try native.open(settings.math_runtime) map_err native.error_message
+ let value:ensemble.PreparedOutput=try ensemble.process_with_preparation(engine,transform,math,array.view(first.samples),cast.wrap(first.channels),array.view(second.samples),cast.wrap(second.channels),hann,windows,intros,gain,phase,preparation,limits,cancel,progress,capture)
+ let _=try native.close(math) map_err native.error_message
+ let _=try fft.close(transform)
+ dot.close(engine)
+ result.ok(value)
+}
+// Stable legacy path preserves inherited runtime policy and measured defaults.
+pub fn compute_buffers(settings:ref<Settings>,first:ref<audio.AudioBuffer>,second:ref<audio.AudioBuffer>,windows:options.WindowSet,intros:options.IntroSet,gain:options.GainChoice,phase:local.PhaseChoice,cancel:str,progress:str,capture:bool)->result<ensemble.Output,string>
+ effects {alloc,fs.read,fs.meta,fs.write,ffi} {
+ let preparation:prep.Recipe=prep.Recipe{polarity:prep.Polarity.Automatic,match_silence:true}
+ var value:ensemble.PreparedOutput=try compute_impl(settings,first,second,windows,intros,gain,phase,preparation,false,cancel,progress,capture)
+ ensemble.legacy_output(value)
+}
+// Caller coordinates any image-global lease; this method only verifies source1.
+pub fn compute_buffers_prepared(settings:ref<Settings>,first:ref<audio.AudioBuffer>,second:ref<audio.AudioBuffer>,windows:options.WindowSet,intros:options.IntroSet,gain:options.GainChoice,phase:local.PhaseChoice,preparation:prep.Recipe,cancel:str,progress:str,capture:bool)->result<ensemble.PreparedOutput,string>
+ effects {alloc,fs.read,fs.meta,fs.write,ffi} {
+ compute_impl(settings,first,second,windows,intros,gain,phase,preparation,true,cancel,progress,capture)
+}

@@ -1,0 +1,83 @@
+module stemair.secondary_config
+import std.codec as codec
+pub type Model=struct{config:string,checkpoint:string,definition:string="",role:u32=0,rebalance:f64=0.0}
+type LegacyModel=struct{config:string,checkpoint:string} derive codec(strict)
+type WireModel=struct{config:string,checkpoint:string,definition:string="",role:u32=0,rebalance:f64=0.0} derive codec(strict)
+pub type Adjustment=struct{target:string,model:u64,primary_weight:f64=0.5} derive codec(strict)
+pub type Recipe=struct{models:array<Model>,outputs:array<string>,adjustments:array<Adjustment>,
+ normalize:bool=false,keep_members:bool=false,complement:string="sum",preprocess:u64=0,
+ preprocess_complement:string="direct",save_instrumental_mix:bool=false,vocal_split:u64=0,
+ vocal_rebalance:f64=0.0,vocal_mixes:bool=false,vocal_mix_only:bool=false,vocal_save_only:bool=false}
+type LegacyRecipe=struct{models:array<LegacyModel>,outputs:array<string>,adjustments:array<Adjustment>,
+ normalize:bool=false,keep_members:bool=false,complement:string="sum",preprocess:u64=0,
+ preprocess_complement:string="direct",save_instrumental_mix:bool=false,vocal_split:u64=0,
+ vocal_rebalance:f64=0.0,vocal_mixes:bool=false,vocal_mix_only:bool=false,vocal_save_only:bool=false} derive codec(strict)
+type WireRecipe=struct{models:array<WireModel>,outputs:array<string>,adjustments:array<Adjustment>,
+ normalize:bool=false,keep_members:bool=false,complement:string="sum",preprocess:u64=0,
+ preprocess_complement:string="direct",save_instrumental_mix:bool=false,vocal_split:u64=0,
+ vocal_rebalance:f64=0.0,vocal_mixes:bool=false,vocal_mix_only:bool=false,vocal_save_only:bool=false} derive codec(strict)
+pub type ModelRecord=struct{model:u64,config:string,checkpoint:string,profile:string,engine:string,
+ checkpoint_loads:u64,bytes_read:u64,inference_requests:u64} derive codec(strict)
+pub type StemRecord=struct{target:string,frames:u64,file:string} derive codec(strict)
+pub type Manifest=struct{input:string,sample_rate:u32,stems:array<StemRecord>,models:array<ModelRecord>,
+ adjustments:array<Adjustment>,normalize:bool,complement:string,backend:string,preprocess:u64=0,
+ preprocess_complement:string="direct",save_instrumental_mix:bool=false,vocal_split:u64=0,
+ vocal_rebalance:f64=0.0,vocal_mixes:bool=false,vocal_mix_only:bool=false,vocal_save_only:bool=false} derive codec(strict)
+
+// Empty/default editor metadata deliberately retains the original serialized bytes.
+pub fn Model_decode(raw:str)->result<Model,codec.Error> effects {alloc} {
+ var value:WireModel=try WireModel_decode(raw)
+ result.ok(Model{config:string.copy(value.config),checkpoint:string.copy(value.checkpoint),definition:string.copy(value.definition),role:value.role,rebalance:value.rebalance})
+}
+pub fn Model_encode(value:ref<Model>)->result<string,codec.Error> effects {alloc} {
+ if str.len(value.definition)>0 or value.role!=0 or value.rebalance!=0.0{var encoded:WireModel=WireModel{config:string.copy(value.config),checkpoint:string.copy(value.checkpoint),definition:string.copy(value.definition),role:value.role,rebalance:value.rebalance}
+  return WireModel_encode(encoded)}
+ var encoded:LegacyModel=LegacyModel{config:string.copy(value.config),checkpoint:string.copy(value.checkpoint)}
+ LegacyModel_encode(encoded)
+}
+pub fn Recipe_decode(raw:str)->result<Recipe,codec.Error> effects {alloc} {
+ var value:WireRecipe=try WireRecipe_decode(raw)
+ var models:array<Model>=[]
+ var i:u64=0
+ loop{if i==array.len(value.models){break}
+  let item:ref<WireModel>=array.borrow(value.models,i)
+  array.push(models,Model{config:string.copy(item.config),checkpoint:string.copy(item.checkpoint),definition:string.copy(item.definition),role:item.role,rebalance:item.rebalance})
+  i+=1}
+ result.ok(Recipe{models:models,outputs:struct.replace(value,[],field=outputs),adjustments:struct.replace(value,[],field=adjustments),normalize:value.normalize,keep_members:value.keep_members,complement:string.copy(value.complement),preprocess:value.preprocess,preprocess_complement:string.copy(value.preprocess_complement),save_instrumental_mix:value.save_instrumental_mix,vocal_split:value.vocal_split,vocal_rebalance:value.vocal_rebalance,vocal_mixes:value.vocal_mixes,vocal_mix_only:value.vocal_mix_only,vocal_save_only:value.vocal_save_only})
+}
+pub fn Recipe_encode(source:ref<Recipe>)->result<string,codec.Error> effects {alloc} {
+ var extended:bool=false
+ var i:u64=0
+ loop{if i==array.len(source.models){break}
+  let value:ref<Model>=array.borrow(source.models,i)
+  if str.len(value.definition)>0 or value.role!=0 or value.rebalance!=0.0{extended=true}
+  i+=1}
+ var copied_outputs:array<string>=[]
+ i=0
+ loop{if i==array.len(source.outputs){break}
+  array.push(copied_outputs,string.copy(array.get(source.outputs,i)))
+  i+=1}
+ var copied_adjustments:array<Adjustment>=[]
+ i=0
+ loop{if i==array.len(source.adjustments){break}
+  array.push(copied_adjustments,try Adjustment_decode(try Adjustment_encode(array.borrow(source.adjustments,i))))
+  i+=1}
+ if extended{
+ var models:array<WireModel>=[]
+ i=0
+ loop{if i==array.len(source.models){break}
+  let item:ref<Model>=array.borrow(source.models,i)
+  array.push(models,WireModel{config:string.copy(item.config),checkpoint:string.copy(item.checkpoint),definition:string.copy(item.definition),role:item.role,rebalance:item.rebalance})
+  i+=1}
+  var encoded:WireRecipe=WireRecipe{models:models,outputs:copied_outputs,adjustments:copied_adjustments,normalize:source.normalize,keep_members:source.keep_members,complement:string.copy(source.complement),preprocess:source.preprocess,preprocess_complement:string.copy(source.preprocess_complement),save_instrumental_mix:source.save_instrumental_mix,vocal_split:source.vocal_split,vocal_rebalance:source.vocal_rebalance,vocal_mixes:source.vocal_mixes,vocal_mix_only:source.vocal_mix_only,vocal_save_only:source.vocal_save_only}
+  return WireRecipe_encode(encoded)
+ }
+  var models:array<LegacyModel>=[]
+ i=0
+ loop{if i==array.len(source.models){break}
+  let item:ref<Model>=array.borrow(source.models,i)
+  array.push(models,LegacyModel{config:string.copy(item.config),checkpoint:string.copy(item.checkpoint)})
+  i+=1}
+ var encoded:LegacyRecipe=LegacyRecipe{models:models,outputs:copied_outputs,adjustments:copied_adjustments,normalize:source.normalize,keep_members:source.keep_members,complement:string.copy(source.complement),preprocess:source.preprocess,preprocess_complement:string.copy(source.preprocess_complement),save_instrumental_mix:source.save_instrumental_mix,vocal_split:source.vocal_split,vocal_rebalance:source.vocal_rebalance,vocal_mixes:source.vocal_mixes,vocal_mix_only:source.vocal_mix_only,vocal_save_only:source.vocal_save_only}
+ LegacyRecipe_encode(encoded)
+}

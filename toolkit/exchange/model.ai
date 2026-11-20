@@ -1,0 +1,231 @@
+module stemair.exchange.model
+import "wire.ai" as wire
+import "../weights.ai" as weights
+import std.files as files
+import std.table as table
+import std.float as fp
+
+pub type Attribute=struct{name:string,integer:u64,scalar:f32,integers:array<u64>,kind:u64=0}
+pub type Node=struct{operation:string,inputs:array<string>,outputs:array<string>,attributes:array<Attribute>}
+pub type Model=struct{weights:weights.Model,nodes:array<Node>,input:string,output:string,shape:array<u64>,opset:u64,checkpoint_arithmetic:bool=false}
+type Parameter=struct{name:string,value:weights.Parameter}
+type Port=struct{name:string,shape:array<u64>}
+
+fn append(to:ref<array<u64>>,source:view<u64>)->unit effects {alloc} {
+ var i:u64=0
+ loop{if i>=view.len(source){break}
+  array.push(to,view.get(source,i))
+  i+=1}
+}
+fn tensor(data:view<byte>,start:u64,end:u64)->result<Parameter,string> effects {alloc} {
+ var shape:array<u64>=[]
+ var name:string=string.new()
+ var dtype:u64=0
+ var raw_start:u64=0
+ var raw_length:u64=0
+ var raw_seen:bool=false
+ var values:array<f32>=[]
+ var cursor:u64=start
+ loop{if cursor>=end{break}
+  let f:wire.Field=try wire.next(data,cursor,end)
+  if f.number==1{let dims:array<u64>=try wire.integers(data,f)
+   append(shape,array.view(dims))}
+  if f.number==2{dtype=f.value}
+  if f.number==8{name=try wire.text(data,f)}
+  if f.number==9{
+   if f.kind!=2 or raw_seen{return result.err("Invalid interchange tensor payload")}
+   raw_start=f.start
+   raw_length=f.length
+   raw_seen=true}
+  if f.number==4{
+   if f.kind==5{let bits:u32=cast.wrap(f.value)
+    array.push(values,cast.bits(bits))
+   }else{
+    if f.kind!=2 or f.length%4!=0{return result.err("Invalid packed F32 tensor")}
+    var p:u64=f.start
+    loop{if p>=f.start+f.length{break}
+     let bits:u32=cast.wrap(try wire.little(data,p,4,end))
+     array.push(values,cast.bits(bits))
+     p+=4}}}
+  if f.number==13 or (f.number==14 and f.value!=0){return result.err("External interchange tensor data is not admitted")}
+  cursor=f.next}
+ if dtype!=1 or str.len(name)==0 or array.len(shape)>8{return result.err("Interchange parameters require named F32 tensors of rank at most eight")}
+ var count:u64=1
+ var i:u64=0
+ loop{if i>=array.len(shape){break}
+  let dim:u64=array.get(shape,i)
+  if dim==0 or dim>268435456 or count>268435456/dim{return result.err("Interchange parameter shape exceeds its bound")}
+  count*=dim
+  i+=1}
+ if raw_seen{
+  if array.len(values)!=0 or raw_length!=count*4{return result.err("Interchange parameter payload does not match its shape")}
+  array.reserve(values,count)
+  i=0
+  loop{if i>=count{break}
+   let bits:u32=cast.wrap(try wire.little(data,raw_start+i*4,4,raw_start+raw_length))
+   array.push(values,cast.bits(bits))
+   i+=1}}
+ if array.len(values)!=count{return result.err("Missing interchange parameter data")}
+ i=0
+ loop{if i>=count{break}
+  if not fp.is_finite(array.get(values,i)){return result.err("Non-finite interchange parameter")}
+  i+=1}
+ result.ok(Parameter{name:name,value:weights.Parameter{shape:shape,values:values}})
+}
+fn attribute(data:view<byte>,start:u64,end:u64)->result<Attribute,string> effects {alloc} {
+ var name:string=string.new()
+ var integer:u64=0
+ var scalar:f32=0.0
+ var integers:array<u64>=[]
+ var declared:u64=0
+ var present:u64=0
+ var cursor:u64=start
+ loop{if cursor>=end{break}
+  let f:wire.Field=try wire.next(data,cursor,end)
+  if f.number==1{name=try wire.text(data,f)}
+  if f.number==2{if f.kind!=5{return result.err("Wrong floating attribute wire type")}
+   if present!=0{return result.err("Duplicate interchange attribute payload")}
+   present=1
+   let bits:u32=cast.wrap(f.value)
+   scalar=cast.bits(bits)}
+  if f.number==3{
+   if f.kind!=0 or present!=0{return result.err("Invalid integer attribute payload")}
+   present=2
+   integer=f.value}
+  if f.number==8{let values:array<u64>=try wire.integers(data,f)
+   if present!=0 and present!=7{return result.err("Mixed interchange attribute payloads")}
+   present=7
+   append(integers,array.view(values))}
+  if f.number==20{if f.kind!=0 or declared!=0{return result.err("Invalid interchange attribute type")}
+   declared=f.value}
+  if f.number==4 or f.number==5 or f.number==6 or f.number==7 or f.number==9 or f.number==10{
+   return result.err("This interchange graph requires an unimplemented attribute kind")}
+  cursor=f.next}
+ if str.len(name)==0 or not fp.is_finite(scalar) or declared==0 or declared!=present{return result.err("Invalid interchange attribute")}
+ result.ok(Attribute{name:name,integer:integer,scalar:scalar,integers:integers,kind:declared})
+}
+fn node(data:view<byte>,start:u64,end:u64)->result<Node,string> effects {alloc} {
+ var operation:string=string.new()
+ var inputs:array<string>=[]
+ var outputs:array<string>=[]
+ var attributes:array<Attribute>=[]
+ var cursor:u64=start
+ loop{if cursor>=end{break}
+  let f:wire.Field=try wire.next(data,cursor,end)
+  if f.number==1{array.push(inputs,try wire.text(data,f))}
+  if f.number==2{array.push(outputs,try wire.text(data,f))}
+  if f.number==4{operation=try wire.text(data,f)}
+  if f.number==5{
+   if f.kind!=2{return result.err("Invalid attribute message wire type")}
+   let value:Attribute=try attribute(data,f.start,f.start+f.length)
+   let key:string=string.copy(str.view(value.name))
+   var i:u64=0
+   loop{if i>=array.len(attributes){break}
+    if str.view(array.borrow(attributes,i).name)==str.view(key){return result.err("Duplicate interchange attribute")}
+    i+=1}
+   array.push(attributes,value)}
+  if f.number==7{let domain:string=try wire.text(data,f)
+   if domain!="" and domain!="ai.onnx"{return result.err("Custom interchange operator domains are not admitted")}}
+  cursor=f.next}
+ if str.len(operation)==0 or array.len(inputs)>16 or array.len(outputs)!=1 or array.len(attributes)>32{return result.err("Unsupported interchange node geometry")}
+ result.ok(Node{operation:operation,inputs:inputs,outputs:outputs,attributes:attributes})
+}
+fn dimension(data:view<byte>,start:u64,end:u64)->result<u64,string> effects {alloc} {
+ var value:u64=0
+ var cursor:u64=start
+ loop{if cursor>=end{break}
+  let f:wire.Field=try wire.next(data,cursor,end)
+  if f.number==1{value=f.value}
+  cursor=f.next}
+ result.ok(value)
+}
+fn shape(data:view<byte>,start:u64,end:u64)->result<array<u64>,string> effects {alloc} {
+ var dims:array<u64>=[]
+ var cursor:u64=start
+ loop{if cursor>=end{break}
+  let f:wire.Field=try wire.next(data,cursor,end)
+  if f.number==1{array.push(dims,try dimension(data,f.start,f.start+f.length))}
+  cursor=f.next}
+ if array.len(dims)>8{return result.err("Interchange input rank exceeds its bound")}
+ result.ok(dims)
+}
+fn tensor_type(data:view<byte>,start:u64,end:u64)->result<array<u64>,string> effects {alloc} {
+ var dims:array<u64>=[]
+ var dtype:u64=0
+ var cursor:u64=start
+ loop{if cursor>=end{break}
+  let f:wire.Field=try wire.next(data,cursor,end)
+  if f.number==1{dtype=f.value}
+  if f.number==2{dims=try shape(data,f.start,f.start+f.length)}
+  cursor=f.next}
+ if dtype!=1{return result.err("Interchange input/output requires F32")}
+ result.ok(dims)
+}
+fn port(data:view<byte>,start:u64,end:u64)->result<Port,string> effects {alloc} {
+ var name:string=string.new()
+ var dims:array<u64>=[]
+ var cursor:u64=start
+ loop{if cursor>=end{break}
+  let f:wire.Field=try wire.next(data,cursor,end)
+  if f.number==1{name=try wire.text(data,f)}
+  if f.number==2{
+   var p:u64=f.start
+   loop{if p>=f.start+f.length{break}
+    let t:wire.Field=try wire.next(data,p,f.start+f.length)
+    if t.number==1{dims=try tensor_type(data,t.start,t.start+t.length)}
+    p=t.next}}
+  cursor=f.next}
+ if str.len(name)==0 or array.len(dims)==0{return result.err("Missing interchange input/output type")}
+ result.ok(Port{name:name,shape:dims})
+}
+pub fn open(path:str)->result<Model,string> effects {alloc,fs.read} {
+ let raw:bytes=match files.read_limited(path,1073741824){ok(v)=>v,err(_)=>{return result.err("Cannot read bounded interchange model")},}
+ let data:view<byte>=bytes.view(raw)
+ var graph_start:u64=0
+ var graph_end:u64=0
+ var opset:u64=0
+ var cursor:u64=0
+ loop{if cursor>=view.len(data){break}
+  let f:wire.Field=try wire.next(data,cursor,view.len(data))
+  if f.number==7{if graph_end!=0 or f.kind!=2{return result.err("Duplicate or invalid interchange graph")}
+   graph_start=f.start
+   graph_end=f.start+f.length}
+  if f.number==8{
+   var domain:string=string.new()
+   var version:u64=0
+   var p:u64=f.start
+   loop{if p>=f.start+f.length{break}
+    let entry:wire.Field=try wire.next(data,p,f.start+f.length)
+    if entry.number==1{domain=try wire.text(data,entry)}
+    if entry.number==2{version=entry.value}
+    p=entry.next}
+   if domain=="" or domain=="ai.onnx"{opset=version}else{return result.err("Custom interchange opsets are not admitted")}}
+  cursor=f.next}
+ if graph_end==0 or opset<9 or opset>21{return result.err("Missing graph or unsupported interchange opset")}
+ var parameters:table.Table<weights.Parameter>=table.new()
+ var nodes:array<Node>=[]
+ var inputs:array<Port>=[]
+ var outputs:array<Port>=[]
+ cursor=graph_start
+ loop{if cursor>=graph_end{break}
+  let f:wire.Field=try wire.next(data,cursor,graph_end)
+  if f.number==1{
+   if array.len(nodes)>=8192{return result.err("Interchange node count exceeds its bound")}
+   array.push(nodes,try node(data,f.start,f.start+f.length))}
+  if f.number==5{
+   if array.len(parameters.values)>=8192{return result.err("Interchange parameter count exceeds its bound")}
+   var p:Parameter=try tensor(data,f.start,f.start+f.length)
+   if table.contains(parameters,str.view(p.name)){return result.err("Duplicate interchange parameter name")}
+   let value:weights.Parameter=struct.replace(p,weights.Parameter{shape:[],values:[]},field=value)
+   let _=table.put(parameters,str.view(p.name),value)}
+  if f.number==11{array.push(inputs,try port(data,f.start,f.start+f.length))}
+  if f.number==12{array.push(outputs,try port(data,f.start,f.start+f.length))}
+  cursor=f.next}
+ if array.len(inputs)!=1 or array.len(outputs)!=1 or array.len(nodes)==0{return result.err("Interchange engine requires one input and one output")}
+ var input:Port=option.unwrap(array.pop(inputs))
+ var output:Port=option.unwrap(array.pop(outputs))
+ let dims:array<u64>=struct.replace(input,[],field=shape)
+ let in_name:string=struct.replace(input,string.new(),field=name)
+ let out_name:string=struct.replace(output,string.new(),field=name)
+ result.ok(Model{weights:weights.Model{parameters:parameters,bytes_read:view.len(data),loads:1},nodes:nodes,input:in_name,output:out_name,shape:dims,opset:opset})
+}

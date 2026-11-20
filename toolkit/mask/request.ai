@@ -1,0 +1,48 @@
+module stemair.mask.request
+import "config.ai" as config
+import "../artifact_cleanup.ai" as cleanup
+import std.codec as codec
+import std.float as fp
+
+// Request policy never changes the retained checkpoint/profile identity.
+pub type HighBand=enum{Profile,Disabled,Phase,Scaled}
+pub type Foreground=enum{Profile,Background,Foreground}
+pub type Policy=struct{high_band:HighBand,foreground:Foreground,cleanup:cleanup.Settings,
+ tta:i32=-1,window:u64=0,aggression:f64=-1.0}
+pub fn policy(high_band:HighBand,foreground:Foreground,settings:ref<cleanup.Settings>)->Policy effects {} {
+ Policy{high_band:high_band,foreground:foreground,cleanup:cleanup.Settings{enabled:settings.enabled,threshold:settings.threshold}}
+}
+pub fn defaults()->Policy effects {} {Policy{high_band:HighBand.Profile,foreground:Foreground.Profile,cleanup:cleanup.disabled()}}
+pub fn with_foreground(value:ref<Policy>,foreground:Foreground)->Policy effects {} {
+ Policy{high_band:value.high_band,foreground:foreground,cleanup:cleanup.Settings{enabled:value.cleanup.enabled,threshold:value.cleanup.threshold},
+  tta:value.tta,window:value.window,aggression:value.aggression}
+}
+pub fn validate_policy(value:ref<Policy>)->result<unit,string> effects {alloc} {
+ // -1 and zero-window inherit the profile; false and zero aggression are explicit.
+ if value.tta< -1 or value.tta>1{return result.err("Mask TTA must inherit, disable or enable")}
+ if value.window!=0 and (value.window<=256 or value.window>4096 or value.window%32!=0){return result.err("Mask window must inherit or use 288 to 4096 frames in steps of 32")}
+ if not fp.is_finite(value.aggression) or (value.aggression!= -1.0 and (value.aggression<0.0 or value.aggression>0.5)){return result.err("Mask aggression must inherit or use a value from 0 to 0.5")}
+ cleanup.validate(struct.borrow(value,field=cleanup))
+}
+pub fn settings_with_policy(identity:str,value:ref<Policy>)->result<config.Config,string> effects {alloc} {
+ let _=try validate_policy(value)
+ var output:config.Config=try settings_with_foreground(identity,value.high_band,value.foreground)
+ if value.tta!= -1{output.tta=value.tta==1}
+ if value.window!=0{output.window=value.window}
+ if value.aggression!= -1.0{output.aggression=value.aggression}
+ let _=try config.validate(output)
+ result.ok(output)
+}
+pub fn settings(identity:str,choice:HighBand)->result<config.Config,string> effects {alloc} {
+ settings_with_foreground(identity,choice,Foreground.Profile)
+}
+pub fn settings_with_foreground(identity:str,choice:HighBand,foreground:Foreground)->result<config.Config,string> effects {alloc} {
+ var output:config.Config=try config.Config_decode(identity) map_err codec.describe
+ if choice==HighBand.Disabled{output.high_band="none"}
+ if choice==HighBand.Phase{output.high_band="mirror-phase"}
+ if choice==HighBand.Scaled{output.high_band="mirror-scaled"}
+ if foreground==Foreground.Background{output.primary_foreground=false}
+ if foreground==Foreground.Foreground{output.primary_foreground=true}
+ let _=try config.validate(output)
+ result.ok(output)
+}

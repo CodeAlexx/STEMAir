@@ -1,0 +1,103 @@
+module stemair.temporal.network
+import "../weights.ai" as weights
+import std.pytorch_checkpoint as checkpoint
+import std.codec as codec
+import std.text as text
+
+pub type NormKind=enum{Channel,Global,Batch,Identity}
+pub type MaskKind=enum{Relu,Softmax}
+pub type Options=struct{features:u64,window:u64,bottleneck:u64,hidden:u64,kernel:u64,
+ blocks:u64,repeats:u64,sources:u64,channels:u64,rate:u64,norm:NormKind,causal:bool,mask:MaskKind,generation:u64}
+// Original serialization keys are compatibility metadata, not product names.
+type Serialized=struct{N:u64=256,L:u64=20,B:u64=256,H:u64=512,P:u64=3,X:u64=8,R:u64=4,
+ C:u64=4,audio_channels:u64=1,samplerate:u64=44100,norm_type:string="gLN",causal:bool=false,
+ mask_nonlinear:string="relu"} derive codec(strict)
+type Constructor=struct{args:array<u64>,kwargs:Serialized} derive codec(strict)
+pub type Normalization=struct{kind:NormKind,gamma:u64=0,beta:u64=0,mean:u64=0,variance:u64=0}
+pub type Block=struct{expand:u64,slope1:u64,norm1:Normalization,depthwise:u64,slope2:u64,
+ norm2:Normalization,project:u64,dilation:u64,padding:u64}
+pub type Network=struct{weights:weights.Model,options:Options,encoder:u64,input_norm:Normalization,
+ bottleneck:u64,blocks:array<Block>,mask:u64,basis:u64,original_parameters:u64}
+fn key(base:str,suffix:str)->string effects {alloc} {text.concat(base,suffix)}
+fn norm(w:ref<weights.Model>,base:str,channels:u64,kind:NormKind)->result<Normalization,string> effects {alloc} {
+ if kind==NormKind.Identity{return result.ok(Normalization{kind:kind})}
+ let shape:array<u64>=if kind==NormKind.Batch{[channels]}else{[1,channels,1]}
+ let gamma:u64=try weights.index(w,key(base,if kind==NormKind.Batch{".weight"}else{".gamma"}),array.view(shape))
+ let beta:u64=try weights.index(w,key(base,if kind==NormKind.Batch{".bias"}else{".beta"}),array.view(shape))
+ var mean:u64=0
+ var variance:u64=0
+ if kind==NormKind.Batch{
+  mean=try weights.index(w,key(base,".running_mean"),array.view(shape))
+  variance=try weights.index(w,key(base,".running_var"),array.view(shape))}
+ result.ok(Normalization{kind:kind,gamma:gamma,beta:beta,mean:mean,variance:variance})
+}
+fn conv(w:ref<weights.Model>,base:str,input:u64,output:u64,kernel:u64)->result<u64,string> effects {alloc} {
+ let shape:array<u64>=[output,input,kernel]
+ weights.index(w,key(base,".weight"),array.view(shape))
+}
+fn serialized(c:ref<Serialized>)->result<Options,string> effects {alloc} {
+ let kind:NormKind=if str.view(c.norm_type)=="gLN"{NormKind.Global}else{
+  if str.view(c.norm_type)=="cLN"{NormKind.Channel}else{
+  if str.view(c.norm_type)=="BN"{NormKind.Batch}else{
+  if str.view(c.norm_type)=="id"{NormKind.Identity}else{return result.err("Unknown serialized temporal normalization")}}}}
+ let mask:MaskKind=if str.view(c.mask_nonlinear)=="relu"{MaskKind.Relu}else{
+  if str.view(c.mask_nonlinear)=="softmax"{MaskKind.Softmax}else{return result.err("Unknown serialized temporal mask")}}
+ result.ok(Options{features:c.N,window:c.L,bottleneck:c.B,hidden:c.H,kernel:c.P,blocks:c.X,
+  repeats:c.R,sources:c.C,channels:c.audio_channels,rate:c.samplerate,norm:kind,causal:c.causal,mask:mask,generation:1})
+}
+pub fn open(path:str,generation:u64)->result<Network,string> effects {alloc,fs.read} {
+ var policy:checkpoint.Limits=checkpoint.defaults()
+ policy.archive_bytes=1073741824
+ policy.legacy_little_endian=true
+ policy.legacy_stream=generation==1
+ policy.symbolic_classes=generation==1
+ policy.root=if generation==1{checkpoint.Root.TupleState}else{checkpoint.Root.Direct}
+ var w:weights.Model=if generation==1{try weights.open_legacy_with_policy(path,policy,true)}else{try weights.open_with_policy(path,policy,true)}
+ var c:Options=Options{features:256,window:20,bottleneck:256,hidden:512,kernel:3,blocks:10,repeats:4,
+  sources:4,channels:2,rate:44100,norm:NormKind.Global,causal:false,mask:MaskKind.Relu,generation:generation}
+ if generation==1{
+  var metadata:Constructor=try Constructor_decode(w.metadata) map_err codec.describe
+  if array.len(metadata.args)!=0{return result.err("Unsupported temporal positional arguments")}
+  c=try serialized(struct.borrow(metadata,field=kwargs))
+ }else if generation!=2{return result.err("Unknown temporal generation")}
+ if c.features<4 or c.features>1024 or c.window<2 or c.window>256 or c.window%2!=0 or
+  c.bottleneck<4 or c.bottleneck>1024 or c.hidden<4 or c.hidden>2048 or c.kernel==0 or
+  c.kernel>15 or c.kernel%2==0 or c.blocks==0 or c.blocks>12 or c.repeats==0 or c.repeats>8 or
+  c.sources!=4 or c.channels!=2 or c.rate!=44100{return result.err("Unsupported temporal architecture geometry")}
+ let encoder:u64=try conv(w,"encoder.conv1d_U",c.channels,c.features,c.window)
+ let input_norm:Normalization=try norm(w,"separator.network.0",c.features,NormKind.Channel)
+ let bottleneck:u64=try conv(w,"separator.network.1",c.features,c.bottleneck,1)
+ let slope_shape:array<u64>=[1]
+ var blocks:array<Block>=[]
+ var repeat:u64=0
+ loop{if repeat==c.repeats{break}
+  var index:u64=0
+  var dilation:u64=1
+  loop{if index==c.blocks{break}
+   let base:string=text.concat(text.concat(text.concat("separator.network.2.",string.from_int(repeat)),"."),string.from_int(index))
+   let depth:string=key(base,".net.3.net")
+   array.push(blocks,Block{
+    expand:try conv(w,key(base,".net.0"),c.bottleneck,c.hidden,1),
+    slope1:try weights.index(w,key(base,".net.1.weight"),array.view(slope_shape)),
+    norm1:try norm(w,key(base,".net.2"),c.hidden,c.norm),
+    depthwise:try conv(w,key(depth,".0"),1,c.hidden,c.kernel),
+    slope2:try weights.index(w,key(depth,if c.causal{".2.weight"}else{".1.weight"}),array.view(slope_shape)),
+    norm2:try norm(w,key(depth,if c.causal{".3"}else{".2"}),c.hidden,c.norm),
+    project:try conv(w,key(depth,if c.causal{".4"}else{".3"}),c.hidden,c.bottleneck,1),
+    dilation:dilation,padding:if c.causal{(c.kernel-1)*dilation}else{(c.kernel-1)*dilation/2}})
+   dilation*=2
+   index+=1}
+  repeat+=1}
+ let mask:u64=try conv(w,"separator.network.3",c.bottleneck,c.sources*c.features,1)
+ let basis_shape:array<u64>=[c.channels*c.window,c.features]
+ let basis:u64=try weights.index(w,"decoder.basis_signals.weight",array.view(basis_shape))
+ let per_block:u64=if c.norm==NormKind.Identity{5}else{if c.norm==NormKind.Batch{13}else{9}}
+ let count:u64=array.len(w.parameters.values)
+ if count!=6+per_block*c.repeats*c.blocks{return result.err("Unexpected temporal parameter inventory")}
+ result.ok(Network{weights:w,options:c,encoder:encoder,input_norm:input_norm,bottleneck:bottleneck,
+  blocks:blocks,mask:mask,basis:basis,original_parameters:count})
+}
+pub fn valid_length(n:ref<Network>,length:u64)->result<u64,string> effects {alloc} {
+ if length<n.options.window or length>4410000{return result.err("Temporal input is outside its frame geometry")}
+ result.ok(length)
+}

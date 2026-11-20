@@ -1,0 +1,33 @@
+module stemair.reference_mastering_cli
+import "reference_mastering_runtime.ai" as runtime
+import "reference_mastering_application.ai" as application
+import "../toolkit/reference_mastering_protocol.ai" as protocol
+import "cli_audio_policy.ai" as policy
+import "paired_config.ai" as paired
+import "codec_runtime.ai" as codecs
+import std.codec as codec
+import std.text as text
+pub fn run(args:view<str>,settings:ref<policy.Settings>)->result<i32,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,io.write} {
+ let batch:bool=view.get(args,1)=="master-pairs"
+ if view.len(args)!=if batch{4}else{5}{return result.err("Use master TARGET REFERENCE OUTPUT_DIRECTORY or master-pairs PAIRS_JSON OUTPUT_DIRECTORY")}
+ var targets:array<string>=[]
+ var references:array<string>=[]
+ if batch{
+  var selection:paired.Plan=try paired.read(view.get(args,2))
+  var i:u64=0
+  loop{if i==array.len(selection.items){break}
+   let item:ref<paired.Item>=array.borrow(selection.items,i)
+   array.push(references,try policy.absolute(item.first))
+   array.push(targets,try policy.absolute(item.second))
+   i+=1}
+ }else{array.push(targets,try policy.absolute(view.get(args,2)))
+  array.push(references,try policy.absolute(view.get(args,3)))}
+ let root:string=try policy.root(settings)
+ let subtype:u32=policy.working_choice(try policy.kind(settings.wav_subtype))
+ let recipe:string=try codecs.settings(root,settings.codec_directory,try policy.format_choice(settings.format),subtype,try policy.bitrate_choice(settings.mp3_bitrate))
+ var request:protocol.Request=try runtime.request(root,settings.sample_decoder,settings.codec_directory,targets,references,try policy.absolute(view.get(args,view.len(args)-1)),"",try policy.budget_choice(settings.audio_buffer_mib),subtype,recipe,try policy.absolute_optional(settings.cancel_file),try policy.absolute_optional(settings.progress_file))
+ var outcome:application.Outcome=application.run(request)
+ match outcome.report{none=>{},some(report)=>{io.write(text.concat(try protocol.Report_encode(report) map_err codec.describe,"\n"))}}
+ if str.len(outcome.error)>0{return result.err(string.copy(outcome.error))}
+ result.ok(0)
+}

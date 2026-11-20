@@ -1,0 +1,58 @@
+module stemair.inference_pitch_output
+import "inference_pitch.ai" as pitch
+import "audio_result.ai" as audio
+import "exchange/audio.ai" as envelope
+import std.float as fp
+
+pub fn supported(kind:str)->bool effects {}{
+ kind=="spectral" or kind=="exchange" or kind=="waveform" or kind=="temporal" or kind=="residual-waveform" or kind=="hybrid" or kind=="attention" or kind=="attention-bundle" or kind=="recording-bundle"
+}
+pub fn primary(state:ref<envelope.State>)->result<array<f32>,string> effects {alloc}{
+ if state.samples==0 or array.len(state.values)!=2*state.samples or array.len(state.divider)!=state.samples{return result.err("Invalid pitched overlap result")}
+ var output:array<f32>=[]
+ array.reserve(output,state.samples*2)
+ var at:u64=0
+ loop{if at==state.samples*2{break}
+  let weight:f32=array.get(state.divider,at%state.samples)
+  if weight<=0.0{return result.err("Pitched overlap does not cover the output")}
+  let value:f32=array.get(state.values,at)/weight
+  if not fp.is_finite(value){return result.err("Non-finite pitched prediction")}
+  array.push(output,value)
+  at+=1}
+ result.ok(output)
+}
+// The return resampler precedes compensation; the time-domain residual uses
+// the original mixture. Weak scalar promotion remains explicit.
+pub fn exchange(state:ref<envelope.State>,prepared:ref<pitch.Prepared>,input:view<f32>,compensation:f64)->result<audio.Samples,string> effects {alloc}{
+ let raw:array<f32>=try primary(state)
+ let restored:array<f32>=try pitch.finish(array.view(raw),prepared)
+ if array.len(restored)!=view.len(input) or not fp.is_finite(compensation) or compensation<0.0{return result.err("Invalid pitched compensation result")}
+ let count:u64=view.len(input)
+ var at:u64=0
+ if compensation>=3.4e38{
+  var output:array<f64>=[]
+  array.reserve(output,2*count)
+  loop{if at==count{break}
+   let value:f64=cast.float(array.get(restored,at))*compensation
+   if not fp.is_finite(value){return result.err("Non-finite pitched compensation")}
+   array.push(output,value)
+   at+=1}
+  at=0
+  loop{if at==count{break}
+   array.push(output,cast.float(view.get(input,at))-array.get(output,at))
+   at+=1}
+  return result.ok(audio.from_wide(output))}
+ let gain:f32=cast.float(compensation)
+ var output:array<f32>=[]
+ array.reserve(output,2*count)
+ loop{if at==count{break}
+  let value:f32=array.get(restored,at)*gain
+  if not fp.is_finite(value){return result.err("Non-finite pitched compensation")}
+  array.push(output,value)
+  at+=1}
+ at=0
+ loop{if at==count{break}
+  array.push(output,view.get(input,at)-array.get(output,at))
+  at+=1}
+ result.ok(audio.from_single(output))
+}

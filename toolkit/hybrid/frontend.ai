@@ -1,0 +1,353 @@
+// Retained F32 transform and whole-branch reduction composition. All GPU work
+// uses shared AIR FFT/reduction operations; source framing stays in the toolkit.
+module stemair.hybrid.frontend
+import "../ops.ai" as host
+import "../numeric.ai" as num
+import "../device_ops.ai" as ops
+import std.compute as compute
+import std.tensor as tensor
+import std.gpu as agpu
+import std.mkl_vml as vml
+import std.torch_sum as mean_reduce
+import std.torch_std as deviation_reduce
+import std.float as fp
+import std.text as text
+import std.cuda_complex_f32 as complex
+
+pub type Geometry=struct{n:u64,hop:u64,length:u64,frames:u64,bins:u64,pad:u64,scale:f32,old:bool=false}
+pub type State=struct{geometry:Geometry,window:array<f32>,mean:mean_reduce.Engine214,
+ deviation:deviation_reduce.Engine,forward_workspace:u64,inverse_workspace:u64,
+ clone_bytes:u64,target_blocks512:u64,window_runtime_version:string,output_channels:u64=8,workspace_limit:u64=67108864,clone_limit:u64=67108864,complex_engines:array<complex.Engine>}
+pub type Normalized=struct{values:array<f32>,mean:f32,deviation:f32}
+pub type Limits=struct{workspace_bytes:u64,clone_bytes:u64,retained_bytes:u64,max_frames:u64=4096}
+pub type Planned=struct{geometry:Geometry,output_channels:u64,clone_bytes:u64,retained_upper_bytes:u64}
+pub fn plan_sources(n:u64,hop:u64,length:u64,old:bool,source_count:u64,limits:ref<Limits>)->result<Planned,string> effects {alloc}{
+ if source_count==0 or source_count>8{return result.err("Invalid retained transform source count")}
+ if limits.workspace_bytes==0 or limits.clone_bytes==0 or limits.retained_bytes==0 or limits.workspace_bytes>9223372036854775807/2{return result.err("Invalid explicit transform resource allowance")}
+ let p:Geometry=try geometry_limited(n,hop,length,old,limits.max_frames)
+ let channels:u64=2*source_count
+ let inverse:compute.IrfftGeometry=match compute.irfft_1d_geometry(p.n,channels*p.frames,limits.workspace_bytes,limits.clone_bytes){some(value)=>value,none=>{return result.err(if limits.clone_bytes==67108864{"Retained inverse exceeds its explicit64MiB private-clone bound"}else{"Retained inverse exceeds its explicit clone allowance"})}}
+ let workspaces:u64=2*limits.workspace_bytes
+ if inverse.clone_bytes>9223372036854775807-workspaces{return result.err("Retained transform allowance overflows")}
+ let retained:u64=inverse.clone_bytes+workspaces
+ if retained>limits.retained_bytes{return result.err("Retained transform exceeds its explicit aggregate allowance")}
+ result.ok(Planned{geometry:p,output_channels:channels,clone_bytes:inverse.clone_bytes,retained_upper_bytes:retained})
+}
+// The general GPU stream owns one forward and one inverse plan. Repreparing a
+// different batch drains/releases its predecessor before allocating scratch.
+pub fn preflight_lengths(n:u64,hop:u64,lengths:view<u64>,old:bool,source_count:u64,limits:ref<Limits>)->result<u64,string> effects {alloc}{
+ if view.len(lengths)==0{return result.err("Scheduled recording has no transform geometry")}
+ var maximum:u64=0
+ var i:u64=0
+ loop{if i==view.len(lengths){break}
+  let plan:Planned=try plan_sources(n,hop,view.get(lengths,i),old,source_count,limits)
+  if plan.retained_upper_bytes>maximum{maximum=plan.retained_upper_bytes}
+  i+=1}
+ result.ok(maximum)
+}
+pub fn geometry(n:u64,hop:u64,length:u64,old:bool)->result<Geometry,string> effects {alloc} {
+ geometry_limited(n,hop,length,old,4096)
+}
+pub fn geometry_limited(n:u64,hop:u64,length:u64,old:bool,maximum:u64)->result<Geometry,string> effects {alloc} {
+ if old or n<8 or n>32768 or n%8!=0 or hop!=n/4 or length<=n or length>16711680{
+  return result.err("Retained transform requires modern padding, quarter hop and bounded nonshort audio")}
+ let frames:u64=(length+hop-1)/hop+4
+ if maximum==0 or maximum>65536 or frames>maximum{return result.err("Retained transform frame bound exceeded")}
+ let count:f64=cast.float(n)
+ let scale:f32=cast.float(1.0/fp.sqrt(count))
+ result.ok(Geometry{n:n,hop:hop,length:length,frames:frames,bins:n/2,pad:hop/2*3,scale:scale})
+}
+pub fn create(context:ref<GpuContext>,stream:ref<GpuStream>,runtime:str,n:u64,hop:u64,length:u64,old:bool)->result<State,string> effects {alloc,ffi,gpu} {
+ create_sources(context,stream,runtime,n,hop,length,old,4)
+}
+pub fn create_sources(context:ref<GpuContext>,stream:ref<GpuStream>,runtime:str,n:u64,hop:u64,length:u64,old:bool,source_count:u64)->result<State,string> effects {alloc,ffi,gpu} {
+ if source_count==0 or source_count>8{return result.err("Invalid retained transform source count")}
+ let output_channels:u64=2*source_count
+ let p:Geometry=try geometry(n,hop,length,old)
+ if not option.is_some(compute.irfft_1d_geometry(p.n,output_channels*p.frames,67108864,67108864)){
+  return result.err("Retained inverse exceeds its explicit64MiB private-clone bound")}
+ let limits:Limits=Limits{workspace_bytes:67108864,clone_bytes:67108864,retained_bytes:201326592}
+ create_sources_with_limits(context,stream,runtime,n,hop,length,old,source_count,limits)
+}
+pub fn create_with_limits(context:ref<GpuContext>,stream:ref<GpuStream>,runtime:str,n:u64,hop:u64,length:u64,old:bool,limits:ref<Limits>)->result<State,string> effects {alloc,ffi,gpu}{
+ create_sources_with_limits(context,stream,runtime,n,hop,length,old,4,limits)
+}
+pub fn create_sources_with_limits(context:ref<GpuContext>,stream:ref<GpuStream>,runtime:str,n:u64,hop:u64,length:u64,old:bool,source_count:u64,limits:ref<Limits>)->result<State,string> effects {alloc,ffi,gpu}{
+ let planned:Planned=try plan_sources(n,hop,length,old,source_count,limits)
+ create_planned(context,stream,runtime,planned,limits)
+}
+fn create_planned(context:ref<GpuContext>,stream:ref<GpuStream>,runtime:str,planned:Planned,limits:ref<Limits>)->result<State,string> effects {alloc,ffi,gpu}{
+ let p:Geometry=planned.geometry
+ let output_channels:u64=planned.output_channels
+ var library:vml.Vml=try vml.open(runtime)
+ let version:string=try vml.runtime_version(library)
+ if not text.contains(version,"Version 2025.3-Product Build 20251007") and
+  not text.contains(version,"Version 2024.2-Product Build 20240605"){
+  return result.err("Retained F32 window requires its qualified CPU vector runtime")}
+ let window:array<f32>=try vml.hann_f32(library,p.n,true)
+ let forward:u64=try compute.prepare_rfft_1d(stream,p.n,2*p.frames,limits.workspace_bytes) map_err ops.error
+ let inverse:compute.IrfftPreparation=try compute.prepare_irfft_1d(stream,p.n,output_channels*p.frames,limits.workspace_bytes,limits.clone_bytes) map_err ops.error
+ let mean:mean_reduce.Engine214=try mean_reduce.create214(context) map_err ops.error
+ let deviation:deviation_reduce.Engine=try deviation_reduce.create(context) map_err ops.error
+ result.ok(State{geometry:p,window:window,mean:mean,deviation:deviation,
+  forward_workspace:forward,inverse_workspace:inverse.workspace_bytes,clone_bytes:inverse.clone_bytes,
+  target_blocks512:agpu.torch_reduce_grid_blocks128(context)/4,window_runtime_version:version,output_channels:output_channels,workspace_limit:limits.workspace_bytes,clone_limit:limits.clone_bytes,complex_engines:[]})
+}
+pub fn normalize(state:ref<State>,context:ref<GpuContext>,stream:ref<GpuStream>,input:view<f32>)->result<Normalized,string> effects {alloc,gpu} {
+ if view.len(input)<2 or not num.finite(input){return result.err("Invalid retained reduction input")}
+ let dimensions:array<u64>=[view.len(input)]
+ var value:tensor.Tensor=try tensor.from_f32(context,stream,input,array.view(dimensions),tensor.DType.F32) map_err ops.error
+ var mean:mean_reduce.Reduction214=try mean_reduce.mean214(struct.borrow(state,field=mean),context,stream,value) map_err ops.error
+ var deviation:deviation_reduce.Reduction=try deviation_reduce.standard_deviation(struct.borrow(state,field=deviation),context,stream,value,1.0) map_err ops.error
+ let mean_values:array<f32>=try tensor.to_f32(stream,struct.borrow(mean,field=value)) map_err ops.error
+ let deviation_values:array<f32>=try tensor.to_f32(stream,struct.borrow(deviation,field=value)) map_err ops.error
+ let center:f32=array.get(mean_values,0)
+ let spread:f32=array.get(deviation_values,0)
+ let denominator:f32=0.00001+spread
+ var output:array<f32>=[]
+ array.reserve(output,view.len(input))
+ var i:u64=0
+ loop{if i==view.len(input){break}
+  let shifted:f32=view.get(input,i)-center
+  array.push(output,shifted/denominator)
+  i+=1}
+ if not num.finite(array.view(output)){return result.err("Nonfinite retained normalized values")}
+ // Both partial/result allocations outlive their queued kernels and readback.
+ let _=try agpu.sync_stream(stream) map_err ops.error
+ result.ok(Normalized{values:output,mean:center,deviation:spread})
+}
+// Unary abs preserves the original STFT's frequency-contiguous layout. Its
+// whole-tensor reductions traverse channel/time/frequency physical order;
+// convolution still consumes logical channel/frequency/time order.
+pub fn normalize_transposed(state:ref<State>,context:ref<GpuContext>,stream:ref<GpuStream>,input:view<f32>,channels:u64,rows:u64,columns:u64)->result<Normalized,string> effects {alloc,gpu}{
+ if channels==0 or rows==0 or columns==0 or channels>8 or rows>32768 or columns>16384 or view.len(input)!=channels*rows*columns{return result.err("Invalid transposed normalization geometry")}
+ var physical:array<f32>=[]
+ array.reserve(physical,view.len(input))
+ var channel:u64=0
+ loop{if channel==channels{break}
+  var column:u64=0
+  loop{if column==columns{break}
+   var row:u64=0
+   loop{if row==rows{break}
+    array.push(physical,view.get(input,(channel*rows+row)*columns+column))
+    row+=1}
+   column+=1}
+  channel+=1}
+ var normalized:Normalized=try normalize(state,context,stream,array.view(physical))
+ var logical:array<f32>=num.zeros(view.len(input))
+ channel=0
+ loop{if channel==channels{break}
+  var row:u64=0
+  loop{if row==rows{break}
+   var column:u64=0
+   loop{if column==columns{break}
+    array.set(logical,(channel*rows+row)*columns+column,array.get(normalized.values,(channel*columns+column)*rows+row))
+    column+=1}
+   row+=1}
+  channel+=1}
+ normalized.values=logical
+ result.ok(normalized)
+}
+fn reflected(position:i64,count:u64)->u64 effects {} {
+ cast.sat(if position<0{-position}else{if position>=cast.sat(count){cast.sat(count*2)-2-position}else{position}})
+}
+// Original outer reflect padding followed by centered STFT reflect padding.
+// Input is channel-major; framing is dense channel/frame/sample for cuFFT.
+pub fn framed(state:ref<State>,input:view<f32>)->result<array<f32>,string> effects {alloc} {
+ let p:Geometry=state.geometry
+ if view.len(input)!=2*p.length or not num.finite(input){return result.err("Invalid retained transform audio")}
+ let outer:u64=(p.frames-1)*p.hop
+ var output:array<f32>=[]
+ array.reserve(output,2*p.frames*p.n)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var frame:u64=0
+  loop{if frame==p.frames{break}
+   var i:u64=0
+   loop{if i==p.n{break}
+    let centered:i64=cast.sat(frame*p.hop+i)-cast.sat(p.n/2)
+    let outer_index:u64=reflected(centered,outer)
+    let original:i64=cast.sat(outer_index)-cast.sat(p.pad)
+    let at:u64=reflected(original,p.length)
+    let sample:f32=if p.old and (original<0 or original>=cast.sat(p.length)){0.0}else{view.get(input,channel*p.length+at)}
+    let value:f32=sample*array.get(state.window,i)
+    array.push(output,value)
+    i+=1}
+   frame+=1}
+  channel+=1}
+ result.ok(output)
+}
+pub fn analyze(state:ref<State>,context:ref<GpuContext>,stream:ref<GpuStream>,input:view<f32>)->result<host.Tensor,string> effects {alloc,gpu} {
+ let p:Geometry=state.geometry
+ let windowed:array<f32>=try framed(state,input)
+ let xs:array<u64>=[2*p.frames,p.n]
+ let ys:array<u64>=[2*p.frames,p.bins+1,2]
+ var x:tensor.Tensor=try tensor.from_f32(context,stream,array.view(windowed),array.view(xs),tensor.DType.F32) map_err ops.error
+ var y:tensor.Tensor=try tensor.empty(context,array.view(ys),tensor.DType.F32) map_err ops.error
+ // The shared stream caches one geometry. Reuse it when unchanged and
+ // prepare the admitted batch when a recording switches segment/tail lengths.
+ let _=try compute.prepare_rfft_1d(stream,p.n,2*p.frames,state.workspace_limit) map_err ops.error
+ let _=try compute.rfft_1d(stream,x,y,state.workspace_limit) map_err ops.error
+ let raw:array<f32>=try tensor.to_f32(stream,y) map_err ops.error
+ let frames:u64=p.frames-4
+ var packed:array<f32>=num.zeros(4*p.bins*frames)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var frame:u64=0
+  loop{if frame==frames{break}
+   var frequency:u64=0
+   loop{if frequency==p.bins{break}
+    let from:u64=((channel*p.frames+frame+2)*(p.bins+1)+frequency)*2
+    let to:u64=(2*channel*p.bins+frequency)*frames+frame
+    array.set(packed,to,array.get(raw,from)*p.scale)
+    array.set(packed,to+p.bins*frames,array.get(raw,from+1)*p.scale)
+    frequency+=1}
+   frame+=1}
+  channel+=1}
+ let _=try agpu.sync_stream(stream) map_err ops.error
+ result.ok(host.tensor(4,p.bins,frames,packed))
+}
+pub fn synthesize(state:ref<State>,context:ref<GpuContext>,stream:ref<GpuStream>,spectrum:ref<host.Tensor>)->result<array<f32>,string> effects {alloc,gpu} {
+ let p:Geometry=state.geometry
+ let channels:u64=state.output_channels
+ let frames:u64=p.frames-4
+ if spectrum.c!=2*channels or spectrum.h!=p.bins or spectrum.w!=frames or array.len(spectrum.data)!=2*channels*p.bins*frames or not num.finite(array.view(spectrum.data)){
+  return result.err("Invalid retained inverse spectrum")}
+ var input:array<f32>=[]
+ array.reserve(input,2*channels*p.frames*(p.bins+1))
+ var channel:u64=0
+ loop{if channel==channels{break}
+  var frame:u64=0
+  loop{if frame==p.frames{break}
+   var frequency:u64=0
+   loop{if frequency==p.bins+1{break}
+    if frame>=2 and frame<frames+2 and frequency<p.bins{
+     let at:u64=(2*channel*p.bins+frequency)*frames+frame-2
+     array.push(input,array.get(spectrum.data,at))
+     array.push(input,array.get(spectrum.data,at+p.bins*frames))
+    }else{array.push(input,0.0)
+     array.push(input,0.0)}
+    frequency+=1}
+   frame+=1}
+  channel+=1}
+ let xs:array<u64>=[channels*p.frames,p.bins+1,2]
+ let ys:array<u64>=[channels*p.frames,p.n]
+ var x:tensor.Tensor=try tensor.from_f32(context,stream,array.view(input),array.view(xs),tensor.DType.F32) map_err ops.error
+ var y:tensor.Tensor=try tensor.empty(context,array.view(ys),tensor.DType.F32) map_err ops.error
+ // Shared C2R executes on its retained private clone; caller input is immutable.
+ let _=try compute.prepare_irfft_1d(stream,p.n,channels*p.frames,state.workspace_limit,state.clone_limit) map_err ops.error
+ let _=try compute.irfft_1d(stream,x,y,state.workspace_limit) map_err ops.error
+ let raw:array<f32>=try tensor.to_f32(stream,y) map_err ops.error
+ var scaled:array<f32>=[]
+ array.reserve(scaled,array.len(raw))
+ var i:u64=0
+ loop{if i==array.len(raw){break}
+  array.push(scaled,array.get(raw,i)*p.scale)
+  i+=1}
+ var product:array<f32>=[]
+ array.reserve(product,array.len(raw))
+ i=0
+ loop{if i==array.len(raw){break}
+  array.push(product,array.get(scaled,i)*array.get(state.window,i%p.n))
+  i+=1}
+ let extent:u64=(p.frames-1)*p.hop+p.n
+ var numerator:array<f32>=num.zeros(channels*extent)
+ var envelope:array<f32>=num.zeros(extent)
+ var square:array<f32>=[]
+ i=0
+ loop{if i==p.n{break}
+  let value:f32=array.get(state.window,i)*array.get(state.window,i)
+  array.push(square,value)
+  i+=1}
+ var frame:u64=0
+ loop{if frame==p.frames{break}
+  i=0
+  loop{if i==p.n{break}
+   let to:u64=frame*p.hop+i
+   array.set(envelope,to,array.get(envelope,to)+array.get(square,i))
+   channel=0
+   loop{if channel==channels{break}
+    let at:u64=channel*extent+to
+    array.set(numerator,at,array.get(numerator,at)+array.get(product,(channel*p.frames+frame)*p.n+i))
+    channel+=1}
+   i+=1}
+  frame+=1}
+ let start:u64=p.n/2+if p.old{0}else{p.pad}
+ var output:array<f32>=[]
+ array.reserve(output,channels*p.length)
+ // Returned interleaving is the existing hybrid composition contract.
+ i=0
+ loop{if i==p.length{break}
+  let denominator:f32=array.get(envelope,start+i)
+  if denominator<0.00000000001{return result.err("Retained inverse has invalid window coverage")}
+  channel=0
+  loop{if channel==channels{break}
+   array.push(output,array.get(numerator,channel*extent+start+i)/denominator)
+   channel+=1}
+  i+=1}
+ let _=try agpu.sync_stream(stream) map_err ops.error
+ if not num.finite(array.view(output)){return result.err("Nonfinite retained inverse output")}
+ result.ok(output)
+}
+
+pub fn plan_magnitude_sources(n:u64,hop:u64,length:u64,old:bool,source_count:u64,limits:ref<Limits>)->result<Planned,string> effects {alloc}{
+ if source_count==0 or source_count>8{return result.err("Invalid retained transform source count")}
+ if limits.workspace_bytes==0 or limits.clone_bytes==0 or limits.retained_bytes==0 or limits.workspace_bytes>9223372036854775807/2{return result.err("Invalid explicit transform resource allowance")}
+ let p:Geometry=try magnitude_geometry(n,hop,length,old)
+ let channels:u64=2*source_count
+ let inverse:compute.IrfftGeometry=match compute.irfft_1d_geometry(p.n,channels*p.frames,limits.workspace_bytes,limits.clone_bytes){some(value)=>value,none=>{return result.err(if limits.clone_bytes==67108864{"Retained inverse exceeds its explicit64MiB private-clone bound"}else{"Retained inverse exceeds its explicit clone allowance"})}}
+ let workspaces:u64=2*limits.workspace_bytes
+ if inverse.clone_bytes>9223372036854775807-workspaces{return result.err("Retained transform allowance overflows")}
+ let retained:u64=inverse.clone_bytes+workspaces
+ if retained>limits.retained_bytes{return result.err("Retained transform exceeds its explicit aggregate allowance")}
+ result.ok(Planned{geometry:p,output_channels:channels,clone_bytes:inverse.clone_bytes,retained_upper_bytes:retained})
+}
+
+// The magnitude family preserves its historical constant/reflect outer pad
+// and may retain the original112-second segment. Older wrappers keep4096.
+pub fn magnitude_geometry(n:u64,hop:u64,length:u64,old:bool)->result<Geometry,string> effects {alloc}{
+ if n<8 or n>32768 or n%8!=0 or hop!=n/4 or length<=n or length>16711680{return result.err("Invalid magnitude frontend geometry")}
+ let frames:u64=(length+hop-1)/hop+4
+ if frames>16384{return result.err("Magnitude frontend frame bound exceeded")}
+ let count:f64=cast.float(n)
+ result.ok(Geometry{n:n,hop:hop,length:length,frames:frames,bins:n/2,pad:hop/2*3,scale:cast.float(1.0/fp.sqrt(count)),old:old})
+}
+pub fn create_magnitude_sources_with_limits(context:ref<GpuContext>,stream:ref<GpuStream>,runtime:str,n:u64,hop:u64,length:u64,old:bool,source_count:u64,limits:ref<Limits>)->result<State,string> effects {alloc,ffi,gpu}{
+ let planned:Planned=try plan_magnitude_sources(n,hop,length,old,source_count,limits)
+ var held:State=try create_planned(context,stream,runtime,planned,limits)
+ let engine:complex.Engine=try complex.create(context) map_err ops.error
+ array.push(held.complex_engines,engine)
+ result.ok(held)
+}
+pub fn preflight_magnitude_lengths(n:u64,hop:u64,lengths:view<u64>,old:bool,source_count:u64,limits:ref<Limits>)->result<u64,string> effects {alloc}{
+ if view.len(lengths)==0{return result.err("Magnitude recording has no transform geometry")}
+ var maximum:u64=0
+ var i:u64=0
+ loop{if i==view.len(lengths){break}
+  let planned:Planned=try plan_magnitude_sources(n,hop,view.get(lengths,i),old,source_count,limits)
+  if planned.retained_upper_bytes>maximum{maximum=planned.retained_upper_bytes}
+  i+=1}
+ result.ok(maximum)
+}
+pub type Magnitude=struct{cartesian:tensor.Tensor,values:array<f32>,bins:u64,frames:u64}
+pub fn magnitude(state:ref<State>,context:ref<GpuContext>,stream:ref<GpuStream>,input:ref<host.Tensor>)->result<Magnitude,string> effects {alloc,gpu}{
+ if array.len(state.complex_engines)!=1 or input.c!=4 or input.h!=state.geometry.bins or input.w!=state.geometry.frames-4{return result.err("Magnitude frontend was not prepared for this spectrum")}
+ let shape:array<u64>=[2,2,input.h*input.w]
+ var cartesian:tensor.Tensor=try tensor.from_f32(context,stream,array.view(input.data),array.view(shape),tensor.DType.F32) map_err ops.error
+ var out:tensor.Tensor=try complex.magnitude(array.borrow(state.complex_engines,0),context,stream,cartesian)
+ let values:array<f32>=try tensor.to_f32(stream,out) map_err ops.error
+ result.ok(Magnitude{cartesian:cartesian,values:values,bins:input.h,frames:input.w})
+}
+pub fn reconstruct(state:ref<State>,context:ref<GpuContext>,stream:ref<GpuStream>,mixture:ref<Magnitude>,estimates:ref<host.Tensor>,sources:u64)->result<host.Tensor,string> effects {alloc,gpu}{
+ if sources==0 or sources>8 or array.len(state.complex_engines)!=1 or estimates.c!=2*sources or estimates.h!=mixture.bins or estimates.w!=mixture.frames{return result.err("Magnitude estimates differ from retained spectrum")}
+ let shape:array<u64>=[sources,2,estimates.h*estimates.w]
+ var values:tensor.Tensor=try tensor.from_f32(context,stream,array.view(estimates.data),array.view(shape),tensor.DType.F32) map_err ops.error
+ var phases:tensor.Tensor=try complex.phase_quadrants(array.borrow(state.complex_engines,0),context,stream,struct.borrow(mixture,field=cartesian))
+ var out:tensor.Tensor=try complex.polar(array.borrow(state.complex_engines,0),context,stream,values,phases)
+ let packed:array<f32>=try tensor.to_f32(stream,out) map_err ops.error
+ result.ok(host.tensor(4*sources,estimates.h,estimates.w,packed))
+}
+pub fn close_complex(state:ref<State>)->result<unit,string> effects {alloc,gpu}{
+ match array.pop(state.complex_engines){none=>result.ok(()),some(engine)=>{let _=try complex.close(engine) map_err ops.error
+  result.ok(())}}
+}

@@ -1,0 +1,87 @@
+module stemair.recording_bag_config
+import "attention/bundle_config.ai" as definition
+import "attention/config.ai" as attention
+import "hybrid/config.ai" as hybrid
+import "residual_waveform/config.ai" as residual
+import std.codec as codec
+import std.float as fp
+import std.text as text
+
+// Member order is distinct from the unique retained checkpoint pool. Repeated
+// positions remain separate calls with independently consumed request RNG.
+pub type Member=struct{signature:string,filename:string,kind:string,identity:string} derive codec(strict)
+pub type Config=struct{engine:string="recording-bundle",sample_rate:u32=44100,targets:array<string>,members:array<Member>,source_defaults:bool=false} derive codec(strict)
+pub type Definition=definition.Definition
+fn same(left:ref<array<string>>,right:ref<array<string>>)->bool effects {}{
+ if array.len(left)!=array.len(right){return false}
+ var i:u64=0
+ loop{if i==array.len(left){break}
+  let first:str=array.get(left,i)
+  let second:str=array.get(right,i)
+  if first!=second{return false}
+  i+=1}
+ true
+}
+pub fn validate(c:ref<Config>)->result<unit,string> effects {alloc}{
+ if c.engine!="recording-bundle" or c.sample_rate!=44100 or array.len(c.targets)<2 or array.len(c.targets)>8 or array.len(c.members)==0{return result.err("Invalid recording bundle geometry")}
+ var i:u64=0
+ loop{if i==array.len(c.members){break}
+  let row:ref<Member>=array.borrow(c.members,i)
+  if str.len(row.signature)==0 or str.len(row.signature)>64 or str.len(row.filename)==0 or str.len(row.filename)>256 or text.contains(row.filename,"/") or text.contains(row.filename,"\\") or row.filename=="." or row.filename==".." or str.len(row.identity)==0 or str.len(row.identity)>524288{return result.err("Invalid recording bundle member identity")}
+  if row.kind=="attention"{
+   var child:attention.Config=try attention.Config_decode(row.identity) map_err codec.describe
+   let _=try attention.validate(child)
+   if not same(struct.borrow(child,field=targets),struct.borrow(c,field=targets)){return result.err("Bundle child sources differ")}
+  }else{if row.kind=="hybrid"{
+   var child:hybrid.Config=try hybrid.Config_decode(row.identity) map_err codec.describe
+   let _=try hybrid.validate(child)
+   if not same(struct.borrow(child,field=targets),struct.borrow(c,field=targets)){return result.err("Bundle child sources differ")}
+  }else{if row.kind=="residual-waveform"{
+   var child:residual.Config=try residual.Config_decode(row.identity) map_err codec.describe
+   let _=try residual.validate(child)
+   if not same(struct.borrow(child,field=targets),struct.borrow(c,field=targets)){return result.err("Bundle child sources differ")}
+  }else{return result.err("Recording bundle child family is unsupported")}}}
+  var j:u64=0
+  loop{if j==i{break}
+   let previous:ref<Member>=array.borrow(c.members,j)
+   let first_signature:str=str.view(struct.borrow(row,field=signature))
+   let previous_signature:str=str.view(struct.borrow(previous,field=signature))
+   let first_filename:str=str.view(struct.borrow(row,field=filename))
+   let previous_filename:str=str.view(struct.borrow(previous,field=filename))
+   if first_signature==previous_signature or first_filename==previous_filename{
+    if first_signature!=previous_signature or first_filename!=previous_filename or str.view(struct.borrow(row,field=kind))!=str.view(struct.borrow(previous,field=kind)) or str.view(struct.borrow(row,field=identity))!=str.view(struct.borrow(previous,field=identity)){return result.err("Repeated bundle position changed its retained model identity")}}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn parse_definition(raw:str)->result<Definition,string> effects {alloc}{definition.definition(raw)}
+pub fn validate_definition(c:ref<Config>,d:ref<Definition>)->result<unit,string> effects {alloc}{
+ let _=try validate(c)
+ if array.len(d.models)!=array.len(c.members){return result.err("Bundle definition and configured positions differ")}
+ var i:u64=0
+ loop{if i==array.len(d.models){break}
+  let name:str=array.get(d.models,i)
+  if name!=str.view(struct.borrow(array.borrow(c.members,i),field=signature)){return result.err("Bundle model order differs from its configured identities")}
+  i+=1}
+ match d.segment{none=>{},some(seconds)=>{if not fp.is_finite(seconds) or seconds*44100.0<1.0 or seconds*44100.0>9223372036854775807.0{return result.err("Bundle segment exceeds its integer extent")}}}
+ match d.weights{none=>{},some(rows)=>{
+  if array.len(rows)!=array.len(c.members){return result.err("Bundle weight row count differs")}
+  i=0
+  loop{if i==array.len(rows){break}
+   if array.len(array.borrow(rows,i))!=array.len(c.targets){return result.err("Bundle source weight count differs")}
+   i+=1}
+  var source:u64=0
+  loop{if source==array.len(c.targets){break}
+   var total:f64=0.0
+   i=0
+   loop{if i==array.len(rows){break}
+    let value:f64=array.get(array.borrow(rows,i),source)
+    let single:f32=cast.float(value)
+    if not fp.is_finite(value) or not fp.is_finite(single) or value<0.0{return result.err("Bundle requires finite nonnegative source weights")}
+    total+=value
+    i+=1}
+   let single:f32=cast.float(total)
+   if not fp.is_finite(single) or single<=0.0{return result.err("Bundle source weights have no finite positive total")}
+   source+=1}}}
+ result.ok(())
+}

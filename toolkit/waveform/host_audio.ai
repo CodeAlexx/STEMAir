@@ -1,0 +1,137 @@
+module stemair.waveform.host_audio
+import "config.ai" as config
+import "host_resampled_audio.ai" as overlap
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../chunks.ai" as chunks
+import "../audio_normalization.ai" as normalization
+import "../control.ai" as control
+import "../recording_shifts.ai" as shifts
+
+fn segment<N,P>(n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,input:view<f32>,length:u64,cancel:str,
+ predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,ffi,fs.meta} {
+ if view.len(input)!=2*length{return result.err("CPU waveform segment extent differs")}
+ let target:u64=try length_for(n,length)
+ let values:array<f32>=try chunks.context_finite(input,2,0,length,target)
+ var x:ops.Tensor=ops.tensor(2,1,target,values)
+ var output:ops.Tensor=try predictor(n,prepared,library,x,cancel)
+ if output.c!=8 or output.h!=1 or output.w<length{return result.err("CPU waveform graph output geometry differs")}
+ let crop:u64=(output.w-length)/2
+ var result:array<f32>=[]
+ array.reserve(result,8*length)
+ var channel:u64=0
+ loop{if channel==8{break}
+  var time:u64=0
+  loop{if time==length{break}
+   array.push(result,array.get(output.data,channel*output.w+crop+time))
+   time+=1}
+  channel+=1}
+ result.ok(result)
+}
+fn shifted<N,P>(n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,c:ref<config.Config>,input:view<f32>,length:u64,cancel:str,
+ predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,ffi,fs.meta} {
+ predict_group(n,prepared,library,array.view(c.shift_offsets),array.len(c.shift_offsets),input,length,cancel,predictor,length_for)
+}
+fn predict_group<N,P>(n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,offsets:view<u64>,divisor_count:u64,input:view<f32>,length:u64,cancel:str,
+ predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,ffi,fs.meta} {
+ if view.len(offsets)==0{return segment(n,prepared,library,input,length,cancel,predictor,length_for)}
+ let half:u64=22050
+ let padded:array<f32>=try chunks.context_finite(input,2,0,length,length+2*half)
+ var output:array<f32>=num.zeros(8*length)
+ var shift:u64=0
+ loop{if shift==view.len(offsets){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let offset:u64=view.get(offsets,shift)
+  let count:u64=length+half
+  let given:array<f32>=try chunks.context_finite(array.view(padded),2,offset,count,count)
+  let predicted:array<f32>=try segment(n,prepared,library,array.view(given),count,cancel,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==8{break}
+   var time:u64=0
+   loop{if time==length{break}
+    let at:u64=channel*length+time
+    array.set(output,at,array.get(output,at)+array.get(predicted,channel*count+half-offset+time))
+    time+=1}
+   channel+=1}
+  shift+=1}
+ let divisor:f32=cast.float(divisor_count)
+ var i:u64=0
+ loop{if i==array.len(output){break}
+  array.set(output,i,array.get(output,i)/divisor)
+  i+=1}
+ result.ok(output)
+}
+// Source generation1 chunks are isolated before zero-padding; unlike the later
+// overlap family, valid-length context never draws from adjacent chunks.
+pub fn separate<N,P>(n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var normalized:normalization.Prepared=try normalization.prepare(input)
+ let length:u64=normalized.frames
+ let mean:f32=normalized.mean
+ let scale:f32=normalized.scale
+ if scale==0.0{return result.ok(num.zeros(8*length))}
+ let values:array<f32>=struct.replace(normalized,[],field=samples)
+ if c.generation==2{
+  let raw:array<f32>=try overlap.separate(n,prepared,library,c,config.segment_length(c),array.view(values),cancel,progress,predictor,length_for)
+  return normalization.restore(array.view(raw),length,mean,scale)}
+ let size:u64=if c.split{441000}else{length}
+ let count:u64=(length+size-1)/size
+ var raw:array<f32>=num.zeros(8*length)
+ var offset:u64=0
+ loop{if offset==length{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let frames:u64=if length-offset<size{length-offset}else{size}
+  let piece:array<f32>=try chunks.context_finite(array.view(values),2,offset,frames,frames)
+  let predicted:array<f32>=try shifted(n,prepared,library,c,array.view(piece),frames,cancel,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==8{break}
+   var time:u64=0
+   loop{if time==frames{break}
+    array.set(raw,channel*length+offset+time,array.get(predicted,channel*frames+time))
+    time+=1}
+   channel+=1}
+  control.report(progress,offset/size+1,count)
+  offset+=frames}
+ normalization.restore(array.view(raw),length,mean,scale)
+}
+
+// Request-scoped RNG traversal; the legacy fixed-offset entry above is unchanged.
+pub fn separate_scheduled<N,P>(n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,c:ref<config.Config>,schedule:ref<shifts.Schedule>,input:view<f32>,cancel:str,progress:str,
+ predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ let family:shifts.Family=if c.generation==1{shifts.Family.First}else{shifts.Family.Second}
+ let _=try shifts.require_geometry(schedule,family,view.len(input)/2,c.split,config.segment_length(c),c.overlap)
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var normalized:normalization.Prepared=try normalization.prepare(input)
+ let length:u64=normalized.frames
+ let mean:f32=normalized.mean
+ let scale:f32=normalized.scale
+ if scale==0.0{return result.ok(num.zeros(8*length))}
+ let values:array<f32>=struct.replace(normalized,[],field=samples)
+ if c.generation==2{
+  let raw:array<f32>=try overlap.separate_scheduled(n,prepared,library,c,schedule,config.segment_length(c),array.view(values),cancel,progress,predictor,length_for)
+  return normalization.restore(array.view(raw),length,mean,scale)}
+ let size:u64=if c.split{441000}else{length}
+ let count:u64=(length+size-1)/size
+ var raw:array<f32>=num.zeros(8*length)
+ var offset:u64=0
+ loop{if offset==length{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let frames:u64=if length-offset<size{length-offset}else{size}
+  let piece:array<f32>=try chunks.context_finite(array.view(values),2,offset,frames,frames)
+  let group:shifts.Group=try shifts.next_group(schedule)
+  let _=try shifts.reserve_group(schedule,group)
+  let predicted:array<f32>=try predict_group(n,prepared,library,array.view(group.offsets),group.divisor,array.view(piece),frames,cancel,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==8{break}
+   var time:u64=0
+   loop{if time==frames{break}
+    array.set(raw,channel*length+offset+time,array.get(predicted,channel*frames+time))
+    time+=1}
+   channel+=1}
+  control.report(progress,offset/size+1,count)
+  offset+=frames}
+ normalization.restore(array.view(raw),length,mean,scale)
+}

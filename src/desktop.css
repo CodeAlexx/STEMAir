@@ -1,0 +1,11 @@
+window { background: #111820; color: #e5edf5; }
+label.title-1 { font-size: 30px; font-weight: 700; color: #65ddd0; }
+entry { background: #1b2633; color: #e5edf5; border-radius: 6px; padding: 8px; }
+button { padding: 8px 18px; border-radius: 6px; }
+button.suggested-action { background: #52cbbb; color: #102122; font-weight: 700; }
+#status { color: #a9bbcf; }
+notebook, notebook > stack, notebook > header { background: #111820; color: #e5edf5; }
+notebook > header > tabs > tab { background: #1b2633; color: #e5edf5; padding: 8px 14px; }
+notebook > header > tabs > tab:checked { background: #243a49; border-bottom: 2px solid #65ddd0; }
+.audio-results, .audio-results row { background: #1b2633; color: #e5edf5; }
+.audio-results row:selected { background: #243a49; color: #e5edf5; }

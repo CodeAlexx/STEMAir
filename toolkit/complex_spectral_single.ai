@@ -1,0 +1,138 @@
+// Centered complex64 transforms. Host Hann construction and retained real FFT
+// operation order preserve the F32 boundaries of the source audio workflow.
+module stemair.complex_spectral_single
+import std.real_fft as real_fft
+import std.vector_math as vector_math
+import "complex_spectral.ai" as classic
+import "ops.ai" as ops
+import "numeric.ai" as num
+import std.fft as fft
+import std.libm as scalar
+import std.system as system
+import std.files as files
+import std.text as text
+
+pub type Profile=struct{vector_magnitude:bool,vector_cosine:bool}
+pub type Plan=struct{n:u64,hop:u64,window:array<f64>,transform:real_fft.Plan,profile:Profile}
+pub fn magnitude(real:f32,imaginary:f32)->f32 effects {} {classic.magnitude(real,imaginary)}
+// The pinned Windows build uses scalar host math. Its Linux GNU build enables
+// the AVX512 absolute loop and, on the SKX feature set, the vector cosine loop.
+// The AIR vector recipes themselves do not require vector hardware.
+pub fn host_profile()->result<Profile,string> effects {alloc,env,fs.read} {
+ if system.platform()=="windows"{return result.ok(Profile{vector_magnitude:false,vector_cosine:false})}
+ let raw:string=match files.read_text("/proc/cpuinfo"){ok(v)=>v,err(_)=>{return result.err("Cannot determine the source CPU math profile")}}
+ let lines:array<string>=text.split(raw,"\n")
+ var i:u64=0
+ loop{if i==array.len(lines){break}
+  let line:str=array.get(lines,i)
+  if str.len(line)>=5 and str.slice(line,0,5)=="flags"{
+   let flags:string=text.concat(" ",text.concat(text.replace(line,"\t"," ")," "))
+   let vector:bool=text.contains(flags," avx512f ")
+   let cosine:bool=vector and text.contains(flags," avx512cd ") and text.contains(flags," avx512dq ") and text.contains(flags," avx512bw ") and text.contains(flags," avx512vl ")
+   return result.ok(Profile{vector_magnitude:vector,vector_cosine:cosine})}
+  i+=1}
+ result.err("Source CPU math profile requires an x86 flags record")
+}
+pub fn magnitude_profile(profile:ref<Profile>,real:f32,imaginary:f32)->f32 effects {} {
+ if profile.vector_magnitude{vector_math.magnitude_f32(real,imaginary)}else{classic.magnitude(real,imaginary)}
+}
+pub fn plan(n:u64,hop:u64)->result<Plan,string> effects {alloc,ffi,env,fs.read} {
+ if n<2 or n>65536 or hop==0 or hop>n{return result.err("Invalid complex64 transform geometry")}
+ let transform:real_fft.Plan=try real_fft.plan(n)
+ let profile:Profile=try host_profile()
+ var window:array<f64>=[]
+ let step:f64=6.2831853071795864769/cast.float(n)
+ if profile.vector_cosine{
+  var i:u64=0
+  loop{if i==n{break}
+   let cosine:f64=try vector_math.cos_pi_f64(cast.float(i)*step-3.14159265358979323846)
+   array.push(window,0.5+0.5*cosine)
+   i+=1}
+  return result.ok(Plan{n:n,hop:hop,window:window,transform:transform,profile:profile})}
+ var library:CAbiLibrary=match scalar.open(){ok(v)=>v,err(_)=>{return result.err("Native window math is unavailable")}}
+ var i:u64=0
+ loop{if i==n{break}
+  let angle:f64=cast.float(i)*step-3.14159265358979323846
+  let cosine:f64=match scalar.cos(library,angle){ok(v)=>v,err(_)=>{return result.err("Native window cosine failed")}}
+  array.push(window,0.5+0.5*cosine)
+  i+=1}
+ let _=scalar.close(library)
+ result.ok(Plan{n:n,hop:hop,window:window,transform:transform,profile:profile})
+}
+pub fn analyze(p:ref<Plan>,wave:view<f32>)->result<ops.Tensor,string> effects {alloc} {
+ if view.len(wave)==0 or view.len(wave)%2!=0 or not num.finite(wave){return result.err("Expected finite planar stereo input")}
+ let samples:u64=view.len(wave)/2
+ let frames:u64=1+samples/p.hop
+ let bins:u64=p.n/2+1
+ if frames>1073741824/(4*bins){return result.err("Complex spectrum exceeds its retained memory bound")}
+ var data:array<f32>=num.zeros(4*bins*frames)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var frame:u64=0
+  loop{if frame==frames{break}
+   var input:array<f64>=[]
+   array.reserve(input,p.n)
+   var i:u64=0
+   loop{if i==p.n{break}
+    let position:i64=cast.sat(frame*p.hop+i)-cast.sat(p.n/2)
+    let index:u64=cast.sat(position)
+    let value:f64=if position>=0 and index<samples{cast.float(view.get(wave,channel*samples+index))}else{0.0}
+    array.push(input,value*array.get(p.window,i))
+    i+=1}
+   let spectrum:fft.Complex=try real_fft.forward(struct.borrow(p,field=transform),array.view(input))
+   i=0
+   loop{if i==bins{break}
+    array.set(data,(2*channel*bins+i)*frames+frame,cast.float(array.get(spectrum.re,i)))
+    array.set(data,((2*channel+1)*bins+i)*frames+frame,cast.float(array.get(spectrum.im,i)))
+    i+=1}
+   frame+=1}
+  channel+=1}
+ result.ok(ops.tensor(4,bins,frames,data))
+}
+pub fn synthesize_f32(p:ref<Plan>,real:view<f64>,imaginary:view<f64>,frames:u64)->result<array<f32>,string> effects {alloc} {
+ let bins:u64=p.n/2+1
+ if frames<2 or view.len(real)!=2*bins*frames or view.len(imaginary)!=view.len(real){return result.err("Invalid stereo inverse spectrum extent")}
+ let samples:u64=p.hop*(frames-1)
+ var normalization:array<f32>=num.zeros(samples+p.n)
+ var frame:u64=0
+ loop{if frame==frames{break}
+  var i:u64=0
+  loop{if i==p.n{break}
+   let at:u64=frame*p.hop+i
+   let old:f64=cast.float(array.get(normalization,at))
+   let window:f64=array.get(p.window,i)
+   array.set(normalization,at,cast.float(old+window*window))
+   i+=1}
+  frame+=1}
+ var output:array<f32>=[]
+ array.reserve(output,2*samples)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var accumulated:array<f32>=num.zeros(samples+p.n)
+  frame=0
+  loop{if frame==frames{break}
+   var spectrum:fft.Complex=fft.Complex{re:[],im:[]}
+   var i:u64=0
+   loop{if i==bins{break}
+    array.push(spectrum.re,view.get(real,(channel*bins+i)*frames+frame))
+    array.push(spectrum.im,view.get(imaginary,(channel*bins+i)*frames+frame))
+    i+=1}
+   let wave:array<f64>=try real_fft.inverse(struct.borrow(p,field=transform),spectrum)
+   i=0
+   loop{if i==p.n{break}
+    let at:u64=frame*p.hop+i
+    let old:f64=cast.float(array.get(accumulated,at))
+    array.set(accumulated,at,cast.float(old+array.get(wave,i)*array.get(p.window,i)))
+    i+=1}
+   frame+=1}
+  var i:u64=0
+  loop{if i==samples{break}
+   let at:u64=i+p.n/2
+   let denominator:f32=array.get(normalization,at)
+   let numerator:f32=array.get(accumulated,at)
+   array.push(output,if denominator>0.000000000000000000000000000000000000011754943508222875{numerator/denominator}else{numerator})
+   i+=1}
+  channel+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite reconstructed waveform")}
+ result.ok(output)
+}

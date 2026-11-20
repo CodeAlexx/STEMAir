@@ -1,0 +1,141 @@
+module stemair.typed_audio_math
+import "audio_result.ai" as audio
+import std.float as fp
+
+// Planar mono/stereo waveform operations. Source-facing shape is frames x
+// channels; padding appends frames separately in each planar channel.
+pub type Limits=struct{max_working_bytes:u64}
+fn valid(s:ref<audio.Samples>,channels:u32)->result<u64,string> effects {alloc} {
+ let _=try audio.validate(s)
+ if channels!=1 and channels!=2{return result.err("Typed waveform requires mono or stereo")}
+ let n:u64=audio.count(s)
+ if n%cast.wrap(channels)!=0{return result.err("Typed waveform has partial planar channels")}
+ result.ok(n/cast.wrap(channels))
+}
+fn width(s:ref<audio.Samples>)->u64 effects {} {if s.precision==audio.Precision.Float32{4}else{8}}
+fn bytes_for(n:u64,size:u64)->result<u64,string> effects {alloc} {
+ if n>18446744073709551615/size{return result.err("Typed waveform byte extent overflows")}
+ result.ok(n*size)
+}
+fn add_bytes(a:u64,b:u64)->result<u64,string> effects {alloc} {
+ if a>18446744073709551615-b{return result.err("Typed waveform byte budget overflows")}
+ result.ok(a+b)
+}
+fn padded(s:ref<audio.Samples>,frames:u64,ch:u64,frame:u64)->f64 effects {} {
+ if frame>=frames{return 0.0}
+ let i:u64=ch*frames+frame
+ if s.precision==audio.Precision.Float32{cast.float(array.get(s.single,i))}else{array.get(s.wide,i)}
+}
+// Reference weak floating-point scalar: finite magnitudes at/above
+// 3.4e38 require F64; NaN/Inf fit the floating scalar category in F32.
+fn wide_product(s:ref<audio.Samples>,factor:f64)->bool effects {} {
+ s.precision==audio.Precision.Float64 or (fp.is_finite(factor) and fp.abs(factor)>=3.4e38)
+}
+fn product(s:ref<audio.Samples>,frames:u64,ch:u64,frame:u64,factor:f64,wide:bool)->f64 effects {} {
+ let v:f64=padded(s,frames,ch,frame)
+ if wide{return v*factor}
+ let a:f32=cast.float(v)
+ let b:f32=cast.float(factor)
+ let p:f32=a*b
+ cast.float(p)
+}
+pub fn blend(first:ref<audio.Samples>,second:ref<audio.Samples>,channels:u32,value:f64,limits:Limits)->result<audio.Samples,string> effects {alloc} {
+ let a:u64=try valid(first,channels)
+ let b:u64=try valid(second,channels)
+ let frames:u64=if a>b{a}else{b}
+ let n:u64=try bytes_for(frames,cast.wrap(channels))
+ let complement:f64=1.0-value
+ let aw:bool=wide_product(first,value)
+ let bw:bool=wide_product(second,complement)
+ let wide:bool=aw or bw
+ let input_bytes:u64=try add_bytes(try bytes_for(audio.count(first),width(first)),try bytes_for(audio.count(second),width(second)))
+ let total:u64=try add_bytes(input_bytes,try bytes_for(n,if wide{8}else{4}))
+ if total>limits.max_working_bytes{return result.err("Typed waveform working budget exceeded")}
+ var single:array<f32>=[]
+ var doubles:array<f64>=[]
+ if wide{array.reserve(doubles,n)}else{array.reserve(single,n)}
+ var ch:u64=0
+ loop{if ch==cast.wrap(channels){break}
+  var i:u64=0
+  loop{if i==frames{break}
+   let x:f64=product(first,a,ch,i,value,aw)
+   let y:f64=product(second,b,ch,i,complement,bw)
+   if wide{array.push(doubles,x+y)}else{
+    let xf:f32=cast.float(x)
+    let yf:f32=cast.float(y)
+    let sum:f32=xf+yf
+    array.push(single,sum)}
+   i+=1}
+  ch+=1}
+ if wide{result.ok(audio.from_wide(doubles))}else{result.ok(audio.from_single(single))}
+}
+pub fn normalize(samples:ref<audio.Samples>,enabled:bool)->result<unit,string> effects {alloc} {
+ let _=try audio.validate(samples)
+ let n:u64=audio.count(samples)
+ if n==0{return result.err("Typed normalization maximum has no identity for empty input")}
+ var peak:f64=0.0
+ var nan:bool=false
+ var i:u64=0
+ loop{if i==n{break}
+  let v:f64=if samples.precision==audio.Precision.Float32{cast.float(array.get(samples.single,i))}else{array.get(samples.wide,i)}
+  let magnitude:f64=fp.abs(v)
+  if fp.is_nan(magnitude){nan=true}else{if magnitude>peak{peak=magnitude}}
+  i+=1}
+ if not enabled or nan or not (peak>1.0){return result.ok(())}
+ i=0
+ loop{if i==n{break}
+  if samples.precision==audio.Precision.Float32{
+   let divisor:f32=cast.float(peak)
+   let value:f32=array.get(samples.single,i)/divisor
+   array.set(samples.single,i,value)
+  }else{array.set(samples.wide,i,array.get(samples.wide,i)/peak)}
+  i+=1}
+ result.ok(())
+}
+pub fn combine(inputs:ref<array<audio.Samples>>,channels:u32,limits:Limits)->result<audio.Samples,string> effects {alloc} {
+ if array.len(inputs)==0{return result.err("Typed combination requires at least one waveform")}
+ var largest:u64=0
+ var frames:u64=0
+ var retained:u64=0
+ var i:u64=0
+ loop{if i==array.len(inputs){break}
+  let s:ref<audio.Samples>=array.borrow(inputs,i)
+  let f:u64=try valid(s,channels)
+  if f>frames{largest=i
+   frames=f}
+  retained=try add_bytes(retained,try bytes_for(audio.count(s),width(s)))
+  i+=1}
+ let selected:ref<audio.Samples>=array.borrow(inputs,largest)
+ let n:u64=try bytes_for(frames,cast.wrap(channels))
+ let wide:bool=selected.precision==audio.Precision.Float64
+ let total:u64=try add_bytes(retained,try bytes_for(n,if wide{8}else{4}))
+ if total>limits.max_working_bytes{return result.err("Typed waveform working budget exceeded")}
+ var output:audio.Samples=if wide{audio.from_wide([])}else{audio.from_single([])}
+ if wide{array.reserve(output.wide,n)}else{array.reserve(output.single,n)}
+ i=0
+ loop{if i==n{break}
+  if wide{array.push(output.wide,0.0)}else{array.push(output.single,0.0)}
+  i+=1}
+ i=0
+ loop{if i==array.len(inputs){break}
+  let s:ref<audio.Samples>=array.borrow(inputs,i)
+  let count:u64=audio.count(s)/cast.wrap(channels)
+  var ch:u64=0
+  loop{if ch==cast.wrap(channels){break}
+   var frame:u64=0
+   loop{if frame==frames{break}
+    let at:u64=ch*frames+frame
+    let v:f64=padded(s,count,ch,frame)
+    if wide{array.set(output.wide,at,array.get(output.wide,at)+v)}else{
+     if s.precision==audio.Precision.Float64{
+      let sum:f64=cast.float(array.get(output.single,at))+v
+      array.set(output.single,at,cast.float(sum))
+     }else{
+      let vf:f32=cast.float(v)
+      let sum:f32=array.get(output.single,at)+vf
+      array.set(output.single,at,sum)}}
+    frame+=1}
+   ch+=1}
+  i+=1}
+ result.ok(output)
+}

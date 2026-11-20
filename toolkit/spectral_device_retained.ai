@@ -1,0 +1,60 @@
+module stemair.spectral_device_retained
+import "config.ai" as config
+import "network.ai" as network
+import "session.ai" as host
+import "spectral_device_frontend.ai" as frontend
+import std.mkl_vml as window_math
+import "ops.ai" as ops
+import "device.ai" as device
+import "chunks.ai" as chunks
+import "numeric.ai" as num
+import "control.ai" as control
+import std.gpu as devicegpu
+import std.tensor as tensor
+import std.group_norm_torch as stable
+
+fn problem(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+pub fn chunk_with_normalizer(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plan:ref<frontend.Plan>,c:ref<config.Config>,input:view<f32>,cancel:str,normalizer:ref<stable.Engine>)->result<array<f32>,string> effects {alloc,gpu,fs.meta} {
+ let samples:u64=c.hop*(c.frames-1)
+ if view.len(input)!=2*samples or not num.finite(input){return result.err("Invalid model chunk waveform")}
+ var silent:bool=true
+ var i:u64=0
+ loop{if i>=view.len(input){break}
+  if view.get(input,i)!=0.0{silent=false
+   break}
+  i+=1}
+ if silent{return result.ok(num.zeros(2*array.len(c.targets)*samples))}
+ var packed:ops.Tensor=try frontend.analyze(context,stream,plan,input)
+ let shape:array<u64>=[1,packed.c,packed.h,packed.w]
+ let uploaded:tensor.Tensor=try tensor.from_f32(context,stream,array.view(packed.data),array.view(shape),tensor.DType.F32) map_err problem
+ var predicted:tensor.Tensor=try device.forward_with_compute_convolution_and_evaluation_policy(context,stream,parameters,n,uploaded,cancel,normalizer,device.ComputeRecipe{normalization:device.NormalizationRecipe.SpatialTraining,activation:device.ActivationRecipe.Cuda130Erf,matrix:device.MatrixRecipe.EagerCompat},device.ConvolutionPolicy{workspace_bytes:2760376320,deterministic:false,allow_tf32:true},device.EvaluationPolicy.AfterBlock)
+ let values:array<f32>=try tensor.to_f32(stream,predicted) map_err problem
+ var output:ops.Tensor=ops.tensor(4*c.bands*array.len(c.targets),c.frequency_bins/c.bands,c.frames,values)
+ frontend.synthesize(context,stream,plan,output)
+}
+
+pub fn chunk(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plan:ref<frontend.Plan>,c:ref<config.Config>,input:view<f32>,cancel:str)->result<array<f32>,string> effects {alloc,gpu,fs.meta} {
+ var normalizer:stable.Engine=try device.normalizer(context)
+ chunk_with_normalizer(context,stream,parameters,n,plan,c,input,cancel,normalizer)
+}
+pub fn separate(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var plan:frontend.Plan=try frontend.create(window_math.default_runtime(),c.n_fft,c.hop,c.frames,c.frequency_bins,c.bands,array.len(c.targets))
+ let _=try frontend.prepare(stream,plan)
+ if view.len(input)==0 or view.len(input)%2!=0 or not num.finite(input){return result.err("Expected finite planar stereo audio")}
+ let samples:u64=view.len(input)/2
+ let p:chunks.Plan=try chunks.plan(samples,c.hop*(c.frames-1),c.overlap)
+ var normalizer:stable.Engine=try device.normalizer(context)
+ var accumulator:chunks.Accumulator=try chunks.accumulator(p,2*array.len(c.targets))
+ var i:u64=0
+ loop{if i>=p.count{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  control.report(progress,i,p.count)
+  let part:array<f32>=try chunks.extract_finite(p,input,2,i)
+  let output:array<f32>=try chunk_with_normalizer(context,stream,parameters,n,plan,c,array.view(part),cancel,normalizer)
+  let _=try chunks.add(p,accumulator,array.view(output))
+  i+=1}
+ let _=try devicegpu.sync(context) map_err problem
+ control.report(progress,p.count,p.count)
+ chunks.finish(p,accumulator)
+}

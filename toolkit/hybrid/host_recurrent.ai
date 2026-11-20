@@ -1,0 +1,64 @@
+module stemair.hybrid.host_recurrent
+import "network.ai" as network
+import "recurrent.ai" as form
+import "host_ops.ai" as host
+import "host_prepared.ai" as prepared
+import "../recurrent.ai" as recurrent
+import "../ops.ai" as rows
+import "../numeric.ai" as num
+import "../weights.ai" as weights
+import "../control.ai" as control
+
+pub fn forward(n:ref<network.Network>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,block:form.Block,x:ref<host.Tensor>,cancel:str)->result<host.Tensor,string> effects {alloc,ffi,fs.meta} {
+ forward_weights(struct.borrow(n,field=weights),p,library,block,x,cancel)
+}
+pub fn forward_weights(model:ref<weights.Model>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,block:form.Block,x:ref<host.Tensor>,cancel:str)->result<host.Tensor,string> effects {alloc,ffi,fs.meta}{
+ if x.c!=block.features or x.h!=1 or x.w==0 or x.w>65536{return result.err("Invalid CPU hybrid recurrent input")}
+ let framed:bool=x.w>200
+ let steps:u64=if framed{200}else{x.w}
+ let frames:u64=if framed{(x.w+99)/100}else{1}
+ if x.n*frames*steps>65536{return result.err("CPU hybrid recurrent frame storage exceeds bound")}
+ var projected:array<f32>=[]
+ array.reserve(projected,x.n*frames*steps*x.c)
+ var b:u64=0
+ loop{if b==x.n{break}
+  var f:u64=0
+  loop{if f==frames{break}
+   if control.cancelled(cancel){return result.err("Separation cancelled")}
+   var data:array<f32>=[]
+   array.reserve(data,steps*x.c)
+   var t:u64=0
+   loop{if t==steps{break}
+    let at:u64=if framed{f*100+t}else{t}
+    var c:u64=0
+    loop{if c==x.c{break}
+     array.push(data,if at<x.w{array.get(x.data,(b*x.c+c)*x.w+at)}else{0.0})
+     c+=1}
+    t+=1}
+   var input:rows.Tensor=rows.tensor(1,steps,x.c,data)
+   var first:rows.Tensor=try recurrent.forward(model,block.first,input,cancel)
+   var second:rows.Tensor=try recurrent.forward(model,block.second,first,cancel)
+   let values:array<f32>=try prepared.project(p,library,block.weight,array.view(second.data),steps,2*x.c)
+   let bias:ref<weights.Parameter>=array.borrow(model.parameters.values,block.bias)
+   var i:u64=0
+   loop{if i==array.len(values){break}
+    array.push(projected,array.get(values,i)+array.get(bias.values,i%x.c))
+    i+=1}
+   f+=1}
+  b+=1}
+ var out:array<f32>=num.zeros(array.len(x.data))
+ b=0
+ loop{if b==x.n{break}
+  var c:u64=0
+  loop{if c==x.c{break}
+   var t:u64=0
+   loop{if t==x.w{break}
+    let frame:u64=if framed and t>=150{1+(t-150)/100}else{0}
+    let position:u64=if framed and t>=150{50+(t-150)%100}else{t}
+    let at:u64=(b*x.c+c)*x.w+t
+    array.set(out,at,array.get(projected,((b*frames+frame)*steps+position)*x.c+c)+array.get(x.data,at))
+    t+=1}
+   c+=1}
+  b+=1}
+ host.make_limited(x.n,x.c,1,x.w,out,x.max_elements)
+}

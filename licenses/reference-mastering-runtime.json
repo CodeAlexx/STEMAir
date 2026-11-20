@@ -1,0 +1,51 @@
+{
+  "schema": "native-reference-mastering-runtime-v1",
+  "helper_license": "GPL-3.0-or-later",
+  "source": "https://github.com/sergree/matchering",
+  "source_revision": "e30c4bb55d4d3e04c81dc1884919c2bca5fc1fdd",
+  "source_version": "2.0.6",
+  "application_factory_bridge": "Pinned original lib_v5/results.py Result/save_audiofile, since upstream does not export save_audiofile",
+  "windows": {
+    "helper_name": "stem-mastering.exe",
+    "helper_sha256": "ac9008f9aef644db0a38d8c256d441f686805558e1ab49c0a76767b125babf2f",
+    "fft_name": "air_cpu_fft.dll",
+    "fft_sha256": "737fe9e647296589adbf2ed03cf9e2d452843e6a7112614b78d50d1fb472c076",
+    "sndfile_version": "libsndfile-1.1.0",
+    "sndfile_sha256": "6f445d58488ac3b8a7a9b05f4ae4ba2bd894f8a1a20e82a91532dabf7e3a65a7",
+    "dot_sha256": "b863f35d267fd95c74ca502ac85977f00ebc3effa3373da7ff47b1eac08192d9",
+    "dot_threads": 2
+  },
+  "linux": {
+    "helper_name": "stem-mastering",
+    "helper_sha256": "cf6cdd1050d41757f3d54d27d4a8ed6635bbaf8b9295907493251281b9ef1305",
+    "fft_name": "libair_cpu_fft.so",
+    "fft_sha256": "16b0d2eba445716808b79d9b345fdc321f5181e755c3084d8ac05fec52baec9f",
+    "sndfile_version": "libsndfile-1.2.2",
+    "sndfile_sha256": "dd944b9bf1d06df6bb1c4f730fdcb3321d114aace43f66560ece7eeb726ed1c4",
+    "dot_sha256": "558cce71bf736752a83d3dd01e60748ac7e70d393785c984dbe24aadd42d8d4f",
+    "dot_threads": 1
+  },
+  "rate_filter": {
+    "path": "assets/rate-filter-v1.npz",
+    "sha256": "344c4eb7d35ef9845192a506aaa5836ca243033a90e6363a9d25fc5cd12a5328",
+    "source": "resampy0.4.2 kaiser_best",
+    "license": "ISC"
+  },
+  "runtime_layout": {
+    "helper": "runtime/reference-mastering/{stem-mastering.exe,stem-mastering}",
+    "fft": "runtime/reference-mastering/{air_cpu_fft.dll,libair_cpu_fft.so}; additive to existing alignment FFT",
+    "dot": "runtime/cpu-dot/{cpu-dot.dll,cpu-dot.so}",
+    "sound_file": "Explicit original-qualified per-host library; reuse selected-sample resolver/pins, no automatic discovery",
+    "ffmpeg": "Explicit existing qualified executable only; unbundled by default"
+  },
+  "required_shared_files": [
+    "stdlib/sndfile.ai",
+    "stdlib/signal_resample_table.ai",
+    "stdlib/local_regression.ai",
+    "stdlib/band_matrix.ai",
+    "stdlib/cubic_spline.ai",
+    "stdlib/signal_filter.ai",
+    "stdlib/cpu_fft.ai"
+  ],
+  "thread_policy": "Exclusive private helper image: Windows2/Linux1(SINGLE_THREADED); setter/getter verified and prior state restored before close; independent of inherited environment"
+}

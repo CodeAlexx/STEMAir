@@ -1,0 +1,11 @@
+module stemair.recording_cpu_cache
+import "model_cache.ai" as cache
+import "cpu_capability.ai" as capability
+import "recording_cpu.ai" as recording
+import "recording_inference.ai" as inference
+import "recording_shifts.ai" as shifts
+pub fn separate(bank:ref<cache.Cache>,index:u64,input:view<f32>,cancel:str,progress:str,options:ref<inference.Options>,stream:ref<inference.Stream>,limits:shifts.Limits)->result<recording.Output,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try capability.require_ready(bank,index)
+ if array.len(bank.cpu)!=1{return result.err("Recording controls require one retained shared CPU library")}
+ recording.separate(struct.borrow(array.borrow(bank.entries,index),field=model),struct.borrow(array.borrow(bank.cpu,0),field=library),input,cancel,progress,options,stream,limits)
+}

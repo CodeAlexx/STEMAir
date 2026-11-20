@@ -1,0 +1,125 @@
+module stemair.exchange.session
+import "config.ai" as config
+import "model.ai" as model
+import "plan.ai" as plan
+import "device.ai" as device
+import "../spectral.ai" as spectral
+import "../session.ai" as host
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "audio.ai" as envelope
+import "../audio_result.ai" as audio_result
+import "host_prepared.ai" as host_prepared
+import "checkpoint.ai" as checkpoint
+import "../weights.ai" as weights
+import std.table as table
+import std.text as text
+import std.float as fp
+import std.tensor as tensor
+import "../spectral_device_frontend.ai" as gpu_spectral
+import std.mkl_vml as window_math
+
+pub type Session=struct{config:config.Config,graph:plan.Plan,requests:u64=0,cpu:array<host_prepared.Backend>,cpu_preparations:u64=0}
+// Explicit preparation borrows only already-retained original parameters.
+pub fn prepare_cpu(s:ref<Session>)->result<unit,string> effects {alloc,fs.read} {
+ if array.len(s.cpu)==0{
+  let bank:host_prepared.Backend=try host_prepared.prepare(struct.borrow(s,field=graph))
+  array.push(s.cpu,bank)
+  s.cpu_preparations+=1
+ }
+ if array.len(s.cpu)!=1{return result.err("Exchange CPU session must own exactly one prepared weight bank")}
+ result.ok(())
+}
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+pub fn open(path:str,settings:config.Config own)->result<Session,string> effects {alloc,fs.read} {
+ var c:config.Config=settings
+ let _=try config.validate(c)
+ open_validated(path,c)
+}
+pub fn open_typed(path:str,settings:config.Config own)->result<Session,string> effects {alloc,fs.read} {
+ var c:config.Config=settings
+ let _=try config.validate_typed(c)
+ open_validated(path,c)
+}
+fn open_validated(path:str,c:config.Config own)->result<Session,string> effects {alloc,fs.read} {
+ let original:model.Model=if text.ends_with(path,".ckpt"){
+  var loaded:checkpoint.Loaded=try checkpoint.open(path)
+  if loaded.settings.n_fft!=c.n_fft or loaded.settings.hop_length!=c.hop or loaded.settings.dim_f!=c.frequency_bins or loaded.settings.dim_t!=c.frames{
+   return result.err("Checkpoint constructor and selected audio geometry differ")}
+  let vacant:model.Model=model.Model{weights:weights.Model{parameters:table.new(),bytes_read:0,loads:0},nodes:[],input:"",output:"",shape:[],opset:0}
+  struct.replace(loaded,vacant,field=graph)
+ }else{try model.open(path)}
+ var graph:plan.Plan=try plan.prepare(original)
+ if array.len(graph.shape)!=4 or (array.get(graph.shape,0)!=0 and array.get(graph.shape,0)!=1) or array.get(graph.shape,1)!=4 or array.get(graph.shape,2)!=c.frequency_bins or
+  (array.get(graph.shape,3)!=0 and array.get(graph.shape,3)!=c.frames){return result.err("Interchange input shape does not match the selected profile")}
+ result.ok(Session{config:c,graph:graph,cpu:[]})
+}
+fn predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,graph:ref<plan.Plan>,input:ref<ops.Tensor>,negative:bool,cancel:str,backend:ref<device.Backend>)->result<array<f32>,string> effects {alloc,gpu,fs.meta} {
+ var values:array<f32>=[]
+ array.reserve(values,array.len(input.data))
+ var i:u64=0
+ loop{if i>=array.len(input.data){break}
+  let value:f32=array.get(input.data,i)
+  array.push(values,if negative{-value}else{value})
+  i+=1}
+ let shape:array<u64>=[1,input.c,input.h,input.w]
+ let uploaded:tensor.Tensor=try tensor.from_f32(context,stream,array.view(values),array.view(shape),tensor.DType.F32) map_err error
+ var output:tensor.Tensor=try device.forward_prepared(context,stream,parameters,graph,uploaded,cancel,backend)
+ if tensor.rank(output)!=4 or array.get(output.dimensions,0)!=1 or array.get(output.dimensions,1)!=input.c or
+  array.get(output.dimensions,2)!=input.h or array.get(output.dimensions,3)!=input.w{return result.err("Interchange graph returned the wrong spectral shape")}
+ result.ok(try tensor.to_f32(stream,output) map_err error)
+}
+fn prepare_transform(stream:ref<GpuStream>,graph:ref<plan.Plan>,c:ref<config.Config>)->result<option<gpu_spectral.Plan>,string> effects {alloc,env,ffi,gpu,fs.meta} {
+ if array.len(graph.nodes)==0 or not array.borrow(graph.nodes,0).checkpoint_arithmetic{return result.ok(option.none())}
+ var selected:gpu_spectral.Plan=try gpu_spectral.create(window_math.default_runtime(),c.n_fft,c.hop,c.frames,c.frequency_bins,1,1)
+ let _=try gpu_spectral.prepare(stream,selected)
+ result.ok(option.some(selected))
+}
+pub fn chunk(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,graph:ref<plan.Plan>,stft:ref<spectral.Plan>,c:ref<config.Config>,wave:view<f32>,cancel:str)->result<array<f32>,string> effects {alloc,env,ffi,gpu,fs.meta} {
+ var backend:device.Backend=try device.prepare(context,graph)
+ var transform:option<gpu_spectral.Plan>=try prepare_transform(stream,graph,c)
+ chunk_prepared(context,stream,parameters,graph,stft,c,wave,cancel,backend,transform)
+}
+fn chunk_prepared(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,graph:ref<plan.Plan>,stft:ref<spectral.Plan>,c:ref<config.Config>,wave:view<f32>,cancel:str,backend:ref<device.Backend>,transform:ref<option<gpu_spectral.Plan>>)->result<array<f32>,string> effects {alloc,gpu,fs.meta} {
+ var packed:ops.Tensor=match transform{none=>try envelope.analyze(stft,c,wave),some(selected)=>{
+  var value:ops.Tensor=try gpu_spectral.analyze(context,stream,selected,wave)
+  envelope.clear_low(value,c)
+  value}}
+ var predicted:array<f32>=[]
+ if c.denoise{
+  let negative:array<f32>=try predict(context,stream,parameters,graph,packed,true,cancel,backend)
+  let positive:array<f32>=try predict(context,stream,parameters,graph,packed,false,cancel,backend)
+  var i:u64=0
+  loop{if i>=array.len(positive){break}
+   array.push(predicted,-array.get(negative,i)*0.5+array.get(positive,i)*0.5)
+   i+=1}
+ }else{predicted=try predict(context,stream,parameters,graph,packed,false,cancel,backend)}
+ match transform{none=>envelope.synthesize(stft,c,predicted),some(selected)=>{
+  var value:ops.Tensor=ops.tensor(4,c.frequency_bins,c.frames,predicted)
+  gpu_spectral.synthesize(context,stream,selected,value)}}
+}
+pub fn separate_state(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,graph:ref<plan.Plan>,stft:ref<spectral.Plan>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<envelope.State,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write} {
+ var backend:device.Backend=try device.prepare(context,graph)
+ var transform:option<gpu_spectral.Plan>=try prepare_transform(stream,graph,c)
+ var state:envelope.State=try envelope.begin(c,input)
+ loop{if state.index>=state.total{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  control.report(progress,state.index,state.total)
+  if envelope.intersects(state){
+   let part:array<f32>=envelope.extract(state,input)
+   let output:array<f32>=try chunk_prepared(context,stream,parameters,graph,stft,c,array.view(part),cancel,backend,transform)
+   let _=try envelope.accumulate(state,array.view(output))
+  }
+  state.index+=1}
+ control.report(progress,state.total,state.total)
+ result.ok(state)
+}
+pub fn separate(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,graph:ref<plan.Plan>,stft:ref<spectral.Plan>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write} {
+ var state:envelope.State=try separate_state(context,stream,parameters,graph,stft,c,input,cancel,progress)
+ envelope.finish(state,input,c.compensation)
+}
+pub fn separate_typed(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,graph:ref<plan.Plan>,stft:ref<spectral.Plan>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<audio_result.Samples,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write} {
+ var state:envelope.State=try separate_state(context,stream,parameters,graph,stft,c,input,cancel,progress)
+ envelope.finish_typed(state,input,c.compensation)
+}

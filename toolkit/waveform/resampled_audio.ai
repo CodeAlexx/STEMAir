@@ -1,0 +1,249 @@
+module stemair.waveform.resampled_audio
+import "../chunks.ai" as chunks
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "../recording_shifts.ai" as shifts
+import std.tensor as tensor
+import std.float as fp
+
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+fn segment<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,input:view<f32>,offset:u64,count:u64,cancel:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta} {
+ let target:u64=try length_for(n,count)
+ let padded:array<f32>=try chunks.context_finite(input,2,offset,count,target)
+ let shape:array<u64>=[1,2,1,target]
+ var packed:tensor.Tensor=try tensor.from_f32(context,stream,array.view(padded),array.view(shape),tensor.DType.F32) map_err error
+ var output:ops.Tensor=try predictor(context,stream,parameters,n,packed,cancel)
+ if output.c!=8 or output.w<count{return result.err("Resampled waveform output geometry differs")}
+ let crop:u64=(output.w-count)/2
+ var result:array<f32>=[]
+ array.reserve(result,8*count)
+ var channel:u64=0
+ loop{if channel==8{break}
+  var time:u64=0
+  loop{if time==count{break}
+   array.push(result,array.get(output.data,channel*output.w+crop+time))
+   time+=1}
+  channel+=1}
+ result.ok(result)
+}
+fn shifted<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,c:ref<C>,input:view<f32>,offset:u64,count:u64,cancel:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta} {
+ predict_group(context,stream,parameters,n,array.view(c.shift_offsets),array.len(c.shift_offsets),input,offset,count,cancel,predictor,length_for)
+}
+fn predict_group<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,offsets:view<u64>,divisor_count:u64,input:view<f32>,offset:u64,count:u64,cancel:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta} {
+ if view.len(offsets)==0{return segment(context,stream,parameters,n,input,offset,count,cancel,predictor,length_for)}
+ let half:u64=22050
+ let padded:array<f32>=try chunks.context_finite(input,2,offset,count,count+2*half)
+ var output:array<f32>=num.zeros(8*count)
+ var shift:u64=0
+ loop{if shift==view.len(offsets){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let start:u64=view.get(offsets,shift)
+  let length:u64=count+half-start
+  let predicted:array<f32>=try segment(context,stream,parameters,n,array.view(padded),start,length,cancel,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==8{break}
+   var time:u64=0
+   loop{if time==count{break}
+    let at:u64=channel*count+time
+    array.set(output,at,array.get(output,at)+array.get(predicted,channel*length+half-start+time))
+    time+=1}
+   channel+=1}
+  shift+=1}
+ let divisor:f32=cast.float(divisor_count)
+ var i:u64=0
+ loop{if i==array.len(output){break}
+  array.set(output,i,array.get(output,i)/divisor)
+  i+=1}
+ result.ok(output)
+}
+// Source-generation overlap uses triangle weights and available neighboring
+// recording context. It does not use the preceding generation's zero-padded
+// non-overlapping chunks or its different shifted-input length.
+// Validated settings and segment size are explicit so other engines can share
+// the same overlap math while keeping their own shift ordering and defaults.
+pub fn separate<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,c:ref<C>,size:u64,input:view<f32>,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ let length:u64=view.len(input)/2
+ if not c.split{return shifted(context,stream,parameters,n,c,input,0,length,cancel,predictor,length_for)}
+ let stride:u64=cast.sat((1.0-c.overlap)*cast.float(size))
+ if stride==0{return result.err("Waveform overlap leaves no chunk stride")}
+ let total:u64=(length+stride-1)/stride
+ var weights:array<f32>=[]
+ array.reserve(weights,size)
+ var time:u64=0
+ loop{if time==size{break}
+  let triangle:u64=if time<size/2{time+1}else{size-time}
+  let linear:f32=cast.float(triangle)/cast.float((size+1)/2)
+  let power:f32=cast.float(c.transition_power)
+  array.push(weights,if power==1.0{linear}else{fp.pow(linear,power)})
+  time+=1}
+ var result:array<f32>=num.zeros(8*length)
+ var accumulated:array<f32>=num.zeros(length)
+ var offset:u64=0
+ loop{if offset>=length{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let count:u64=if length-offset<size{length-offset}else{size}
+  let predicted:array<f32>=try shifted(context,stream,parameters,n,c,input,offset,count,cancel,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==8{break}
+   time=0
+   loop{if time==count{break}
+    let at:u64=channel*length+offset+time
+    array.set(result,at,array.get(result,at)+array.get(predicted,channel*count+time)*array.get(weights,time))
+    time+=1}
+   channel+=1}
+  time=0
+  loop{if time==count{break}
+   let at:u64=offset+time
+   array.set(accumulated,at,array.get(accumulated,at)+array.get(weights,time))
+   time+=1}
+  control.report(progress,offset/stride+1,total)
+  offset+=stride}
+ var channel:u64=0
+ loop{if channel==8{break}
+  time=0
+  loop{if time==length{break}
+   let weight:f32=array.get(accumulated,time)
+   if weight<=0.0{return result.err("Waveform overlap weights do not cover the recording")}
+   let at:u64=channel*length+time
+   array.set(result,at,array.get(result,at)/weight)
+   time+=1}
+  channel+=1}
+ result.ok(result)
+}
+
+pub fn separate_scheduled<N,C>(
+ context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<N>,c:ref<C>,schedule:ref<shifts.Schedule>,size:u64,input:view<f32>,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ let length:u64=view.len(input)/2
+ let _=try shifts.require_geometry(schedule,shifts.Family.Second,length,c.split,size,c.overlap)
+ if not c.split{
+  let group:shifts.Group=try shifts.next_group(schedule)
+  let _=try shifts.reserve_group(schedule,group)
+  return predict_group(context,stream,parameters,n,array.view(group.offsets),group.divisor,input,0,length,cancel,predictor,length_for)}
+ let stride:u64=cast.sat((1.0-c.overlap)*cast.float(size))
+ if stride==0{return result.err("Waveform overlap leaves no chunk stride")}
+ let total:u64=(length+stride-1)/stride
+ var weights:array<f32>=[]
+ array.reserve(weights,size)
+ var time:u64=0
+ loop{if time==size{break}
+  let triangle:u64=if time<size/2{time+1}else{size-time}
+  let linear:f32=cast.float(triangle)/cast.float((size+1)/2)
+  let power:f32=cast.float(c.transition_power)
+  array.push(weights,if power==1.0{linear}else{fp.pow(linear,power)})
+  time+=1}
+ var result:array<f32>=num.zeros(8*length)
+ var accumulated:array<f32>=num.zeros(length)
+ var offset:u64=0
+ loop{if offset>=length{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let count:u64=if length-offset<size{length-offset}else{size}
+  let group:shifts.Group=try shifts.next_group(schedule)
+  let _=try shifts.reserve_group(schedule,group)
+  let predicted:array<f32>=try predict_group(context,stream,parameters,n,array.view(group.offsets),group.divisor,input,offset,count,cancel,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==8{break}
+   time=0
+   loop{if time==count{break}
+    let at:u64=channel*length+offset+time
+    array.set(result,at,array.get(result,at)+array.get(predicted,channel*count+time)*array.get(weights,time))
+    time+=1}
+   channel+=1}
+  time=0
+  loop{if time==count{break}
+   let at:u64=offset+time
+   array.set(accumulated,at,array.get(accumulated,at)+array.get(weights,time))
+   time+=1}
+  control.report(progress,offset/stride+1,total)
+  offset+=stride}
+ var channel:u64=0
+ loop{if channel==8{break}
+  time=0
+  loop{if time==length{break}
+   let weight:f32=array.get(accumulated,time)
+   if weight<=0.0{return result.err("Waveform overlap weights do not cover the recording")}
+   let at:u64=channel*length+time
+   array.set(result,at,array.get(result,at)/weight)
+   time+=1}
+  channel+=1}
+ result.ok(result)
+}
+
+fn segment_sources<N>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,sources:u64,input:view<f32>,offset:u64,count:u64,cancel:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta} {
+ let target:u64=try length_for(n,count)
+ if target<count or target>18446744073709551615/(2*sources){return result.err("Source-count graph target extent overflows")}
+ let padded:array<f32>=try chunks.context_finite(input,2,offset,count,target)
+ let shape:array<u64>=[1,2,1,target]
+ var packed:tensor.Tensor=try tensor.from_f32(context,stream,array.view(padded),array.view(shape),tensor.DType.F32) map_err error
+ var output:ops.Tensor=try predictor(context,stream,parameters,n,packed,cancel)
+ if output.c!=2*sources or output.h!=1 or output.w<count{return result.err("Resampled waveform output geometry differs")}
+ let crop:u64=(output.w-count)/2
+ var result:array<f32>=[]
+ array.reserve(result,2*sources*count)
+ var channel:u64=0
+ loop{if channel==2*sources{break}
+  var time:u64=0
+  loop{if time==count{break}
+   array.push(result,array.get(output.data,channel*output.w+crop+time))
+   time+=1}
+  channel+=1}
+ result.ok(result)
+}
+
+pub fn separate_sources<N,C>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<N>,c:ref<C>,size:u64,sources:u64,input:view<f32>,cancel:str,progress:str,predictor:fn(ref<GpuContext>,ref<GpuStream>,ref<array<tensor.Tensor>>,ref<N>,ref<tensor.Tensor>,str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if sources<2 or sources>18446744073709551615/2 or view.len(input)%2!=0 or view.len(input)/2>18446744073709551615/(2*sources){return result.err("Source-count overlap extent overflows")}
+ if array.len(c.shift_offsets)!=0{return result.err("Source-count outer overlap requires unshifted inner chunks")}
+ let length:u64=view.len(input)/2
+ if not c.split{return segment_sources(context,stream,parameters,n,sources,input,0,length,cancel,predictor,length_for)}
+ let stride:u64=cast.sat((1.0-c.overlap)*cast.float(size))
+ if stride==0{return result.err("Waveform overlap leaves no chunk stride")}
+ let total:u64=(length+stride-1)/stride
+ var weights:array<f32>=[]
+ array.reserve(weights,size)
+ var time:u64=0
+ loop{if time==size{break}
+  let triangle:u64=if time<size/2{time+1}else{size-time}
+  let linear:f32=cast.float(triangle)/cast.float((size+1)/2)
+  let power:f32=cast.float(c.transition_power)
+  array.push(weights,if power==1.0{linear}else{fp.pow(linear,power)})
+  time+=1}
+ var result:array<f32>=num.zeros(2*sources*length)
+ var accumulated:array<f32>=num.zeros(length)
+ var offset:u64=0
+ loop{if offset>=length{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let count:u64=if length-offset<size{length-offset}else{size}
+  let predicted:array<f32>=try segment_sources(context,stream,parameters,n,sources,input,offset,count,cancel,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==2*sources{break}
+   time=0
+   loop{if time==count{break}
+    let at:u64=channel*length+offset+time
+    array.set(result,at,array.get(result,at)+array.get(predicted,channel*count+time)*array.get(weights,time))
+    time+=1}
+   channel+=1}
+  time=0
+  loop{if time==count{break}
+   let at:u64=offset+time
+   array.set(accumulated,at,array.get(accumulated,at)+array.get(weights,time))
+   time+=1}
+  control.report(progress,offset/stride+1,total)
+  offset+=stride}
+ var channel:u64=0
+ loop{if channel==2*sources{break}
+  time=0
+  loop{if time==length{break}
+   let weight:f32=array.get(accumulated,time)
+   if weight<=0.0{return result.err("Waveform overlap weights do not cover the recording")}
+   let at:u64=channel*length+time
+   array.set(result,at,array.get(result,at)/weight)
+   time+=1}
+  channel+=1}
+ result.ok(result)
+}

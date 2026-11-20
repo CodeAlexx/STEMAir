@@ -1,0 +1,54 @@
+module stemair.learned_cleanup_output
+import "container_export.ai" as container
+import "../toolkit/typed_source_wave.ai" as source
+import "../toolkit/learned_cleanup_waves.ai" as learned
+import "../toolkit/learned_cleanup_request.ai" as request
+import std.text as text
+
+fn base_name(plan:ref<container.Plan>,index:u64)->string effects {alloc}{
+ if array.len(plan.source_names)>index{string.copy(array.get(plan.source_names,index))}else{text.concat("source-",string.from_int(index+1))}
+}
+pub fn planned(plan:ref<container.Plan>,targets:ref<array<string>>,settings:ref<request.Settings>,ensemble:bool,vocal_split:bool)->result<container.Plan,string> effects {alloc}{
+ var output:container.Plan=try container.copy_plan(plan)
+ output.source_names=[]
+ var i:u64=0
+ loop{if i==array.len(targets){break}
+  let base:string=base_name(plan,i)
+  if learned.room_target(settings,array.get(targets,i),ensemble,vocal_split){
+   array.push(output.source_names,text.concat(base,"_deverbed"))
+   array.push(output.source_names,text.concat(base,"_reverb_only"))}
+  array.push(output.source_names,base)
+  i+=1}
+ let _=try container.validate(output)
+ result.ok(output)
+}
+fn suffix(target:str)->string effects {alloc}{
+ if text.ends_with(target,"_deverbed"){return "_deverbed"}
+ if text.ends_with(target,"_reverb_only"){return "_reverb_only"}
+ ""
+}
+pub fn rendered(plan:ref<container.Plan>,waves:ref<array<source.Wave>>)->result<container.Plan,string> effects {alloc}{
+ var originals:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  let label:str=array.borrow(waves,i).target
+  if str.len(suffix(label))==0{array.push(originals,string.copy(label))}
+  i+=1}
+ if array.len(originals)==array.len(waves){return container.copy_plan(plan)}
+ if array.len(plan.source_names)!=0 and array.len(plan.source_names)!=array.len(originals){return result.err("Learned output names differ from original save points")}
+ var out:container.Plan=try container.copy_plan(plan)
+ out.source_names=[]
+ i=0
+ loop{if i==array.len(waves){break}
+  let target:str=array.borrow(waves,i).target
+  let tail:string=suffix(target)
+  let name:str=if str.len(tail)==0{target}else{str.slice(target,0,str.len(target)-str.len(tail))}
+  var at:u64=0
+  loop{if at==array.len(originals){return result.err("Learned output lost its original save point")}
+   if array.get(originals,at)==name{break}
+   at+=1}
+  array.push(out.source_names,text.concat(base_name(plan,at),tail))
+  i+=1}
+ let _=try container.validate(out)
+ result.ok(out)
+}

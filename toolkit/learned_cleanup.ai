@@ -1,0 +1,206 @@
+module stemair.learned_cleanup
+import "mask/config.ai" as config
+import "mask/recurrent_network.ai" as network
+import "mask/recurrent_host.ai" as host
+import "mask/bands.ai" as bands
+import "complex_spectral.ai" as spectral
+import "ops.ai" as ops
+import "numeric.ai" as num
+import "control.ai" as control
+import "audio_result.ai" as audio
+import std.float as fp
+import std.complex_norm_f32 as norm
+import std.libm as libm
+import std.cabi as foreign
+
+pub type Kind=enum { Noise, Room }
+pub type Session=struct{kind:Kind,network:network.Network,prepared:host.Backend,configuration:config.Config,plans:array<spectral.Plan>,magnitude_recipe:norm.Recipe,requests:u64=0,patches:u64=0,groups:u64=0,preparations:u64=1}
+pub type Output=struct{primary:audio.Samples,residual:audio.Samples,frames:u64}
+pub fn configuration(kind:Kind)->config.Config effects {alloc} {
+ var selected:array<config.Band>=[]
+ if kind==Kind.Noise{array.push(selected,config.Band{sample_rate:44100,n_fft:2048,hop:1024,crop_start:0,crop_stop:1024})}else{
+  array.push(selected,config.Band{sample_rate:7350,n_fft:640,hop:80,crop_start:0,crop_stop:85,low_start:25,low_stop:53})
+  array.push(selected,config.Band{sample_rate:7350,n_fft:320,hop:80,crop_start:4,crop_stop:87,high_start:25,high_stop:12,low_start:31,low_stop:62})
+  array.push(selected,config.Band{sample_rate:14700,n_fft:512,hop:160,crop_start:17,crop_stop:216,high_start:48,high_stop:24,low_start:139,low_stop:210})
+  array.push(selected,config.Band{sample_rate:44100,n_fft:960,hop:480,crop_start:78,crop_stop:383,high_start:130,high_stop:86})}
+ config.Config{architecture:"recurrent",sample_rate:44100,bins:if kind==Kind.Noise{1024}else{672},channels:if kind==Kind.Noise{16}else{64},levels:4,branches:5,window:512,tta:false,aggression:0.0,pre_filter_start:if kind==Kind.Noise{0}else{668},pre_filter_stop:if kind==Kind.Noise{0}else{672},bands:selected,targets:["clean","removed"]}
+}
+pub fn open(path:str,kind:Kind)->result<Session,string> effects {alloc,fs.read} {
+ var c:config.Config=configuration(kind)
+ let _=try config.validate(c)
+ var n:network.Network=try network.open(path,c.channels,128,c.bins)
+ let p:host.Backend=try host.prepare(n)
+ let transforms:array<spectral.Plan>=try bands.plans(c)
+ result.ok(Session{kind:kind,network:n,prepared:p,configuration:c,plans:transforms,magnitude_recipe:norm.Recipe.WideHypot})
+}
+// Qualified host recipes are explicit; the old entry retains its original law.
+pub fn open_host_math(path:str,kind:Kind)->result<Session,string> effects {alloc,ffi,fs.read}{
+ var runtime:libm.Runtime=try libm.open_runtime() map_err foreign.error_message
+ let recipe:norm.Recipe=if runtime.host==libm.Host.Windows{norm.Recipe.WideHypot}else{norm.Recipe.ScaledFma}
+ libm.close_runtime(runtime)
+ var output:Session=try open(path,kind)
+ output.magnitude_recipe=recipe
+ result.ok(output)
+}
+// Four-patch groups preserve the source envelope; the shared CPU predictor
+// evaluates the independent members with the same retained packed parameters.
+fn masks(s:ref<Session>,library:ref<CAbiLibrary>,magnitude:ref<ops.Tensor>,maximum:f32,cancel:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta} {
+ let frames:u64=magnitude.w
+ let bins:u64=magnitude.h
+ let patches:u64=frames/128+1
+ var out:array<f32>=num.zeros(2*bins*frames)
+ var group:u64=0
+ loop{if group>=patches{break}
+  let end:u64=if patches-group>4{group+4}else{patches}
+  var index:u64=group
+  loop{if index==end{break}
+   if control.cancelled(cancel){return result.err("Learned cleanup cancelled")}
+   var values:array<f32>=num.zeros(2*bins*256)
+   var ch:u64=0
+   loop{if ch==2{break}
+    var f:u64=0
+    loop{if f==bins{break}
+     var t:u64=0
+     loop{if t==256{break}
+      let pos:i64=cast.sat(index*128+t)-64
+      let at:u64=cast.sat(pos)
+      if pos>=0 and at<frames{
+       array.set(values,(ch*bins+f)*256+t,array.get(magnitude.data,(ch*bins+f)*frames+at)/maximum)}
+      t+=1}
+     f+=1}
+    ch+=1}
+   var input:ops.Tensor=ops.tensor(2,bins,256,values)
+   let predicted:ops.Tensor=try host.predict(struct.borrow(s,field=network),struct.borrow(s,field=prepared),library,input,cancel)
+   if predicted.c!=2 or predicted.h!=bins or predicted.w!=128{return result.err("Learned cleanup predictor output geometry differs")}
+   ch=0
+   loop{if ch==2{break}
+    var f:u64=0
+    loop{if f==bins{break}
+     var t:u64=0
+     loop{if t==128{break}
+      let at:u64=index*128+t
+      if at<frames{array.set(out,(ch*bins+f)*frames+at,array.get(predicted.data,(ch*bins+f)*128+t))}
+      t+=1}
+     f+=1}
+    ch+=1}
+   s.patches+=1
+   index+=1}
+  s.groups+=1
+  group=end}
+ result.ok(out)
+}
+fn masked(spectrum:ref<ops.Tensor>,magnitude:ref<ops.Tensor>,mask:view<f32>,complement:bool)->ops.Tensor effects {alloc} {
+ let count:u64=spectrum.h*spectrum.w
+ var values:array<f32>=num.zeros(4*count)
+ var ch:u64=0
+ loop{if ch==2{break}
+  var i:u64=0
+  loop{if i==count{break}
+   let confidence:f32=view.get(mask,ch*count+i)
+   let amplitude:f32=(if complement{1.0-confidence}else{confidence})*array.get(magnitude.data,ch*count+i)
+   let phase:f32=fp.atan2(array.get(spectrum.data,(2*ch+1)*count+i),array.get(spectrum.data,2*ch*count+i))
+   array.set(values,2*ch*count+i,amplitude*fp.cos(phase))
+   array.set(values,(2*ch+1)*count+i,amplitude*fp.sin(phase))
+   i+=1}
+  ch+=1}
+ ops.tensor(4,spectrum.h,spectrum.w,values)
+}
+fn inverse(s:ref<Session>,spectrum:ref<ops.Tensor>,frames:u64)->result<audio.Samples,string> effects {alloc} {
+ if s.kind==Kind.Room{return result.ok(audio.from_wide(try bands.synthesize(struct.borrow(s,field=configuration),struct.borrow(s,field=plans),spectrum)))}
+ let count:u64=spectrum.h*spectrum.w
+ var re:array<f64>=[]
+ var im:array<f64>=[]
+ var ch:u64=0
+ loop{if ch==2{break}
+  var i:u64=0
+  loop{if i==count{break}
+   array.push(re,cast.float(array.get(spectrum.data,2*ch*count+i)))
+   array.push(im,cast.float(array.get(spectrum.data,(2*ch+1)*count+i)))
+   i+=1}
+  ch+=1}
+ let raw:array<f32>=try spectral.synthesize_f32(array.borrow(s.plans,0),array.view(re),array.view(im),spectrum.w)
+ let available:u64=array.len(raw)/2
+ var out:array<f32>=[]
+ ch=0
+ loop{if ch==2{break}
+  var i:u64=0
+  loop{if i==frames{break}
+   array.push(out,if i<available{array.get(raw,ch*available+i)}else{0.0})
+   i+=1}
+  ch+=1}
+ result.ok(audio.from_single(out))
+}
+pub fn analyze(s:ref<Session>,input:view<f32>)->result<ops.Tensor,string> effects {alloc} {
+ if view.len(input)<4 or view.len(input)%2!=0 or not num.finite(input){return result.err("Learned cleanup requires finite planar stereo")}
+ // The original room helper analyzes its bands with the legacy combined
+ // prefilter, then explicitly selects the recurrent inverse filter recipe.
+ // Keep these two choices independent; ordinary recurrent profiles are unchanged.
+ var analysis:config.Config=configuration(s.kind)
+ analysis.architecture="cascade"
+ let spectrum:ops.Tensor=if s.kind==Kind.Noise{try spectral.analyze(array.borrow(s.plans,0),input)}else{try bands.analyze(analysis,struct.borrow(s,field=plans),input)}
+ if spectrum.w<2{return result.err("Learned cleanup requires at least two transform frames")}
+ result.ok(spectrum)
+}
+pub fn analyze_samples(s:ref<Session>,input:ref<audio.Samples>)->result<ops.Tensor,string> effects {alloc}{
+ let _=try audio.validate(input)
+ if input.precision==audio.Precision.Float32{return analyze(s,array.view(input.single))}
+ if s.kind==Kind.Noise{return result.err("The original noise helper does not accept Float64 model input")}
+ if audio.count(input)<4 or audio.count(input)%2!=0{return result.err("Learned cleanup requires planar stereo")}
+ var analysis:config.Config=configuration(s.kind)
+ analysis.architecture="cascade"
+ let spectrum:ops.Tensor=try bands.analyze_wide(analysis,struct.borrow(s,field=plans),array.view(input.wide))
+ if spectrum.w<2{return result.err("Learned cleanup requires at least two transform frames")}
+ result.ok(spectrum)
+}
+pub fn magnitudes(spectrum:ref<ops.Tensor>)->ops.Tensor effects {alloc} {
+ magnitudes_with_recipe(spectrum,norm.Recipe.WideHypot)
+}
+pub fn magnitudes_with_recipe(spectrum:ref<ops.Tensor>,recipe:norm.Recipe)->ops.Tensor effects {alloc} {
+ let count:u64=spectrum.h*spectrum.w
+ var values:array<f32>=[]
+ var ch:u64=0
+ loop{if ch==2{break}
+  var i:u64=0
+  loop{if i==count{break}
+   let value:f32=norm.magnitude(array.get(spectrum.data,2*ch*count+i),array.get(spectrum.data,(2*ch+1)*count+i),recipe)
+   array.push(values,value)
+   i+=1}
+  ch+=1}
+ ops.tensor(2,spectrum.h,spectrum.w,values)
+}
+pub fn maximum(magnitude:ref<ops.Tensor>)->f32 effects {} {
+ var value:f32=0.0
+ var i:u64=0
+ loop{if i==array.len(magnitude.data){break}
+  let next:f32=array.get(magnitude.data,i)
+  if next>value{value=next}
+  i+=1}
+ value
+}
+pub fn finish(s:ref<Session>,spectrum:ref<ops.Tensor>,magnitude:ref<ops.Tensor>,mask:view<f32>,frames:u64)->result<Output,string> effects {alloc} {
+ if view.len(mask)!=2*spectrum.h*spectrum.w or not num.finite(mask){return result.err("Non-finite or invalid learned cleanup prediction")}
+ var first:ops.Tensor=masked(spectrum,magnitude,mask,s.kind==Kind.Noise)
+ let primary:audio.Samples=try inverse(s,first,frames)
+ var residual:audio.Samples=audio.from_single([])
+ if s.kind==Kind.Room{
+  var second:ops.Tensor=masked(spectrum,magnitude,mask,true)
+  residual=try inverse(s,second,frames)}
+ s.requests+=1
+ let output_frames:u64=audio.count(primary)/2
+ result.ok(Output{primary:primary,residual:residual,frames:output_frames})
+}
+pub fn apply(s:ref<Session>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str)->result<Output,string> effects {alloc,ffi,fs.meta} {
+ var spectrum:ops.Tensor=try analyze(s,input)
+ apply_analyzed(s,library,spectrum,view.len(input)/2,cancel)
+}
+pub fn apply_samples(s:ref<Session>,library:ref<CAbiLibrary>,input:ref<audio.Samples>,cancel:str)->result<Output,string> effects {alloc,ffi,fs.meta}{
+ var spectrum:ops.Tensor=try analyze_samples(s,input)
+ apply_analyzed(s,library,spectrum,audio.count(input)/2,cancel)
+}
+fn apply_analyzed(s:ref<Session>,library:ref<CAbiLibrary>,captured:ops.Tensor own,frames:u64,cancel:str)->result<Output,string> effects {alloc,ffi,fs.meta}{
+ var spectrum:ops.Tensor=captured
+ var magnitude:ops.Tensor=magnitudes_with_recipe(spectrum,s.magnitude_recipe)
+ let largest:f32=maximum(magnitude)
+ let mask:array<f32>=try masks(s,library,magnitude,largest,cancel)
+ finish(s,spectrum,magnitude,array.view(mask),frames)
+}

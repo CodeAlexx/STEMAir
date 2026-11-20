@@ -1,0 +1,7 @@
+{
+  "source": "julius 0.2.7 by Alexandre Defossez",
+  "package_sha256": "3c0f5f5306d7d6016fcc95196b274cae6f07e2c9596eed314e4e7641554fbb08",
+  "resample_source_sha256": "94a66e6d7c2527510d3067f31daa5ac98331cad9c0cf2423d8cbb9c5912a26db",
+  "core_source_sha256": "4f0ce5b63a3a1e7daf5721740f65e15e63ac31508d3e669d5e16d828b96ca9d4",
+  "license": "windowed-sinc-MIT.txt"
+}

@@ -1,0 +1,111 @@
+module stemair.cli_audio_utilities
+import "cli_audio_policy.ai" as io_policy
+import "cli_processing_sample.ai" as sample_input
+import "checked_input.ai" as checked
+import "container_export.ai" as container
+import "ensemble_application.ai" as ensemble
+import "audio_tool_application.ai" as tools
+import "pitch_application.ai" as pitch
+import "alignment_application.ai" as alignment
+import "alignment_choices.ai" as alignment_choices
+import "ensemble_alignment_io.ai" as detailed_alignment
+import "recording_alignment_runtime.ai" as recording_runtime
+import "time_application.ai" as audio_time
+import "../toolkit/export_audio.ai" as wave
+import "../toolkit/compressed_export.ai" as compressed
+import "../toolkit/codec_process.ai" as codec_process
+import std.audio as audio
+import std.codec as codec
+import std.files as files
+import std.path as path
+
+fn io_error(e:fs.error)->string effects {alloc} {string.copy(fs.error.message(e))}
+fn read_error(e:files.ReadError)->string effects {alloc} {match e{Io(v)=>io_error(v),TooLarge=>"Export settings exceed 16 KiB"}}
+fn recipe(file:str)->result<string,string> effects {alloc,fs.read} {
+ let raw:bytes=try files.read_limited(file,16384) map_err read_error
+ match str.from_bytes(bytes.view(raw)){none=>result.err("Export settings must be UTF-8"),some(v)=>result.ok(string.copy(v))}
+}
+fn export_read_error(e:audio.WavReadError)->string effects {alloc} {match e{
+ Io(v)=>io_error(v),Audio(v)=>audio.message(v),Limit(_)=>"Export input exceeds the selected audio buffer limit"}}
+// Preserve native WAV rate/channels; compressed inputs convert to the product's44100Hz stereo path.
+fn export_input(file:str,options:ref<checked.Options>)->result<audio.AudioBuffer,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ match audio.read_wav_f32_limited(try io_policy.absolute(file),options.limits){
+  ok(value)=>{var owned:audio.WavRead=value
+   return result.ok(struct.replace(owned,audio.AudioBuffer{samples:[],rate:1,channels:1},field=buffer))},
+  err(problem)=>match problem{
+   Audio(value)=>{if value.code!=audio.ErrorCode.BadMagic and value.code!=audio.ErrorCode.UnsupportedFormat and value.code!=audio.ErrorCode.BadBits{return result.err(audio.message(value))}},
+   Io(value)=>{return result.err(io_error(value))},Limit(value)=>{return result.err(export_read_error(audio.WavReadError.Limit(value)))}}
+ }
+ checked.buffer(try io_policy.absolute(file),44100,options)
+}
+pub fn handled(action:str)->bool effects {} {
+ action=="ensemble" or action=="audio-tool" or action=="pitch-resample" or action=="align" or action=="recording-align" or action=="audio-time" or action=="export-wav" or action=="export-audio"
+}
+pub fn run(args:view<str>,settings:ref<io_policy.Settings>,log:ref<container.Journal>)->result<unit,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi,io.write} {
+ let action:str=view.get(args,1)
+ if action=="export-wav" or action=="export-audio"{
+  if view.len(args)<5 or view.len(args)>7{return result.err("Use export-wav|export-audio RECIPE INPUT OUTPUT [CANCEL_FILE] [PROGRESS_FILE]")}
+  let cancel:string=if view.len(args)>=6{string.copy(view.get(args,5))}else{string.copy(settings.cancel_file)}
+  let progress:string=if view.len(args)>=7{string.copy(view.get(args,6))}else{string.copy(settings.progress_file)}
+  let target:string=if path.is_absolute(view.get(args,4)){path.normalize(view.get(args,4))}else{path.join(try files.cwd() map_err io_error,view.get(args,4))}
+  var options:checked.Options=try io_policy.input(settings,path.dirname(target),cancel)
+  let raw:string=try recipe(view.get(args,2))
+  if action=="export-wav"{
+   let selected:wave.Settings=try wave.Settings_decode(raw) map_err codec.describe
+   let _=try io_policy.recipe_choices(settings,"wav",selected.subtype,"")
+   let source:audio.AudioBuffer=try export_input(view.get(args,3),options)
+   let report:wave.Report=try wave.run(source,selected,target,cancel,progress)
+   io.write(try wave.Report_encode(report) map_err codec.describe)
+   io.write("\n")
+   return result.ok(())}
+  let selected:compressed.Settings=try compressed.Settings_decode(raw) map_err codec.describe
+  let _=try io_policy.recipe_choices(settings,selected.format,selected.subtype,selected.bitrate)
+  // The existing explicit recipe remains authoritative; no tool discovery occurs.
+  match options.tool{none=>{options.tool=option.some(import_tool(selected.encoder,selected.encoder_sha256))},some(_)=>{}}
+  let source:audio.AudioBuffer=try export_input(view.get(args,3),options)
+  let limits:compressed.Limits=try io_policy.limits(settings,true)
+  let report:compressed.Report=try compressed.run_limited(source,selected,target,cancel,progress,limits)
+  io.write(try compressed.Report_encode(report) map_err codec.describe)
+  io.write("\n")
+  return result.ok(())}
+ let multiple:bool=action=="ensemble" or action=="audio-tool"
+ let aligned:bool=action=="align" or action=="recording-align"
+ let minimum:u64=if multiple{4}else{if aligned{6}else{5}}
+ if view.len(args)<minimum or view.len(args)>minimum+2{return result.err("Invalid audio workflow arguments")}
+ let directory:str=view.get(args,minimum-1)
+ let cancel:string=if view.len(args)>minimum{string.copy(view.get(args,minimum))}else{string.copy(settings.cancel_file)}
+ let progress:string=if view.len(args)>minimum+1{string.copy(view.get(args,minimum+1))}else{string.copy(settings.progress_file)}
+ var plan:container.Plan=try io_policy.plan(settings)
+ if action=="recording-align"{
+  let recipe:alignment_choices.Recipe=try alignment_choices.read(view.get(args,2))
+  let bytes:u64=cast.wrap(settings.audio_buffer_mib)*1048576
+  let runtime=try recording_runtime.settings_for_windows(try io_policy.root(settings),recipe.windows,recipe.save_aligned,bytes*4,bytes*2,bytes*4)
+  var input_options:checked.Options=try io_policy.input(settings,directory,cancel)
+  return detailed_alignment.run(runtime,recipe,try io_policy.absolute(view.get(args,3)),try io_policy.absolute(view.get(args,4)),directory,cancel,progress,plan,log,input_options)}
+ var checked:checked.Options=try io_policy.input(settings,directory,cancel)
+ if action=="pitch-resample" or action=="audio-time"{
+  var prepared:sample_input.Input=try sample_input.open(settings,view.get(args,3),checked,progress)
+  let outcome:result<unit,string>=sampled_tool(action,view.get(args,2),prepared.path,directory,cancel,progress,plan,log,option.some(checked))
+  return sample_input.finish(prepared,outcome)}
+ var options:option<checked.Options>=option.some(checked)
+ if action=="ensemble"{var selected:ensemble.Settings=try ensemble.read(view.get(args,2))
+  selected.inputs=try io_policy.input_paths(struct.borrow(selected,field=inputs))
+  return ensemble.run_with_input_to(selected,directory,cancel,progress,plan,log,options)}
+ if action=="audio-tool"{var selected:tools.Settings=try tools.read(view.get(args,2))
+  selected.inputs=try io_policy.input_paths(struct.borrow(selected,field=inputs))
+  return tools.run_with_input_to(selected,directory,cancel,progress,plan,log,options)}
+ if action=="align"{let selected:alignment.Settings=try alignment.read(view.get(args,2))
+  return alignment.run_with_input_to(selected,try io_policy.absolute(view.get(args,3)),try io_policy.absolute(view.get(args,4)),directory,cancel,progress,plan,log,options)}
+ result.err("Unknown audio workflow")
+}
+fn sampled_tool(action:str,file:str,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>,options:option<checked.Options> own)->result<unit,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time} {
+ var selected_input:option<checked.Options>=options
+ if action=="pitch-resample"{let selected:pitch.Settings=try pitch.read(file)
+  return pitch.run_with_input_to(selected,input,directory,cancel,progress,plan,log,selected_input)}
+ let selected:audio_time.Settings=try audio_time.read(file)
+ let _=try audio_time.run_with_input_to(selected,input,directory,cancel,progress,plan,log,selected_input)
+ result.ok(())
+}
+fn import_tool(executable:str,sha:str)->codec_process.Tool effects {alloc} {codec_process.Tool{path:string.copy(executable),sha256:string.copy(sha)}}

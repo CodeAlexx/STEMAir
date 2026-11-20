@@ -1,0 +1,94 @@
+module stemair.recording_shifts
+import std.python_random as random
+import std.float as fp
+
+pub type Family=enum{First,Second,Outer}
+pub type Limits=struct{max_forwards:u64,max_groups:u64,max_group_offsets:u64,max_random_calls:u64}
+pub type Request=struct{family:Family,count:u64,seed:u64,frames:u64,split:bool,segment:u64,overlap:f64=0.25}
+pub type Forecast=struct{groups:u64,forwards_upper:u64,random_calls:u64,offsets_per_group:u64,segment:u64,stride:u64}
+pub type Group=struct{offsets:array<u64>,divisor:u64,shifted:bool}
+pub type Schedule=struct{request:Request,plan:Forecast,limits:Limits,generator:random.Generator,groups:u64=0,forwards:u64=0,random_calls:u64=0}
+fn product(a:u64,b:u64)->result<u64,string> effects {alloc} {
+ if a!=0 and b>18446744073709551615/a{return result.err("Recording request work count overflows")}
+ result.ok(a*b)
+}
+fn ceil_div(value:u64,divisor:u64)->u64 effects {} {value/divisor+if value%divisor==0{0}else{1}}
+pub fn forecast(r:Request,limits:Limits)->result<Forecast,string> effects {alloc} {
+ if r.frames==0 or r.frames>18446744073709529565 or not fp.is_finite(r.overlap) or r.overlap<0.0 or r.overlap>=1.0 or limits.max_forwards==0 or limits.max_groups==0{return result.err("Invalid recording request extent, overlap or caller budget")}
+ let segment:u64=if r.family==Family.First{441000}else{r.segment}
+ if segment==0{return result.err("Recording request requires its actual model segment")}
+ let stride:u64=if r.family==Family.First{segment}else{cast.sat((1.0-r.overlap)*cast.float(segment))}
+ if r.split and stride==0{return result.err("Recording overlap leaves no chunk stride")}
+ let selected:u64=if r.count==0{0}else{if r.family==Family.First and r.count>22050{22050}else{r.count}}
+ let groups:u64=if r.family==Family.Outer{1}else{if r.split{ceil_div(r.frames,stride)}else{1}}
+ let draws:u64=if r.count==0{0}else{if r.family==Family.First{22049}else{r.count}}
+ let random_calls:u64=try product(groups,draws)
+ var forwards:u64=0
+ if r.family==Family.Outer{
+  let shifted_length:u64=if r.count==0{r.frames}else{r.frames+22050}
+  let pieces:u64=if r.split{ceil_div(shifted_length,stride)}else{1}
+  forwards=try product(pieces,if r.count==0{1}else{r.count})
+ }else{forwards=try product(groups,if r.count==0{1}else{selected})}
+ if groups>limits.max_groups or selected>limits.max_group_offsets or random_calls>limits.max_random_calls or forwards>limits.max_forwards{return result.err("Recording request exceeds its explicit caller work budget")}
+ result.ok(Forecast{groups:groups,forwards_upper:forwards,random_calls:random_calls,offsets_per_group:selected,segment:segment,stride:stride})
+}
+pub fn begin(r:Request,limits:Limits)->result<Schedule,string> effects {alloc} {
+ let plan:Forecast=try forecast(r,limits)
+ result.ok(Schedule{request:r,plan:plan,limits:limits,generator:random.generator(r.seed)})
+}
+// First-family schedules reshuffle the complete population for every split
+// chunk. Second-family groups redraw independently; outer-family draws once.
+pub fn next_group(s:ref<Schedule>)->result<Group,string> effects {alloc} {
+ if s.groups>=s.plan.groups{return result.err("Recording shift group exceeds its source traversal")}
+ s.groups+=1
+ if s.request.count==0{return result.ok(Group{offsets:[],divisor:1,shifted:false})}
+ var offsets:array<u64>=[]
+ if s.request.family==Family.First{
+  var population:array<u64>=[]
+  array.reserve(population,22050)
+  var i:u64=0
+  loop{if i==22050{break}
+   array.push(population,i)
+   i+=1}
+  let _=try random.shuffle_indices(struct.borrow(s,field=generator),population)
+  s.random_calls+=22049
+  array.reserve(offsets,s.plan.offsets_per_group)
+  i=0
+  loop{if i==s.plan.offsets_per_group{break}
+   array.push(offsets,array.get(population,i))
+   i+=1}
+ }else{
+  array.reserve(offsets,s.plan.offsets_per_group)
+  var i:u64=0
+  loop{if i==s.plan.offsets_per_group{break}
+   let offset:u32=try random.randbelow(struct.borrow(s,field=generator),22051)
+   array.push(offsets,cast.wrap(offset))
+   s.random_calls+=1
+   i+=1}}
+ result.ok(Group{offsets:offsets,divisor:s.request.count,shifted:true})
+}
+pub fn reserve_forward(s:ref<Schedule>)->result<unit,string> effects {alloc} {
+ if s.forwards>=s.plan.forwards_upper or s.forwards>=s.limits.max_forwards{return result.err("Recording forward exceeds its forecast caller budget")}
+ s.forwards+=1
+ result.ok(())
+}
+pub fn reserve_group(s:ref<Schedule>,g:ref<Group>)->result<unit,string> effects {alloc} {
+ let count:u64=if g.shifted{array.len(g.offsets)}else{1}
+ var i:u64=0
+ loop{if i==count{break}
+  let _=try reserve_forward(s)
+  i+=1}
+ result.ok(())
+}
+pub fn reserve_recording(s:ref<Schedule>,frames:u64)->result<unit,string> effects {alloc} {
+ let count:u64=if s.request.split{ceil_div(frames,s.plan.stride)}else{1}
+ var i:u64=0
+ loop{if i==count{break}
+  let _=try reserve_forward(s)
+  i+=1}
+ result.ok(())
+}
+pub fn require_geometry(s:ref<Schedule>,family:Family,frames:u64,split:bool,segment:u64,overlap:f64)->result<unit,string> effects {alloc} {
+ if s.groups!=0 or s.forwards!=0 or s.request.family!=family or s.request.frames!=frames or s.request.split!=split or s.plan.segment!=segment or (family!=Family.First and s.request.overlap!=overlap){return result.err("Recording schedule differs from the current request geometry or was already used")}
+ result.ok(())
+}

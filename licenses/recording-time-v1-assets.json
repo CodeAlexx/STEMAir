@@ -1,0 +1,23 @@
+{
+  "model": "recording-time-v1",
+  "filename": "recording-time-v1.yaml",
+  "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/repro_mdx_a_time_only.yaml",
+  "bytes": 69,
+  "sha256": "43a3fada0508ab5097405df94ca5121125c4c09ae6482598b8251304dbbe93de",
+  "configuration": "configs/recording-time-v1.json",
+  "credit": "Original Demucs models by Meta Platforms and collaborators, MIT license; attention-MIT.txt, hybrid-MIT.txt and waveform-MIT.txt. Original identifiers preserve checkpoint compatibility.",
+  "dependencies": [
+    {
+      "filename": "residual-waveform-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/9a6b4851-03af0aa6.th",
+      "bytes": 267602121,
+      "sha256": "03af0aa64af2c4f0795659c265fdead238fab31c064a8a4b5b051c1b22c8ad48"
+    },
+    {
+      "filename": "residual-pair-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/1ef250f1-592467ce.th",
+      "bytes": 267602121,
+      "sha256": "592467cef0b0d878bc66fe38c8456353ff435334331baab08e1dc82beeefd596"
+    }
+  ]
+}

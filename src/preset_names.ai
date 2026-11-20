@@ -1,0 +1,19 @@
+module stemair.preset_names
+import std.path as path
+
+pub fn renamed_path(file:str,name:str)->result<string,string> effects {alloc} {
+ let chars:view<byte>=str.bytes(name)
+ if view.len(chars)==0 or view.len(chars)>240 or name=="." or name==".."{
+  return result.err("Enter a preset filename between 1 and 240 UTF-8 bytes")}
+ var i:u64=0
+ loop{if i==view.len(chars){break}
+  let b:u8=cast.bits(view.get(chars,i))
+  if b<32 or b==47 or b==92 or b==58 or b==34 or b==60 or b==62 or b==124 or b==63 or b==42{
+   return result.err("Use a filename without path separators or reserved filename characters")}
+  i+=1}
+ let last:byte=view.get(chars,view.len(chars)-1)
+ if last==32 or last==46{return result.err("A preset filename must not end in a space or period")}
+ let destination:string=path.join(path.dirname(file),name)
+ if destination==file{return result.err("Enter a different preset filename")}
+ result.ok(destination)
+}

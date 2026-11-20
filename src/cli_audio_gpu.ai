@@ -1,0 +1,88 @@
+module stemair.cli_audio_gpu
+import "cli_audio_policy.ai" as policy
+import "cli_processing_sample.ai" as sample_input
+import "sample_processing_jobs.ai" as sampled
+import "cli_audio_utilities.ai" as utility
+import "container_export.ai" as container
+import "checked_input.ai" as checked
+import "job.ai" as job
+import "time_application.ai" as audio_time
+import "pitch_application.ai" as pitch
+import "queue_job.ai" as queue
+import "queue_config.ai" as queue_config
+import "secondary_application.ai" as secondary
+import "model_ensemble_application.ai" as models
+import "../toolkit/secondary_config.ai" as secondary_config
+import "../toolkit/model_ensemble_config.ai" as model_config
+import "../toolkit/compressed_export.ai" as codec_export
+import std.codec as codec
+import std.text as text
+import "cpu_session_close.ai" as cpu_close
+
+fn recipe(plan:ref<container.Plan>)->result<string,string> effects {alloc} {
+ match plan.compressed{none=>result.ok(""),some(value)=>result.ok(try codec_export.Settings_encode(value) map_err codec.describe)}
+}
+fn finish(value:job.Completed own)->i32 effects {alloc,ffi,gpu,io.write} {
+ var done:job.Completed=value
+ io.write(text.concat(done.message,"\n"))
+ if not done.ok and str.len(done.export_report)>0{io.ewrite(text.concat(done.export_report,"\n"))}
+ match cpu_close.retained_all(struct.borrow(done,field=retained)){ok(_)=>{},err(e)=>{io.ewrite(text.concat("Session close failed: ",e))
+  return 1}}
+ if done.ok{0}else{1}
+}
+pub fn run(args:view<str>,settings:ref<policy.Settings>)->result<i32,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,gpu,process,time,ffi,io.write,random} {
+ let action:str=view.get(args,1)
+ if utility.handled(action){
+  var log:container.Journal=container.empty_journal()
+  match utility.run(args,settings,log){ok(_)=>{if action!="export-wav" and action!="export-audio"{io.write("Audio processing complete\n")}
+   return result.ok(0)},err(e)=>{if str.len(log.failure)==0{container.record_failure(log,"",e)}
+   policy.journal(log)
+   return result.err(policy.failure(log,e))}}}
+ let queued:bool=action=="queue"
+ let chained:bool=action=="secondary" or action=="model-ensemble"
+ let explicit_single:bool=action=="separate"
+ if (queued and view.len(args)!=4) or (chained and view.len(args)!=5) or (explicit_single and view.len(args)!=6) or
+  (not queued and not chained and not explicit_single and view.len(args)!=5){return result.err("Invalid GPU workflow arguments")}
+ let recording:string=try policy.recording_snapshot(settings)
+ let directory:str=view.get(args,view.len(args)-1)
+ let plan:container.Plan=try policy.plan(settings)
+ let raw:string=try recipe(plan)
+ let limits:codec_export.Limits=try policy.limits(settings,container.extension(plan)!="wav")
+ let working:u32=policy.working_choice(plan.working_wav)
+ let cancel:string=try policy.absolute_optional(settings.cancel_file)
+ var options:checked.Options=try policy.input(settings,directory,cancel)
+ let preparation=try sample_input.options(settings,options)
+ if queued{
+  var selected:queue_config.Plan=try queue_config.read(view.get(args,2))
+  var i:u64=0
+  loop{if i==array.len(selected.items){break}
+   let item:ref<queue_config.Item>=array.borrow(selected.items,i)
+   item.input=try policy.absolute(item.input)
+   i+=1}
+  let ensemble:option<model_config.Recipe>=if str.len(selected.ensemble)>0{option.some(try models.read(selected.ensemble))}else{option.none()}
+  let second:option<secondary_config.Recipe>=if str.len(selected.secondary)>0{option.some(try secondary.read(selected.secondary))}else{option.none()}
+  let time_recipe:string=if str.len(selected.audio_time)>0{let value:audio_time.Settings=try audio_time.read(selected.audio_time)
+   try audio_time.encode(value)}else{""}
+  let pitch_recipe:string=if str.len(selected.pitch)>0{let value:pitch.Settings=try pitch.read(selected.pitch)
+   try pitch.Settings_encode(value) map_err codec.describe}else{""}
+  let work:queue.Work=queue.Work{retained:option.none(),items:struct.replace(selected,[],field=items),settings:string.copy(selected.config),checkpoint:string.copy(selected.checkpoint),ensemble:ensemble,secondary:second,
+   audio_time_recipe:time_recipe,pitch_recipe:pitch_recipe,
+   directory:string.copy(directory),cancel:string.copy(cancel),progress:string.copy(settings.progress_file),use_gpu:true,gpu_index:settings.gpu_index,recording_controls:string.copy(recording),mask_controls:try policy.mask_controls(settings),learned_controls:try policy.learned_snapshot(settings),mask_cleanup:settings.mask_cleanup,mask_cleanup_threshold:settings.mask_cleanup_threshold,continue_on_error:selected.continue_on_error,
+   wav_choice:working,codec_recipe:raw,export_max_frames:limits.max_frames,export_max_stage_bytes:limits.max_stage_bytes,export_max_encoded_bytes:limits.max_encoded_bytes}
+  return result.ok(finish(match preparation{none=>queue.run_checked(work,options),some(selected)=>queue.run_sampled(work,options,selected)}))}
+ if action=="secondary"{
+  let selected:secondary_config.Recipe=try secondary.read(view.get(args,2))
+  let work:job.SecondaryWork=job.SecondaryWork{retained:option.none(),settings:selected,input:try policy.absolute(view.get(args,3)),output:string.copy(directory),cancel:string.copy(cancel),progress:string.copy(settings.progress_file),use_gpu:true,gpu_index:settings.gpu_index,recording_controls:string.copy(recording),mask_controls:try policy.mask_controls(settings),learned_controls:try policy.learned_snapshot(settings),mask_cleanup:settings.mask_cleanup,mask_cleanup_threshold:settings.mask_cleanup_threshold,
+   wav_choice:working,codec_recipe:raw,export_max_frames:limits.max_frames,export_max_stage_bytes:limits.max_stage_bytes,export_max_encoded_bytes:limits.max_encoded_bytes}
+  return result.ok(finish(sampled.dispatch(sampled.Payload.Secondary(work),option.some(options),preparation)))}
+ if action=="model-ensemble"{
+  let selected:model_config.Recipe=try models.read(view.get(args,2))
+  let work:job.ModelEnsembleWork=job.ModelEnsembleWork{retained:option.none(),settings:selected,input:try policy.absolute(view.get(args,3)),output:string.copy(directory),cancel:string.copy(cancel),progress:string.copy(settings.progress_file),use_gpu:true,gpu_index:settings.gpu_index,recording_controls:string.copy(recording),mask_controls:try policy.mask_controls(settings),learned_controls:try policy.learned_snapshot(settings),mask_cleanup:settings.mask_cleanup,mask_cleanup_threshold:settings.mask_cleanup_threshold,
+   wav_choice:working,codec_recipe:raw,export_max_frames:limits.max_frames,export_max_stage_bytes:limits.max_stage_bytes,export_max_encoded_bytes:limits.max_encoded_bytes}
+  return result.ok(finish(sampled.dispatch(sampled.Payload.ModelEnsemble(work),option.some(options),preparation)))}
+ let first:u64=if explicit_single{2}else{1}
+ let work:job.Work=job.Work{retained:option.none(),settings:string.copy(view.get(args,first)),checkpoint:string.copy(view.get(args,first+1)),input:try policy.absolute(view.get(args,first+2)),output:string.copy(directory),cancel:string.copy(cancel),progress:string.copy(settings.progress_file),use_gpu:true,gpu_index:settings.gpu_index,recording_controls:string.copy(recording),mask_controls:try policy.mask_controls(settings),learned_controls:try policy.learned_snapshot(settings),mask_cleanup:settings.mask_cleanup,mask_cleanup_threshold:settings.mask_cleanup_threshold,
+  wav_choice:working,codec_recipe:raw,export_max_frames:limits.max_frames,export_max_stage_bytes:limits.max_stage_bytes,export_max_encoded_bytes:limits.max_encoded_bytes}
+ result.ok(finish(sampled.dispatch(sampled.Payload.Single(work),option.some(options),preparation)))
+}

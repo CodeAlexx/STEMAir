@@ -1,0 +1,67 @@
+module stemair.model_ensemble_device
+import "wave_boundary.ai" as boundary
+import "recording_sources.ai" as recording_sources
+import "mask/request.ai" as mask_request
+import "model_cache.ai" as cache
+import "model_ensemble.ai" as ensemble
+import "model_ensemble_config.ai" as config
+import "engine.ai" as engine
+import "device_engine.ai" as device
+import "control.ai" as control
+import std.audio as audio
+import "typed_model_ensemble.ai" as typed_ensemble
+import "typed_source_wave.ai" as typed_source
+import "audio_result.ai" as typed_samples
+import "numeric.ai" as numeric
+pub fn separate(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str)->result<ensemble.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ separate_with_high_band(bank,members,c,input,cancel,progress,mask_request.HighBand.Profile)
+}
+pub fn separate_with_high_band(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand)->result<ensemble.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ separate_with_high_band_as(bank,members,c,input,cancel,progress,high_band,audio.WavSubtype.Float32)
+}
+pub fn separate_with_high_band_as(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,kind:audio.WavSubtype)->result<ensemble.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ var policy:mask_request.Policy=mask_request.defaults()
+ policy.high_band=high_band
+ separate_with_policy_as(bank,members,c,input,cancel,progress,policy,kind)
+}
+pub fn separate_with_policy_as(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,kind:audio.WavSubtype)->result<ensemble.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ let _=try mask_request.validate_policy(policy)
+ let _=try ensemble.validate_members(bank,members)
+ var acc:ensemble.Accumulator=try ensemble.begin_as(c,kind)
+ var i:u64=0
+ loop{if i==view.len(members){break}
+  if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+  let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,view.get(members,i)),field=model)
+  let targets:array<string>=ensemble.names(struct.borrow(struct.borrow(model,field=profile),field=targets))
+  let values:array<f32>=try device.separate_with_policy(model,input,cancel,progress,policy)
+  let _=try ensemble.push(acc,c,targets,values,input,cancel)
+  i+=1}
+ ensemble.finish(acc,c,cancel,progress)
+}
+pub fn separate_typed_with_policy_as(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,kind:audio.WavSubtype,limits:typed_source.Limits)->result<typed_ensemble.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ var inputs:recording_sources.Set=recording_sources.empty()
+ separate_typed_with_policy_as_inputs(bank,members,c,input,cancel,progress,policy,kind,limits,inputs)
+}
+pub fn separate_typed_with_policy_as_inputs(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,kind:audio.WavSubtype,requested:typed_source.Limits,inputs:ref<recording_sources.Set>)->result<typed_ensemble.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ var limits:typed_source.Limits=requested
+ limits.max_working_bytes=try recording_sources.available(inputs,limits.max_working_bytes)
+ let _=try mask_request.validate_policy(policy)
+ let _=try ensemble.validate_members(bank,members)
+ var acc:typed_ensemble.Accumulator=try typed_ensemble.begin(c,kind,limits)
+ var mixture:typed_samples.Samples=typed_samples.from_single(numeric.copy(input))
+ var i:u64=0
+ loop{if i==view.len(members){break}
+  if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+  let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,view.get(members,i)),field=model)
+  let targets:array<string>=ensemble.names(struct.borrow(struct.borrow(model,field=profile),field=targets))
+  var selected:typed_samples.Samples=try recording_sources.master(inputs,model.profile.identity,mixture,limits)
+  let tensor:array<f32>=try boundary.model_f32(selected,boundary.Limits{max_working_bytes:limits.max_working_bytes})
+  let lower:array<f32>=try recording_sources.lower(inputs,model.profile.identity,limits)
+  var values:typed_samples.Samples=try device.separate_typed_with_policy_and_band_input(model,array.view(tensor),cancel,progress,policy,array.view(lower))
+  let count:u64=array.len(targets)
+  if count==0 or typed_samples.count(values)%(2*count)!=0{return result.err("Wrong typed member output extent")}
+  let frames:u64=typed_samples.count(values)/(2*count)
+  let _=try typed_ensemble.push(acc,c,targets,values,frames,selected,cancel)
+  i+=1}
+ typed_ensemble.finish(acc,c,cancel,progress)
+}

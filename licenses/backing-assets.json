@@ -1,0 +1,10 @@
+{
+  "model": "backing-v1",
+  "filename": "backing-v1.pth",
+  "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-BVE-4B_SN-44100-1.pth",
+  "bytes": 223650277,
+  "sha256": "56165bdfa0dd5df7930ff76652200dc287e1bfef622bba5c812c736dc22067fe",
+  "reference_metadata_tail_md5": "944950a9c5963a5eb70b445d67b7068a",
+  "configuration": "configs/backing-v1.json",
+  "credit": "UVR developers Anjok07 and aufr33; original recurrent cascaded network and BVE backing-vocal checkpoint distributed with the public application"
+}

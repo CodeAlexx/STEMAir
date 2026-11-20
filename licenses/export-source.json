@@ -1,0 +1,24 @@
+{
+  "purpose": "Source and development-oracle attribution for six opt-in WAV output formats",
+  "application": {
+    "name": "Ultimate Vocal Remover GUI",
+    "authors": "Anjok07, aufr33 and contributors",
+    "url": "https://github.com/Anjok07/ultimatevocalremovergui",
+    "revision": "a5f88453bfb2b38b05a965bcf67727243e0cbf19",
+    "files": [
+      "separate.py write_audio/save_audio_file/save_format",
+      "lib_v5/spec_utils.py normalize",
+      "gui_data/constants.py WAV_TYPE",
+      "UVR.py process_check_wav_type"
+    ],
+    "license": "MIT according to pinned README; absent root LICENSE is documented in THIRD-PARTY.md"
+  },
+  "codec_reference": {
+    "name": "libsndfile",
+    "authors": "Erik de Castro Lopo and contributors",
+    "url": "https://github.com/libsndfile/libsndfile",
+    "source_1_1_0_revision": "ea3ac90e98c6a98cd52cae39010446fba368a2e3",
+    "license": "LGPL-2.1-or-later",
+    "use": "Source inspection and independent development comparison only; no code or binary is linked or shipped by this vertical"
+  }
+}

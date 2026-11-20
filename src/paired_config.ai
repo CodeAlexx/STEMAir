@@ -1,0 +1,51 @@
+module stemair.paired_config
+import "queue_config.ai" as queue
+import "../toolkit/paired_inputs.ai" as pairs
+import std.codec as codec
+import std.files as files
+
+pub type Item=struct{first:string,second:string,folder:string} derive codec(strict)
+pub type Plan=struct{items:array<Item>,continue_on_error:bool=false} derive codec(strict)
+pub type Outcome=struct{first:string,second:string,folder:string,state:string="pending",message:string="",exports:string=""} derive codec(strict)
+pub type Report=struct{items:array<Outcome>,recipe:string,directory:string,state:string="pending",
+ succeeded:u64=0,skipped:u64=0,failed:u64=0,poison_cpu:bool=false} derive codec(strict)
+pub fn validate(items:ref<array<Item>>)->result<unit,string> effects {alloc} {
+ var folders:array<queue.Item>=[]
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  let item:ref<Item>=array.borrow(items,i)
+  if str.len(item.second)==0{return result.err("Choose both recordings for each pair")}
+  array.push(folders,queue.Item{input:string.copy(item.first),folder:string.copy(item.folder)})
+  i+=1}
+ queue.validate(folders)
+}
+pub fn from_pairs(value:ref<pairs.Pairing>)->result<Plan,string> effects {alloc} {
+ var items:array<Item>=[]
+ var i:u64=0
+ loop{if i==array.len(value.items){break}
+  let pair:ref<pairs.Pair>=array.borrow(struct.borrow(value,field=items),i)
+  array.push(items,Item{first:string.copy(pair.first),second:string.copy(pair.second),folder:queue.folder(i,pair.first)})
+  i+=1}
+ let _=try validate(items)
+ result.ok(Plan{items:items})
+}
+pub fn remaining(report:ref<Report>)->array<Item> effects {alloc} {
+ var items:array<Item>=[]
+ var i:u64=0
+ loop{if i==array.len(report.items){break}
+  let item:ref<Outcome>=array.borrow(struct.borrow(report,field=items),i)
+  if item.state!="complete" and item.state!="skipped"{
+   array.push(items,Item{first:string.copy(item.first),second:string.copy(item.second),folder:string.copy(item.folder)})}
+  i+=1}
+ items
+}
+fn read_error(error:files.ReadError)->string effects {alloc} {
+ match error{Io(e)=>string.copy(fs.error.message(e)),TooLarge=>"Paired input recipe exceeds 4 MiB"}
+}
+pub fn read(file:str)->result<Plan,string> effects {alloc,fs.read} {
+ let raw:bytes=try files.read_limited(file,4194304) map_err read_error
+ let source:str=match str.from_bytes(bytes.view(raw)){some(value)=>value,none=>{return result.err("Paired input recipe must be UTF-8")}}
+ var plan:Plan=try Plan_decode(source) map_err codec.describe
+ let _=try validate(struct.borrow(plan,field=items))
+ result.ok(plan)
+}

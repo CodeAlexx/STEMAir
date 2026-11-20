@@ -1,0 +1,35 @@
+{
+  "model": "recording-mixed-packed-v1",
+  "filename": "recording-mixed-packed-v1.yaml",
+  "url": "https://raw.githubusercontent.com/facebookresearch/demucs/main/demucs/remote/mdx_q.yaml",
+  "bytes": 162,
+  "sha256": "0b0b5877bda9c4c9917ad9301c50ceb8d3f7425880b2b81184540dcdf23ceafd",
+  "configuration": "configs/recording-mixed-packed-v1.json",
+  "credit": "Original Demucs models by Meta Platforms and collaborators, MIT license; attention-MIT.txt, hybrid-MIT.txt and waveform-MIT.txt. Original identifiers preserve checkpoint compatibility.",
+  "dependencies": [
+    {
+      "filename": "residual-packed-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/6b9c2ca1-3fd82607.th",
+      "bytes": 59648321,
+      "sha256": "3fd82607b051e9f8ed0e86a30791023a3b589a427fb994c8bbfdff8c1903eeff"
+    },
+    {
+      "filename": "residual-packed-pair-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/b72baf4e-8778635e.th",
+      "bytes": 44368175,
+      "sha256": "8778635e98a9d4b34b3d132300597758f8f3f2978510eb20c202fd0d54a7bbf0"
+    },
+    {
+      "filename": "hybrid-packed-03.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/42e558d4-196e0e1b.th",
+      "bytes": 58227087,
+      "sha256": "196e0e1bc5e83ea6ffbf0750b1abae1305b83de12ec98e5b50915a7139c52759"
+    },
+    {
+      "filename": "hybrid-packed-02.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/305bc58f-18378783.th",
+      "bytes": 46847123,
+      "sha256": "18378783cf76d44213f7a0c87da872a35b976c31ac11c4b367438b4674a2f0fe"
+    }
+  ]
+}

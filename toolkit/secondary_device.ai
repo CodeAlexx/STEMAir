@@ -1,0 +1,54 @@
+module stemair.secondary_device
+import "mask/request.ai" as mask_request
+import "model_roles.ai" as roles
+import "secondary.ai" as secondary
+import "secondary_config.ai" as config
+import "model_cache.ai" as cache
+import "model_ensemble.ai" as stems
+import "engine.ai" as engine
+import "device_engine.ai" as device
+import "control.ai" as control
+pub fn separate(bank:ref<cache.Cache>,bindings:ref<array<secondary.Binding>>,plan:ref<secondary.Plan>,c:ref<config.Recipe>,input:view<f32>,cancel:str,progress:str)->result<secondary.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ separate_with_high_band(bank,bindings,plan,c,input,cancel,progress,mask_request.HighBand.Profile)
+}
+pub fn separate_with_high_band(bank:ref<cache.Cache>,bindings:ref<array<secondary.Binding>>,plan:ref<secondary.Plan>,c:ref<config.Recipe>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand)->result<secondary.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ var policy:mask_request.Policy=mask_request.defaults()
+ policy.high_band=high_band
+ separate_with_policy(bank,bindings,plan,c,input,cancel,progress,policy)
+}
+pub fn separate_with_policy(bank:ref<cache.Cache>,bindings:ref<array<secondary.Binding>>,plan:ref<secondary.Plan>,c:ref<config.Recipe>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>)->result<secondary.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ let _=try mask_request.validate_policy(policy)
+ var raw:array<secondary.Prediction>=[]
+ var captured:array<secondary.StageInput>=[]
+ var work:array<secondary.Stage>=secondary.stages(plan,c)
+ var i:u64=0
+ loop{if i==array.len(work){break}
+  if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+  let stage:ref<secondary.Stage>=array.borrow(work,i)
+  let model_index:u64=stage.model
+  let member:u64=try secondary.binding(bindings,model_index)
+  if member>=array.len(bank.entries){return result.err("A secondary model binding is out of range")}
+  let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,member),field=model)
+  let targets:array<string>=try roles.targets(struct.borrow(model,field=profile),array.borrow(c.models,model_index),stage.source)
+  control.status(progress,secondary.progress_message(c,i+1,array.len(work)))
+  var selected_policy:mask_request.Policy=mask_request.with_foreground(policy,roles.foreground(array.borrow(c.models,model_index),stage.source))
+  var captured_input:array<f32>=[]
+  let values:array<f32>=if str.view(stage.source)=="instrumental"{
+   let filtered:array<f32>=try secondary.instrumental_input(raw,c,input)
+   let predicted:array<f32>=try device.separate_with_policy(model,array.view(filtered),cancel,progress,selected_policy)
+   if c.keep_members and (c.complement=="spectral" or c.preprocess_complement=="spectral"){captured_input=filtered}
+   predicted
+  }else{if str.view(stage.source)=="vocals"{
+   let filtered:array<f32>=try secondary.vocal_input(raw,c,input,cancel,progress)
+   let predicted:array<f32>=try device.separate_with_policy(model,array.view(filtered),cancel,progress,selected_policy)
+   if c.keep_members and (c.complement=="spectral" or c.preprocess_complement=="spectral"){captured_input=filtered}
+   predicted
+  }else{try device.separate_with_policy(model,input,cancel,progress,selected_policy)}}
+  let _=try secondary.push_stage(raw,model_index,targets,values,stage.source)
+  if array.len(captured)>0{let _=try secondary.cache_extent(raw,captured)}
+  if array.len(captured_input)>0{let _=try secondary.capture_input(raw,captured,model_index,stage.source,captured_input)}
+  i+=1}
+ var output:secondary.Output=try secondary.finish(raw,plan,c,input,cancel,progress)
+ output.inputs=captured
+ result.ok(output)
+}

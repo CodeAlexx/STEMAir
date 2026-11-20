@@ -1,0 +1,235 @@
+module stemair.typed_model_ensemble
+import "recording_sources.ai" as recording_sources
+import "audio_result.ai" as audio_result
+import "typed_source_wave.ai" as source
+import "typed_audio_math.ai" as math
+import "model_ensemble.ai" as legacy
+import "model_ensemble_config.ai" as config
+import "ensemble.ai" as reduction
+import "model_cache.ai" as cache
+import "engine.ai" as engine
+import "mask/request.ai" as request
+import "wave_boundary.ai" as boundary
+import "control.ai" as control
+import "recording_context.ai" as recording_context
+import "cpu_inference.ai" as cpu_request
+import "numeric.ai" as numeric
+import "learned_cleanup_waves.ai" as learned
+import "typed_model_result.ai" as model_result
+import std.audio as audio
+
+pub type MemberOutput=struct{waves:array<source.Wave>}
+pub type Accumulator=struct{stems:array<legacy.Stem>,member_frames:array<u64>,saved:array<MemberOutput>,member_subtype:audio.WavSubtype,limits:source.Limits}
+pub type Output=struct{targets:array<string>,values:array<f32>,frames:u64,target_frames:array<u64>,member_frames:array<u64>,saved:array<MemberOutput>}
+pub fn begin(c:ref<config.Options>,kind:audio.WavSubtype,limits:source.Limits)->result<Accumulator,string> effects {alloc} {
+ let _=try legacy.validate(c)
+ if array.len(c.outputs)==0{return result.err("Typed ensemble stems have not been resolved")}
+ if limits.max_working_bytes<64{return result.err("Typed ensemble working-byte limit is too small")}
+ var stems:array<legacy.Stem>=[]
+ var i:u64=0
+ loop{if i==array.len(c.outputs){break}
+  array.push(stems,legacy.Stem{estimates:[]})
+  i+=1}
+ result.ok(Accumulator{stems:stems,member_frames:[],saved:[],member_subtype:kind,limits:limits})
+}
+fn add_bytes(a:u64,b:u64)->result<u64,string> effects {alloc} {
+ if a>18446744073709551615-b{return result.err("Typed ensemble retained byte extent overflows")}
+ result.ok(a+b)
+}
+fn sample_bytes(s:ref<audio_result.Samples>)->result<u64,string> effects {alloc} {
+ let _=try source.frames(s)
+ let width:u64=if s.precision==audio_result.Precision.Float32{4}else{8}
+ if audio_result.count(s)>18446744073709551615/width{return result.err("Typed ensemble byte extent overflows")}
+ result.ok(audio_result.count(s)*width)
+}
+fn retained(acc:ref<Accumulator>)->result<u64,string> effects {alloc} {
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(acc.stems){break}
+  let stem:ref<legacy.Stem>=array.borrow(acc.stems,i)
+  var j:u64=0
+  loop{if j==array.len(stem.estimates){break}
+   let count:u64=array.len(array.borrow(stem.estimates,j))
+   if count>18446744073709551615/4{return result.err("Typed ensemble byte extent overflows")}
+   total=try add_bytes(total,4*count)
+   j+=1}
+  i+=1}
+ i=0
+ loop{if i==array.len(acc.saved){break}
+  let member:ref<MemberOutput>=array.borrow(acc.saved,i)
+  var j:u64=0
+  loop{if j==array.len(member.waves){break}
+   total=try add_bytes(total,try sample_bytes(struct.borrow(array.borrow(member.waves,j),field=samples)))
+   total=try add_bytes(total,try source.reference_bytes(array.borrow(member.waves,j)))
+   j+=1}
+  i+=1}
+ result.ok(total)
+}
+fn push_selected(acc:ref<Accumulator>,c:ref<config.Options>,selected:array<source.Wave> own,raw_frames:u64,normalize:bool,cancel:str)->result<unit,string> effects {alloc,fs.meta} {
+ var owned:array<source.Wave>=selected
+ let _=try source.validate(owned)
+ if array.len(owned)!=array.len(c.outputs) or array.len(owned)!=array.len(acc.stems){return result.err("Typed processed ensemble stem count differs")}
+ let before:u64=try retained(acc)
+ var additional:u64=0
+ var i:u64=0
+ loop{if i==array.len(owned){break}
+  let w:ref<source.Wave>=array.borrow(owned,i)
+  if str.view(w.target)!=str.view(array.borrow(c.outputs,i).target){return result.err("Typed processed ensemble stem order differs")}
+  let count:u64=audio_result.count(struct.borrow(w,field=samples))
+  if count>18446744073709551615/32{return result.err("Typed ensemble conversion workspace overflows")}
+  // Cover owned typed values, encoded/interleaved/decoded reload workspace,
+  // retained F32 estimates and optional saved typed values conservatively.
+  additional=try add_bytes(additional,32*count)
+  additional=try add_bytes(additional,try source.reference_bytes(w))
+  i+=1}
+ if (try add_bytes(before,additional))>acc.limits.max_working_bytes{return result.err("Typed ensemble exceeds its retained working-byte limit")}
+ // Stage all reloads before mutating the accumulator, so a failing conversion
+ // never leaves a half-ingested member available to a retry.
+ var reloaded:array<array<f32>>=[]
+ i=0
+ loop{if i==array.len(owned){break}
+  if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+  let w:ref<source.Wave>=array.borrow(owned,i)
+  if normalize{let _=try math.normalize(struct.borrow(w,field=samples),c.normalize)}
+  let decoded:array<f32>=try boundary.serialized_f32(struct.borrow(w,field=samples),44100,2,acc.member_subtype,boundary.Limits{max_working_bytes:acc.limits.max_working_bytes})
+  array.push(reloaded,decoded)
+  i+=1}
+ i=0
+ loop{if i==array.len(reloaded){break}
+  let values:array<f32>=ref.swap(array.borrow(reloaded,i),[])
+  array.push(struct.borrow(array.borrow(acc.stems,i),field=estimates),values)
+  i+=1}
+ array.push(acc.member_frames,raw_frames)
+ if c.keep_members{array.push(acc.saved,MemberOutput{waves:owned})}
+ result.ok(())
+}
+pub fn push(acc:ref<Accumulator>,c:ref<config.Options>,targets:ref<array<string>>,values:audio_result.Samples own,frames:u64,input:ref<audio_result.Samples>,cancel:str)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read} {
+ if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+ let before:u64=try retained(acc)
+ var held:audio_result.Samples=values
+ let raw:u64=try sample_bytes(held)
+ let master:u64=try sample_bytes(input)
+ let input_frames:u64=try source.frames(input)
+ let largest:u64=if input_frames>frames{input_frames}else{frames}
+ let outputs:u64=array.len(c.outputs)
+ if raw>18446744073709551615/2 or outputs==0 or largest>18446744073709551615/64/outputs{return result.err("Typed ensemble selection workspace overflows")}
+ let required:u64=try add_bytes(try add_bytes(try add_bytes(before,2*raw),master),64*largest*outputs)
+ if required>acc.limits.max_working_bytes{return result.err("Typed ensemble selection exceeds its working-byte limit")}
+ var waves:array<source.Wave>=try source.unpack(targets,held,frames,acc.limits)
+ push_waves(acc,c,waves,frames,input,cancel)
+}
+pub fn push_waves(acc:ref<Accumulator>,c:ref<config.Options>,provided:array<source.Wave> own,frames:u64,input:ref<audio_result.Samples>,cancel:str)->result<unit,string> effects {alloc,env,ffi,fs.meta,fs.read}{
+ var waves:array<source.Wave>=provided
+ let _=try source.validate(waves)
+ var selected:array<source.Wave>=[]
+ var i:u64=0
+ loop{if i==array.len(c.outputs){break}
+  let target:ref<config.Target>=array.borrow(c.outputs,i)
+  let output:audio_result.Samples=try source.select(waves,target,c.complement,input,acc.limits)
+  let count:u64=try source.frames(output)
+  array.push(selected,source.Wave{frequency_reference:[],target:string.copy(target.target),samples:output,frames:count})
+  i+=1}
+ push_selected(acc,c,selected,frames,true,cancel)
+}
+// Processed callbacks provide their already-normalized, save-ready waves.
+// Do not normalize these again: Source processing already ran its write points.
+pub fn push_processed(acc:ref<Accumulator>,c:ref<config.Options>,waves:array<source.Wave> own,cancel:str)->result<unit,string> effects {alloc,fs.meta} {
+ var selected:array<source.Wave>=waves
+ let _=try source.validate(selected)
+ let first:u64=array.borrow(selected,0).frames
+ push_selected(acc,c,selected,first,false,cancel)
+}
+pub fn finish(acc:ref<Accumulator>,c:ref<config.Options>,cancel:str,progress:str)->result<Output,string> effects {alloc,fs.meta,fs.write} {
+ if array.len(acc.member_frames)<2{return result.err("A typed model ensemble needs at least two completed members")}
+ var targets:array<string>=[]
+ var values:array<f32>=[]
+ var frames:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(c.outputs){break}
+  let target:ref<config.Target>=array.borrow(c.outputs,i)
+  var combined:reduction.Output=try reduction.combine(struct.borrow(array.borrow(acc.stems,i),field=estimates),target.method,c.domain,c.normalize,cancel,progress)
+  array.push(targets,string.copy(target.target))
+  array.push(frames,combined.frames)
+  var j:u64=0
+  loop{if j==array.len(combined.values){break}
+   array.push(values,array.get(combined.values,j))
+   j+=1}
+  i+=1}
+ var extents:array<u64>=[]
+ i=0
+ loop{if i==array.len(acc.member_frames){break}
+  array.push(extents,array.get(acc.member_frames,i))
+  i+=1}
+ let first:u64=array.get(frames,0)
+ result.ok(Output{targets:targets,values:values,frames:first,target_frames:frames,member_frames:extents,saved:struct.replace(acc,[],field=saved)})
+}
+pub fn separate_cpu_with_request_as(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,high_band:request.HighBand,foreground:request.Foreground,kind:audio.WavSubtype,limits:source.Limits)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try cache.require_cpu_policy(bank)
+ let _=try legacy.validate_members(bank,members)
+ var acc:Accumulator=try begin(c,kind,limits)
+ var mixture:audio_result.Samples=audio_result.from_single(numeric.copy(input))
+ var i:u64=0
+ loop{if i==view.len(members){break}
+  if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+  let index:u64=view.get(members,i)
+  let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,index),field=model)
+  let targets:array<string>=legacy.names(struct.borrow(struct.borrow(model,field=profile),field=targets))
+  let model_kind:string=string.copy(model.profile.kind)
+  var output:audio_result.Samples=try cache.separate_cpu_typed(bank,index,input,cancel,progress,high_band,foreground)
+  let count:u64=array.len(targets)
+  if count==0 or audio_result.count(output)%(2*count)!=0{return result.err("Wrong typed member output extent")}
+  let frames:u64=audio_result.count(output)/(2*count)
+  let settings=cache.learned_settings(bank)
+  if settings.noise{
+   let kind:string=string.copy(model_kind)
+   let names:array<string>=legacy.names(targets)
+   var finished:model_result.Output=try model_result.finish(kind,"recording",names,mixture,output,limits)
+   let _=try learned.noise_cpu(bank,kind,struct.borrow(finished,field=sources),mixture,limits,cancel)
+   let _=try push_waves(acc,c,struct.replace(finished,[],field=sources),frames,mixture,cancel)
+  }else{let _=try push(acc,c,targets,output,frames,mixture,cancel)}
+  i+=1}
+ finish(acc,c,cancel,progress)
+}
+pub fn separate_cpu_with_policy_as(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,kind:audio.WavSubtype,limits:source.Limits)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var controls:recording_context.Context=recording_context.disabled()
+ separate_cpu_with_policy_as_controlled(bank,members,c,input,cancel,progress,policy,kind,limits,controls)
+}
+
+pub fn separate_cpu_with_policy_as_controlled(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,kind:audio.WavSubtype,limits:source.Limits,controls:ref<recording_context.Context>)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var inputs:recording_sources.Set=recording_sources.empty()
+ separate_cpu_with_policy_as_controlled_inputs(bank,members,c,input,cancel,progress,policy,kind,limits,controls,inputs)
+}
+pub fn separate_cpu_with_policy_as_controlled_inputs(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,kind:audio.WavSubtype,requested:source.Limits,controls:ref<recording_context.Context>,inputs:ref<recording_sources.Set>)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var limits:source.Limits=requested
+ limits.max_working_bytes=try recording_sources.available(inputs,limits.max_working_bytes)
+ let _=try recording_context.validate(controls)
+ let _=try request.validate_policy(policy)
+ let _=try cache.require_cpu_policy(bank)
+ let _=try legacy.validate_members(bank,members)
+ var acc:Accumulator=try begin(c,kind,limits)
+ var mixture:audio_result.Samples=audio_result.from_single(numeric.copy(input))
+ var i:u64=0
+ loop{if i==view.len(members){break}
+  if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+  let index:u64=view.get(members,i)
+  let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,index),field=model)
+  let targets:array<string>=legacy.names(struct.borrow(struct.borrow(model,field=profile),field=targets))
+  var selected:audio_result.Samples=try recording_sources.master(inputs,model.profile.identity,mixture,limits)
+  let tensor:array<f32>=try boundary.model_f32(selected,boundary.Limits{max_working_bytes:limits.max_working_bytes})
+  let lower:array<f32>=try recording_sources.lower(inputs,model.profile.identity,limits)
+  let model_kind:string=string.copy(model.profile.kind)
+  var output:audio_result.Samples=try cpu_request.separate_with_policy_and_band_input(bank,index,array.view(tensor),cancel,progress,policy,controls,array.view(lower))
+  let count:u64=array.len(targets)
+  if count==0 or audio_result.count(output)%(2*count)!=0{return result.err("Wrong typed member output extent")}
+  let frames:u64=audio_result.count(output)/(2*count)
+  let settings=cache.learned_settings(bank)
+  if settings.noise or array.len(controls.frequency_reference)>0{
+   let kind:string=string.copy(model_kind)
+   let names:array<string>=legacy.names(targets)
+   var finished:model_result.Output=try model_result.finish_with_reference(kind,"recording",names,selected,output,limits,array.view(controls.frequency_reference))
+   let _=try learned.noise_cpu(bank,kind,struct.borrow(finished,field=sources),selected,limits,cancel)
+   let _=try push_waves(acc,c,struct.replace(finished,[],field=sources),frames,selected,cancel)
+  }else{let _=try push(acc,c,targets,output,frames,selected,cancel)}
+  i+=1}
+ finish(acc,c,cancel,progress)
+}

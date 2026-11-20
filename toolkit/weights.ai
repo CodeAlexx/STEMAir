@@ -1,0 +1,115 @@
+module stemair.weights
+import std.pytorch_checkpoint as checkpoint
+import std.table as table
+import std.text as text
+import std.float as fp
+import std.block_quant as quant
+import std.files as files
+import std.gzip as gz
+
+pub type Parameter=struct{shape:array<u64>,values:array<f32>}
+pub type Model=struct{parameters:table.Table<Parameter>,bytes_read:u64,loads:u64,metadata:string=""}
+pub fn open(path:str)->result<Model,string> effects {alloc,fs.read} {
+ open_with_counters(path,false)
+}
+// Evaluation-only batch counters carry no learned values. Their payload is
+// still validated by the shared checkpoint reader; all other dtypes are refused.
+pub fn open_with_counters(path:str,allow_counters:bool)->result<Model,string> effects {alloc,fs.read} {
+ var policy:checkpoint.Limits=checkpoint.defaults()
+ policy.archive_bytes=1073741824
+ policy.tensors=8192
+ policy.legacy_little_endian=true
+ open_with_policy(path,policy,allow_counters)
+}
+pub fn open_with_policy(path:str,policy:checkpoint.Limits,allow_counters:bool)->result<Model,string> effects {alloc,fs.read} {
+ open_typed(path,policy,allow_counters,false)
+}
+// Older tuple checkpoints may be gzip wrapped. Decode once in memory and keep
+// disk-read telemetry tied to the original compressed file.
+pub fn open_legacy_with_policy(path:str,policy:checkpoint.Limits,allow_counters:bool)->result<Model,string> effects {alloc,fs.read} {
+ if str.len(path)<3 or str.slice(path,str.len(path)-3,str.len(path))!=".gz"{
+  return open_with_policy(path,policy,allow_counters)}
+ let packed:bytes=match files.read_limited(path,policy.archive_bytes){ok(v)=>v,
+  err(_)=>{return result.err("Cannot read compressed checkpoint within byte limit")},}
+ let count:u64=view.len(bytes.view(packed))
+ let decoded:bytes=try gz.inflate_all(gz.Framing.Gzip,bytes.view(packed),policy.archive_bytes) map_err gz.error_message
+ var source:checkpoint.Checkpoint=try checkpoint.from_bytes(decoded,policy)
+ let metadata:string=string.copy(source.arguments_json)
+ var model:Model=try decode_retained(source,metadata,allow_counters,false)
+ model.bytes_read=count
+ result.ok(model)
+}
+// Source loaders that construct F32 parameters and copy F16 storage into them
+// opt in explicitly. Existing profile loaders retain their strict F32 policy.
+pub fn open_promoted(path:str,policy:checkpoint.Limits)->result<Model,string> effects {alloc,fs.read} {
+ open_typed(path,policy,false,true)
+}
+// Startup format adapters can retain one bounded disk read and reuse the same
+// strict F32/F16 promotion path without reopening the checkpoint.
+pub fn from_promoted_bytes(raw:bytes own,policy:checkpoint.Limits)->result<Model,string> effects {alloc}{
+ var source:checkpoint.Checkpoint=try checkpoint.from_bytes(raw,policy)
+ let metadata:string=string.copy(source.arguments_json)
+ decode_retained(source,metadata,false,true)
+}
+fn open_typed(path:str,policy:checkpoint.Limits,allow_counters:bool,allow_half:bool)->result<Model,string> effects {alloc,fs.read} {
+ var source:checkpoint.Checkpoint=try checkpoint.open(path,policy)
+ let metadata:string=string.copy(source.arguments_json)
+ decode_retained(source,metadata,allow_counters,allow_half)
+}
+// Original settings and weights share the same retained archive read.
+pub fn open_root_settings(path:str,key:str,policy:checkpoint.Limits)->result<Model,string> effects {alloc,fs.read} {
+ var source:checkpoint.Checkpoint=try checkpoint.open(path,policy)
+ let metadata:string=try checkpoint.root_metadata(source,key,policy)
+ decode_retained(source,metadata,true,false)
+}
+fn decode_retained(loaded:checkpoint.Checkpoint own,metadata:string own,allow_counters:bool,allow_half:bool)->result<Model,string> effects {alloc} {
+ var source:checkpoint.Checkpoint=loaded
+ let archive:bytes=struct.replace(source,bytes.copy(b""),field=archive)
+ var output:table.Table<Parameter>=table.new()
+ var i:u64=0
+ loop{if i>=array.len(source.tensors){break}
+  let t:ref<checkpoint.Tensor>=array.borrow(source.tensors,i)
+  let name:str=str.view(t.name)
+  if allow_counters and str.len(name)>=20 and str.slice(name,str.len(name)-20,str.len(name))==".num_batches_tracked"{
+   if str.view(t.dtype)!="I64" or array.len(t.shape)!=0 or t.logical_elements!=1 or not t.contiguous{
+    return result.err("Invalid evaluation batch counter")}
+   i+=1
+   continue}
+  let half:bool=allow_half and str.view(t.dtype)=="F16"
+  if (str.view(t.dtype)!="F32" and not half) or not t.contiguous or t.logical_elements>268435456{
+   return result.err(text.concat("Unsupported parameter dtype or layout: ",str.view(t.name)))}
+  var shape:array<u64>=[]
+  var j:u64=0
+  loop{if j>=array.len(t.shape){break}
+   array.push(shape,array.get(t.shape,j))
+   j+=1}
+  var values:array<f32>=[]
+  array.reserve(values,t.logical_elements)
+  j=0
+  loop{if j>=t.logical_elements{break}
+   var bits:u32=0
+   var b:u64=0
+   let width:u64=if half{2}else{4}
+   loop{if b>=width{break}
+    let byte_value:u8=cast.bits(view.get(bytes.view(archive),t.byte_offset+j*width+b))
+    let word:u32=cast.wrap(byte_value)
+    bits |= word << cast.wrap(8*b)
+    b+=1}
+   let value:f32=if half{quant.f16_to_f32(cast.wrap(bits))}else{cast.bits(bits)}
+   if not fp.is_finite(value){return result.err("Non-finite checkpoint parameter")}
+   array.push(values,value)
+   j+=1}
+  let _=table.put(output,str.view(t.name),Parameter{shape:shape,values:values})
+  i+=1}
+ result.ok(Model{parameters:output,bytes_read:source.archive_bytes,loads:1,metadata:metadata})
+}
+pub fn index(model:ref<Model>,name:str,shape:view<u64>)->result<u64,string> effects {alloc} {
+ let index:u64=match table.index_of(struct.borrow(model,field=parameters),name){some(v)=>v,none=>{return result.err(text.concat("Missing parameter: ",name))},}
+ let p:ref<Parameter>=array.borrow(struct.borrow(struct.borrow(model,field=parameters),field=values),index)
+ if array.len(p.shape)!=view.len(shape){return result.err(text.concat("Wrong parameter rank: ",name))}
+ var i:u64=0
+ loop{if i>=view.len(shape){break}
+  if view.get(shape,i)!=array.get(p.shape,i){return result.err(text.concat("Wrong parameter shape: ",name))}
+  i+=1}
+ result.ok(index)
+}

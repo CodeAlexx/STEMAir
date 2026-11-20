@@ -1,0 +1,580 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+ <requires lib="gtk" version="4.10"/>
+ <object class="GtkStringList" id="room_target_choices"><items><item>Vocals</item><item>Lead vocals</item><item>Backing vocals</item><item>All vocal outputs</item></items></object>
+ <object class="GtkStringList" id="mask_tta_choices"><items><item>Model default</item><item>TTA off</item><item>TTA on</item></items></object>
+ <object class="GtkStringList" id="model_editor_role_choices"><items><item>Standard model</item><item>Lead vocal model</item><item>Backing vocal model</item></items></object>
+ <object class="GtkStringList" id="model_editor_rebalance_choices"><items><item>0.0</item><item>0.1</item><item>0.2</item><item>0.3</item><item>0.4</item><item>0.5</item><item>0.6</item><item>0.7</item><item>0.8</item><item>0.9</item></items></object>
+ <object class="GtkStringList" id="model_output_choices"><items><item>Common stems</item><item>Vocals and instrumental</item></items></object>
+ <object class="GtkStringList" id="model_method_choices"><items><item>Average</item><item>Minimum magnitude</item><item>Maximum magnitude</item></items></object>
+ <object class="GtkStringList" id="secondary_target_choices"><items><item>Vocals</item><item>Instrumental</item><item>Bass</item><item>Drums</item><item>Other</item></items></object>
+ <object class="GtkStringList" id="secondary_output_choices"><items><item>All primary stems</item><item>Vocals and instrumental</item><item>Bass and complement</item><item>Drums and complement</item><item>Other and complement</item></items></object>
+ <object class="GtkStringList" id="complement_choices"><items><item>Use model estimates</item><item>Spectral complement</item></items></object>
+ <object class="GtkStringList" id="alignment_polarity_choices"><items><item>Keep second</item><item>Invert second</item><item>Automatic</item></items></object>
+ <object class="GtkStringList" id="alignment_window_choices"><items><item>0.0625 seconds</item><item>0.125 seconds</item><item>0.25 seconds</item><item>0.5 seconds</item><item>Low: two windows</item><item>Medium: three windows</item><item>High: four windows</item><item>0.75 seconds</item><item>1 second</item><item>2 seconds</item><item>None: whole-track alignment</item></items></object>
+ <object class="GtkStringList" id="alignment_intro_choices"><items><item>Default intro</item><item>One eighth</item><item>One sixth</item><item>One quarter</item><item>One half</item><item>Two intros</item><item>Three intros</item><item>Five intros</item></items></object>
+ <object class="GtkStringList" id="alignment_gain_choices"><items><item>Unity</item><item>Low</item><item>Medium</item><item>High</item><item>Very high</item></items></object>
+ <object class="GtkStringList" id="alignment_phase_choices"><items><item>Unchanged</item><item>Try opposite polarity</item><item>90 degree steps</item><item>45 degree steps</item><item>20 degree steps</item><item>10 degree steps</item><item>1 degree steps</item></items></object>
+ <object class="GtkStringList" id="alignment_initial_polarity_choices"><items><item>Automatic</item><item>Positive</item><item>Negative</item><item>Native</item></items></object>
+ <object class="GtkStringList" id="wav_subtype_choices"><items><item>Unsigned 8-bit</item><item>Signed 16-bit</item><item>Signed 24-bit</item><item>Signed 32-bit</item><item>Float 32-bit</item><item>Float 64-bit</item></items></object>
+ <object class="GtkStringList" id="container_choices"><items><item>WAV</item><item>FLAC</item><item>MP3</item></items></object>
+ <object class="GtkStringList" id="audio_budget_choices"><items><item>256 MiB</item><item>512 MiB</item><item>1 GiB</item><item>2 GiB</item></items></object>
+ <object class="GtkStringList" id="mp3_bitrate_choices"><items><item>96 kbps</item><item>128 kbps</item><item>160 kbps</item><item>224 kbps</item><item>256 kbps</item><item>320 kbps</item></items></object>
+ <object class="GtkAdjustment" id="audio_volume_adjustment"><property name="lower">0</property><property name="upper">100</property><property name="step-increment">5</property><property name="page-increment">10</property><property name="value">75</property></object>
+ <object class="GtkAdjustment" id="audio_seek_adjustment"><property name="lower">0</property><property name="upper">100</property><property name="step-increment">1</property><property name="page-increment">10</property></object>
+ <object class="GtkWindow" id="window">
+  <property name="title">STEMAir</property>
+  <property name="default-width">1000</property><property name="default-height">1100</property>
+  <child><object class="GtkBox">
+   <property name="orientation">vertical</property><property name="spacing">8</property>
+   <property name="margin-start">32</property><property name="margin-end">32</property>
+   <property name="margin-top">20</property><property name="margin-bottom">20</property>
+   <child><object class="GtkLabel"><property name="label">STEMAir</property><property name="xalign">0</property><style><class name="title-1"/></style></object></child>
+   <child><object class="GtkLabel"><property name="label">Separate sources and clean up audio.</property><property name="xalign">0</property></object></child>
+   <child><object class="GtkSeparator"/></child>
+   <child><object class="GtkLabel"><property name="label">MODEL</property><property name="xalign">0</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkEntry" id="settings"><property name="hexpand">true</property><property name="placeholder-text">Model configuration</property></object></child>
+    <child><object class="GtkButton" id="choose_settings"><property name="label">Configuration…</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkEntry" id="checkpoint"><property name="hexpand">true</property><property name="placeholder-text">Model checkpoint</property></object></child>
+    <child><object class="GtkButton" id="choose_checkpoint"><property name="label">Weights…</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">16</property>
+    <child><object class="GtkCheckButton" id="gpu"><property name="label">Use GPU</property><property name="active">false</property></object></child>
+    <child><object class="GtkLabel"><property name="label">GPU index</property></object></child>
+    <child><object class="GtkEntry" id="gpu_index"><property name="text">0</property><property name="width-chars">4</property><property name="tooltip-text">Zero-based device index. Main models and optional learned cleanup use the same selected device.</property></object></child>
+    <child><object class="GtkCheckButton" id="high_band"><property name="label">Reconstruct high frequencies</property><property name="tooltip-text">Use high-frequency reconstruction with compatible separation models.</property></object></child>
+    <child><object class="GtkButton" id="reload"><property name="label">Release loaded models</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkCheckButton" id="cleanup_enabled"><property name="label">Reduce mask artifacts</property><property name="tooltip-text">Clean sustained high-confidence mask regions after prediction. Applies to compatible mask models without reloading weights.</property></object></child>
+    <child><object class="GtkLabel"><property name="label">Threshold</property></object></child>
+    <child><object class="GtkEntry" id="cleanup_threshold"><property name="text">0.2</property><property name="width-chars">10</property><property name="sensitive">false</property><property name="tooltip-text">0 to below 1, with up to six decimal places. Default 0.2.</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Mask prediction</property></object></child>
+    <child><object class="GtkDropDown" id="mask_tta"><property name="model">mask_tta_choices</property><property name="tooltip-text">Average an additional shifted prediction with compatible mask models.</property></object></child>
+    <child><object class="GtkLabel"><property name="label">Window</property></object></child>
+    <child><object class="GtkEntry" id="mask_window"><property name="text">Default</property><property name="width-chars">8</property><property name="tooltip-text">Default uses the model setting. Otherwise enter 288 to 4096 frames in steps of 32.</property></object></child>
+    <child><object class="GtkLabel"><property name="label">Aggression</property></object></child>
+    <child><object class="GtkEntry" id="mask_aggression"><property name="text">Default</property><property name="width-chars">8</property><property name="tooltip-text">Default uses the model setting. Otherwise enter a whole number from 0 to 50.</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkCheckButton" id="inference_pitch"><property name="label">Pitch during inference</property><property name="tooltip-text">Shift compatible model inputs and restore the original pitch after separation.</property></object></child>
+    <child><object class="GtkLabel"><property name="label">Semitones</property></object></child>
+    <child><object class="GtkEntry" id="inference_semitones"><property name="text">0</property><property name="width-chars">8</property><property name="tooltip-text">A decimal from -20 to 20.</property></object></child>
+    <child><object class="GtkCheckButton" id="match_frequency"><property name="label">Match mixture frequencies</property><property name="tooltip-text">Use the compatible model's frequency range for spectral subtraction.</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkCheckButton" id="recording_override"><property name="label">Recording inference</property><property name="tooltip-text">Use request settings on the selected CPU or GPU for compatible waveform, temporal, hybrid and attention models. Otherwise inherit the profile.</property></object></child>
+    <child><object class="GtkLabel"><property name="label">Shifts</property></object></child>
+    <child><object class="GtkEntry" id="recording_shifts"><property name="text">2</property><property name="width-chars">6</property><property name="tooltip-text">A nonnegative whole count. Zero disables random time shifts.</property></object></child>
+    <child><object class="GtkCheckButton" id="recording_split"><property name="label">Split recording</property><property name="active">true</property></object></child>
+    <child><object class="GtkLabel"><property name="label">Overlap</property></object></child>
+    <child><object class="GtkEntry" id="recording_overlap"><property name="text">0.25</property><property name="width-chars">7</property><property name="tooltip-text">Zero to below one. The first generation uses isolated chunks.</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Segment</property></object></child>
+    <child><object class="GtkEntry" id="recording_segment"><property name="text">Default</property><property name="width-chars">8</property><property name="tooltip-text">Default or 1 to 200 seconds. Individual checkpoints retain their model's segment duration.</property></object></child>
+    <child><object class="GtkLabel"><property name="label">Replay seed</property></object></child>
+    <child><object class="GtkEntry" id="recording_seed"><property name="text">Random</property><property name="width-chars">14</property><property name="tooltip-text">Random accepts one new seed per request; a nonnegative integer reproduces its shift sequence.</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkCheckButton" id="noise_reduction"><property name="label">Reduce noise</property><property name="tooltip-text">Apply the selected noise model before compatible spectral separation.</property></object></child>
+    <child><object class="GtkEntry" id="noise_checkpoint"><property name="hexpand">true</property><property name="placeholder-text">Noise reduction weights</property></object></child>
+    <child><object class="GtkButton" id="choose_noise_checkpoint"><property name="label">Weights…</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkCheckButton" id="room_reduction"><property name="label">Reduce room sound</property><property name="tooltip-text">Save additional room-reduced vocal outputs with the selected model.</property></object></child>
+    <child><object class="GtkDropDown" id="room_targets"><property name="model">room_target_choices</property></object></child>
+    <child><object class="GtkEntry" id="room_checkpoint"><property name="hexpand">true</property><property name="placeholder-text">Room reduction weights</property></object></child>
+    <child><object class="GtkButton" id="choose_room_checkpoint"><property name="label">Weights…</property></object></child>
+   </object></child>
+   <child><object class="GtkLabel"><property name="label">RECORDING</property><property name="xalign">0</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkEntry" id="input"><property name="hexpand">true</property><property name="placeholder-text">Audio file (WAV, FLAC, MP3…)</property></object></child>
+    <child><object class="GtkButton" id="choose_input"><property name="label">Browse…</property></object></child>
+   </object></child>
+   <child><object class="GtkLabel"><property name="label">SAVE SOURCES TO</property><property name="xalign">0</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkEntry" id="output"><property name="hexpand">true</property><property name="placeholder-text">An existing output folder</property></object></child>
+    <child><object class="GtkButton" id="choose_output"><property name="label">Folder…</property></object></child>
+   </object></child>
+   <child><object class="GtkSeparator"/></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Format</property></object></child>
+    <child><object class="GtkDropDown" id="output_container"><property name="model">container_choices</property><property name="width-request">100</property></object></child>
+    <child><object class="GtkLabel"><property name="label">Sample format</property><property name="tooltip-text">WAV precision before optional compression. Float64 retains the F32 processing precision.</property></object></child>
+    <child><object class="GtkDropDown" id="export_subtype"><property name="model">wav_subtype_choices</property><property name="selected">4</property><property name="width-request">180</property></object></child>
+    <child><object class="GtkLabel"><property name="label">MP3</property></object></child>
+    <child><object class="GtkDropDown" id="mp3_bitrate"><property name="model">mp3_bitrate_choices</property><property name="selected">5</property><property name="width-request">110</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Audio codec tools</property></object></child>
+    <child><object class="GtkEntry" id="codec_directory"><property name="hexpand">true</property><property name="placeholder-text">Audio codec tools for compressed input, resampling and FLAC / MP3 output</property></object></child>
+    <child><object class="GtkButton" id="choose_codec_directory"><property name="label">Tools folder…</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkCheckButton" id="naming_append_model"><property name="label">Model name in filenames</property></object></child>
+    <child><object class="GtkCheckButton" id="naming_model_folder"><property name="label">Model subfolders</property></object></child>
+    <child><object class="GtkCheckButton" id="naming_testing"><property name="label">Timestamp filenames</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkCheckButton" id="naming_append_ensemble"><property name="label">Ensemble name in filenames</property></object></child>
+    <child><object class="GtkEntry" id="naming_ensemble_label"><property name="hexpand">true</property><property name="placeholder-text">Ensembled (default)</property><property name="tooltip-text">Optional ensemble label. Spaces become underscores in filenames.</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Audio buffer limit</property><property name="tooltip-text">Decoded audio per recording or source. Models and processing need additional memory.</property></object></child>
+    <child><object class="GtkDropDown" id="audio_budget"><property name="model">audio_budget_choices</property><property name="selected">1</property><property name="width-request">120</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkCheckButton" id="processing_sample"><property name="label">Process a sample</property><property name="tooltip-text">Use one temporary sample for model separation and pitch or tempo changes. Manual blending and paired alignment use the full recordings.</property></object></child>
+    <child><object class="GtkEntry" id="processing_sample_seconds"><property name="text">30</property><property name="width-chars">5</property><property name="tooltip-text">Whole seconds from 5 to 120. Uses the same duration and decoder as Create selected samples in Audio tools.</property></object></child>
+    <child><object class="GtkLabel"><property name="label">seconds (5–120)</property></object></child>
+   </object></child>
+   <child><object class="GtkNotebook" id="workflow"><property name="vexpand">true</property>
+    <child><object class="GtkNotebookPage">
+     <property name="tab"><object class="GtkLabel"><property name="label">Single model</property></object></property>
+     <property name="child"><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">12</property><property name="margin-top">16</property>
+      <child><object class="GtkLabel"><property name="label">Separate the recording with the model selected above.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkLabel"><property name="label">Loaded models stay available for further recordings until released.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkLabel"><property name="label">Outputs</property></object></child>
+       <child><object class="GtkDropDown" id="single_outputs"><property name="model">secondary_output_choices</property><property name="width-request">250</property></object></child>
+      </object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkLabel"><property name="label">Complement</property></object></child>
+       <child><object class="GtkDropDown" id="single_complement"><property name="model">complement_choices</property><property name="width-request">250</property></object></child>
+      </object></child>
+      <child><object class="GtkBox"><property name="spacing">16</property>
+       <child><object class="GtkCheckButton" id="single_normalize"><property name="label">Normalize peaks above 1</property></object></child>
+       <child><object class="GtkCheckButton" id="single_keep"><property name="label">Keep model estimates</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel"><property name="label">Complement choices apply to derived sources. Spectral outputs may end earlier on their analysis frame grid.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkButton" id="separate"><property name="label">Separate audio</property><property name="halign">start</property><style><class name="suggested-action"/></style></object></child>
+     </object></property>
+    </object></child>
+    <child><object class="GtkNotebookPage">
+     <property name="tab"><object class="GtkLabel"><property name="label">Model ensemble</property></object></property>
+     <property name="child"><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">12</property><property name="margin-top">16</property>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="model_add"><property name="label">Add selected model</property></object></child>
+       <child><object class="GtkButton" id="model_remove"><property name="label">Remove last</property></object></child>
+       <child><object class="GtkButton" id="model_clear"><property name="label">Clear models</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel" id="model_inputs"><property name="label">Choose a configuration and weights above, then add at least two models.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="model_processing_add"><property name="label">Attach processing to last member…</property></object></child>
+       <child><object class="GtkButton" id="model_processing_clear"><property name="label">Clear last member processing</property></object></child>
+      </object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkLabel"><property name="label">Outputs</property></object></child>
+       <child><object class="GtkDropDown" id="model_outputs"><property name="model">model_output_choices</property><property name="width-request">250</property></object></child>
+       <child><object class="GtkLabel"><property name="label">Stems / vocals</property></object></child>
+       <child><object class="GtkDropDown" id="model_primary"><property name="model">model_method_choices</property><property name="width-request">220</property></object></child>
+      </object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkLabel"><property name="label">Instrumental method (paired outputs)</property></object></child>
+       <child><object class="GtkDropDown" id="model_secondary"><property name="model">model_method_choices</property><property name="width-request">220</property></object></child>
+      </object></child>
+      <child><object class="GtkBox"><property name="spacing">16</property>
+       <child><object class="GtkCheckButton" id="model_wave"><property name="label">Compare waveforms</property></object></child>
+       <child><object class="GtkCheckButton" id="model_normalize"><property name="label">Normalize peaks above 1</property></object></child>
+       <child><object class="GtkCheckButton" id="model_keep"><property name="label">Keep member stems</property></object></child>
+      </object></child>
+      <child><object class="GtkCheckButton" id="model_residual"><property name="label">Subtract vocals from recording for instrumental (otherwise sum other stems)</property></object></child>
+      <child><object class="GtkCheckButton" id="model_spectral"><property name="label">Use spectral complements</property></object></child>
+      <child><object class="GtkButton" id="model_run"><property name="label">Separate and ensemble</property><property name="halign">start</property><style><class name="suggested-action"/></style></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="model_preset_save"><property name="label">Save ensemble preset…</property></object></child>
+       <child><object class="GtkButton" id="model_preset_open"><property name="label">Open ensemble preset…</property></object></child>
+       <child><object class="GtkButton" id="model_preset_rename"><property name="label">Rename preset…</property></object></child>
+       <child><object class="GtkButton" id="model_preset_delete"><property name="label">Delete preset…</property></object></child>
+      </object></child>
+     </object></property>
+    </object></child>
+    <child><object class="GtkNotebookPage">
+     <property name="tab"><object class="GtkLabel"><property name="label">Audio tools</property></object></property>
+     <property name="child"><object class="GtkScrolledWindow"><property name="vexpand">true</property><property name="hscrollbar-policy">never</property>
+      <child><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">12</property><property name="margin-top">16</property>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkButton" id="ensemble_add"><property name="label">Add audio inputs…</property></object></child>
+    <child><object class="GtkButton" id="ensemble_clear"><property name="label">Clear all inputs</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkButton" id="ensemble_current"><property name="label">Add current recording</property></object></child>
+    <child><object class="GtkButton" id="ensemble_remove"><property name="label">Remove last</property></object></child>
+    <child><object class="GtkButton" id="ensemble_swap"><property name="label">Swap pair</property></object></child>
+   </object></child>
+   <child><object class="GtkLabel" id="ensemble_inputs"><property name="label">Choose at least two matching source recordings.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkScrolledWindow"><property name="min-content-height">160</property><property name="hscrollbar-policy">never</property>
+    <child><object class="GtkListBox" id="ensemble_rows"><property name="selection-mode">multiple</property><style><class name="audio-results"/></style></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkButton" id="ensemble_remove_selected"><property name="label">Remove selected inputs</property></object></child>
+    <child><object class="GtkButton" id="ensemble_keep_selected"><property name="label">Keep selected inputs only</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkButton" id="ensemble_open_file"><property name="label">Open selected recording</property></object></child>
+    <child><object class="GtkButton" id="ensemble_open_folder"><property name="label">Open recording folder</property></object></child>
+    <child><object class="GtkButton" id="ensemble_verify"><property name="label">Verify all inputs</property></object></child>
+   </object></child>
+   <child><object class="GtkCheckButton" id="ensemble_activation_file"><property name="label">Enter or double-click opens the recording</property><property name="tooltip-text">When off, open the recording folder. Applies to both input lists for this app session.</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Sample seconds (5–120)</property></object></child>
+    <child><object class="GtkEntry" id="ensemble_sample_seconds"><property name="width-chars">5</property><property name="text">30</property></object></child>
+    <child><object class="GtkButton" id="ensemble_sample"><property name="label">Create selected samples</property><property name="tooltip-text">Export 44.1 kHz PCM16 WAV samples to the output folder.</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Sample decoder</property></object></child>
+    <child><object class="GtkEntry" id="ensemble_sample_library"><property name="hexpand">true</property><property name="placeholder-text">Optional decoder library for compressed samples</property></object></child>
+    <child><object class="GtkButton" id="ensemble_sample_library_pick"><property name="label">Choose decoder…</property></object></child>
+   </object></child>
+   <child><object class="GtkScrolledWindow"><property name="max-content-height">140</property><property name="propagate-natural-height">true</property><property name="hscrollbar-policy">never</property>
+    <child><object class="GtkLabel" id="ensemble_verification_details"><property name="label"></property><property name="xalign">0</property><property name="wrap">true</property><property name="selectable">true</property></object></child>
+   </object></child>
+   <child><object class="GtkLabel"><property name="label">Select one row for the open buttons. Enter or double-click uses the activation choice above.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">16</property>
+    <child><object class="GtkCheckButton" id="ensemble_wave"><property name="label">Compare waveform magnitudes</property></object></child>
+    <child><object class="GtkCheckButton" id="ensemble_normalize"><property name="label">Normalize peaks above 1</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkButton" id="ensemble_min"><property name="label">Minimum magnitude</property></object></child>
+    <child><object class="GtkButton" id="ensemble_max"><property name="label">Maximum magnitude</property></object></child>
+    <child><object class="GtkButton" id="ensemble_average"><property name="label">Average audio</property></object></child>
+   </object></child>
+   <child><object class="GtkSeparator"/></child>
+   <child><object class="GtkLabel"><property name="label">Combine sums all listed inputs. Paired tools use exactly two inputs in the listed order. Shorter inputs are padded with silence; these tools preserve peaks above 1.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkButton" id="tool_combine"><property name="label">Combine audio</property></object></child>
+    <child><object class="GtkLabel"><property name="label">Amount (0–1)</property></object></child>
+    <child><object class="GtkEntry" id="tool_amount"><property name="text">0.5</property><property name="width-chars">8</property></object></child>
+    <child><object class="GtkButton" id="tool_mix"><property name="label">Mix pair</property></object></child>
+    <child><object class="GtkButton" id="tool_reduce"><property name="label">Reduce background</property></object></child>
+   </object></child>
+   <child><object class="GtkLabel"><property name="label">Mix: first × amount + second × (1 − amount). Reduce: first (background) × (1 − amount) + second (vocal).</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkButton" id="tool_spectral"><property name="label">Spectral complement</property></object></child>
+   <child><object class="GtkLabel"><property name="label">Use the mixture first and its estimated stem second. The spectral complement follows the shorter input on a 1024-sample frame grid. Amount is not used.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkSeparator"/></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Semitones (-10 to 10)</property></object></child>
+    <child><object class="GtkEntry" id="pitch_amount"><property name="text">0</property><property name="width-chars">8</property></object></child>
+    <child><object class="GtkButton" id="tool_pitch"><property name="label">Pitch and duration</property></object></child>
+   </object></child>
+   <child><object class="GtkLabel"><property name="label">Apply to all queued recordings, or the recording selected above when the queue is empty. Positive shifts raise pitch and shorten duration; negative shifts lengthen it. Uses the normalization option above.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkSeparator"/></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Tempo multiplier</property></object></child>
+    <child><object class="GtkEntry" id="tempo_amount"><property name="text">1</property><property name="width-chars">8</property></object></child>
+    <child><object class="GtkButton" id="tool_tempo"><property name="label">Change tempo</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Semitones (-10 to 10)</property></object></child>
+    <child><object class="GtkEntry" id="pitch_preserve_amount"><property name="text">0</property><property name="width-chars">8</property></object></child>
+    <child><object class="GtkButton" id="tool_pitch_preserve"><property name="label">Pitch with original duration</property></object></child>
+   </object></child>
+   <child><object class="GtkLabel"><property name="label">Apply to all queued recordings, or the recording selected above when the queue is empty. These controls use the optional CPU audio processor. Use a tempo above 0 and up to 10; a tempo of 2 doubles the tempo and halves the duration. Uses the normalization option above. Select the audio codec tools folder for compressed input or resampling to 44100 Hz.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkSeparator"/></child>
+   <child><object class="GtkLabel"><property name="label">Align a constant timing offset, then subtract the second recording from the reference. Select the audio codec tools folder for compressed input or resampling to 44100 Hz.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkLabel"><property name="label">Reference recording</property><property name="xalign">0</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkEntry" id="alignment_first"><property name="hexpand">true</property></object></child>
+    <child><object class="GtkButton" id="alignment_first_pick"><property name="label">Browse…</property></object></child>
+   </object></child>
+   <child><object class="GtkLabel"><property name="label">Second recording</property><property name="xalign">0</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkEntry" id="alignment_second"><property name="hexpand">true</property></object></child>
+    <child><object class="GtkButton" id="alignment_second_pick"><property name="label">Browse…</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">16</property>
+    <child><object class="GtkLabel"><property name="label">Coarse polarity</property></object></child>
+    <child><object class="GtkDropDown" id="alignment_polarity"><property name="model">alignment_polarity_choices</property></object></child>
+    <child><object class="GtkCheckButton" id="alignment_save_aligned"><property name="label">Save aligned recording</property></object></child>
+   </object></child>
+   <child><object class="GtkButton" id="alignment_run"><property name="label">Coarse align and subtract</property><property name="halign">start</property></object></child>
+   <child><object class="GtkLabel"><property name="label">Reference mastering matches the second recording's tone and loudness to the reference. Uses complete recordings up to 15 minutes and the output format selected above.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Sound-file decoder library</property></object></child>
+    <child><object class="GtkEntry" id="mastering_library"><property name="hexpand">true</property></object></child>
+    <child><object class="GtkButton" id="mastering_library_pick"><property name="label">Browse…</property></object></child>
+   </object></child>
+   <child><object class="GtkButton" id="mastering_run"><property name="label">Master second recording to reference</property><property name="halign">start</property></object></child>
+   <child><object class="GtkLabel"><property name="label">Detailed alignment options</property><property name="xalign">0</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Initial polarity</property></object></child>
+    <child><object class="GtkDropDown" id="alignment_initial_polarity"><property name="model">alignment_initial_polarity_choices</property></object></child>
+    <child><object class="GtkCheckButton" id="alignment_match_silence"><property name="label">Match leading silence</property></object></child>
+    <child><object class="GtkCheckButton" id="alignment_spectral_match"><property name="label">Spectral matching</property><property name="tooltip-text">Match the secondary recording to the reference spectrum.</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Windows</property></object></child>
+    <child><object class="GtkDropDown" id="alignment_windows"><property name="model">alignment_window_choices</property></object></child>
+    <child><object class="GtkLabel"><property name="label">Intros</property></object></child>
+    <child><object class="GtkDropDown" id="alignment_intros"><property name="model">alignment_intro_choices</property></object></child>
+   </object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkLabel"><property name="label">Gain search</property></object></child>
+    <child><object class="GtkDropDown" id="alignment_gain"><property name="model">alignment_gain_choices</property></object></child>
+    <child><object class="GtkLabel"><property name="label">Local phase (windowed)</property></object></child>
+    <child><object class="GtkDropDown" id="alignment_phase"><property name="model">alignment_phase_choices</property></object></child>
+   </object></child>
+   <child><object class="GtkButton" id="recording_alignment_run"><property name="label">Detailed align and subtract</property><property name="halign">start</property></object></child>
+   <child><object class="GtkSeparator"/></child>
+   <child><object class="GtkLabel"><property name="label">Paired recording batch</property><property name="xalign">0</property></object></child>
+   <child><object class="GtkLabel"><property name="label">Order the lists, then accept pairs by row. Unmatched rows stay unused. Paired alignment uses complete recordings.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property><property name="homogeneous">true</property>
+    <child><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">6</property><property name="hexpand">true</property>
+     <child><object class="GtkLabel"><property name="label">First recordings</property><property name="xalign">0</property></object></child>
+     <child><object class="GtkScrolledWindow"><property name="min-content-height">160</property><property name="max-content-height">200</property><property name="child"><object class="GtkListBox" id="pairs_first_rows"><property name="selection-mode">multiple</property></object></property></object></child>
+     <child><object class="GtkBox"><property name="spacing">6</property>
+      <child><object class="GtkButton" id="pairs_first_add"><property name="label">Add…</property></object></child>
+      <child><object class="GtkButton" id="pairs_first_up"><property name="label">Up</property></object></child>
+      <child><object class="GtkButton" id="pairs_first_down"><property name="label">Down</property></object></child>
+      <child><object class="GtkButton" id="pairs_first_duplicate"><property name="label">Duplicate</property></object></child>
+     </object></child><child><object class="GtkBox"><property name="spacing">6</property>
+      <child><object class="GtkButton" id="pairs_first_remove"><property name="label">Remove</property></object></child>
+      <child><object class="GtkButton" id="pairs_first_transfer"><property name="label">Transfer to other list</property></object></child>
+      <child><object class="GtkButton" id="pairs_first_clear"><property name="label">Clear</property></object></child>
+     </object></child></object></child>
+    <child><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">6</property><property name="hexpand">true</property>
+     <child><object class="GtkLabel"><property name="label">Second recordings</property><property name="xalign">0</property></object></child>
+     <child><object class="GtkScrolledWindow"><property name="min-content-height">160</property><property name="max-content-height">200</property><property name="child"><object class="GtkListBox" id="pairs_second_rows"><property name="selection-mode">multiple</property></object></property></object></child>
+     <child><object class="GtkBox"><property name="spacing">6</property>
+      <child><object class="GtkButton" id="pairs_second_add"><property name="label">Add…</property></object></child>
+      <child><object class="GtkButton" id="pairs_second_up"><property name="label">Up</property></object></child>
+      <child><object class="GtkButton" id="pairs_second_down"><property name="label">Down</property></object></child>
+      <child><object class="GtkButton" id="pairs_second_duplicate"><property name="label">Duplicate</property></object></child>
+     </object></child><child><object class="GtkBox"><property name="spacing">6</property>
+      <child><object class="GtkButton" id="pairs_second_remove"><property name="label">Remove</property></object></child>
+      <child><object class="GtkButton" id="pairs_second_transfer"><property name="label">Transfer to other list</property></object></child>
+      <child><object class="GtkButton" id="pairs_second_clear"><property name="label">Clear</property></object></child>
+     </object></child></object></child>
+   </object></child>
+   <child><object class="GtkLabel" id="pairs_counts"><property name="label">0 pairs; unmatched first: 0; unmatched second: 0</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property>
+    <child><object class="GtkCheckButton" id="pairs_continue"><property name="label">Continue after a failed pair</property></object></child>
+    <child><object class="GtkButton" id="pairs_accept"><property name="label">Accept pairs and current options</property></object></child>
+    <child><object class="GtkButton" id="pairs_run"><property name="label">Run accepted pairs</property></object></child>
+    <child><object class="GtkButton" id="pairs_remaining"><property name="label">Run remaining pairs</property></object></child>
+   </object></child>
+   <child><object class="GtkLabel"><property name="label">Runs use accepted alignment, output and buffer options. Accept again to replace them. Existing partial exports are preserved when retrying unfinished pairs.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkLabel" id="pairs_report"><property name="label">No pairs accepted.</property><property name="xalign">0</property><property name="wrap">true</property><property name="selectable">true</property></object></child>
+   <child><object class="GtkButton" id="mastering_pairs_run"><property name="label">Master current second list to first list</property><property name="halign">start</property></object></child>
+   <child><object class="GtkLabel"><property name="label">Mastering pairs the current lists by row, using the first list as references. Unmatched rows stay unused. Current output and buffer options are captured when you start; processing stops on an error and preserves completed files.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+     </object></child></object></property>
+    </object></child>
+    <child><object class="GtkNotebookPage">
+     <property name="tab"><object class="GtkLabel"><property name="label">Recording queue</property></object></property>
+     <property name="child"><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">12</property><property name="margin-top">16</property>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="queue_add"><property name="label">Add recordings…</property></object></child>
+       <child><object class="GtkButton" id="queue_current"><property name="label">Add current recording</property></object></child>
+       <child><object class="GtkButton" id="queue_remove"><property name="label">Remove last</property></object></child>
+       <child><object class="GtkButton" id="queue_use_settings"><property name="label">Use current settings for pending queue</property></object></child>
+     <child><object class="GtkButton" id="queue_clear"><property name="label">Clear pending</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel" id="queue_inputs"><property name="label">Add recordings to process in order.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkScrolledWindow"><property name="min-content-height">160</property><property name="vexpand">true</property><property name="hscrollbar-policy">never</property>
+       <child><object class="GtkListBox" id="queue_rows"><property name="selection-mode">multiple</property><style><class name="audio-results"/></style></object></child>
+      </object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="queue_remove_selected"><property name="label">Remove selected recordings</property></object></child>
+       <child><object class="GtkButton" id="queue_keep_selected"><property name="label">Keep selected recordings only</property></object></child>
+      </object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="queue_open_file"><property name="label">Open selected recording</property></object></child>
+       <child><object class="GtkButton" id="queue_open_folder"><property name="label">Open recording folder</property></object></child>
+       <child><object class="GtkButton" id="queue_verify"><property name="label">Verify all recordings</property></object></child>
+      </object></child>
+      <child><object class="GtkCheckButton" id="queue_activation_file"><property name="label">Enter or double-click opens the recording</property><property name="tooltip-text">When off, open the recording folder. Applies to both input lists for this app session.</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkLabel"><property name="label">Sample seconds (5–120)</property></object></child>
+       <child><object class="GtkEntry" id="queue_sample_seconds"><property name="width-chars">5</property><property name="text">30</property></object></child>
+       <child><object class="GtkButton" id="queue_sample"><property name="label">Create selected samples</property><property name="tooltip-text">Export 44.1 kHz PCM16 WAV samples to the output folder.</property></object></child>
+      </object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkLabel"><property name="label">Sample decoder</property></object></child>
+       <child><object class="GtkEntry" id="queue_sample_library"><property name="hexpand">true</property><property name="placeholder-text">Optional decoder library for compressed samples</property></object></child>
+       <child><object class="GtkButton" id="queue_sample_library_pick"><property name="label">Choose decoder…</property></object></child>
+      </object></child>
+      <child><object class="GtkScrolledWindow"><property name="max-content-height">140</property><property name="propagate-natural-height">true</property><property name="hscrollbar-policy">never</property>
+       <child><object class="GtkLabel" id="queue_verification_details"><property name="label"></property><property name="xalign">0</property><property name="wrap">true</property><property name="selectable">true</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel"><property name="label">Each recording gets a numbered folder inside the output folder above. Completed recordings leave this pending list; retry keeps the remaining recording numbers.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkCheckButton" id="queue_continue"><property name="label">Continue after a separation error (unreadable recordings are always skipped)</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="queue_single"><property name="label">Process pending with selected model</property><style><class name="suggested-action"/></style></object></child>
+       <child><object class="GtkButton" id="queue_ensemble"><property name="label">Process pending with model ensemble</property></object></child>
+      </object></child>
+      <child><object class="GtkButton" id="queue_secondary"><property name="label">Process pending with secondary models</property><property name="halign">start</property></object></child>
+     </object></property>
+    </object></child>
+    <child><object class="GtkNotebookPage">
+     <property name="tab"><object class="GtkLabel"><property name="label">Secondary models</property></object></property>
+     <property name="child"><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">12</property><property name="margin-top">16</property>
+      <child><object class="GtkLabel"><property name="label">The first selected model supplies primary stems. Add other models below, then assign the last model to a stem. This model list is shared with Model ensemble.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="secondary_model_add"><property name="label">Add selected model</property></object></child>
+       <child><object class="GtkButton" id="secondary_model_remove"><property name="label">Remove last model</property></object></child>
+       <child><object class="GtkButton" id="secondary_model_clear"><property name="label">Clear models</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel" id="secondary_models"><property name="label">Choose configuration and weights above, then add the primary model first.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="preprocess_assign"><property name="label">Use last model for preprocessing</property></object></child>
+       <child><object class="GtkButton" id="preprocess_clear"><property name="label">Disable preprocessing</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel" id="preprocess_summary"><property name="label">Instrumental preprocessing: disabled</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">16</property>
+       <child><object class="GtkCheckButton" id="preprocess_residual"><property name="label">Subtract preprocessor vocals for instrumental</property></object></child>
+       <child><object class="GtkCheckButton" id="preprocess_extra"><property name="label">Save instrumental-only complement (instrument pair)</property></object></child>
+      </object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkDropDown" id="secondary_target"><property name="model">secondary_target_choices</property><property name="width-request">170</property></object></child>
+       <child><object class="GtkLabel"><property name="label">Primary weight (0–1)</property></object></child>
+       <child><object class="GtkEntry" id="secondary_weight"><property name="text">0.5</property><property name="width-chars">7</property></object></child>
+       <child><object class="GtkButton" id="secondary_assign"><property name="label">Assign last model</property></object></child>
+       <child><object class="GtkButton" id="secondary_clear"><property name="label">Clear assignments</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel" id="secondary_rules"><property name="label">Secondary assignments: none</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkLabel"><property name="label">Result = primary × weight + secondary × (1 − weight). Unassigned stems retain the primary output.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">16</property>
+       <child><object class="GtkDropDown" id="secondary_outputs"><property name="model">secondary_output_choices</property><property name="width-request">250</property></object></child>
+       <child><object class="GtkCheckButton" id="secondary_normalize"><property name="label">Normalize final peaks above 1</property></object></child>
+       <child><object class="GtkCheckButton" id="secondary_keep"><property name="label">Keep raw member stems</property></object></child>
+      </object></child>
+      <child><object class="GtkCheckButton" id="secondary_residual"><property name="label">Subtract selected source for its complement (otherwise sum other stems)</property></object></child>
+      <child><object class="GtkCheckButton" id="secondary_spectral"><property name="label">Use spectral complements</property></object></child>
+      <child><object class="GtkCheckButton" id="preprocess_spectral"><property name="label">Use spectral complement for preprocessor instrumental input</property></object></child>
+      <child><object class="GtkButton" id="secondary_run"><property name="label">Separate with secondary models</property><property name="halign">start</property><style><class name="suggested-action"/></style></object></child>
+     </object></property>
+    </object></child>
+    <child><object class="GtkNotebookPage">
+     <property name="tab"><object class="GtkLabel"><property name="label">Vocal chain</property></object></property>
+     <property name="child"><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">12</property><property name="margin-top">16</property>
+      <child><object class="GtkLabel"><property name="label">Add the primary model first, then a lead/backing splitter. This model list and output options are shared with Secondary models.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="vocal_model_add"><property name="label">Add selected model</property></object></child>
+       <child><object class="GtkButton" id="vocal_model_remove"><property name="label">Remove last model</property></object></child>
+       <child><object class="GtkButton" id="vocal_model_clear"><property name="label">Clear models</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel" id="vocal_models"><property name="label">Choose configuration and weights above, then add the primary model first.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="vocal_assign"><property name="label">Use last model for vocal splitting</property></object></child>
+       <child><object class="GtkButton" id="vocal_clear"><property name="label">Disable vocal splitting</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel" id="vocal_summary"><property name="label">Vocal splitting: disabled</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkLabel"><property name="label">Backing-model rebalance (0–1)</property></object></child>
+       <child><object class="GtkEntry" id="vocal_amount"><property name="text">0.9</property><property name="width-chars">8</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel"><property name="label">0 sends primary vocals directly to the splitter. A positive amount adds reduced instrumental input.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkCheckButton" id="vocal_mixes"><property name="label">Save instrumental with lead and backing vocals</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">16</property>
+       <child><object class="GtkCheckButton" id="vocal_mix_only"><property name="label">Only instrumental outputs</property></object></child>
+       <child><object class="GtkCheckButton" id="vocal_save_only"><property name="label">Only vocal outputs</property></object></child>
+      </object></child>
+      <child><object class="GtkBox"><property name="spacing">16</property>
+       <child><object class="GtkDropDown" id="vocal_outputs"><property name="model">secondary_output_choices</property><property name="width-request">250</property></object></child>
+       <child><object class="GtkCheckButton" id="vocal_normalize"><property name="label">Normalize final peaks above 1</property></object></child>
+       <child><object class="GtkCheckButton" id="vocal_keep"><property name="label">Keep raw member stems</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel"><property name="label">The chain uses primary vocals after secondary blending. Rebalance and mixed outputs also need the primary instrumental stem.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkButton" id="vocal_run"><property name="label">Process vocal chain</property><property name="halign">start</property><style><class name="suggested-action"/></style></object></child>
+      <child><object class="GtkLabel"><property name="label">The Recording queue can process this chain with Process pending with secondary models.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+     </object></property>
+    </object></child>
+    <child><object class="GtkNotebookPage">
+     <property name="tab"><object class="GtkLabel"><property name="label">Listen &amp; results</property></object></property>
+     <property name="child"><object class="GtkScrolledWindow"><property name="hscrollbar-policy">never</property>
+      <child><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">10</property>
+       <child><object class="GtkLabel"><property name="label">Listen to recordings and exported sources.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+       <child><object class="GtkBox"><property name="spacing">10</property>
+        <child><object class="GtkButton" id="audio_input"><property name="label">Play recording</property></object></child>
+        <child><object class="GtkButton" id="audio_choose"><property name="label">Choose audio…</property><property name="tooltip-text">Choose audio to listen to (Ctrl+Shift+U).</property></object></child>
+        <child><object class="GtkButton" id="audio_external"><property name="label">Open in default app</property></object></child>
+       </object></child>
+       <child><object class="GtkEntry" id="audio_file"><property name="placeholder-text">Selected audio path</property><property name="tooltip-text">Focus the audio path with Ctrl+Shift+I.</property><property name="hexpand">true</property></object></child>
+       <child><object class="GtkVideo" id="audio_player"><property name="height-request">120</property><property name="hexpand">true</property></object></child>
+       <child><object class="GtkBox"><property name="spacing">10</property>
+        <child><object class="GtkButton" id="audio_play"><property name="label">Play selected</property></object></child>
+        <child><object class="GtkButton" id="audio_pause"><property name="label">Pause</property></object></child>
+        <child><object class="GtkButton" id="audio_stop"><property name="label">Stop</property></object></child>
+        <child><object class="GtkCheckButton" id="audio_muted"><property name="label">Mute</property></object></child>
+        <child><object class="GtkLabel"><property name="label">Volume (%)</property></object></child>
+        <child><object class="GtkScale" id="audio_volume"><property name="orientation">horizontal</property><property name="adjustment">audio_volume_adjustment</property><property name="width-request">160</property><property name="digits">0</property><property name="draw-value">true</property></object></child>
+       </object></child>
+       <child><object class="GtkLabel" id="audio_status"><property name="label">No audio loaded</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+       <child><object class="GtkScale" id="audio_seek"><property name="orientation">horizontal</property><property name="adjustment">audio_seek_adjustment</property><property name="draw-value">false</property><property name="sensitive">false</property></object></child>
+       <child><object class="GtkSeparator"/></child>
+       <child><object class="GtkLabel"><property name="label">Results folder</property><property name="xalign">0</property></object></child>
+       <child><object class="GtkEntry" id="audio_folder"><property name="editable">false</property><property name="hexpand">true</property></object></child>
+       <child><object class="GtkBox"><property name="spacing">10</property>
+        <child><object class="GtkButton" id="audio_refresh"><property name="label">Use output folder</property></object></child>
+        <child><object class="GtkButton" id="audio_choose_folder"><property name="label">Choose folder…</property></object></child>
+        <child><object class="GtkButton" id="audio_open_folder"><property name="label">Open folder</property></object></child>
+        <child><object class="GtkButton" id="audio_reveal"><property name="label">Open file folder</property></object></child>
+       </object></child>
+       <child><object class="GtkScrolledWindow"><property name="height-request">170</property><property name="vexpand">true</property>
+        <child><object class="GtkListBox" id="audio_results"><style><class name="audio-results"/></style><property name="selection-mode">single</property></object></child>
+       </object></child>
+       <child><object class="GtkLabel" id="audio_results_status"><property name="label">Completed jobs appear here. Choose a folder to browse existing results.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      </object></child>
+     </object></property>
+    </object></child>
+    <child><object class="GtkNotebookPage">
+     <property name="tab"><object class="GtkLabel"><property name="label">Models</property></object></property>
+     <property name="child"><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">12</property><property name="margin-top">16</property>
+      <child><object class="GtkLabel"><property name="label">Choose a supported model. Browsing the catalog stays offline; only Download connects to the model host.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkEntry" id="catalog_directory"><property name="hexpand">true</property><property name="placeholder-text">Model folder (absolute path)</property></object></child>
+       <child><object class="GtkButton" id="catalog_choose"><property name="label">Model folder…</property></object></child>
+       <child><object class="GtkButton" id="catalog_refresh"><property name="label">Refresh</property></object></child>
+      </object></child>
+      <child><object class="GtkScrolledWindow"><property name="height-request">180</property><property name="vexpand">true</property>
+       <child><object class="GtkListBox" id="catalog_profiles"><style><class name="audio-results"/></style><property name="selection-mode">single</property></object></child>
+      </object></child>
+      <child><object class="GtkLabel" id="catalog_details"><property name="label">Select an admitted profile</property><property name="xalign">0</property><property name="wrap">true</property><property name="selectable">true</property></object></child>
+      <child><object class="GtkBox"><property name="spacing">12</property>
+       <child><object class="GtkButton" id="catalog_use"><property name="label">Use existing</property></object></child>
+       <child><object class="GtkButton" id="catalog_verify"><property name="label">Verify identity</property></object></child>
+       <child><object class="GtkButton" id="catalog_acquire"><property name="label">Download</property></object></child>
+      </object></child>
+      <child><object class="GtkBox"><property name="spacing">8</property><child><object class="GtkButton" id="model_edit"><property name="label">Edit parameters</property></object></child><child><object class="GtkButton" id="model_restore"><property name="label">Restore bundled defaults</property></object></child></object></child>
+      <child><object class="GtkScrolledWindow" id="model_editor"><property name="visible">false</property><property name="height-request">280</property><property name="vexpand">true</property><child><object class="GtkBox"><property name="orientation">vertical</property><property name="spacing">8</property>
+       <child><object class="GtkLabel" id="model_editor_identity"><property name="xalign">0</property><property name="wrap">true</property><property name="selectable">true</property></object></child>
+       <child><object class="GtkLabel"><property name="label">Save and use ends the loaded-model session. Models load with these settings on the next job. Pending queues keep their accepted definitions.</property><property name="wrap">true</property><property name="xalign">0</property></object></child>
+       <child><object class="GtkBox" id="model_editor_sources"><property name="spacing">8</property><child><object class="GtkLabel"><property name="label">Primary stem</property></object></child><child><object class="GtkEntry" id="model_editor_source"><property name="hexpand">true</property><property name="placeholder-text">Vocals, Instrumental, Other, Bass, Drums, Guitar, Piano, Synthesizer, Strings, Woodwinds, Brass, Wind Inst</property></object></child><child><object class="GtkCheckButton" id="model_editor_custom"><property name="label">Custom</property></object></child><child><object class="GtkCheckButton" id="model_editor_inverse"><property name="label">Inverse</property></object></child><child><object class="GtkDropDown" id="model_editor_role"><property name="model">model_editor_role_choices</property><property name="tooltip-text">Role affects vocal-split target order and prevents recursive automatic vocal splitting. Other primaries use Standard.</property></object></child><child><object class="GtkLabel"><property name="label">Backing rebalance</property></object></child><child><object class="GtkDropDown" id="model_editor_rebalance"><property name="model">model_editor_rebalance_choices</property></object></child></object></child>
+       <child><object class="GtkBox" id="model_editor_parameters_row"><property name="spacing">8</property><child><object class="GtkLabel"><property name="label">Native parameter configuration</property></object></child><child><object class="GtkEntry" id="model_editor_parameters"><property name="hexpand">true</property></object></child><child><object class="GtkButton" id="model_editor_choose"><property name="label">Choose…</property></object></child></object></child>
+       <child><object class="GtkBox" id="model_editor_exchange"><property name="orientation">vertical</property><property name="spacing">8</property>
+        <child><object class="GtkBox"><property name="spacing">8</property><child><object class="GtkLabel"><property name="label">FFT size</property></object></child><child><object class="GtkEntry" id="model_editor_fft"><property name="hexpand">true</property></object></child></object></child>
+        <child><object class="GtkBox"><property name="spacing">8</property><child><object class="GtkLabel"><property name="label">Frequency bins</property></object></child><child><object class="GtkEntry" id="model_editor_bins"><property name="hexpand">true</property></object></child></object></child>
+        <child><object class="GtkBox"><property name="spacing">8</property><child><object class="GtkLabel"><property name="label">Frame exponent (frames = 2^exponent)</property></object></child><child><object class="GtkEntry" id="model_editor_frames"><property name="hexpand">true</property></object></child></object></child>
+        <child><object class="GtkBox"><property name="spacing">8</property><child><object class="GtkLabel"><property name="label">Compensation</property></object></child><child><object class="GtkEntry" id="model_editor_compensation"><property name="hexpand">true</property></object></child></object></child>
+       </object></child>
+       <child><object class="GtkBox" id="model_editor_mask"><property name="spacing">8</property><child><object class="GtkCheckButton" id="model_editor_recurrent"><property name="label">Recurrent architecture</property></object></child>
+        <child><object class="GtkLabel"><property name="label">Network width</property></object></child><child><object class="GtkEntry" id="model_editor_channels"><property name="width-chars">6</property></object></child>
+        <child><object class="GtkLabel"><property name="label">Recurrent width</property></object></child><child><object class="GtkEntry" id="model_editor_recurrent_width"><property name="width-chars">6</property></object></child>
+       </object></child>
+       <child><object class="GtkLabel" id="model_editor_status"><property name="wrap">true</property><property name="xalign">0</property><property name="selectable">true</property></object></child>
+       <child><object class="GtkBox"><property name="spacing">8</property><child><object class="GtkButton" id="model_editor_validate"><property name="label">Validate</property></object></child><child><object class="GtkButton" id="model_editor_save"><property name="label">Save and use</property></object></child><child><object class="GtkButton" id="model_editor_reset"><property name="label">Reset draft to source defaults</property></object></child><child><object class="GtkButton" id="model_editor_cancel"><property name="label">Cancel editing</property></object></child></object></child>
+      </object></child></object></child>
+      <child><object class="GtkLabel" id="catalog_status"><property name="label">Use existing verifies the pinned file before choosing it. Verify checks identity without changing the chosen model. Download verifies and selects only on success.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+      <child><object class="GtkLabel"><property name="label">Cancel waits for the current network read or identity check. Existing files and foreign download stages are preserved. A retained stage is reported for manual review.</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+     </object></property>
+    </object></child>
+   </object></child>
+   <child><object class="GtkLabel" id="status"><property name="label">Ready</property><property name="xalign">0</property><property name="wrap">true</property></object></child>
+   <child><object class="GtkBox"><property name="spacing">12</property><property name="halign">end</property>
+    <child><object class="GtkButton" id="session_save"><property name="label">Save session as…</property><property name="tooltip-text">Save settings, model assignments, pending inputs and file references to a new preset.</property></object></child>
+    <child><object class="GtkButton" id="session_open"><property name="label">Open session…</property><property name="tooltip-text">Restore a saved session without starting processing.</property></object></child>
+    <child><object class="GtkButton" id="preferences_reset"><property name="label">Restore defaults</property><property name="tooltip-text">Restore and save default settings (Ctrl+Alt+Shift+R).</property></object></child>
+    <child><object class="GtkButton" id="session_rename"><property name="label">Rename session…</property></object></child>
+    <child><object class="GtkButton" id="session_delete"><property name="label">Delete session…</property></object></child>
+    <child><object class="GtkButton" id="preferences_save"><property name="label">Save preferences</property><property name="tooltip-text">Save current settings (Ctrl+Alt+Shift+S).</property></object></child>
+    <child><object class="GtkButton" id="cancel"><property name="label">Cancel</property><property name="sensitive">false</property></object></child>
+   </object></child>
+  </object></child>
+ </object>
+</interface>

@@ -1,0 +1,301 @@
+module stemair.exchange.host
+import "plan.ai" as plan
+import "../weights.ai" as weights
+import "../numeric.ai" as num
+import "../control.ai" as control
+import std.cpu_neural_f32 as neural
+import std.float as fp
+
+type Value=weights.Parameter
+fn copy(x:ref<Value>)->Value effects {alloc} {
+ var shape:array<u64>=[]
+ var i:u64=0
+ loop{if i>=array.len(x.shape){break}
+  array.push(shape,array.get(x.shape,i))
+  i+=1}
+ weights.Parameter{shape:shape,values:num.copy(array.view(x.values))}
+}
+fn operand(parameters:ref<array<Value>>,pool:ref<array<option<Value>>>,id:u64,original:u64)->result<Value,string> effects {alloc} {
+ if id<original{return result.ok(copy(array.borrow(parameters,id)))}
+ match array.borrow(pool,id-original){none=>result.err("Interchange operand is not live"),some(v)=>result.ok(copy(v)),}
+}
+fn same_shape(a:ref<Value>,b:ref<Value>)->bool effects {} {
+ if array.len(a.shape)!=array.len(b.shape){return false}
+ var i:u64=0
+ loop{if i>=array.len(a.shape){break}
+  if array.get(a.shape,i)!=array.get(b.shape,i){return false}
+  i+=1}
+ true
+}
+fn convolution(x:ref<Value>,w:ref<Value>,bias:ref<Value>,n:ref<plan.Node>,up:bool)->result<Value,string> effects {alloc} {
+ if array.len(x.shape)!=4 or array.len(w.shape)!=4{return result.err("Convolution requires rank-four tensors")}
+ let batch:u64=array.get(x.shape,0)
+ let ci:u64=array.get(x.shape,1)
+ let height:u64=array.get(x.shape,2)
+ let width:u64=array.get(x.shape,3)
+ let kh:u64=array.get(w.shape,2)
+ let kw:u64=array.get(w.shape,3)
+ let groups:u64=n.groups
+ let co:u64=if up{array.get(w.shape,1)*groups}else{array.get(w.shape,0)}
+ if height==0 or width==0 or kh==0 or kw==0 or groups==0 or ci%groups!=0 or co%groups!=0 or
+  (n.kernel_h!=0 and n.kernel_h!=kh) or (n.kernel_w!=0 and n.kernel_w!=kw) or
+  (not up and array.get(w.shape,1)*groups!=ci) or (up and array.get(w.shape,0)!=ci) or
+  array.len(bias.values)!=co{return result.err("Invalid convolution channels, kernel or bias")}
+ let eh:u64=(kh-1)*n.dilation_h+1
+ let ew:u64=(kw-1)*n.dilation_w+1
+ if (not up and (height+2*n.pad_h<eh or width+2*n.pad_w<ew)) or
+  (up and ((height-1)*n.stride_h+eh<=2*n.pad_h or (width-1)*n.stride_w+ew<=2*n.pad_w)){
+  return result.err("Invalid convolution extent")}
+ let oh:u64=if up{(height-1)*n.stride_h+eh-2*n.pad_h}else{(height+2*n.pad_h-eh)/n.stride_h+1}
+ let ow:u64=if up{(width-1)*n.stride_w+ew-2*n.pad_w}else{(width+2*n.pad_w-ew)/n.stride_w+1}
+ var out:array<f32>=[]
+ array.reserve(out,batch*co*oh*ow)
+ var b:u64=0
+ loop{if b>=batch{break}
+  var o:u64=0
+  loop{if o>=co{break}
+   let group:u64=o/(co/groups)
+   var y:u64=0
+   loop{if y>=oh{break}
+    var z:u64=0
+    loop{if z>=ow{break}
+     var sum:f32=0.0
+     var c:u64=group*(ci/groups)
+     loop{if c>=(group+1)*(ci/groups){break}
+      var ky:u64=0
+      loop{if ky>=kh{break}
+       var kx:u64=0
+       loop{if kx>=kw{break}
+        let iy:i64=if up{cast.sat(y+n.pad_h)-cast.sat(ky*n.dilation_h)}else{cast.sat(y*n.stride_h+ky*n.dilation_h)-cast.sat(n.pad_h)}
+        let ix:i64=if up{cast.sat(z+n.pad_w)-cast.sat(kx*n.dilation_w)}else{cast.sat(z*n.stride_w+kx*n.dilation_w)-cast.sat(n.pad_w)}
+        if iy>=0 and ix>=0{
+         let uy:u64=cast.sat(iy)
+         let ux:u64=cast.sat(ix)
+         let sy:u64=if up{uy/n.stride_h}else{uy}
+         let sx:u64=if up{ux/n.stride_w}else{ux}
+         if sy<height and sx<width and (not up or (uy%n.stride_h==0 and ux%n.stride_w==0)){
+          let wi:u64=if up{((c*(co/groups)+o%(co/groups))*kh+ky)*kw+kx}else{((o*(ci/groups)+c%(ci/groups))*kh+ky)*kw+kx}
+          sum+=array.get(x.values,((b*ci+c)*height+sy)*width+sx)*array.get(w.values,wi)
+         }
+        }
+        kx+=1}
+       ky+=1}
+      c+=1}
+     array.push(out,sum+array.get(bias.values,o))
+     z+=1}
+    y+=1}
+   o+=1}
+  b+=1}
+ result.ok(weights.Parameter{shape:[batch,co,oh,ow],values:out})
+}
+fn transpose(x:ref<Value>,order:view<u64>)->result<Value,string> effects {alloc} {
+ let rank:u64=array.len(x.shape)
+ if view.len(order)!=rank{return result.err("Transpose rank mismatch")}
+ var shape:array<u64>=[]
+ var strides:array<u64>=[]
+ var i:u64=0
+ loop{if i>=rank{break}
+  let axis:u64=view.get(order,i)
+  if axis>=rank{return result.err("Transpose axis out of range")}
+  var j:u64=0
+  loop{if j>=i{break}
+   if view.get(order,j)==axis{return result.err("Duplicate transpose axis")}
+   j+=1}
+  array.push(shape,array.get(x.shape,axis))
+  var stride:u64=1
+  j=axis+1
+  loop{if j>=rank{break}
+   stride*=array.get(x.shape,j)
+   j+=1}
+  array.push(strides,stride)
+  i+=1}
+ var out:array<f32>=[]
+ array.reserve(out,array.len(x.values))
+ i=0
+ loop{if i>=array.len(x.values){break}
+  var rest:u64=i
+  var source:u64=0
+  var j:u64=rank
+  loop{if j==0{break}
+   j-=1
+   let dim:u64=array.get(shape,j)
+   source+=(rest%dim)*array.get(strides,j)
+   rest/=dim}
+  array.push(out,array.get(x.values,source))
+  i+=1}
+ result.ok(weights.Parameter{shape:shape,values:out})
+}
+fn matmul(x:ref<Value>,w:ref<Value>)->result<Value,string> effects {alloc} {
+ let rank:u64=array.len(x.shape)
+ if rank<2 or array.len(w.shape)!=2{return result.err("Matrix multiplication requires a rank-two right operand")}
+ let inner:u64=array.get(x.shape,rank-1)
+ let columns:u64=array.get(w.shape,1)
+ if inner!=array.get(w.shape,0){return result.err("Matrix inner dimensions differ")}
+ var out:array<f32>=[]
+ let rows:u64=array.len(x.values)/inner
+ array.reserve(out,rows*columns)
+ var row:u64=0
+ loop{if row>=rows{break}
+  var col:u64=0
+  loop{if col>=columns{break}
+   var sum:f32=0.0
+   var k:u64=0
+   loop{if k>=inner{break}
+    sum+=array.get(x.values,row*inner+k)*array.get(w.values,k*columns+col)
+    k+=1}
+   array.push(out,sum)
+   col+=1}
+  row+=1}
+ var shape:array<u64>=[]
+ var i:u64=0
+ loop{if i>=rank{break}
+  array.push(shape,if i+1==rank{columns}else{array.get(x.shape,i)})
+  i+=1}
+ result.ok(weights.Parameter{shape:shape,values:out})
+}
+fn execute(parameters:ref<array<Value>>,pool:ref<array<option<Value>>>,n:ref<plan.Node>,original:u64)->result<Value,string> effects {alloc} {
+ var x:Value=try operand(parameters,pool,array.get(n.inputs,0),original)
+ match n.operation{
+  Convolution=>{
+   var w:Value=try operand(parameters,pool,array.get(n.inputs,1),original)
+   if array.len(w.shape)!=4{return result.err("Convolution parameter requires rank four")}
+   let channels:u64=array.get(w.shape,0)
+   var bias:Value=if array.len(n.inputs)==3{try operand(parameters,pool,array.get(n.inputs,2),original)}else{weights.Parameter{shape:[channels],values:num.zeros(channels)}}
+   convolution(x,w,bias,n,false)
+  },
+  TransposeConvolution=>{
+   var w:Value=try operand(parameters,pool,array.get(n.inputs,1),original)
+   if array.len(w.shape)!=4{return result.err("Transpose convolution parameter requires rank four")}
+   let channels:u64=array.get(w.shape,1)*n.groups
+   var bias:Value=if array.len(n.inputs)==3{try operand(parameters,pool,array.get(n.inputs,2),original)}else{weights.Parameter{shape:[channels],values:num.zeros(channels)}}
+   convolution(x,w,bias,n,true)
+  },
+  Relu=>{
+   var i:u64=0
+   loop{if i>=array.len(x.values){break}
+    let v:f32=array.get(x.values,i)
+    if v<0.0{array.set(x.values,i,0.0)}
+    i+=1}
+   result.ok(x)
+  },
+  Transpose=>transpose(x,array.view(n.permutation)),
+  Matmul=>{
+   var w:Value=try operand(parameters,pool,array.get(n.inputs,1),original)
+   matmul(x,w)
+  },
+  Dense=>{
+   var w:Value=try operand(parameters,pool,array.get(n.inputs,1),original)
+   if array.len(w.shape)!=2 or array.len(x.shape)<2{return result.err("Dense rank mismatch")}
+   let inner:u64=array.get(x.shape,array.len(x.shape)-1)
+   let columns:u64=array.get(w.shape,0)
+   if inner!=array.get(w.shape,1){return result.err("Dense input width mismatch")}
+   var bias:Value=if array.len(n.inputs)==3{try operand(parameters,pool,array.get(n.inputs,2),original)}else{weights.Parameter{shape:[columns],values:num.zeros(columns)}}
+   if array.len(bias.values)!=columns{return result.err("Dense bias width mismatch")}
+   var out:array<f32>=[]
+   var row:u64=0
+   loop{if row==array.len(x.values)/inner{break}
+    var column:u64=0
+    loop{if column==columns{break}
+     var sum:f32=0.0
+     var k:u64=0
+     loop{if k==inner{break}
+      sum+=array.get(x.values,row*inner+k)*array.get(w.values,column*inner+k)
+      k+=1}
+     array.push(out,sum+array.get(bias.values,column))
+     column+=1}
+    row+=1}
+   array.set(x.shape,array.len(x.shape)-1,columns)
+   result.ok(weights.Parameter{shape:struct.replace(x,[],field=shape),values:out})
+  },
+  GroupNormalization=>{
+   if array.len(x.shape)!=4{return result.err("Group normalization requires rank four")}
+   var gamma:Value=copy(array.borrow(parameters,array.get(n.inputs,1)))
+   var beta:Value=copy(array.borrow(parameters,array.get(n.inputs,2)))
+   x.values=try neural.group_norm_nchw_with_affine(array.view(x.values),array.view(gamma.values),array.view(beta.values),
+    array.get(x.shape,0),array.get(x.shape,1),array.get(x.shape,2)*array.get(x.shape,3),n.groups,0.00001,
+    neural.Affine.Separate,neural.Limits{lanes:8})
+   result.ok(x)
+  },
+  RunningNormalization=>{
+   if array.len(x.shape)!=4{return result.err("Running normalization requires rank four")}
+   let channels:u64=array.get(x.shape,1)
+   let spatial:u64=array.get(x.shape,2)*array.get(x.shape,3)
+   var gamma:Value=copy(array.borrow(parameters,array.get(n.inputs,1)))
+   var beta:Value=copy(array.borrow(parameters,array.get(n.inputs,2)))
+   var mean:Value=copy(array.borrow(parameters,array.get(n.inputs,3)))
+   var variance:Value=copy(array.borrow(parameters,array.get(n.inputs,4)))
+   if array.len(gamma.values)!=channels or array.len(beta.values)!=channels or array.len(mean.values)!=channels or array.len(variance.values)!=channels{return result.err("Running normalization channels differ")}
+   var i:u64=0
+   loop{if i==array.len(x.values){break}
+    let c:u64=(i/spatial)%channels
+    let scale:f32=array.get(gamma.values,c)/fp.sqrt(array.get(variance.values,c)+0.00001)
+    let shift:f32=array.get(beta.values,c)-array.get(mean.values,c)*scale
+    array.set(x.values,i,array.get(x.values,i)*scale+shift)
+    i+=1}
+   result.ok(x)
+  },
+  Add=>{
+   var y:Value=try operand(parameters,pool,array.get(n.inputs,1),original)
+   if not same_shape(x,y){return result.err("Addition broadcast is not admitted")}
+   var i:u64=0
+   loop{if i>=array.len(x.values){break}
+    array.set(x.values,i,array.get(x.values,i)+array.get(y.values,i))
+    i+=1}
+   result.ok(x)
+  },
+  Mul=>{
+   var y:Value=try operand(parameters,pool,array.get(n.inputs,1),original)
+   if not same_shape(x,y){return result.err("Multiplication broadcast is not admitted")}
+   var i:u64=0
+   loop{if i>=array.len(x.values){break}
+    array.set(x.values,i,array.get(x.values,i)*array.get(y.values,i))
+    i+=1}
+   result.ok(x)
+  },
+  Normalization=>{
+   if array.len(x.shape)!=4{return result.err("Normalization requires rank-four input")}
+   let channels:u64=array.get(x.shape,1)
+   let spatial:u64=array.get(x.shape,2)*array.get(x.shape,3)
+   var scale:Value=copy(array.borrow(parameters,n.scale))
+   var bias:Value=copy(array.borrow(parameters,n.bias))
+   if array.len(scale.values)!=channels{return result.err("Normalization channel mismatch")}
+   var i:u64=0
+   loop{if i>=array.len(x.values){break}
+    let channel:u64=(i/spatial)%channels
+    array.set(x.values,i,array.get(x.values,i)*array.get(scale.values,channel)+array.get(bias.values,channel))
+    i+=1}
+   result.ok(x)
+  },}
+}
+pub fn forward(p:ref<plan.Plan>,input:Value own,cancel:str)->result<Value,string> effects {alloc,fs.meta} {
+ var pool:array<option<Value>>=[]
+ var uses:array<u64>=[]
+ var i:u64=0
+ loop{if i>=p.values{break}
+  if i>=p.original_parameters{array.push(pool,option.none())}
+  array.push(uses,array.get(p.uses,i))
+  i+=1}
+ let _=ref.swap(array.borrow(pool,p.input-p.original_parameters),option.some(input))
+ i=0
+ loop{if i>=array.len(p.nodes){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let n:ref<plan.Node>=array.borrow(p.nodes,i)
+  let output:Value=try execute(struct.borrow(p.weights.parameters,field=values),pool,n,p.original_parameters)
+  let _=ref.swap(array.borrow(pool,n.output-p.original_parameters),option.some(output))
+  var j:u64=0
+  loop{if j>=array.len(n.inputs){break}
+   let id:u64=array.get(n.inputs,j)
+   let remaining:u64=array.get(uses,id)-1
+   array.set(uses,id,remaining)
+   if remaining==0 and id>=p.original_parameters{let _=ref.swap(array.borrow(pool,id-p.original_parameters),option.none())}
+   j+=1}
+  i+=1}
+ operand(struct.borrow(p.weights.parameters,field=values),pool,p.output,p.original_parameters)
+}
+
+// The explicit prepared backend reuses exactly the scalar non-contraction recipe.
+// Existing execute/forward callers and their arithmetic remain unchanged.
+pub fn execute_noncontraction(parameters:ref<array<Value>>,pool:ref<array<option<Value>>>,n:ref<plan.Node>,original:u64)->result<Value,string> effects {alloc} {
+ if n.operation==plan.Operation.Convolution or n.operation==plan.Operation.TransposeConvolution or n.operation==plan.Operation.Matmul or n.operation==plan.Operation.Dense{return result.err("Prepared contraction must use its retained CPU weights")}
+ execute(parameters,pool,n,original)
+}

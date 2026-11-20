@@ -1,0 +1,98 @@
+module stemair.typed_secondary_cache
+import "audio_result.ai" as audio
+import "typed_source_wave.ai" as source
+
+// Retained predictions and callback masters keep their original scalar storage.
+// This limit counts sample payloads; it is not a whole-process memory limit.
+pub type Limits=struct{max_retained_bytes:u64}
+pub type Prediction=struct{model:u64,sources:array<source.Wave>,write_order:array<string>,stage:string}
+pub type StageInput=struct{model:u64,source:string,samples:audio.Samples}
+pub type State=struct{predictions:array<Prediction>,inputs:array<StageInput>}
+pub fn empty()->State effects {alloc} {State{predictions:[],inputs:[]}}
+fn size(samples:ref<audio.Samples>)->result<u64,string> effects {alloc} {
+ let _=try audio.validate(samples)
+ let count:u64=audio.count(samples)
+ let width:u64=if samples.precision==audio.Precision.Float32{4}else{8}
+ if count>18446744073709551615/width{return result.err("Processing sample storage overflows")}
+ result.ok(count*width)
+}
+fn add_bytes(total:u64,bytes:u64,limits:Limits)->result<u64,string> effects {alloc} {
+ if total>limits.max_retained_bytes or bytes>limits.max_retained_bytes-total{return result.err("Processing source and input cache exceeds its retained host memory bound")}
+ result.ok(total+bytes)
+}
+pub fn extent(state:ref<State>,limits:Limits)->result<u64,string> effects {alloc} {
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(state.predictions){break}
+  let prediction:ref<Prediction>=array.borrow(state.predictions,i)
+  let _=try source.validate(struct.borrow(prediction,field=sources))
+  var at:u64=0
+  loop{if at==array.len(prediction.sources){break}
+   total=try add_bytes(total,try size(struct.borrow(array.borrow(prediction.sources,at),field=samples)),limits)
+   total=try add_bytes(total,try source.reference_bytes(array.borrow(prediction.sources,at)),limits)
+   at+=1}
+  i+=1}
+ i=0
+ loop{if i==array.len(state.inputs){break}
+  total=try add_bytes(total,try size(struct.borrow(array.borrow(state.inputs,i),field=samples)),limits)
+  i+=1}
+ result.ok(total)
+}
+pub fn find(state:ref<State>,model:u64,stage:str)->result<u64,string> effects {alloc} {
+ var i:u64=0
+ loop{if i==array.len(state.predictions){break}
+  let item:ref<Prediction>=array.borrow(state.predictions,i)
+  if item.model==model and str.view(item.stage)==stage{return result.ok(i)}
+  i+=1}
+ result.err("A required secondary prediction is missing")
+}
+pub fn push(state:ref<State>,model:u64,targets:array<string> own,samples:audio.Samples own,stage:str,limits:Limits)->result<unit,string> effects {alloc} {
+ var held:audio.Samples=samples
+ let bytes:u64=try size(held)
+ let count:u64=audio.count(held)
+ let target_count:u64=array.len(targets)
+ if target_count==0 or target_count>16 or count==0 or count%(2*target_count)!=0{return result.err("Invalid secondary model prediction")}
+ let _=try add_bytes(try extent(state,limits),bytes,limits)
+ if bytes>18446744073709551615/2{return result.err("Processing unpack extent overflows")}
+ var names:array<string>=targets
+ let waves:array<source.Wave>=try source.unpack(names,held,count/(2*target_count),source.Limits{max_working_bytes:2*bytes})
+ push_sources(state,model,waves,names,stage,limits)
+}
+pub fn push_sources(state:ref<State>,model:u64,waves:array<source.Wave> own,write_order:array<string> own,stage:str,limits:Limits)->result<unit,string> effects {alloc} {
+ var sources:array<source.Wave>=waves
+ let _=try source.validate(sources)
+ if array.len(sources)>16 or array.len(write_order)!=array.len(sources){return result.err("Invalid secondary source/write-order extent")}
+ if stage!="recording" and stage!="instrumental" and stage!="vocals"{return result.err("Unknown secondary input stage")}
+ if result.is_ok(find(state,model,stage)){return result.err("A model prediction was computed twice for one input stage")}
+ var total:u64=try extent(state,limits)
+ var i:u64=0
+ loop{if i==array.len(sources){break}
+  let wave:ref<source.Wave>=array.borrow(sources,i)
+  if wave.frames==0{return result.err("Invalid empty secondary model source")}
+  total=try add_bytes(total,try size(struct.borrow(wave,field=samples)),limits)
+  total=try add_bytes(total,try source.reference_bytes(wave),limits)
+  let name:str=array.get(write_order,i)
+  if not option.is_some(source.find(sources,name)){return result.err("Secondary write order names an absent source")}
+  var j:u64=0
+  loop{if j==i{break}
+   if array.get(write_order,j)==name{return result.err("Duplicate secondary write-order source")}
+   j+=1}
+  i+=1}
+ array.push(state.predictions,Prediction{model:model,sources:sources,write_order:write_order,stage:string.copy(stage)})
+ result.ok(())
+}
+pub fn capture(state:ref<State>,model:u64,source:str,samples:audio.Samples own,limits:Limits)->result<unit,string> effects {alloc} {
+ var held:audio.Samples=samples
+ let bytes:u64=try size(held)
+ let count:u64=audio.count(held)
+ if count==0 or count%2!=0{return result.err("Invalid captured processing input")}
+ if source!="recording" and source!="instrumental" and source!="vocals"{return result.err("Unknown captured processing input stage")}
+ var i:u64=0
+ loop{if i==array.len(state.inputs){break}
+  let item:ref<StageInput>=array.borrow(state.inputs,i)
+  if item.model==model and str.view(item.source)==source{return result.err("A processing input was captured twice for one stage")}
+  i+=1}
+ let _=try add_bytes(try extent(state,limits),bytes,limits)
+ array.push(state.inputs,StageInput{model:model,source:string.copy(source),samples:held})
+ result.ok(())
+}

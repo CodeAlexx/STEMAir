@@ -1,0 +1,28 @@
+module stemair.hybrid.multi_capacity
+import std.system as system
+pub type Plan=struct{frames:u64,steps:u64,peak_words:u64,complex_words:u64,transpose_matrix_words:u64,matrix_input_bytes:u64,local_words:u64,working_bytes:u64}
+pub fn plan(frames:u64)->result<Plan,string> effects {alloc}{
+ if frames==0 or frames>16711680{return result.err("Frequency-band recording extent exceeds retained graph bound")}
+ let steps:u64=(frames+1023)/1024
+ // Source [.1,.3] split: encoder0 heights51/102/359 and
+ // decoder5 input heights51/103/358, kernel8/stride4.
+ let rewrite:u64=96*359*steps
+ let complex:u64=16*2048*steps
+ let time_rewrite:u64=96*((frames+3)/4)
+ let peak:u64=if rewrite>complex{rewrite}else{complex}
+ let largest:u64=if peak>time_rewrite{peak}else{time_rewrite}
+ let local:u64=4*steps*steps
+ let matrix:u64=128*358*steps
+ let input_bytes:u64=4*48*358*steps
+ // Conservative logical working reservation, not allocator/RSS measurement:
+ // six largest activations, three complete outputs, two input masters.
+ let working:u64=6*largest*4+3*8*frames*4+2*2*frames*4
+ result.ok(Plan{frames:frames,steps:steps,peak_words:largest,complex_words:complex,
+  transpose_matrix_words:matrix,matrix_input_bytes:input_bytes,local_words:local,working_bytes:working})
+}
+pub fn require_memory(value:ref<Plan>,maximum:u64)->result<unit,string> effects {alloc}{
+ if maximum==0 or value.working_bytes>maximum{return result.err("Frequency-band recording exceeds explicit retained working-byte budget")}
+ let available:system.Memory=match system.memory(){ok(v)=>v,err(_)=>{return result.err("Cannot query frequency-band recording RAM availability")}}
+ if value.working_bytes+536870912>available.available_bytes{return result.err("Not enough available RAM for bounded frequency-band recording activations")}
+ result.ok(())
+}

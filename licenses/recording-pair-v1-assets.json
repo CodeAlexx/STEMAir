@@ -1,0 +1,17 @@
+{
+  "model": "recording-pair-v1",
+  "filename": "recording-pair-v1.yaml",
+  "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR_Demucs_Model_1.yaml",
+  "bytes": 33,
+  "sha256": "40dd1254be3d410a0ab18522c40f535b0a9fcb5691a7224449fae35b83f5b382",
+  "configuration": "configs/recording-pair-v1.json",
+  "credit": "Original Demucs models by Meta Platforms and collaborators, MIT license; attention-MIT.txt, hybrid-MIT.txt and waveform-MIT.txt. Original identifiers preserve checkpoint compatibility.",
+  "dependencies": [
+    {
+      "filename": "hybrid-pair-v1.th",
+      "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/ebf34a2db.th",
+      "bytes": 167390507,
+      "sha256": "dbdd521017d706829716055df8a86e7ee5d05a590508488c82ffb551c6edb918"
+    }
+  ]
+}

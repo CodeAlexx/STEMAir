@@ -1,0 +1,48 @@
+module stemair.weighted_sources
+import "numeric.ai" as num
+import std.float as fp
+
+pub type Accumulator=struct{samples:array<f32>,totals:array<f64>,frames:u64,sources:u64,members:u64=0}
+pub fn create(frames:u64,sources:u64)->result<Accumulator,string> effects {alloc}{
+ if frames==0 or sources<2 or sources>8 or frames>134217728{return result.err("Invalid weighted source extent")}
+ var totals:array<f64>=[]
+ var i:u64=0
+ loop{if i==sources{break}
+  array.push(totals,0.0)
+  i+=1}
+ result.ok(Accumulator{samples:num.zeros(2*sources*frames),totals:totals,frames:frames,sources:sources})
+}
+pub fn add(state:ref<Accumulator>,samples:view<f32>,weights:view<f64>)->result<unit,string> effects {alloc}{
+ if view.len(samples)!=2*state.sources*state.frames or view.len(weights)!=state.sources or not num.finite(samples){return result.err("Weighted member shape or values differ")}
+ var source:u64=0
+ loop{if source==state.sources{break}
+  let weight:f64=view.get(weights,source)
+  let coefficient:f32=cast.float(weight)
+  if not fp.is_finite(weight) or not fp.is_finite(coefficient) or weight<0.0{return result.err("Invalid source weight")}
+  array.set(state.totals,source,array.get(state.totals,source)+weight)
+  var i:u64=source*2*state.frames
+  let stop:u64=i+2*state.frames
+  loop{if i==stop{break}
+   let weighted:f32=view.get(samples,i)*coefficient
+   array.set(state.samples,i,array.get(state.samples,i)+weighted)
+   i+=1}
+  source+=1}
+ state.members+=1
+ result.ok(())
+}
+pub fn finish(state:Accumulator own)->result<array<f32>,string> effects {alloc}{
+ var current:Accumulator=state
+ if current.members==0{return result.err("Weighted bundle is empty")}
+ var source:u64=0
+ loop{if source==current.sources{break}
+  let total:f32=cast.float(array.get(current.totals,source))
+  if not fp.is_finite(total) or total<=0.0{return result.err("A source has no finite positive total weight")}
+  var i:u64=source*2*current.frames
+  let stop:u64=i+2*current.frames
+  loop{if i==stop{break}
+   array.set(current.samples,i,array.get(current.samples,i)/total)
+   i+=1}
+  source+=1}
+ if not num.finite(array.view(current.samples)){return result.err("Weighted bundle output is non-finite")}
+ result.ok(struct.replace(current,[],field=samples))
+}

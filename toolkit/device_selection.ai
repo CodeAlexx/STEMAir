@@ -1,0 +1,23 @@
+module stemair.device_selection
+import std.gpu as gpuapi
+import std.text as text
+pub fn parse(raw:str)->result<u32,string> effects {alloc}{
+ if str.len(raw)==0 or str.len(raw)>10{return result.err("GPU index must be a nonnegative whole number")}
+ var i:u64=0
+ loop{if i==str.len(raw){break}
+  let value:u8=cast.bits(view.get(str.bytes(raw),i))
+  if value<48 or value>57{return result.err("GPU index must be a nonnegative whole number")}
+  i+=1}
+ let value:u64=match text.parse_u64(raw){none=>{return result.err("GPU index exceeds its integer extent")},some(v)=>v}
+ from_integer(value)
+}
+pub fn from_integer(value:u64)->result<u32,string> effects {alloc}{
+ if value>4294967295{return result.err("GPU index exceeds its integer extent")}
+ result.ok(cast.wrap(value))
+}
+pub fn available(index:u32)->result<unit,string> effects {alloc,gpu}{
+ let count:u64=match gpuapi.device_count(){ok(value)=>value,err(e)=>{return result.err(string.copy(e.message))}}
+ let requested:u64=cast.wrap(index)
+ if requested>=count{return result.err("Selected GPU index is unavailable")}
+ result.ok(())
+}

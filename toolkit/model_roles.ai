@@ -1,0 +1,33 @@
+module stemair.model_roles
+import "secondary_config.ai" as config
+import "stem_names.ai" as names
+import "engine.ai" as engine
+import "mask/request.ai" as request
+import std.float as fp
+import std.text as text
+
+pub fn validate(model:ref<config.Model>,profile:ref<engine.Profile>)->result<unit,string> effects {alloc} {
+ if model.role>2 or not fp.is_finite(model.rebalance) or model.rebalance<0.0 or model.rebalance>0.9 or (model.role!=2 and model.rebalance!=0.0){return result.err("Invalid accepted model role or backing rebalance")}
+ if model.role==0{return result.ok(())}
+ if array.len(profile.targets)!=2{return result.err("A vocal model role requires two complementary sources")}
+ let first:str=array.get(profile.targets,0)
+ let second:str=array.get(profile.targets,1)
+ if (first!="vocals" or second!="instrumental") and (first!="instrumental" or second!="vocals"){return result.err("A vocal model role requires a vocal/instrumental native source order")}
+ result.ok(())
+}
+pub fn targets(profile:ref<engine.Profile>,model:ref<config.Model>,stage:str)->result<array<string>,string> effects {alloc} {
+ let _=try validate(model,profile)
+ if stage=="vocals" and model.role>0{
+  let selected:names.Role=names.Role{kind:model.role,rebalance:model.rebalance}
+  let pair:names.Pair=try names.split_pair(array.get(profile.targets,0),selected)
+  return result.ok([string.copy(pair.primary),string.copy(pair.secondary)])}
+ var out:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(profile.targets){break}
+  array.push(out,string.copy(array.get(profile.targets,i)))
+  i+=1}
+ result.ok(out)
+}
+pub fn foreground(model:ref<config.Model>,stage:str)->request.Foreground effects {} {
+ if stage=="vocals" and model.role>0{request.Foreground.Background}else{request.Foreground.Profile}
+}

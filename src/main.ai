@@ -1,0 +1,138 @@
+module stemair.main
+import "cli_audio_policy.ai" as policy
+import "cli_audio_utilities.ai" as utility
+import "cli_audio_cpu.ai" as cpu
+import "recording_inference_policy.ai" as recording_policy
+import "../toolkit/recording_context.ai" as recording_context
+import "artifact_cleanup_policy.ai" as cleanup_policy
+import "../toolkit/mask/request.ai" as mask_request
+import "cli_audio_cpu_queue.ai" as cpu_queue
+import "recording_sample_cli.ai" as samples
+import "paired_alignment_cli.ai" as paired
+import "reference_mastering_cli.ai" as mastering
+import "cli_processing_sample.ai" as sample_input
+import "container_export.ai" as container
+import "checked_input.ai" as checked
+import "catalog_main.ai" as catalog
+import "queue_config.ai" as queue
+import "secondary_application.ai" as secondary
+import "model_ensemble_application.ai" as models
+import "../toolkit/secondary_config.ai" as secondary_config
+import "../toolkit/model_ensemble_config.ai" as model_config
+import "../toolkit/model_cache.ai" as cache
+import "../toolkit/engine.ai" as engine
+import "cpu_session_close.ai" as cpu_close
+import std.text as text
+
+fn fail(problem:str)->i32 effects {alloc,io.write} {io.ewrite(text.concat(problem,"\n"))
+ 1}
+fn process(args:view<str>,settings:ref<policy.Settings>,log:ref<container.Journal>,recording:str)->result<unit,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, io.write, process, random, time} {
+ let action:str=view.get(args,1)
+ if utility.handled(action){return utility.run(args,settings,log)}
+ if (action=="separate" and view.len(args)!=6) or ((action=="secondary" or action=="model-ensemble") and view.len(args)!=5){return result.err("Invalid separation arguments; use stem-air help")}
+ if action!="separate" and action!="secondary" and action!="model-ensemble"{return result.err("Unknown processing action; use stem-air help")}
+ let directory:str=view.get(args,view.len(args)-1)
+ var plan:container.Plan=try policy.plan(settings)
+ let input_cancel:string=string.copy(settings.cancel_file)
+ var options:checked.Options=try policy.input(settings,directory,input_cancel)
+ let sample_progress:string=string.copy(settings.progress_file)
+ var prepared:sample_input.Input=try sample_input.open(settings,view.get(args,if action=="separate"{4}else{3}),options,sample_progress)
+ let outcome:result<unit,string>=process_model(args,settings,log,options,prepared.path,plan,recording)
+ sample_input.finish(prepared,outcome)
+}
+fn process_model(args:view<str>,settings:ref<policy.Settings>,log:ref<container.Journal>,input_options:checked.Options own,input:str,plan:ref<container.Plan>,snapshot:str)->result<unit,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, random, time} {
+ var options:checked.Options=input_options
+ var recording:recording_context.Context=try recording_policy.resolve(snapshot,options.limits.max_decoded_bytes)
+ let action:str=view.get(args,1)
+ let directory:str=view.get(args,view.len(args)-1)
+ let application_root:string=try policy.root(settings)
+ var request:mask_request.Policy=try policy.request(settings,0)
+ var bank:cache.Cache=cache.empty()
+ let outcome:result<unit,string>=process_bank(args,settings,log,options,input,plan,bank,application_root,request,recording)
+ cpu_close.finish(bank,outcome)
+}
+fn process_bank(args:view<str>,settings:ref<policy.Settings>,log:ref<container.Journal>,input_options:checked.Options own,input:str,plan:ref<container.Plan>,bank:ref<cache.Cache>,application_root:str,request:ref<mask_request.Policy>,recording:ref<recording_context.Context>)->result<unit,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, random, time}{
+ var options:checked.Options=input_options
+ let learned:string=try policy.learned_snapshot(settings)
+ let _=try cache.select_learned(bank,learned)
+ let action:str=view.get(args,1)
+ let directory:str=view.get(args,view.len(args)-1)
+ if action=="separate"{return cpu.single_prepared_controlled(bank,view.get(args,2),view.get(args,3),input,directory,settings.cancel_file,settings.progress_file,plan,log,options,application_root,request,recording)}
+ if action=="secondary"{var selected:secondary_config.Recipe=try secondary.read(view.get(args,2))
+  return cpu.secondary_prepared_controlled(bank,selected,input,directory,settings.cancel_file,settings.progress_file,plan,log,options,application_root,request,recording)}
+ var selected:model_config.Recipe=try models.read(view.get(args,2))
+ cpu.ensemble_prepared_controlled(bank,selected,input,directory,settings.cancel_file,settings.progress_file,plan,log,options,application_root,request,recording)
+}
+fn success(action:str)->str effects {} {
+ if action=="separate"{"Separation complete\n"}else{if action=="secondary"{"Secondary processing complete\n"}else{
+ if action=="model-ensemble"{"Model ensemble complete\n"}else{if action=="ensemble"{"Ensemble complete\n"}else{
+ if action=="pitch-resample"{"Pitch and duration complete\n"}else{if action=="align"{"Coarse alignment complete\n"}else{"Audio tool complete\n"}}}}}}
+}
+fn dispatch(args:view<str>,settings:ref<policy.Settings>)->i32 effects {alloc,env,fs.read,fs.write,fs.meta,process,time,net,random,ffi,io.write} {
+ match policy.inherit_application_root(settings){err(problem)=>{return fail(problem)},ok(_)=>{}}
+ let recording:string=match policy.recording_snapshot(settings){ok(value)=>value,err(problem)=>{return fail(problem)}}
+ if view.len(args)==1 or view.get(args,1)=="help" or view.get(args,1)=="--help"{
+  io.write("StemAIR - native local music separation (in development)\n")
+  io.write("  stem-air [--io-settings FILE] separate CONFIG CHECKPOINT INPUT OUTPUT_DIRECTORY\n")
+  io.write("  stem-air [--io-settings FILE] secondary|model-ensemble RECIPE INPUT OUTPUT_DIRECTORY\n")
+  io.write("  stem-air [--io-settings FILE] queue RECIPE OUTPUT_DIRECTORY\n")
+  io.write("  stem-air [--io-settings FILE] ensemble|audio-tool RECIPE OUTPUT_DIRECTORY\n")
+  io.write("  stem-air [--io-settings FILE] pitch-resample|audio-time RECIPE INPUT OUTPUT_DIRECTORY\n")
+  io.write("  stem-air [--io-settings FILE] align|recording-align RECIPE FIRST SECOND OUTPUT_DIRECTORY\n")
+  io.write("  stem-air [--io-settings FILE] pair-align ALIGNMENT_RECIPE PAIRS_JSON OUTPUT_DIRECTORY\n")
+  io.write("  stem-air [--io-settings FILE] master TARGET REFERENCE OUTPUT_DIRECTORY\n")
+  io.write("  stem-air [--io-settings FILE] master-pairs PAIRS_JSON OUTPUT_DIRECTORY\n")
+  io.write("  stem-air [--io-settings FILE] export-wav|export-audio RECIPE INPUT OUTPUT\n")
+  io.write("  stem-air [--io-settings FILE] sample-recordings RECIPE OUTPUT_DIRECTORY\n")
+  io.write("  stem-air inspect CONFIG CHECKPOINT\n  stem-air models list ROOT [ASSET_DIRECTORY]\n  stem-air models verify|acquire ROOT PROFILE [ASSET_DIRECTORY]\n")
+  io.write("I/O settings: noise_reduction, room_reduction, room_targets (vocals/lead/backing/all), noise_checkpoint and room_checkpoint select optional learned cleanup.\n")
+  io.write("Default: checked audio input, 512 MiB logical audio buffer, float32 WAV output. Choose explicit supported audio codec tools for compressed input/output. Engine and processing limits also apply.\n")
+  io.write("I/O settings may enable recording_override with recording_shifts, recording_split, recording_overlap, recording_segment and recording_seed (Random or an unsigned integer). Recording controls use the selected CPU or GPU model route.\n")
+  return 0}
+ let action:str=view.get(args,1)
+ if action=="sample-recordings"{return match samples.run(args,settings){ok(code)=>code,err(problem)=>fail(problem)}}
+ if action=="pair-align"{return match paired.run(args,settings){ok(code)=>code,err(problem)=>fail(problem)}}
+ if action=="master" or action=="master-pairs"{return match mastering.run(args,settings){ok(code)=>code,err(problem)=>fail(problem)}}
+ if action=="models"{return catalog.main(view.slice(args,1,view.len(args)))}
+ if action=="inspect"{
+  if view.len(args)!=4{return fail("Use stem-air inspect CONFIG CHECKPOINT")}
+  let profile:engine.Profile=match engine.read(view.get(args,2)){ok(v)=>v,err(e)=>{return fail(e)}}
+  var loaded:engine.Loaded=match engine.open(view.get(args,3),profile){ok(v)=>v,err(e)=>{return fail(e)}}
+  io.write(text.concat("parameters=",text.concat(string.from_int(engine.parameter_count(loaded)),text.concat(" checkpoint_loads=",text.concat(string.from_int(engine.loads(loaded)),text.concat(" bytes_read=",string.from_int(engine.bytes_read(loaded))))))))
+  io.write("\nArchitecture and parameter shapes validated; inference not run.\n")
+  return 0}
+ if action=="queue"{
+  if view.len(args)!=4{return fail("Use stem-air queue RECIPE OUTPUT_DIRECTORY")}
+  var selection:queue.Plan=match queue.read(view.get(args,2)){ok(v)=>v,err(e)=>{return fail(e)}}
+  var plan:container.Plan=match policy.plan(settings){ok(v)=>v,err(e)=>{return fail(e)}}
+  let input_cancel:string=string.copy(settings.cancel_file)
+  var options:checked.Options=match policy.input(settings,view.get(args,3),input_cancel){ok(v)=>v,err(e)=>{return fail(e)}}
+  var bank:cache.Cache=cache.empty()
+  var controlled:recording_context.Context=match recording_policy.resolve(recording,options.limits.max_decoded_bytes){ok(value)=>value,err(problem)=>{return fail(problem)}}
+  let outcome:result<cpu_queue.Outcome,string>=cpu_queue.run_controlled(bank,selection,settings,view.get(args,3),plan,options,controlled)
+  let closed:result<unit,string>=cache.close(bank)
+  let done:cpu_queue.Outcome=match outcome{ok(v)=>v,err(e)=>{match closed{err(problem)=>{return fail(text.concat(e,text.concat("; CPU session close failed: ",problem)))},ok(_)=>{}}
+   return fail(e)}}
+  match closed{err(e)=>{return fail(e)},ok(_)=>{}}
+  match cpu_queue.summary(done){ok(raw)=>{io.write(text.concat(raw,"\n"))},err(e)=>{return fail(e)}}
+  return if done.ok{0}else{1}}
+ var log:container.Journal=container.empty_journal()
+ match process(args,settings,log,recording){err(e)=>{
+  if str.len(log.failure)==0{container.record_failure(log,"",e)}
+  let code:i32=fail(policy.failure(log,e))
+  policy.journal(log)
+  code},ok(_)=>{
+   if action!="export-wav" and action!="export-audio"{io.write(success(action))}
+   0}}
+}
+pub fn main(args:view<str>)->i32 effects {alloc,env,fs.read,fs.write,fs.meta,process,time,net,random,ffi,io.write} {
+ var settings:policy.Settings=policy.Settings{}
+ if view.len(args)>1 and view.get(args,1)=="--io-settings"{
+  if view.len(args)<4{return fail("Use stem-air --io-settings FILE ACTION ...")}
+  settings=match policy.read(view.get(args,2)){ok(v)=>v,err(e)=>{return fail(e)}}
+  return dispatch(view.slice(args,2,view.len(args)),settings)}
+ dispatch(args,settings)
+}

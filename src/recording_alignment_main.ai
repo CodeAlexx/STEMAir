@@ -1,0 +1,44 @@
+module stemair.recording_alignment_main
+import "recording_alignment_application.ai" as alignment
+import "alignment_thread_policy.ai" as threads
+import std.files as files
+import std.codec as codec
+import std.text as text
+
+pub fn read(file:str)->result<alignment.Settings,string> effects {alloc,fs.read} {
+ let raw:bytes=match files.read_limited(file,16384){ok(value)=>value,err(_)=>{
+  return result.err("Cannot read a recording alignment recipe within 16384 bytes")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(value)=>value,none=>{
+  return result.err("Recording alignment recipe must be UTF-8")}}
+ let settings:alignment.Settings=try alignment.Settings_decode(source) map_err codec.describe
+ let _=try alignment.validate(settings)
+ result.ok(settings)
+}
+fn usage()->unit effects {io.write} {
+ io.write("Use stem-recording-align RECIPE.json FIRST.wav SECOND.wav OUTPUT_DIRECTORY [CANCEL_FILE] [PROGRESS_FILE]\n")
+}
+fn run(args:view<str>)->result<unit,string> effects {alloc,ffi,fs.meta,fs.read,fs.write,io.write} {
+ let settings:alignment.Settings=try read(view.get(args,1))
+ let cancel:string=if view.len(args)>=6{string.copy(view.get(args,5))}else{""}
+ let progress:string=if view.len(args)>=7{string.copy(view.get(args,6))}else{""}
+ let lease:threads.Lease=try threads.begin(settings.dot_runtime,settings.dot_sha256) map_err threads.describe
+ let outcome:result<alignment.Report,string>=alignment.run(settings,view.get(args,2),view.get(args,3),view.get(args,4),cancel,progress)
+ let restored:result<unit,threads.Failure>=threads.end(lease)
+ let restoration:string=match restored{ok(_)=>"",err(error)=>threads.describe(error)}
+ let report:alignment.Report=match outcome{ok(value)=>{
+  if str.len(restoration)>0{return result.err(restoration)}
+  value},err(error)=>{return result.err(if str.len(restoration)==0{error}else{text.concat(error,text.concat("; ",restoration))})}}
+ let encoded:string=try alignment.Report_encode(report) map_err codec.describe
+ io.write(encoded)
+ io.write("\n")
+ result.ok(())
+}
+pub fn main(args:view<str>)->i32 effects {alloc,ffi,fs.meta,fs.read,fs.write,io.write} {
+ if view.len(args)==2 and (view.get(args,1)=="help" or view.get(args,1)=="--help"){usage()
+  return 0}
+ if view.len(args)<5 or view.len(args)>7{usage()
+  return 2}
+ match run(args){ok(_)=>0,err(error)=>{io.ewrite(error)
+  io.ewrite("\n")
+  1}}
+}

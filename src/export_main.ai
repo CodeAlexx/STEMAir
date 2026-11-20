@@ -1,0 +1,31 @@
+module stemair.export_main
+import "../toolkit/export_audio.ai" as export_audio
+import std.audio as audio
+import std.files as files
+import std.codec as codec
+
+fn failure(error:files.ReadError)->string effects {alloc} {
+ match error{Io(problem)=>string.copy(fs.error.message(problem)),TooLarge=>"Export input exceeds its file-size bound"}
+}
+fn run(args:view<str>)->result<string,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let recipe:bytes=try files.read_limited(view.get(args,1),16384) map_err failure
+ let source:str=match str.from_bytes(bytes.view(recipe)){some(v)=>v,none=>{return result.err("Export settings must be UTF-8")}}
+ let settings:export_audio.Settings=try export_audio.Settings_decode(source) map_err codec.describe
+ let input:bytes=try files.read_limited(view.get(args,2),67112960) map_err failure
+ let info:audio.WavInfo=try audio.inspect_wav(bytes.view(input)) map_err audio.message
+ if info.frames==0{return result.err("Cannot export an empty recording")}
+ let audio:audio.AudioBuffer=try audio.decode_wav(bytes.view(input)) map_err audio.message
+ let cancel:string=if view.len(args)>=5{string.copy(view.get(args,4))}else{""}
+ let progress:string=if view.len(args)>=6{string.copy(view.get(args,5))}else{""}
+ let report:export_audio.Report=try export_audio.run(audio,settings,view.get(args,3),cancel,progress)
+ result.ok(try export_audio.Report_encode(report) map_err codec.describe)
+}
+pub fn main(args:view<str>)->i32 effects {alloc,fs.read,fs.write,fs.meta,io.write} {
+ if view.len(args)<4 or view.len(args)>6{io.ewrite("Usage: stem-export SETTINGS.json INPUT.wav OUTPUT.wav [CANCEL_FILE] [PROGRESS_FILE]\n")
+  return 2}
+ match run(args){ok(report)=>{io.write(report)
+  io.write("\n")
+  0},err(problem)=>{io.ewrite(problem)
+  io.ewrite("\n")
+  1}}
+}

@@ -1,0 +1,57 @@
+module stemair.session_presets
+import "preferences.ai" as preferences
+import std.files as files
+import std.text as text
+import "preset_names.ai" as names
+
+// Session presets contain settings and file references; model state stays in memory.
+pub fn read(file:str)->result<preferences.State,string> effects {alloc,fs.read} {
+ let raw:bytes=match files.read_limited(file,4194304){ok(value)=>value,err(_)=>{
+  return result.err("Cannot read the session preset within its 4 MiB limit")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(value)=>value,none=>{
+  return result.err("The session preset is not UTF-8")}}
+ preferences.decode(source)
+}
+fn failure(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+fn rename_failure(error:fs.error)->string effects {alloc} {
+ text.concat("Cannot rename this preset on the selected filesystem: ",fs.error.message(error))
+}
+// Management affects the selected preset file, never the active desktop state.
+pub fn identity(file:str)->result<string,string> effects {alloc,fs.read,fs.meta} {
+ let info:fs.meta=try files.symlink_metadata(file) map_err failure
+ if not info.is_file or info.is_symlink{return result.err("Choose a regular session preset file")}
+ let _=try read(file)
+ let digest:string=try files.sha256(file) map_err failure
+ result.ok(digest)
+}
+fn unchanged(file:str,expected:str)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ let current:string=try identity(file)
+ if current!=expected{return result.err("The selected preset changed; choose it again")}
+ result.ok(())
+}
+pub fn renamed_path(file:str,name:str)->result<string,string> effects {alloc} {
+ names.renamed_path(file,name)
+}
+
+pub fn rename(file:str,name:str,expected:str)->result<string,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let destination:string=try renamed_path(file,name)
+ let _=try unchanged(file,expected)
+ let _=try files.rename_new(file,destination) map_err rename_failure
+ result.ok(destination)
+}
+pub fn remove(file:str,expected:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let _=try unchanged(file,expected)
+ let _=try files.remove(file) map_err failure
+ result.ok(())
+}
+pub fn save(state:ref<preferences.State>,file:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let raw:string=try preferences.encode(state)
+ let temporary:string=text.concat(file,".saving")
+ var sink:files.Sink=try files.sink_create(file,temporary) map_err failure
+ match files.sink_write(sink,str.bytes(raw)){ok(_)=>{},err(error)=>{
+  let _=files.sink_discard(sink)
+  return result.err(failure(error))}}
+ let published:files.Publication=try files.sink_publish_new(sink,false) map_err failure
+ if not published.temporary_removed{return result.err(text.concat("Session preset saved; staging remains at ",published.temporary))}
+ result.ok(())
+}

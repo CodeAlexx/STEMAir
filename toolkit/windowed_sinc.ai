@@ -1,0 +1,100 @@
+module stemair.windowed_sinc
+import "numeric.ai" as num
+import std.float as fp
+
+pub type Plan=struct{step:u64,phases:u64,width:u64,kernel:array<f32>}
+fn gcd(a:u64,b:u64)->u64 effects {} {
+ var x:u64=a
+ var y:u64=b
+ loop{if y==0{break}
+  let remainder:u64=x%y
+  x=y
+  y=remainder}
+ x
+}
+// Small-ratio rational interpolation, 24 zero crossings and cosine-squared
+// taper. Coefficients follow F32 tensor arithmetic and unit DC normalization.
+pub fn plan(input_rate:u64,output_rate:u64)->result<Plan,string> effects {alloc} {
+ if input_rate==0 or output_rate==0 or input_rate>192000 or output_rate>192000{return result.err("Invalid windowed-sinc rates")}
+ let divisor:u64=gcd(input_rate,output_rate)
+ let step:u64=input_rate/divisor
+ let phases:u64=output_rate/divisor
+ if step>64 or phases>64{return result.err("Windowed-sinc reduced ratio exceeds its bound")}
+ if step==phases{return result.ok(Plan{step:1,phases:1,width:0,kernel:[1.0]})}
+ let minimum:u64=if step<phases{step}else{phases}
+ let cutoff:f64=cast.float(minimum)*0.945
+ let width:u64=cast.sat(fp.ceil(24.0*cast.float(step)/cutoff))
+ let size:u64=2*width+step
+ var kernel:array<f32>=[]
+ var phase:u64=0
+ loop{if phase==phases{break}
+  let phase_fraction:f64=-cast.float(phase)/cast.float(phases)
+  let offset:f32=cast.float(phase_fraction)
+  let frequency:f32=cast.float(cutoff)
+  let beginning:u64=array.len(kernel)
+  var sum:f64=0.0
+  var i:u64=0
+  loop{if i==size{break}
+   let integer:i64=cast.sat(i)-cast.sat(width)
+   let index:f32=cast.float(integer)
+   var time:f32=(offset+index/cast.float(step))*frequency
+   if time< -24.0{time= -24.0}
+   if time>24.0{time=24.0}
+   time*=3.14159265358979323846
+   let cosine:f32=fp.cos(time/24.0/2.0)
+   let window:f32=cosine*cosine
+   let sinc:f32=if time==0.0{1.0}else{fp.sin(time)/time}
+   let value:f32=sinc*window
+   array.push(kernel,value)
+   sum+=cast.float(value)
+   i+=1}
+  let normalization:f32=cast.float(sum)
+  i=0
+  loop{if i==size{break}
+   array.set(kernel,beginning+i,array.get(kernel,beginning+i)/normalization)
+   i+=1}
+  phase+=1}
+ result.ok(Plan{step:step,phases:phases,width:width,kernel:kernel})
+}
+pub fn padded(p:ref<Plan>,input:view<f32>,channels:u64)->result<array<f32>,string> effects {alloc} {
+ if channels==0 or channels>64 or view.len(input)==0 or view.len(input)%channels!=0 or
+  view.len(input)>317520000 or not num.finite(input){return result.err("Expected finite planar resampling input")}
+ if p.step==0 or p.phases==0 or array.len(p.kernel)!=p.phases*(2*p.width+p.step){return result.err("Invalid windowed-sinc plan")}
+ let length:u64=view.len(input)/channels
+ let padded_length:u64=length+2*p.width+p.step
+ var output:array<f32>=[]
+ array.reserve(output,channels*padded_length)
+ var channel:u64=0
+ loop{if channel==channels{break}
+  var time:u64=0
+  loop{if time==padded_length{break}
+   let source:u64=if time<p.width{0}else{if time-p.width>=length{length-1}else{time-p.width}}
+   array.push(output,view.get(input,channel*length+source))
+   time+=1}
+  channel+=1}
+ result.ok(output)
+}
+pub fn apply(p:ref<Plan>,input:view<f32>,channels:u64)->result<array<f32>,string> effects {alloc} {
+ let source:array<f32>=try padded(p,input,channels)
+ let length:u64=view.len(input)/channels
+ let padded_length:u64=length+2*p.width+p.step
+ let count:u64=length*p.phases/p.step
+ let size:u64=2*p.width+p.step
+ var output:array<f32>=[]
+ array.reserve(output,channels*count)
+ var channel:u64=0
+ loop{if channel==channels{break}
+  var time:u64=0
+  loop{if time==count{break}
+   let phase:u64=time%p.phases
+   let start:u64=(time/p.phases)*p.step
+   var value:f32=0.0
+   var i:u64=0
+   loop{if i==size{break}
+    value+=array.get(source,channel*padded_length+start+i)*array.get(p.kernel,phase*size+i)
+    i+=1}
+   array.push(output,value)
+   time+=1}
+  channel+=1}
+ result.ok(output)
+}

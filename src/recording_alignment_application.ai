@@ -1,0 +1,132 @@
+module stemair.recording_alignment_application
+import "../toolkit/recording_alignment.ai" as core
+import "../toolkit/recording_resources.ai" as resources
+import "../toolkit/local_residual.ai" as local
+import "../toolkit/export_audio.ai" as export
+import "../toolkit/control.ai" as control
+import "../toolkit/numeric.ai" as num
+import std.audio as audio
+import std.cpu_dot as dot
+import std.cpu_fft as fft
+import std.cabi as native
+import std.files as files
+import std.path as path
+import std.codec as codec
+import std.text as text
+
+pub type Settings=struct{dot_runtime:string,dot_sha256:string,fft_runtime:string,fft_sha256:string,math_runtime:string,host_recipe:string,input_limit_bytes:u64,max_decoded_bytes:u64,max_working_bytes:u64,save_aligned:bool=false} derive codec(strict)
+pub type Report=struct{frames:u64,channels:u64,lag_samples:i64,inverted:bool,silence_delta:i64,intro_index:u64,local_windows:u64,
+ residual:string,aligned:string,residual_staging_removed:bool,aligned_staging_removed:bool,residual_staging_path:string,aligned_staging_path:string,
+ backend:string,checkpoint_loads:u64} derive codec(strict)
+type AlignedState=struct{removed:bool,path:string}
+fn read_problem(error:files.ReadError)->string effects {alloc} {
+ match error{Io(value)=>string.copy(fs.error.message(value)),TooLarge=>string.copy("Recording input exceeds the caller encoded-file byte limit")}
+}
+fn problem(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+pub fn validate(settings:ref<Settings>)->result<local.Recipe,string> effects {alloc} {
+ if settings.input_limit_bytes==0 or settings.max_decoded_bytes==0 or settings.max_working_bytes==0{return result.err("Recording alignment requires explicit positive resource limits")}
+ if str.len(settings.dot_runtime)==0 or str.len(settings.fft_runtime)==0 or str.len(settings.math_runtime)==0 or
+  str.len(settings.dot_sha256)!=64 or str.len(settings.fft_sha256)!=64{return result.err("Recording alignment requires explicit pinned CPU dot/transform runtimes and a host math library")}
+ if settings.host_recipe=="windows-ucrt"{return result.ok(local.Recipe.WindowsScalar)}
+ if settings.host_recipe=="linux-vector-roundoff"{return result.ok(local.Recipe.LinuxVectorRoundoff)}
+ result.err("Choose a qualified host window recipe")
+}
+pub fn preflight(directory:str,save_aligned:bool)->result<unit,string> effects {alloc,fs.meta} {
+ if not match files.is_dir(directory){ok(value)=>value,err(_)=>false}{return result.err("Output directory must already exist")}
+ let names:array<str>=["recording-alignment.json","residual.wav","residual.wav.export","aligned.wav","aligned.wav.export"]
+ var i:u64=0
+ loop{if i==if save_aligned{5}else{3}{break}
+  match files.symlink_metadata(path.join(directory,array.get(names,i))){ok(_)=>{return result.err("An alignment output or staging name already exists; existing files are preserved")},err(error)=>{
+   if error.code!=1{return result.err("Cannot inspect the selected alignment output path")}}}
+  i+=1}
+ result.ok(())
+}
+type Inputs=struct{first:audio.AudioBuffer,second:audio.AudioBuffer}
+fn load_pair(settings:ref<Settings>,first:str,second:str,cancel:str,capture:bool)->result<Inputs,string> effects {alloc,fs.read,fs.meta} {
+ let first_bytes:u64=try files.file_size(first) map_err problem
+ let second_bytes:u64=try files.file_size(second) map_err problem
+ if first_bytes>settings.input_limit_bytes or second_bytes>settings.input_limit_bytes{return result.err("Recording input exceeds the caller encoded-file byte limit")}
+ let encoded:u64=try resources.checked_add(first_bytes,second_bytes)
+ if (try resources.checked_add(try resources.multiply(encoded,10),131072))>settings.max_working_bytes{return result.err("Recording load exceeds the caller working-memory limit")}
+ let raw_a:bytes=try files.read_limited(first,settings.input_limit_bytes) map_err read_problem
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ let raw_b:bytes=try files.read_limited(second,settings.input_limit_bytes) map_err read_problem
+ let a:audio.WavInfo=try audio.inspect_wav(bytes.view(raw_a)) map_err audio.message
+ let b:audio.WavInfo=try audio.inspect_wav(bytes.view(raw_b)) map_err audio.message
+ if a.rate!=44100 or b.rate!=44100{return result.err("Recording alignment requires44100-Hz mono or stereo WAV inputs")}
+ let limits:core.Limits=resources.Limits{max_decoded_bytes:settings.max_decoded_bytes,max_working_bytes:settings.max_working_bytes}
+ let plan:resources.Plan=try resources.plan(a.frames,cast.wrap(a.channels),b.frames,cast.wrap(b.channels),limits,capture)
+ let actual_encoded:u64=try resources.checked_add(view.len(bytes.view(raw_a)),view.len(bytes.view(raw_b)))
+ let decoded_capacity:u64=try resources.multiply(try resources.checked_add(try resources.capacity(try resources.multiply(a.frames,cast.wrap(a.channels))),try resources.capacity(try resources.multiply(b.frames,cast.wrap(b.channels)))),4)
+ if (try resources.checked_add(try resources.checked_add(try resources.multiply(actual_encoded,2),decoded_capacity),131072))>settings.max_working_bytes{return result.err("Recording decode exceeds the caller working-memory limit")}
+ let first_buffer:audio.AudioBuffer=try audio.decode_wav(bytes.view(raw_a)) map_err audio.message
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ let second_buffer:audio.AudioBuffer=try audio.decode_wav(bytes.view(raw_b)) map_err audio.message
+ result.ok(Inputs{first:first_buffer,second:second_buffer})
+}
+pub fn compute(settings:ref<Settings>,first:str,second:str,cancel:str,progress:str,capture:bool)->result<core.FactoryOutput,string>
+ effects {alloc,fs.read,fs.meta,fs.write,ffi} {
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ let recipe:local.Recipe=try validate(settings)
+ var inputs:Inputs=try load_pair(settings,first,second,cancel,capture)
+ compute_buffers(settings,inputs.first,inputs.second,cancel,progress,capture)
+}
+// Checked application readers own encoded-file limits and format conversion.
+// The shared planner still owns the combined decoded and working-memory bounds.
+pub fn compute_buffers(settings:ref<Settings>,first:ref<audio.AudioBuffer>,second:ref<audio.AudioBuffer>,cancel:str,progress:str,capture:bool)->result<core.FactoryOutput,string>
+ effects {alloc,fs.read,fs.meta,fs.write,ffi} {
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ let recipe:local.Recipe=try validate(settings)
+ if first.rate!=44100 or second.rate!=44100 or (first.channels!=1 and first.channels!=2) or (second.channels!=1 and second.channels!=2){return result.err("Recording alignment requires44100-Hz mono or stereo inputs")}
+ if array.len(first.samples)%cast.wrap(first.channels)!=0 or array.len(second.samples)%cast.wrap(second.channels)!=0{return result.err("Recording alignment requires complete interleaved frames")}
+ let limits:core.Limits=resources.Limits{max_decoded_bytes:settings.max_decoded_bytes,max_working_bytes:settings.max_working_bytes}
+ let _=try resources.plan(audio.num_frames(first),cast.wrap(first.channels),audio.num_frames(second),cast.wrap(second.channels),limits,capture)
+ let dot_identity:string=try files.sha256(settings.dot_runtime) map_err problem
+ let fft_identity:string=try files.sha256(settings.fft_runtime) map_err problem
+ if dot_identity!=settings.dot_sha256 or fft_identity!=settings.fft_sha256{return result.err("CPU runtime bytes differ from the explicit pinned identities")}
+ var engine:dot.Engine=try dot.open(settings.dot_runtime,"0.3.20","Zen")
+ let _=try dot.check_f64(engine)
+ var transform:fft.Engine=try fft.open(settings.fft_runtime)
+ var math:CAbiLibrary=try native.open(settings.math_runtime) map_err native.error_message
+ let value:core.FactoryOutput=if capture{
+  try core.process_factory_captured_limited(engine,transform,math,array.view(first.samples),cast.wrap(first.channels),array.view(second.samples),cast.wrap(second.channels),recipe,limits,cancel,progress)
+ }else{try core.process_factory_limited(engine,transform,math,array.view(first.samples),cast.wrap(first.channels),array.view(second.samples),cast.wrap(second.channels),recipe,limits,cancel,progress)}
+ let _=try native.close(math) map_err native.error_message
+ let _=try fft.close(transform)
+ dot.close(engine)
+ result.ok(value)
+}
+fn write(samples:view<f32>,channels:u64,target:str,cancel:str,progress:str)->result<export.Report,string> effects {alloc,fs.read,fs.meta,fs.write} {
+ let buffer:audio.AudioBuffer=audio.AudioBuffer{samples:num.copy(samples),rate:44100,channels:cast.wrap(channels)}
+ let settings:export.Settings=export.Settings{subtype:string.copy("s16"),normalize:false,durable:false}
+ export.run(buffer,settings,target,cancel,progress)
+}
+pub fn publish(settings:ref<Settings>,value:ref<core.FactoryOutput>,directory:str,cancel:str,progress:str)->result<Report,string>
+ effects {alloc,fs.read,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ if not match files.is_dir(directory){ok(exists)=>exists,err(_)=>false}{return result.err("Output directory must already exist")}
+ if value.preparation.frames==0 or value.preparation.frames>4611686018427387903 or (value.preparation.channels!=1 and value.preparation.channels!=2) or
+  array.len(value.residual)!=value.preparation.frames*value.preparation.channels or array.len(value.aligned)!=value.preparation.frames*value.preparation.channels{return result.err("Recording alignment output extents differ")}
+ let residual:export.Report=try write(array.view(value.residual),value.preparation.channels,path.join(directory,"residual.wav"),cancel,progress)
+ let aligned:option<export.Report>=if settings.save_aligned{
+  option.some(match write(array.view(value.aligned),value.preparation.channels,path.join(directory,"aligned.wav"),cancel,progress){ok(report)=>report,err(error)=>{
+   return result.err(text.concat(error,"; residual WAV is already published"))}})
+ }else{option.none()}
+ let aligned_state:AlignedState=match aligned{some(report)=>AlignedState{removed:report.staging_removed,path:string.copy(report.staging_path)},none=>AlignedState{removed:true,path:string.copy("")}}
+ let report:Report=Report{frames:value.preparation.frames,channels:value.preparation.channels,lag_samples:array.get(value.preparation.lags,0).samples,
+  inverted:value.preparation.decision.inverted,silence_delta:value.preparation.silence_delta,intro_index:value.preparation.intro_index,local_windows:array.len(value.steps),
+  residual:string.copy("residual.wav"),aligned:if settings.save_aligned{string.copy("aligned.wav")}else{string.copy("")},
+  residual_staging_removed:residual.staging_removed,aligned_staging_removed:aligned_state.removed,residual_staging_path:string.copy(residual.staging_path),aligned_staging_path:string.copy(aligned_state.path),
+  backend:string.copy("native-air-cpu"),checkpoint_loads:0}
+ let encoded:string=try Report_encode(report) map_err codec.describe
+ match files.write_new_text(path.join(directory,"recording-alignment.json"),encoded){ok(_)=>{},err(_)=>{
+  return result.err("Cannot create alignment report; published WAVs remain available")}}
+ result.ok(report)
+}
+pub fn run(settings:ref<Settings>,first:str,second:str,directory:str,cancel:str,progress:str)->result<Report,string>
+ effects {alloc,fs.read,fs.meta,fs.write,ffi} {
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ let _=try preflight(directory,settings.save_aligned)
+ let value:core.FactoryOutput=try compute(settings,first,second,cancel,progress,false)
+ publish(settings,value,directory,cancel,progress)
+}

@@ -1,0 +1,56 @@
+// Source-ordered local phase candidates, with one retained analytic signal.
+module stemair.phase_tracks
+import std.analytic_signal as analytic
+import std.cpu_fft as cpu
+import std.fft as fft
+import std.libm as libm
+import std.vector_math as vector
+import std.cabi as native
+
+pub type Choice=enum{Unchanged,OppositePair,Degrees90,Degrees45,Degrees20,Degrees10,Degrees1}
+pub type Math=enum{WindowsScalar,LinuxVector}
+pub fn count(choice:Choice)->u64 effects {} {
+ match choice{Unchanged=>1,OppositePair=>2,Degrees90=>4,Degrees45=>8,Degrees20=>18,Degrees10=>36,Degrees1=>360}
+}
+pub fn step(choice:Choice)->u64 effects {} {
+ match choice{Unchanged=>190,OppositePair=>180,Degrees90=>90,Degrees45=>45,Degrees20=>20,Degrees10=>10,Degrees1=>1}
+}
+pub type Coefficients=struct{degrees:i64,radians:f64,cosine:f64,sine:f64}
+pub fn coefficients(math:ref<CAbiLibrary>,recipe:Math,degrees:i64)->result<Coefficients,string> effects {alloc,ffi} {
+ if degrees< -179 or degrees>179{return result.err("Local phase rotation requires degrees within -179..179")}
+ let radians:f64=cast.float(degrees)*(3.141592653589793/180.0)
+ let cosine:f64=if recipe==Math.WindowsScalar{try libm.cos(math,radians) map_err native.error_message}else{try vector.cos_pi_f64(radians)}
+ let sine:f64=if recipe==Math.WindowsScalar{try libm.sin(math,radians) map_err native.error_message}else{try vector.sin_pi_f64(radians)}
+ result.ok(Coefficients{degrees:degrees,radians:radians,cosine:cosine,sine:sine})
+}
+pub fn degree(choice:Choice,index:u64)->result<i64,string> effects {alloc} {
+ if index<2 or index>=count(choice){return result.err("Local analytic rotation index is outside the selected phase search")}
+ let positive:i64=cast.sat((index/2)*step(choice))
+ result.ok(if index%2==0{positive}else{-positive})
+}
+pub type Prepared=struct{original:array<f64>,analytic:fft.Complex,choice:Choice}
+pub fn prepare(engine:ref<cpu.Engine>,input:view<f64>,choice:Choice,max_length:u64)->result<Prepared,string> effects {alloc,ffi} {
+ if view.len(input)==0 or view.len(input)>max_length or max_length==0 or max_length>262144{return result.err("Phase input exceeds its explicit 1..262144 caller limit")}
+ var original:array<f64>=[]
+ array.reserve(original,view.len(input))
+ var i:u64=0
+ loop{if i==view.len(input){break}
+  array.push(original,view.get(input,i))
+  i+=1}
+ let signal:fft.Complex=if count(choice)>2{try analytic.from_real(engine,input,max_length)}else{fft.Complex{re:[],im:[]}}
+ result.ok(Prepared{original:original,analytic:signal,choice:choice})
+}
+pub fn candidate(prepared:ref<Prepared>,math:ref<CAbiLibrary>,recipe:Math,index:u64)->result<array<f64>,string> effects {alloc,ffi} {
+ if index>=count(prepared.choice){return result.err("Phase candidate is outside the selected search")}
+ if index<2{
+  var output:array<f64>=[]
+  array.reserve(output,array.len(prepared.original))
+  var i:u64=0
+  loop{if i==array.len(prepared.original){break}
+   let value:f64=array.get(prepared.original,i)
+   array.push(output,if index==1{-value}else{value})
+   i+=1}
+  return result.ok(output)}
+ let factors:Coefficients=try coefficients(math,recipe,try degree(prepared.choice,index))
+ analytic.project(prepared.analytic,factors.cosine,factors.sine)
+}

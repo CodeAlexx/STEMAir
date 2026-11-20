@@ -1,0 +1,9 @@
+{
+  "model": "waveform-wide-v1",
+  "filename": "waveform-wide-v1.th",
+  "url": "https://dl.fbaipublicfiles.com/demucs/v2.0/demucs.th",
+  "bytes": 2594202563,
+  "sha256": "f6c4148ba0dc92242d82d7b3f2af55c77bd7cb4ff1a0a3028a523986f36a3cfd",
+  "credit": "Demucs by Alexandre Defossez and Facebook AI Research",
+  "license": "MIT; waveform-MIT.txt"
+}

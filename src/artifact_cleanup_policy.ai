@@ -1,0 +1,54 @@
+module stemair.artifact_cleanup_policy
+import "../toolkit/artifact_cleanup.ai" as cleanup
+import "mask_request_policy.ai" as high_band
+import "../toolkit/mask/request.ai" as mask_request
+import std.text as text
+import std.codec as codec
+
+type Saved=struct{enabled:bool,threshold:f64} derive codec(strict)
+pub fn parse_threshold(value:str)->result<f64,string> effects {alloc} {
+ let count:u64=str.len(value)
+ if count==0 or count>8{return result.err("Enter a cleanup threshold from 0 to below 1, with at most six decimal places")}
+ let chars:view<byte>=str.bytes(value)
+ let first:u8=cast.bits(view.get(chars,0))
+ if first!=48{return result.err("Cleanup threshold must begin with 0")}
+ if count>1{
+  let point:u8=cast.bits(view.get(chars,1))
+  if count<3 or point!=46{return result.err("Enter 0 or a decimal such as 0.2")}
+  var i:u64=2
+  loop{if i==count{break}
+   let digit:u8=cast.bits(view.get(chars,i))
+   if digit<48 or digit>57{return result.err("Cleanup threshold contains an invalid decimal digit")}
+   i+=1}}
+ match text.parse_f64(value){some(v)=>result.ok(v),none=>result.err("Invalid cleanup threshold")}
+}
+pub fn current(enabled:bool,threshold:str)->result<cleanup.Settings,string> effects {alloc} {
+ var value:cleanup.Settings=cleanup.Settings{enabled:enabled,threshold:try parse_threshold(threshold)}
+ let _=try cleanup.validate(value)
+ result.ok(value)
+}
+pub fn encode(value:ref<cleanup.Settings>)->result<string,string> effects {alloc} {
+ let _=try cleanup.validate(value)
+ let record:Saved=Saved{enabled:value.enabled,threshold:value.threshold}
+ result.ok(try Saved_encode(record) map_err codec.describe)
+}
+pub fn decode(raw:str)->result<cleanup.Settings,string> effects {alloc} {
+ if str.len(raw)==0{return result.ok(cleanup.disabled())}
+ if str.len(raw)>256{return result.err("Accepted cleanup policy exceeds its bound")}
+ let saved:Saved=try Saved_decode(raw) map_err codec.describe
+ var value:cleanup.Settings=cleanup.Settings{enabled:saved.enabled,threshold:saved.threshold}
+ let _=try cleanup.validate(value)
+ result.ok(value)
+}
+pub fn request(choice:u32,enabled:bool,threshold:f64)->result<mask_request.Policy,string> effects {alloc} {
+ var selected:cleanup.Settings=cleanup.Settings{enabled:enabled,threshold:threshold}
+ let _=try cleanup.validate(selected)
+ result.ok(mask_request.policy(try high_band.from_choice(choice),mask_request.Foreground.Profile,selected))
+}
+// Text widgets emit intermediate empty/partial edits. Keep durable settings
+// valid while the caller retains the actual draft for execution preflight.
+pub fn edit_threshold(candidate:str,previous:str)->result<string,string> effects {alloc} {
+ if result.is_ok(parse_threshold(candidate)){return result.ok(string.copy(candidate))}
+ let _=try parse_threshold(previous)
+ result.ok(string.copy(previous))
+}

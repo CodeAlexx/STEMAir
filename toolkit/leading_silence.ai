@@ -1,0 +1,38 @@
+// Waveform recipe: F-layout channel energy, then1024-sample threshold blocks.
+module stemair.leading_silence
+import std.sequential_sum as sequential
+import std.float as fp
+import "numeric.ai" as num
+
+pub type End=struct{frame:u64,channel:u64,energies:array<f32>}
+pub fn analyze(samples:view<f32>,channels:u64)->result<End,string> effects {alloc} {
+ if (channels!=1 and channels!=2) or view.len(samples)%channels!=0 or not num.finite(samples){return result.err("Silence analysis requires finite interleaved mono or stereo samples")}
+ let frames:u64=view.len(samples)/channels
+ var energies:array<f32>=[]
+ var chosen:u64=0
+ if channels==2{
+  var ch:u64=0
+  loop{if ch==channels{break}
+   var absolute:array<f32>=[]
+   array.reserve(absolute,frames)
+   var i:u64=0
+   loop{if i==frames{break}
+    array.push(absolute,fp.abs(view.get(samples,i*channels+ch)))
+    i+=1}
+   array.push(energies,sequential.sum_f32(array.view(absolute)))
+   ch+=1}
+  if array.get(energies,1)>array.get(energies,0){chosen=1}}
+ var start:u64=0
+ loop{if start>=frames{break}
+  let end:u64=if frames-start<1024{frames}else{start+1024}
+  var maximum:f32=0.0
+  var at:u64=start
+  loop{if at==end{break}
+   let value:f32=fp.abs(view.get(samples,at*channels+chosen))
+   if value>maximum{maximum=value}
+   at+=1}
+  let wide:f64=cast.float(maximum)
+  if wide>0.01{return result.ok(End{frame:start,channel:chosen,energies:energies})}
+  start+=1024}
+ result.ok(End{frame:frames,channel:chosen,energies:energies})
+}

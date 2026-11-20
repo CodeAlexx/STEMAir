@@ -1,0 +1,11 @@
+{
+ "engine":"waveform",
+ "generation":2,
+ "sample_rate":44100,
+ "split":true,
+ "segment_samples":1764000,
+ "overlap":0.25,
+ "transition_power":1.0,
+ "shift_offsets":[],
+ "targets":["bass","drums","other","vocals"]
+}

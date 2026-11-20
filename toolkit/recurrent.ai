@@ -1,0 +1,86 @@
+module stemair.recurrent
+import "weights.ai" as weights
+import "ops.ai" as ops
+import "numeric.ai" as num
+import "control.ai" as control
+import std.text as text
+import std.float as fp
+
+pub type Direction=struct{input:u64,hidden:u64,input_bias:u64,hidden_bias:u64}
+pub type Bidirectional=struct{input_features:u64,hidden_features:u64,forward:Direction,reverse:Direction}
+fn key(base:str,suffix:str)->string effects {alloc} {text.concat(base,suffix)}
+fn direction(w:ref<weights.Model>,base:str,input:u64,hidden:u64,layer:u64,suffix:str)->result<Direction,string> effects {alloc} {
+ let input_shape:array<u64>=[4*hidden,input]
+ let hidden_shape:array<u64>=[4*hidden,hidden]
+ let bias_shape:array<u64>=[4*hidden]
+ result.ok(Direction{
+  input:try weights.index(w,key(key(key(base,".weight_ih_l"),string.from_int(layer)),suffix),array.view(input_shape)),
+  hidden:try weights.index(w,key(key(key(base,".weight_hh_l"),string.from_int(layer)),suffix),array.view(hidden_shape)),
+  input_bias:try weights.index(w,key(key(key(base,".bias_ih_l"),string.from_int(layer)),suffix),array.view(bias_shape)),
+  hidden_bias:try weights.index(w,key(key(key(base,".bias_hh_l"),string.from_int(layer)),suffix),array.view(bias_shape))})
+}
+pub fn bind(w:ref<weights.Model>,base:str,input:u64,hidden:u64)->result<Bidirectional,string> effects {alloc} {
+ bind_layer(w,base,input,hidden,0)
+}
+pub fn bind_layer(w:ref<weights.Model>,base:str,input:u64,hidden:u64,layer:u64)->result<Bidirectional,string> effects {alloc} {
+ if input==0 or input>8192 or hidden==0 or hidden>4096 or layer>7{return result.err("Invalid recurrent feature dimensions")}
+ let forward:Direction=try direction(w,base,input,hidden,layer,"")
+ let reverse:Direction=try direction(w,base,input,hidden,layer,"_reverse")
+ result.ok(Bidirectional{input_features:input,hidden_features:hidden,forward:forward,reverse:reverse})
+}
+fn value(w:ref<weights.Model>,parameter:u64,index:u64)->f32 effects {} {
+ array.get(array.borrow(w.parameters.values,parameter).values,index)
+}
+fn sigmoid(value:f32)->f32 effects {} {1.0/(1.0+fp.exp(-value))}
+// Input and output are single-batch row tensors [1,time,features]. Each
+// direction starts at zero state, with the standard input/forget/cell/output
+// gate order and separate input/recurrent biases at F32 arithmetic boundaries.
+pub fn forward(w:ref<weights.Model>,layer:Bidirectional,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,fs.meta} {
+ if input.c!=1 or input.w!=layer.input_features or input.h>65536 or not num.finite(array.view(input.data)){
+  return result.err("Invalid recurrent input rows")}
+ let hidden:u64=layer.hidden_features
+ var output:array<f32>=num.zeros(input.h*2*hidden)
+ var direction:u64=0
+ loop{if direction>=2{break}
+  let parameters:Direction=if direction==0{layer.forward}else{layer.reverse}
+  var state:array<f32>=num.zeros(hidden)
+  var cell:array<f32>=num.zeros(hidden)
+  var step:u64=0
+  loop{if step>=input.h{break}
+   if control.cancelled(cancel){return result.err("Separation cancelled")}
+   let time:u64=if direction==0{step}else{input.h-1-step}
+   var gates:array<f32>=[]
+   array.reserve(gates,4*hidden)
+   var gate:u64=0
+   loop{if gate>=4*hidden{break}
+    var projected:f32=0.0
+    var i:u64=0
+    loop{if i>=layer.input_features{break}
+     projected+=array.get(input.data,time*input.w+i)*value(w,parameters.input,gate*input.w+i)
+     i+=1}
+    projected+=value(w,parameters.input_bias,gate)
+    var recurrent:f32=0.0
+    i=0
+    loop{if i>=hidden{break}
+     recurrent+=array.get(state,i)*value(w,parameters.hidden,gate*hidden+i)
+     i+=1}
+    recurrent+=value(w,parameters.hidden_bias,gate)
+    array.push(gates,projected+recurrent)
+    gate+=1}
+   var i:u64=0
+   loop{if i>=hidden{break}
+    let input_gate:f32=sigmoid(array.get(gates,i))
+    let forget:f32=sigmoid(array.get(gates,hidden+i))
+    let proposal:f32=fp.tanh(array.get(gates,2*hidden+i))
+    let output_gate:f32=sigmoid(array.get(gates,3*hidden+i))
+    let updated:f32=forget*array.get(cell,i)+input_gate*proposal
+    let activated:f32=output_gate*fp.tanh(updated)
+    array.set(cell,i,updated)
+    array.set(state,i,activated)
+    array.set(output,time*2*hidden+direction*hidden+i,activated)
+    i+=1}
+   step+=1}
+  direction+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite recurrent output")}
+ result.ok(ops.tensor(1,input.h,2*hidden,output))
+}

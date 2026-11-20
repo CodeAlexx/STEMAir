@@ -1,0 +1,109 @@
+module stemair.spectral
+import std.fft as fft
+import std.float as fp
+import "numeric.ai" as num
+
+// Retained FFT plans with an explicit F32 window and centered reflect padding.
+// Each spectrum frame is [frequency, real/imaginary]. No waveform or weight I/O.
+pub type Plan=struct{n:u64,hop:u64,window:array<f32>,forward:fft.Plan,inverse:fft.Plan}
+pub type Overlap=struct{samples:array<f32>,normalization:array<f32>,count:u64,frames:u64,next:u64=0}
+pub fn hann(n:u64)->array<f32> effects {alloc} {
+ if n<2 or n>65536{panic "Invalid Hann window size"}
+ // Periodic Hann: compute the scalar angular step before F32 index multiply.
+ // This preserves the creator tensor operation order rather than (tau*i)/n.
+ let denominator:f64=cast.float(n)
+ let step64:f64=6.2831853071795864769/denominator
+ let step:f32=cast.float(step64)
+ var out:array<f32>=[]
+ var i:u64=0
+ loop{if i>=n{break}
+  let angle:f32=cast.float(i)*step
+  array.push(out,0.5-0.5*fp.cos(angle))
+  i+=1}
+ out
+}
+pub fn sqrt_hann(n:u64)->array<f32> effects {alloc} {
+ var out:array<f32>=[]
+ var i:u64=0
+ loop{if i>=n{break}
+  let angle:f32=6.2831853071795864769*cast.float(i)/cast.float(n)
+  let hann:f32=0.5-0.5*fp.cos(angle)
+  array.push(out,fp.sqrt(if hann>0.0{hann}else{0.0}))
+  i+=1}
+ out
+}
+pub fn plan(n:u64,hop:u64,window:array<f32> own)->Plan effects {alloc} {
+ if n<2 or n>65536 or n%2!=0 or hop==0 or hop>n or array.len(window)!=n{panic "Invalid STFT geometry"}
+ Plan{n:n,hop:hop,window:window,forward:fft.plan(n,false),inverse:fft.plan(n,true)}
+}
+pub fn frame_count(p:ref<Plan>,samples:u64)->u64 effects {} {1+samples/p.hop}
+pub fn validate(p:ref<Plan>,wave:view<f32>)->result<unit,string> effects {alloc} {
+ if view.len(wave)<=p.n/2 or view.len(wave)>16777216{return result.err("Centered reflected STFT requires more than half an FFT of input and at most 16777216 samples")}
+ var i:u64=0
+ loop{if i>=view.len(wave){break}
+  let value:f32=view.get(wave,i)
+  if not fp.is_finite(value) or value< -32768.0 or value>32768.0{return result.err("STFT input must be finite and within +/-32768")}
+  i+=1}
+ result.ok(())
+}
+// Caller validates the complete waveform once, before processing its frames.
+pub fn analyze_frame(p:ref<Plan>,wave:view<f32>,frame:u64)->array<f32> effects {alloc} {
+ if view.len(wave)<=p.n/2 or frame>=frame_count(p,view.len(wave)){panic "Invalid reflected STFT frame"}
+ var input:array<f64>=[]
+ var i:u64=0
+ loop{if i>=p.n{break}
+  let position:i64=cast.sat(frame*p.hop+i)-cast.sat(p.n/2)
+  let reflected:i64=if position<0{ -position}else{if position>=cast.sat(view.len(wave)){cast.sat(2*view.len(wave))-2-position}else{position}}
+  let value:f32=view.get(wave,cast.sat(reflected))*array.get(p.window,i)
+  array.push(input,cast.float(value))
+  i+=1}
+ let spectrum:fft.Complex=fft.rfft_with(struct.borrow(p,field=forward),array.view(input))
+ var out:array<f32>=[]
+ i=0
+ loop{if i>=p.n/2+1{break}
+  array.push(out,cast.float(array.get(spectrum.re,i)))
+  array.push(out,cast.float(array.get(spectrum.im,i)))
+  i+=1}
+ out
+}
+pub fn overlap(p:ref<Plan>,samples:u64)->Overlap effects {alloc} {
+ if samples==0 or samples>16777216{panic "Invalid ISTFT sample count"}
+ Overlap{samples:num.zeros(samples+p.n),normalization:num.zeros(samples+p.n),count:samples,frames:frame_count(p,samples)}
+}
+pub fn add_frame(p:ref<Plan>,out:ref<Overlap>,spectrum:view<f32>)->result<unit,string> effects {alloc} {
+ if view.len(spectrum)!=(p.n/2+1)*2 or out.next>=out.frames{return result.err("Invalid ISTFT frame geometry or order")}
+ var complex:fft.Complex=fft.Complex{re:[],im:[]}
+ var i:u64=0
+ loop{if i>=view.len(spectrum){break}
+  let re:f32=view.get(spectrum,i)
+  let im:f32=view.get(spectrum,i+1)
+  if not fp.is_finite(re) or not fp.is_finite(im){return result.err("Non-finite ISTFT spectrum")}
+  array.push(complex.re,cast.float(re))
+  array.push(complex.im,cast.float(im))
+  i+=2}
+ let wave:array<f64>=fft.irfft_with(struct.borrow(p,field=inverse),complex,p.n)
+ let start:u64=out.next*p.hop
+ i=0
+ loop{if i>=p.n{break}
+  let window:f32=array.get(p.window,i)
+  let sample:f32=cast.float(array.get(wave,i))
+  array.set(out.samples,start+i,array.get(out.samples,start+i)+sample*window)
+  array.set(out.normalization,start+i,array.get(out.normalization,start+i)+window*window)
+  i+=1}
+ out.next+=1
+ result.ok(())
+}
+pub fn finish(p:ref<Plan>,out:ref<Overlap>)->result<array<f32>,string> effects {alloc} {
+ if out.next!=out.frames{return result.err("Incomplete ISTFT frames")}
+ var wave:array<f32>=[]
+ var i:u64=0
+ loop{if i>=out.count{break}
+  let offset:u64=i+p.n/2
+  let denominator:f32=array.get(out.normalization,offset)
+  if denominator<=1e-8{return result.err("ISTFT window does not cover the requested output")}
+  let value:f32=array.get(out.samples,offset)/denominator
+  if not fp.is_finite(value){return result.err("Non-finite ISTFT output")}
+  array.push(wave,value)
+  i+=1}
+ result.ok(wave)
+}

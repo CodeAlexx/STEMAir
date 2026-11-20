@@ -1,0 +1,86 @@
+module stemair.model_settings_panel
+import "../../AIR/toolkits/desktop/ui.ai" as desk
+import "model_settings_draft.ai" as draft
+import "model_defaults.ai" as defaults
+import std.json as json
+import std.text as text
+
+pub type State=struct{draft:option<draft.Draft>}
+pub fn empty()->State effects {} {State{draft:option.none()}}
+pub fn open(app:ref<desk.Session>,state:ref<State>,value:draft.Draft own)->unit effects {alloc,net,time} {
+ state.draft=option.some(value)
+ display(app,state)
+ ()
+}
+pub fn role_controls(app:ref<desk.Session>,state:ref<State>)->unit effects {alloc,net,time} {
+ match state.draft{none=>{},some(value)=>{
+  let active:bool=if value.kind=="spectral"{false}else{match draft.sources(value){err(_)=>false,ok(pair)=>pair.primary=="vocals" or pair.primary=="instrumental"}}
+  if not active{value.role=0
+   value.rebalance=0.0}
+  if value.role!=2{value.rebalance=0.0}
+  let _=desk.set_bool(app,"model_editor_role","sensitive",active)
+  let _=desk.set_bool(app,"model_editor_rebalance","sensitive",active and value.role==2)
+  let _=desk.set_number(app,"model_editor_role","selected",if value.role==1{1.0}else{if value.role==2{2.0}else{0.0}})
+  let _=desk.set_number(app,"model_editor_rebalance","selected",value.rebalance*10.0)}}
+ ()
+}
+pub fn close(app:ref<desk.Session>,state:ref<State>)->unit effects {alloc,net,time} {
+ state.draft=option.none()
+ let _=desk.set_bool(app,"model_editor","visible",false)
+ role_controls(app,state)
+ ()
+}
+pub fn display(app:ref<desk.Session>,state:ref<State>)->unit effects {alloc,net,time} {
+ match state.draft{none=>{let _=desk.set_bool(app,"model_editor","visible",false)},some(value)=>{
+  let _=desk.set_bool(app,"model_editor","visible",true)
+  let _=desk.set_text(app,"model_editor_identity",text.concat(value.profile,text.concat(" — ",text.concat(value.kind,text.concat("\nOriginal asset SHA256: ",value.asset_sha256)))))
+  let _=desk.set_text(app,"model_editor_source",value.source)
+  let _=desk.set_number(app,"model_editor_role","selected",if value.role==1{1.0}else{if value.role==2{2.0}else{0.0}})
+  let _=desk.set_number(app,"model_editor_rebalance","selected",value.rebalance*10.0)
+  let _=desk.set_bool(app,"model_editor_custom","active",value.custom)
+  let _=desk.set_bool(app,"model_editor_inverse","active",value.inverse)
+  let _=desk.set_text(app,"model_editor_parameters",value.parameter_file)
+  let _=desk.set_text(app,"model_editor_fft",value.n_fft)
+  let _=desk.set_text(app,"model_editor_bins",value.frequency_bins)
+  let _=desk.set_text(app,"model_editor_frames",value.frame_exponent)
+  let _=desk.set_text(app,"model_editor_compensation",value.compensation)
+  let _=desk.set_text(app,"model_editor_channels",value.channels)
+  let _=desk.set_text(app,"model_editor_recurrent_width",value.recurrent_width)
+  let _=desk.set_bool(app,"model_editor_recurrent","active",value.recurrent)
+  let _=desk.set_bool(app,"model_editor_exchange","visible",value.kind=="exchange")
+  let _=desk.set_bool(app,"model_editor_mask","visible",value.kind=="mask")
+  let _=desk.set_bool(app,"model_editor_parameters_row","visible",value.kind!="exchange")
+  let _=desk.set_bool(app,"model_editor_sources","visible",value.kind!="spectral")
+  let _=desk.set_bool(app,"model_editor_fft","sensitive",not value.lock_geometry)
+  let _=desk.set_bool(app,"model_editor_bins","sensitive",not value.lock_geometry)
+  let _=desk.set_bool(app,"model_editor_frames","sensitive",not value.lock_geometry)
+  let _=desk.set_text(app,"model_editor_status",if value.kind=="spectral"{"Select a complete native spectral configuration; target order is preserved."}else{
+   if value.lock_geometry{"Checkpoint geometry is fixed by startup metadata. Other fields preserve the current definition."}else{"Current definition loaded. Parameter profiles are validated native JSON, not checkpoint imports."}})}}
+ role_controls(app,state)
+ ()
+}
+pub fn change(state:ref<State>,event:ref<json.Document>)->bool effects {alloc} {
+ let id:string=desk.field(event,"id")
+ if not str.starts_with(id,"model_editor_"){return false}
+ match state.draft{none=>{},some(value)=>{
+  if id=="model_editor_source"{value.source=desk.field(event,"value")
+   value.source_edited=true}
+  if id=="model_editor_custom"{value.custom=desk.boolean(event,"value")
+   value.source_edited=true}
+  if id=="model_editor_inverse"{value.inverse=desk.boolean(event,"value")
+   value.source_edited=true}
+  if id=="model_editor_role"{value.role=cast.sat(desk.number(event,"value"))}
+  if id=="model_editor_rebalance"{value.rebalance=desk.number(event,"value")/10.0}
+  if id=="model_editor_parameters"{value.parameter_file=desk.field(event,"value")}
+  if id=="model_editor_fft"{value.n_fft=desk.field(event,"value")}
+  if id=="model_editor_bins"{value.frequency_bins=desk.field(event,"value")}
+  if id=="model_editor_frames"{value.frame_exponent=desk.field(event,"value")}
+  if id=="model_editor_compensation"{value.compensation=desk.field(event,"value")}
+  if id=="model_editor_channels"{value.channels=desk.field(event,"value")}
+  if id=="model_editor_recurrent_width"{value.recurrent_width=desk.field(event,"value")}
+  if id=="model_editor_recurrent"{value.recurrent=desk.boolean(event,"value")}}}
+ true
+}
+pub fn validate(state:ref<State>)->result<defaults.Record,string> effects {alloc,fs.read,fs.meta} {
+ match state.draft{none=>result.err("Open a model parameter draft first"),some(value)=>draft.validate(value)}
+}

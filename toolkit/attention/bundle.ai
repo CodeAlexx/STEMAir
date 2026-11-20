@@ -1,0 +1,107 @@
+module stemair.attention.bundle
+import "session.ai" as session
+import "host_session.ai" as host
+import "retained_session.ai" as retained
+import "config.ai" as config
+import "../weighted_sources.ai" as weighted
+import "../audio_normalization.ai" as normalization
+import "../recording_moments.ai" as moments
+import "../recording_audio.ai" as recording
+import "../device_ops.ai" as ops
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "../ops.ai" as host_ops
+import std.tensor as tensor
+
+pub type Member=struct{model:session.Session,weights:array<f64>}
+pub type State=struct{members:array<Member>,requests:u64=0}
+pub fn loads(state:ref<State>)->u64 effects {}{
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(state.members){break}
+  total+=array.borrow(state.members,i).model.network.weights.loads
+  i+=1}
+ total
+}
+pub fn bytes_read(state:ref<State>)->u64 effects {}{
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(state.members){break}
+  total+=array.borrow(state.members,i).model.network.weights.bytes_read
+  i+=1}
+ total
+}
+pub fn parameter_count(state:ref<State>)->u64 effects {}{
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(state.members){break}
+  total+=array.len(array.borrow(state.members,i).model.network.weights.parameters.values)
+  i+=1}
+ total
+}
+fn predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,model:ref<session.Session>,input:ref<tensor.Tensor>,cancel:str)->result<host_ops.Tensor,string> effects {alloc,gpu,fs.meta}{
+ retained.predict(context,stream,parameters,model,input,cancel)
+}
+fn valid_length(model:ref<session.Session>,length:u64)->result<u64,string> effects {alloc}{retained.valid_length(model,length)}
+pub fn append(state:ref<State>,checkpoint:str,c:ref<config.Config>,weights:view<f64>)->result<unit,string> effects {alloc,fs.read}{
+ if array.len(state.members)>=16 or view.len(weights)!=array.len(c.targets){return result.err("Invalid bundle member dimensions")}
+ var copied:array<f64>=[]
+ var i:u64=0
+ loop{if i==view.len(weights){break}
+  array.push(copied,view.get(weights,i))
+  i+=1}
+ let model:session.Session=try session.open(checkpoint,c)
+ array.push(state.members,Member{model:model,weights:copied})
+ result.ok(())
+}
+pub fn prepare_cpu(state:ref<State>,platform:str)->result<unit,string> effects {alloc}{
+ var i:u64=0
+ loop{if i==array.len(state.members){break}
+  let _=try session.prepare_cpu(struct.borrow(array.borrow(state.members,i),field=model),platform)
+  i+=1}
+ result.ok(())
+}
+fn normalized_copy(input:ref<normalization.Prepared>)->normalization.Prepared effects {alloc}{
+ normalization.Prepared{samples:num.copy(array.view(input.samples)),frames:input.frames,mean:0.0,scale:1.0}
+}
+pub fn separate_cpu(state:ref<State>,library:ref<CAbiLibrary>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write}{
+ let preparation:normalization.Prepared=try normalization.prepare(input)
+ if preparation.scale==0.0{return result.ok(num.zeros(2*array.len(c.targets)*preparation.frames))}
+ var accumulator:weighted.Accumulator=try weighted.create(preparation.frames,array.len(c.targets))
+ var i:u64=0
+ loop{if i==array.len(state.members){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let member:ref<Member>=array.borrow(state.members,i)
+  if array.len(member.model.cpu)!=1{return result.err("Bundle member CPU state was not prepared")}
+  let raw:array<f32>=try host.separate_normalized(struct.borrow(member.model,field=network),array.borrow(member.model.cpu,0),library,c,normalized_copy(preparation),cancel,progress)
+  let _=try weighted.add(accumulator,array.view(raw),array.view(member.weights))
+  i+=1}
+ let combined:array<f32>=try weighted.finish(accumulator)
+ let output:array<f32>=try normalization.restore_sources(array.view(combined),preparation.frames,array.len(c.targets),preparation.mean,preparation.scale)
+ state.requests+=1
+ result.ok(output)
+}
+pub fn separate_gpu(context:ref<GpuContext>,stream:ref<GpuStream>,state:ref<State>,runtime:str,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,gpu,fs.meta,fs.write}{
+ let preparation:normalization.Prepared=try moments.prepare(input,2)
+ if preparation.scale==0.0{return result.ok(num.zeros(2*array.len(c.targets)*preparation.frames))}
+ var accumulator:weighted.Accumulator=try weighted.create(preparation.frames,array.len(c.targets))
+ var i:u64=0
+ loop{if i==array.len(state.members){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let member:ref<Member>=array.borrow(state.members,i)
+  let model:ref<session.Session>=struct.borrow(member,field=model)
+  if array.len(model.gpu)!=0{return result.err("Bundle GPU resources were not released")}
+  var parameters:array<tensor.Tensor>=try ops.upload(context,stream,struct.borrow(model.network,field=weights))
+  array.push(model.gpu,try retained.prepare_work(context,stream,struct.borrow(model,field=network),runtime,preparation.frames))
+  let size:u64=if c.segment_samples!=0{c.segment_samples}else{model.network.training_length}
+  let result_value:result<array<f32>,string>=recording.separate_normalized_sources(context,stream,parameters,model,c,size,model.network.source_count,normalized_copy(preparation),cancel,progress,predict,valid_length)
+  model.gpu=[]
+  let raw:array<f32>=try result_value
+  model.requests+=1
+  let _=try weighted.add(accumulator,array.view(raw),array.view(member.weights))
+  i+=1}
+ let combined:array<f32>=try weighted.finish(accumulator)
+ let output:array<f32>=try normalization.restore_sources(array.view(combined),preparation.frames,array.len(c.targets),preparation.mean,preparation.scale)
+ state.requests+=1
+ result.ok(output)
+}

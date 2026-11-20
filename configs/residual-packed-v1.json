@@ -1,0 +1,9 @@
+{
+ "engine":"residual-waveform",
+ "generation":1,
+ "packed":true,
+ "sample_rate":44100,
+ "split":true,
+ "shift_offsets":[],
+ "targets":["bass","drums","other","vocals"]
+}

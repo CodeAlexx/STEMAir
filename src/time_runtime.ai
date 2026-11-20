@@ -1,0 +1,67 @@
+module stemair.time_runtime
+import "time_application.ai" as app
+import "../toolkit/time_tool.ai" as core
+import "../toolkit/time_tool_process.ai" as transport
+import std.files as files
+import std.path as path
+import std.system as system
+import std.text as text
+import std.codec as codec
+import std.json as json
+
+// Deployment policy stays outside the reusable audio processor. The installed
+// file wins; a malformed installed entry never silently falls back to a build.
+fn executable(root:str,windows:bool)->result<string,string> effects {alloc,fs.meta} {
+ let name:str=if windows{"time-tool.exe"}else{"time-tool"}
+ let candidates:array<string>=[path.join(path.join(root,"runtime/time-tool"),name),path.join(path.join(root,"build/runtime/time-tool"),name)]
+ var i:u64=0
+ loop{if i==array.len(candidates){break}
+  let file:str=array.get(candidates,i)
+  match files.symlink_metadata(file){ok(info)=>{
+   if not info.is_file or info.is_symlink{return result.err("The optional audio processor must be an ordinary executable file")}
+   return result.ok(string.copy(file))},err(error)=>{if error.code!=1{return result.err("Cannot inspect the optional audio processor")}}}
+  i+=1}
+ result.err("Tempo and duration-preserving pitch require the optional audio processor runtime")
+}
+pub fn tool(root:str)->result<transport.Tool,string> effects {alloc,env,fs.read,fs.meta} {
+ let windows:bool=system.platform()=="windows"
+ let file:string=try executable(root,windows)
+ let raw:bytes=match files.read_limited(path.join(root,"licenses/time-runtime-source.json"),16384){ok(v)=>v,err(_)=>{
+  return result.err("The optional audio processor identity is unavailable")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("The optional audio processor identity must be UTF-8")}}
+ var document:json.Document=match json.parse(source){ok(v)=>v,err(_)=>{return result.err("The optional audio processor identity is invalid")}}
+ let policy:codec.Policy=codec.Policy{reject_unknown:false,reject_duplicates:true}
+ var reader:codec.Reader=codec.root_reader(policy)
+ let version:string=try codec.text_field(document,reader,"version") map_err codec.describe
+ var platform:codec.Reader=try codec.object_field(document,reader,if windows{"windows"}else{"linux"},policy) map_err codec.describe
+ let sha:string=try codec.text_field(document,platform,"executable_sha256") map_err codec.describe
+ var dependencies:array<transport.Dependency>=[]
+ var items:codec.Items=try codec.items_field(document,platform,"dependencies",codec.strict()) map_err codec.describe
+ loop{var item:codec.Reader=match try codec.next_object(document,items) map_err codec.describe{some(v)=>v,none=>{break}}
+  let location:string=try codec.text_field(document,item,"path") map_err codec.describe
+  let identity:string=try codec.text_field(document,item,"sha256") map_err codec.describe
+  let _=try codec.reader_finish(document,item) map_err codec.describe
+  if array.len(dependencies)>=32{return result.err("The optional audio processor declares too many runtime files")}
+  var resolved:string=string.copy(location)
+  if not path.is_absolute(location){
+   if str.len(location)==0 or location=="." or location==".." or path.basename(location)!=location or text.contains(location,":"){
+    return result.err("The optional audio processor contains an invalid runtime filename")}
+   resolved=path.join(path.dirname(file),location)
+  }else{if windows{return result.err("Windows audio runtime files must be installed beside the processor")}}
+  array.push(dependencies,transport.Dependency{path:resolved,sha256:identity})}
+ let _=try codec.reader_finish(document,platform) map_err codec.describe
+ let _=try codec.reader_finish(document,reader) map_err codec.describe
+ if array.len(dependencies)==0{return result.err("The optional audio processor runtime identity is incomplete")}
+ let selected:transport.Tool=transport.Tool{executable:file,sha256:sha,version:version,dependencies:dependencies}
+ let _=try transport.validate(selected) map_err transport.message
+ result.ok(selected)
+}
+pub fn settings(root:str,operation:str,value:f64,normalize:bool)->result<app.Settings,string>
+ effects {alloc,env,fs.read,fs.meta} {
+ var selected:app.Settings=app.Settings{operation:string.copy(operation),value:value,normalize:normalize,tool:transport.Tool{dependencies:[]}}
+ let action:core.Action=try app.action(selected)
+ // Original identity operations bypass both the external tool and PCM16 input
+ // conversion. They remain available when its optional deployment is absent.
+ if not core.identity(action){selected.tool=try tool(root)}
+ result.ok(selected)
+}

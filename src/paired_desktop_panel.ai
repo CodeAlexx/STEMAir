@@ -1,0 +1,84 @@
+module stemair.paired_desktop_panel
+import "../../AIR/toolkits/desktop/ui.ai" as desk
+import "preferences.ai" as prefs
+import "paired_panel_state.ai" as snapshot
+import "paired_config.ai" as config
+import "paired_list_editor.ai" as edit
+import "paired_list_panel.ai" as render
+import "input_selection.ai" as selection
+import std.codec as codec
+import std.json as json
+import std.path as path
+import std.text as text
+pub type State=struct{first:selection.State,second:selection.State}
+pub fn empty()->State effects {alloc} {State{first:selection.empty(),second:selection.empty()}}
+pub fn details(value:ref<snapshot.Snapshot>)->result<string,string> effects {alloc} {
+ var out:string=text.concat("Accepted ",text.concat(string.from_int(array.len(value.accepted)),text.concat(" pairs; remaining: ",string.from_int(array.len(value.remaining)))))
+ string.append(out,text.concat("\nOutput: ",value.applied.output))
+ if str.len(value.report_file)>0{string.append(out,text.concat("\nReport: ",value.report_file))}
+ if str.len(value.report)>0{
+  var report:config.Report=try config.Report_decode(value.report) map_err codec.describe
+  string.append(out,text.concat("\nLast run: ",text.concat(string.from_int(report.succeeded),text.concat(" complete, ",text.concat(string.from_int(report.skipped),text.concat(" skipped, ",text.concat(string.from_int(report.failed)," failed")))))))
+  var i:u64=0
+  loop{if i==array.len(report.items) or i==12{break}
+   let row:ref<config.Outcome>=array.borrow(struct.borrow(report,field=items),i)
+   string.append(out,text.concat("\n",text.concat(row.folder,text.concat(": ",text.concat(row.state,if str.len(row.message)>0{text.concat(" - ",row.message)}else{""})))))
+   i+=1}
+  if array.len(report.items)>12{string.append(out,"\nFurther pairs are recorded in the report.")}}
+ result.ok(out)
+}
+pub fn refresh(app:ref<desk.Session>,value:ref<prefs.State>,state:ref<State>)->unit effects {alloc,net,time} {
+ render.show(app,struct.borrow(value,field=paired_first_inputs),struct.borrow(value,field=paired_second_inputs),struct.borrow(state,field=first),struct.borrow(state,field=second))
+ let report:string=if str.len(value.paired_snapshot)==0{"No pairs accepted. Order the lists and accept the pairs before running."}else{match snapshot.decode(value.paired_snapshot){err(error)=>error,ok(saved)=>match details(saved){ok(text)=>text,err(error)=>error}}}
+ let _=desk.set_text(app,"pairs_report",report)
+ ()
+}
+pub fn reset(app:ref<desk.Session>,value:ref<prefs.State>,state:ref<State>)->unit effects {alloc,net,time} {
+ selection.reset(struct.borrow(state,field=first),array.len(value.paired_first_inputs))
+ selection.reset(struct.borrow(state,field=second),array.len(value.paired_second_inputs))
+ let _=desk.set_bool(app,"pairs_continue","active",value.paired_continue)
+ refresh(app,value,state)
+}
+pub fn handles(id:str,kind:str)->bool effects {} {
+ if kind=="selection"{return id=="pairs_first_rows" or id=="pairs_second_rows"}
+ if kind=="dialog"{return id=="pairs_first_inputs" or id=="pairs_second_inputs"}
+ if kind=="change"{return id=="pairs_continue"}
+ if kind!="action"{return false}
+ id=="pairs_first_add" or id=="pairs_second_add" or id=="pairs_first_up" or id=="pairs_second_up" or
+ id=="pairs_first_down" or id=="pairs_second_down" or id=="pairs_first_duplicate" or id=="pairs_second_duplicate" or
+ id=="pairs_first_remove" or id=="pairs_second_remove" or id=="pairs_first_transfer" or id=="pairs_second_transfer" or
+ id=="pairs_first_clear" or id=="pairs_second_clear"
+}
+pub fn receive(app:ref<desk.Session>,value:ref<prefs.State>,state:ref<State>,event:ref<json.Document>,root:str,busy:bool)->result<bool,string> effects {alloc,net,time} {
+ if busy{return result.ok(false)}
+ let kind:string=desk.field(event,"event")
+ let id:string=desk.field(event,"id")
+ let first:bool=str.starts_with(id,"pairs_first_")
+ if kind=="selection"{
+  let _=try if first{selection.receive(struct.borrow(state,field=first),event)}else{selection.receive(struct.borrow(state,field=second),event)}
+  return result.ok(false)}
+ if kind=="change"{value.paired_continue=desk.boolean(event,"value")
+  return result.ok(true)}
+ if id=="pairs_first_add" or id=="pairs_second_add"{
+  let _=try desk.dialog_multiple(app,if first{"pairs_first_inputs"}else{"pairs_second_inputs"},if first{"Choose first recordings"}else{"Choose second recordings"},root)
+  return result.ok(false)}
+ var changed:bool=false
+ if kind=="dialog"{
+  if desk.boolean(event,"cancelled"){return result.ok(false)}
+  let incoming:array<string>=desk.dialog_paths(event)
+  changed=try if first{edit.add(struct.borrow(value,field=paired_first_inputs),struct.borrow(state,field=first),incoming,4096)}else{edit.add(struct.borrow(value,field=paired_second_inputs),struct.borrow(state,field=second),incoming,4096)}
+ }else{
+  if text.ends_with(id,"_up") or text.ends_with(id,"_down"){
+   changed=try if first{edit.move(struct.borrow(value,field=paired_first_inputs),struct.borrow(state,field=first),text.ends_with(id,"_up"))}else{edit.move(struct.borrow(value,field=paired_second_inputs),struct.borrow(state,field=second),text.ends_with(id,"_up"))}}
+  if text.ends_with(id,"_duplicate"){
+   changed=try if first{edit.duplicate(struct.borrow(value,field=paired_first_inputs),struct.borrow(state,field=first),4096)}else{edit.duplicate(struct.borrow(value,field=paired_second_inputs),struct.borrow(state,field=second),4096)}}
+  if text.ends_with(id,"_remove"){
+   changed=try if first{edit.remove(struct.borrow(value,field=paired_first_inputs),struct.borrow(state,field=first))}else{edit.remove(struct.borrow(value,field=paired_second_inputs),struct.borrow(state,field=second))}}
+  if text.ends_with(id,"_clear"){
+   changed=try if first{edit.clear(struct.borrow(value,field=paired_first_inputs),struct.borrow(state,field=first))}else{edit.clear(struct.borrow(value,field=paired_second_inputs),struct.borrow(state,field=second))}}
+  if text.ends_with(id,"_transfer"){
+   changed=try if first{edit.transfer(struct.borrow(value,field=paired_first_inputs),struct.borrow(state,field=first),struct.borrow(value,field=paired_second_inputs),struct.borrow(state,field=second),4096)}else{edit.transfer(struct.borrow(value,field=paired_second_inputs),struct.borrow(state,field=second),struct.borrow(value,field=paired_first_inputs),struct.borrow(state,field=first),4096)}}}
+ if changed{value.paired_snapshot=""
+  refresh(app,value,state)}
+ result.ok(changed)
+}

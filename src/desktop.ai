@@ -1,0 +1,1782 @@
+module stemair.desktop
+import "mask_request_policy.ai" as mask_policy
+import "artifact_cleanup_policy.ai" as cleanup_policy
+import "learned_controls_policy.ai" as learned_policy
+import "mask_inference_policy.ai" as inference_policy
+import "recording_inference_policy.ai" as recording_policy
+import "../toolkit/device_selection.ai" as device_selection
+import "../toolkit/artifact_cleanup.ai" as cleanup
+import "../../AIR/toolkits/desktop/ui.ai" as desk
+import "job.ai" as job
+import "ensemble_application.ai" as ensemble_app
+import "ensemble_processing_application.ai" as processing_app
+import "ensemble_presets.ai" as presets
+import "preferences.ai" as preferences
+import "session_presets.ai" as session_presets
+import "listen.ai" as listen
+import "model_panel.ai" as model_panel
+import "model_settings_panel.ai" as model_editor
+import "model_settings_actions.ai" as model_actions
+import "model_settings_draft.ai" as model_draft
+import "model_defaults.ai" as model_defaults
+import "model_queue_snapshot.ai" as model_snapshot
+import "model_catalog.ai" as model_catalog
+import "model_selection.ai" as model_selection
+import "audio_tool_application.ai" as audio_tools
+import "pitch_application.ai" as pitch
+import "alignment_application.ai" as alignment
+import "alignment_runtime.ai" as alignment_runtime
+import "reference_mastering_runtime.ai" as mastering_runtime
+import "reference_mastering_job.ai" as mastering_job
+import "recording_alignment_application.ai" as recording_alignment
+import "recording_alignment_runtime.ai" as recording_runtime
+import "alignment_choices.ai" as alignment_choices
+import "paired_panel_state.ai" as paired_state
+import "paired_desktop_panel.ai" as paired_panel
+import "paired_desktop_job.ai" as paired_job
+import "paired_config.ai" as paired_config
+import "paired_desktop_runtime.ai" as paired_runtime
+import "container_export.ai" as container
+import "time_runtime.ai" as time_runtime
+import "time_application.ai" as audio_time
+import "codec_runtime.ai" as codec_runtime
+import "audio_io_policy.ai" as audio_io
+import "desktop_audio_jobs.ai" as audio_jobs
+import "desktop_naming.ai" as naming
+import "queue_acceptance.ai" as queue_acceptance
+import "input_list_panel.ai" as input_lists
+import "input_selection.ai" as input_selection
+import "input_navigation.ai" as input_navigation
+import "input_verification_application.ai" as verification
+import "input_verification.ai" as verification_data
+import "desktop_verification_job.ai" as verification_job
+import "recording_sample_application.ai" as sample
+import "recording_sample_runtime.ai" as sample_runtime
+import "recording_sample_panel.ai" as sample_panel
+import "recording_sample_job.ai" as sample_job
+import "desktop_sample_job.ai" as desktop_sample_job
+import "checked_input.ai" as checked_input
+import "../toolkit/compressed_export.ai" as compressed_export
+import "../toolkit/secondary_config.ai" as secondary_config
+import "../toolkit/secondary.ai" as secondary
+import "../toolkit/vocal_chain.ai" as vocal
+import "../toolkit/model_cache.ai" as cache
+import "cpu_session_close.ai" as cpu_close
+import "../toolkit/model_ensemble_config.ai" as model_config
+import "queue_config.ai" as queue_config
+import "queue_job.ai" as queue
+import std.tasks as tasks
+import std.process as proc
+import std.json as json
+import std.files as files
+import std.path as path
+import std.text as text
+import std.float as fp
+import std.codec as codec
+
+fn busy(app:ref<desk.Session>,value:bool)->unit effects {alloc,net,time} {
+ let ids:array<string>=["session_save","session_open","preferences_save","preferences_reset","audio_refresh","audio_choose_folder","settings","checkpoint","input","output","choose_settings","choose_checkpoint","choose_input","choose_output","gpu","gpu_index","high_band","cleanup_enabled","cleanup_threshold","noise_reduction","room_reduction","room_targets","noise_checkpoint","room_checkpoint","choose_noise_checkpoint","choose_room_checkpoint","mask_tta","mask_window","mask_aggression","inference_pitch","inference_semitones","match_frequency","recording_override","recording_shifts","recording_split","recording_overlap","recording_segment","recording_seed","reload","separate","single_outputs","single_complement","single_normalize","single_keep",
+  "ensemble_add","ensemble_current","ensemble_remove","ensemble_swap","ensemble_clear","ensemble_wave","ensemble_normalize","ensemble_min","ensemble_max","ensemble_average","tool_combine","tool_mix","tool_reduce","tool_spectral","tool_amount","tool_pitch","pitch_amount",
+  "alignment_first","alignment_first_pick","alignment_second","alignment_second_pick","alignment_polarity","alignment_save_aligned","alignment_run","recording_alignment_run","mastering_run","mastering_pairs_run","mastering_library","mastering_library_pick",
+  "pairs_first_rows","pairs_second_rows","pairs_first_add","pairs_second_add","pairs_first_up","pairs_second_up","pairs_first_down","pairs_second_down","pairs_first_duplicate","pairs_second_duplicate","pairs_first_remove","pairs_second_remove","pairs_first_transfer","pairs_second_transfer","pairs_first_clear","pairs_second_clear","pairs_continue","pairs_accept","pairs_run","pairs_remaining",
+  "alignment_windows","alignment_intros","alignment_gain","alignment_phase","alignment_initial_polarity","alignment_match_silence","alignment_spectral_match",
+  "tempo_amount","pitch_preserve_amount","tool_tempo","tool_pitch_preserve","export_subtype","output_container","mp3_bitrate","codec_directory","choose_codec_directory",
+  "model_add","model_remove","model_clear","model_processing_add","model_processing_clear","model_preset_save","model_preset_open","model_outputs","model_primary","model_secondary","model_wave","model_normalize","model_keep","model_residual","model_spectral","model_run",
+  "queue_add","queue_current","queue_remove","queue_clear","queue_continue","queue_single","queue_ensemble","queue_secondary",
+  "session_rename","session_delete","model_preset_rename","model_preset_delete",
+  "audio_budget","ensemble_rows","ensemble_remove_selected","ensemble_keep_selected","queue_rows","queue_remove_selected","queue_keep_selected",
+  "ensemble_open_file","ensemble_open_folder","queue_open_file","queue_open_folder",
+  "ensemble_activation_file","queue_activation_file",
+  "ensemble_verify","queue_verify","ensemble_sample","queue_sample",
+  "ensemble_sample_seconds","queue_sample_seconds","ensemble_sample_library","queue_sample_library","ensemble_sample_library_pick","queue_sample_library_pick",
+  "processing_sample","processing_sample_seconds","naming_append_model","naming_model_folder","naming_testing","naming_append_ensemble","naming_ensemble_label",
+  "secondary_model_add","secondary_model_remove","secondary_model_clear","secondary_target","secondary_weight","secondary_assign","secondary_clear","secondary_outputs","secondary_normalize","secondary_keep","secondary_residual","secondary_spectral","secondary_run",
+  "preprocess_assign","preprocess_clear","preprocess_residual","preprocess_spectral","preprocess_extra",
+  "model_edit","model_restore","model_editor","queue_use_settings","catalog_profiles","catalog_directory","catalog_choose","catalog_refresh","catalog_verify","catalog_use","catalog_acquire",
+  "vocal_model_add","vocal_model_remove","vocal_model_clear","vocal_assign","vocal_clear","vocal_amount","vocal_mixes","vocal_mix_only","vocal_save_only","vocal_outputs","vocal_normalize","vocal_keep","vocal_run"]
+ var i:u64=0
+ loop{if i>=array.len(ids){break}
+  let _=desk.set_bool(app,array.get(ids,i),"sensitive",not value)
+  i+=1}
+ let _=desk.set_bool(app,"cancel","sensitive",value)
+ ()
+}
+fn export_controls(app:ref<desk.Session>,state:ref<preferences.State>)->unit effects {alloc,net,time} {
+ let _=desk.set_bool(app,"alignment_phase","sensitive",state.alignment_windows!=10.0)
+ let _=desk.set_bool(app,"mp3_bitrate","sensitive",state.output_container==2.0)
+ let _=desk.set_bool(app,"codec_directory","sensitive",true)
+ let _=desk.set_bool(app,"choose_codec_directory","sensitive",true)
+ ()
+}
+fn processing_action(id:str)->bool effects {} {
+ id=="separate" or id=="secondary_run" or id=="vocal_run" or id=="model_run" or
+ id=="ensemble_min" or id=="ensemble_max" or id=="ensemble_average" or
+ id=="tool_pitch" or id=="tool_combine" or id=="tool_mix" or id=="tool_reduce" or id=="tool_spectral" or
+ id=="tool_tempo" or id=="tool_pitch_preserve" or id=="alignment_run" or id=="recording_alignment_run" or
+ id=="queue_single" or id=="queue_ensemble" or id=="queue_secondary"
+}
+fn sample_processing_action(id:str)->bool effects {} {
+ id=="separate" or id=="secondary_run" or id=="vocal_run" or id=="model_run" or
+ id=="tool_pitch" or id=="tool_tempo" or id=="tool_pitch_preserve" or
+ id=="queue_single" or id=="queue_ensemble" or id=="queue_secondary"
+}
+fn ensemble_list(app:ref<desk.Session>,inputs:ref<array<string>>,lists:ref<input_lists.State>)->unit effects {alloc,net,time} {
+ input_lists.audio(app,struct.borrow(lists,field=audio),inputs)
+}
+fn model_list(app:ref<desk.Session>,models:ref<array<model_config.Model>>)->unit effects {alloc,net,time} {
+ var label:string=text.concat(string.from_int(array.len(models))," models selected")
+ var annotated:string=string.copy(label)
+ var i:u64=0
+ loop{if i==array.len(models) or i==3{break}
+  let model:ref<model_config.Model>=array.borrow(models,i)
+  let row:string=text.concat("\n",text.concat(string.from_int(i+1),text.concat(". ",text.concat(path.basename(model.config),text.concat(" — ",path.basename(model.checkpoint))))))
+  string.append(label,row)
+  string.append(annotated,row)
+  if str.len(model.processing)>0{string.append(annotated," (processing attached)")}
+  i+=1}
+ if array.len(models)>3{
+  let rest:string=text.concat("\n…and ",text.concat(string.from_int(array.len(models)-3)," more"))
+  string.append(label,rest)
+  string.append(annotated,rest)}
+ let _=desk.set_text(app,"model_inputs",annotated)
+ let _=desk.set_text(app,"secondary_models",label)
+ let _=desk.set_text(app,"vocal_models",label)
+ ()
+}
+fn secondary_name(index:f64)->str effects {} {
+ if index==1.0{"instrumental"}else{if index==2.0{"bass"}else{if index==3.0{"drums"}else{if index==4.0{"other"}else{"vocals"}}}}
+}
+fn secondary_list(app:ref<desk.Session>,rules:ref<array<secondary_config.Adjustment>>)->unit effects {alloc,net,time} {
+ var label:string="Secondary assignments:"
+ var i:u64=0
+ loop{if i==array.len(rules){break}
+  let rule:ref<secondary_config.Adjustment>=array.borrow(rules,i)
+  string.append(label,text.concat("\n",text.concat(rule.target,text.concat(" ← model ",text.concat(string.from_int(rule.model+1),text.concat(", primary weight ",string.from_float(rule.primary_weight)))))))
+  i+=1}
+ if array.len(rules)==0{string.append(label," none")}
+ let _=desk.set_text(app,"secondary_rules",label)
+ ()
+}
+fn preprocess_list(app:ref<desk.Session>,index:u64)->unit effects {alloc,net,time} {
+ let label:string=if index==0{"Instrumental preprocessing: disabled"}else{text.concat("Preprocess with model ",text.concat(string.from_int(index+1),"; separate instrumental input, then restore original-recording vocals."))}
+ let _=desk.set_text(app,"preprocess_summary",label)
+ ()
+}
+fn vocal_list(app:ref<desk.Session>,index:u64)->unit effects {alloc,net,time} {
+ let label:string=if index==0{"Vocal splitting: disabled"}else{text.concat("Split primary vocals with model ",string.from_int(index+1))}
+ let _=desk.set_text(app,"vocal_summary",label)
+ ()
+}
+fn vocal_amount(settings:ref<vocal.Settings>,value:str)->result<unit,string> effects {alloc} {
+ let amount:f64=match text.parse_f64(value){some(v)=>v,none=>{return result.err("Enter a vocal rebalance amount between 0 and 1")}}
+ settings.rebalance=amount
+ vocal.validate(settings)
+}
+fn selected_outputs(selected:f64)->array<string> effects {alloc} {
+ if selected==1.0{["vocals","instrumental"]}else{if selected==2.0{["bass","no_bass"]}else{
+  if selected==3.0{["drums","no_drums"]}else{if selected==4.0{["other","no_other"]}else{[]}}}}
+}
+fn single_recipe(settings:str,checkpoint:str,selected:f64,method:f64,normalize:bool,keep:bool)->secondary_config.Recipe effects {alloc} {
+ secondary_config.Recipe{models:[secondary_config.Model{config:string.copy(settings),checkpoint:string.copy(checkpoint)}],outputs:selected_outputs(selected),adjustments:[],
+  complement:if method==1.0{"spectral"}else{"sum"},normalize:normalize,keep_members:keep}
+}
+fn secondary_recipe(state:ref<preferences.State>)->secondary_config.Recipe effects {alloc} {
+ var copied:array<secondary_config.Model>=[]
+ var i:u64=0
+ loop{if i==array.len(state.ensemble_models){break}
+  let model:ref<model_config.Model>=array.borrow(state.ensemble_models,i)
+  array.push(copied,secondary_config.Model{config:string.copy(model.config),checkpoint:string.copy(model.checkpoint),definition:string.copy(model.definition)})
+  i+=1}
+ var adjustments:array<secondary_config.Adjustment>=[]
+ i=0
+ loop{if i==array.len(state.secondary_rules){break}
+  let rule:ref<secondary_config.Adjustment>=array.borrow(state.secondary_rules,i)
+  array.push(adjustments,secondary_config.Adjustment{target:string.copy(rule.target),model:rule.model,primary_weight:rule.primary_weight})
+  i+=1}
+ secondary_config.Recipe{models:copied,outputs:selected_outputs(state.secondary_outputs),adjustments:adjustments,normalize:state.secondary_normalize,keep_members:state.secondary_keep,complement:if state.secondary_spectral{"spectral"}else{if state.secondary_residual{"residual"}else{"sum"}},
+  preprocess:state.preprocess_model,preprocess_complement:if state.preprocess_spectral{"spectral"}else{if state.preprocess_residual{"residual"}else{"direct"}},save_instrumental_mix:state.preprocess_extra,vocal_split:state.vocal_model,
+  vocal_rebalance:if state.vocal_model>0{state.vocal_options.rebalance}else{0.0},vocal_mixes:state.vocal_model>0 and state.vocal_options.mixes,
+  vocal_mix_only:state.vocal_model>0 and state.vocal_options.mix_only,vocal_save_only:state.vocal_model>0 and state.vocal_options.vocal_only}
+}
+fn add_model(models:ref<array<model_config.Model>>,settings:str,checkpoint:str,definition:str)->result<unit,string> effects {alloc,fs.read} {
+ if str.len(settings)==0 or str.len(checkpoint)==0{return result.err("Choose a model configuration and weights first")}
+ let key:string=try cache.checkpoint_id(checkpoint)
+ var i:u64=0
+ loop{if i==array.len(models){break}
+  let previous:string=try cache.checkpoint_id(array.borrow(models,i).checkpoint)
+  if key==previous{return result.err("That model is already in the ensemble")}
+  i+=1}
+ array.push(models,model_config.Model{config:string.copy(settings),checkpoint:string.copy(checkpoint),definition:string.copy(definition)})
+ result.ok(())
+}
+fn reduction(index:f64)->string effects {alloc} {
+ if index==1.0{"minimum"}else{if index==2.0{"maximum"}else{"average"}}
+}
+fn queue_list(app:ref<desk.Session>,items:ref<array<queue_config.Item>>,lists:ref<input_lists.State>)->unit effects {alloc,net,time} {
+ input_lists.queued(app,struct.borrow(lists,field=queue),items)
+}
+fn queue_add(items:ref<array<queue_config.Item>>,index:u64,input:str)->bool effects {alloc} {
+ if str.len(input)==0 or array.len(items)>=4096{return false}
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  if str.view(array.borrow(items,i).input)==input{return false}
+  i+=1}
+ array.push(items,queue_config.Item{input:string.copy(input),folder:queue_config.folder(index,input)})
+ true
+}
+fn queue_pending(items:ref<array<queue_config.Item>>,report:ref<queue_config.Report>)->array<queue_config.Item> effects {alloc} {
+ var pending:array<queue_config.Item>=[]
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  let original:ref<queue_config.Item>=array.borrow(items,i)
+  var completed:bool=false
+  var j:u64=0
+  loop{if j==array.len(report.items){break}
+   let outcome:ref<queue_config.Outcome>=array.borrow(report.items,j)
+   if str.view(original.input)==str.view(outcome.input) and str.view(original.folder)==str.view(outcome.folder) and str.view(outcome.state)=="complete"{completed=true}
+   j+=1}
+  if not completed{array.push(pending,queue_config.Item{input:string.copy(original.input),folder:string.copy(original.folder)})}
+  i+=1}
+ pending
+}
+fn model_recipe(state:ref<preferences.State>)->model_config.Recipe effects {alloc} {
+ var copied:array<model_config.Model>=[]
+ var i:u64=0
+ loop{if i==array.len(state.ensemble_models){break}
+  let model:ref<model_config.Model>=array.borrow(state.ensemble_models,i)
+  array.push(copied,model_config.Model{config:string.copy(model.config),checkpoint:string.copy(model.checkpoint),processing:string.copy(model.processing),definition:string.copy(model.definition)})
+  i+=1}
+ var outputs:array<model_config.Target>=[]
+ if state.model_paired{
+  array.push(outputs,model_config.Target{target:"vocals",method:reduction(state.model_primary),exclude:""})
+  array.push(outputs,model_config.Target{target:"instrumental",method:reduction(state.model_secondary),exclude:""})}
+ model_config.Recipe{models:copied,options:model_config.Options{outputs:outputs,method:reduction(state.model_primary),
+  domain:if state.model_wave{"waveform"}else{"spectrum"},normalize:state.model_normalize,keep_members:state.model_keep,complement:if state.model_spectral{"spectral"}else{if state.model_residual{"residual"}else{"sum"}}}}
+}
+fn capture_models(state:ref<preferences.State>)->result<string,string> effects {alloc,fs.read,fs.meta} {
+ if array.len(state.queue_items)==0{return result.ok("")}
+ if str.len(state.queue_model_snapshot)>0{return result.ok(string.copy(state.queue_model_snapshot))}
+ let ensemble:model_config.Recipe=model_recipe(state)
+ let secondary:secondary_config.Recipe=secondary_recipe(state)
+ model_snapshot.capture_selected(state.settings,state.checkpoint,
+  try model_config.Recipe_encode(ensemble) map_err codec.describe,
+  try secondary_config.Recipe_encode(secondary) map_err codec.describe,state.model_definition)
+}
+fn queue_append(state:ref<preferences.State>,input:str)->unit effects {alloc} {
+ let index:u64=state.queue_index
+ if queue_add(state.queue_items,index,input){state.queue_index+=1}
+ ()
+}
+fn show_page(app:ref<desk.Session>,state:ref<preferences.State>,page:f64)->unit effects {alloc,net,time} {
+ state.workflow_page=page
+ let _=desk.set_number(app,"workflow","page",page)
+ ()
+}
+fn preferences_display(app:ref<desk.Session>,state:ref<preferences.State>,lists:ref<input_lists.State>,paired:ref<paired_panel.State>)->unit effects {alloc,net,time} {
+ paired_panel.reset(app,state,paired)
+ let _=desk.set_number(app,"workflow","page",state.workflow_page)
+ if state.window_width>0{
+  var command:codec.Writer=desk.command("window-size","window")
+  codec.field_u64(command,"width",state.window_width)
+  codec.field_u64(command,"height",state.window_height)
+  codec.field_bool(command,"maximized",state.window_maximized)
+  let _=desk.submit(app,command)}
+ let _=desk.set_text(app,"settings",state.settings)
+ let _=desk.set_text(app,"checkpoint",state.checkpoint)
+ let _=desk.set_text(app,"input",state.input)
+ let _=desk.set_text(app,"output",state.output)
+ let _=desk.set_text(app,"tool_amount",state.tool_amount)
+ let _=desk.set_text(app,"pitch_amount",state.pitch_amount)
+ let _=desk.set_text(app,"tempo_amount",state.tempo_amount)
+ let _=desk.set_text(app,"pitch_preserve_amount",state.pitch_preserve_amount)
+ let _=desk.set_text(app,"codec_directory",state.codec_directory)
+ let _=desk.set_text(app,"ensemble_sample_seconds",state.sample_seconds)
+ let _=desk.set_text(app,"queue_sample_seconds",state.sample_seconds)
+ let _=desk.set_text(app,"processing_sample_seconds",state.sample_seconds)
+ let _=desk.set_bool(app,"processing_sample","active",state.processing_sample)
+ let _=desk.set_text(app,"ensemble_sample_library",state.sample_library)
+ let _=desk.set_text(app,"mastering_library",state.sample_library)
+ let _=desk.set_text(app,"queue_sample_library",state.sample_library)
+ let _=desk.set_text(app,"alignment_first",state.alignment_first)
+ let _=desk.set_text(app,"alignment_second",state.alignment_second)
+ let _=desk.set_number(app,"alignment_polarity","selected",state.alignment_polarity)
+ let _=desk.set_bool(app,"alignment_save_aligned","active",state.alignment_save_aligned)
+ let _=desk.set_number(app,"alignment_windows","selected",state.alignment_windows)
+ let _=desk.set_number(app,"alignment_intros","selected",state.alignment_intros)
+ let _=desk.set_number(app,"alignment_gain","selected",state.alignment_gain)
+ let _=desk.set_number(app,"alignment_phase","selected",state.alignment_phase)
+ let _=desk.set_number(app,"alignment_initial_polarity","selected",state.alignment_initial_polarity)
+ let _=desk.set_bool(app,"alignment_match_silence","active",state.alignment_match_silence)
+ let _=desk.set_bool(app,"alignment_spectral_match","active",state.alignment_spectral_match)
+ let _=desk.set_text(app,"secondary_weight",state.secondary_weight)
+ let _=desk.set_text(app,"vocal_amount",state.vocal_weight)
+ let _=desk.set_bool(app,"gpu","active",state.use_gpu)
+ let _=desk.set_bool(app,"high_band","active",state.high_band)
+ let _=desk.set_bool(app,"noise_reduction","active",state.noise_reduction)
+ let _=desk.set_bool(app,"room_reduction","active",state.room_reduction)
+ let _=desk.set_number(app,"room_targets","selected",state.room_targets)
+ let _=desk.set_text(app,"noise_checkpoint",state.noise_checkpoint)
+ let _=desk.set_text(app,"room_checkpoint",state.room_checkpoint)
+ let _=desk.set_bool(app,"cleanup_enabled","active",state.cleanup_enabled)
+ let _=desk.set_text(app,"cleanup_threshold",state.cleanup_threshold)
+ let _=desk.set_number(app,"mask_tta","selected",state.mask_tta)
+ let _=desk.set_text(app,"mask_window",state.mask_window)
+ let _=desk.set_text(app,"mask_aggression",state.mask_aggression)
+ let _=desk.set_text(app,"gpu_index",state.gpu_index)
+ let _=desk.set_bool(app,"recording_override","active",state.recording_override)
+ let _=desk.set_bool(app,"inference_pitch","active",state.inference_pitch)
+ let _=desk.set_bool(app,"match_frequency","active",state.match_frequency)
+ let _=desk.set_text(app,"inference_semitones",state.inference_semitones)
+ let _=desk.set_text(app,"recording_shifts",state.recording_shifts)
+ let _=desk.set_bool(app,"recording_split","active",state.recording_split)
+ let _=desk.set_text(app,"recording_overlap",state.recording_overlap)
+ let _=desk.set_text(app,"recording_segment",state.recording_segment)
+ let _=desk.set_text(app,"recording_seed",state.recording_seed)
+ let _=desk.set_bool(app,"cleanup_threshold","sensitive",state.cleanup_enabled)
+ let _=desk.set_bool(app,"naming_append_model","active",state.naming_append_model)
+ let _=desk.set_bool(app,"naming_model_folder","active",state.naming_model_folder)
+ let _=desk.set_bool(app,"naming_testing","active",state.naming_testing)
+ let _=desk.set_bool(app,"naming_append_ensemble","active",state.naming_append_ensemble)
+ let _=desk.set_text(app,"naming_ensemble_label",state.naming_ensemble_label)
+ let _=desk.set_bool(app,"single_normalize","active",state.single_normalize)
+ let _=desk.set_bool(app,"single_keep","active",state.single_keep)
+ let _=desk.set_bool(app,"ensemble_wave","active",state.ensemble_wave)
+ let _=desk.set_bool(app,"ensemble_normalize","active",state.ensemble_normalize)
+ let _=desk.set_bool(app,"model_wave","active",state.model_wave)
+ let _=desk.set_bool(app,"model_normalize","active",state.model_normalize)
+ let _=desk.set_bool(app,"model_keep","active",state.model_keep)
+ let _=desk.set_bool(app,"model_residual","active",state.model_residual)
+ let _=desk.set_bool(app,"model_spectral","active",state.model_spectral)
+ let _=desk.set_bool(app,"secondary_normalize","active",state.secondary_normalize)
+ let _=desk.set_bool(app,"secondary_keep","active",state.secondary_keep)
+ let _=desk.set_bool(app,"secondary_residual","active",state.secondary_residual)
+ let _=desk.set_bool(app,"secondary_spectral","active",state.secondary_spectral)
+ let _=desk.set_bool(app,"preprocess_residual","active",state.preprocess_residual)
+ let _=desk.set_bool(app,"preprocess_spectral","active",state.preprocess_spectral)
+ let _=desk.set_bool(app,"preprocess_extra","active",state.preprocess_extra)
+ let _=desk.set_bool(app,"queue_continue","active",state.queue_continue)
+ let _=desk.set_number(app,"export_subtype","selected",state.export_subtype)
+ let _=desk.set_number(app,"output_container","selected",state.output_container)
+ let _=desk.set_number(app,"mp3_bitrate","selected",state.mp3_bitrate)
+ let _=desk.set_number(app,"audio_budget","selected",state.audio_budget)
+ let _=desk.set_number(app,"single_outputs","selected",state.single_outputs)
+ let _=desk.set_number(app,"single_complement","selected",state.single_complement)
+ let _=desk.set_number(app,"model_primary","selected",state.model_primary)
+ let _=desk.set_number(app,"model_secondary","selected",state.model_secondary)
+ let _=desk.set_number(app,"secondary_target","selected",state.secondary_target)
+ let _=desk.set_number(app,"secondary_outputs","selected",state.secondary_outputs)
+ let _=desk.set_number(app,"model_outputs","selected",if state.model_paired{1.0}else{0.0})
+ let _=desk.set_number(app,"vocal_outputs","selected",state.secondary_outputs)
+ let _=desk.set_bool(app,"vocal_normalize","active",state.secondary_normalize)
+ let _=desk.set_bool(app,"vocal_keep","active",state.secondary_keep)
+ let _=desk.set_bool(app,"vocal_mixes","active",state.vocal_options.mixes)
+ let _=desk.set_bool(app,"vocal_mix_only","active",state.vocal_options.mix_only)
+ let _=desk.set_bool(app,"vocal_save_only","active",state.vocal_options.vocal_only)
+ ensemble_list(app,state.ensemble_inputs,lists)
+ model_list(app,state.ensemble_models)
+ secondary_list(app,state.secondary_rules)
+ preprocess_list(app,state.preprocess_model)
+ vocal_list(app,state.vocal_model)
+ queue_list(app,state.queue_items,lists)
+ export_controls(app,state)
+ ()
+}
+pub fn main(args:view<str>)->i32 effects {alloc,env,fs.read,fs.write,fs.meta,io.write,net,random,time,thread,process,gpu,ffi} {
+ if view.len(args)!=3 and view.len(args)!=5 and view.len(args)!=7{io.ewrite("usage: StemAIR AIR_UI PROJECT_ROOT [RECORDING OUTPUT_DIRECTORY [CONFIG MODEL]]\n")
+  return 2}
+ let root:str=view.get(args,2)
+ var app:desk.Session=match desk.prepare(view.get(args,1),path.join(root,"src/desktop.ui"),path.join(root,"src/desktop.css")){ok(v)=>v,err(e)=>{io.ewrite(e)
+  return 1},}
+ var state:preferences.State=preferences.defaults(root)
+ var preference_file:string=""
+ var preference_warning:string=""
+ var preference_writable:bool=true
+ match preferences.location(){err(e)=>{preference_warning=e
+  preference_writable=false},ok(file)=>{preference_file=file
+  match preferences.load(preference_file,root){ok(loaded)=>{state=loaded},err(e)=>{preference_warning=e
+   preference_writable=false}}}}
+ var preference_serialized:string=match preferences.encode(state){ok(v)=>v,err(_)=>string.new()}
+ var preference_dirty:bool=view.len(args)>=5
+ if view.len(args)==7{state.model_definition=""
+  state.settings=string.copy(view.get(args,5))
+  state.checkpoint=string.copy(view.get(args,6))}
+ if view.len(args)>=5{state.input=string.copy(view.get(args,3))
+  state.output=string.copy(view.get(args,4))}
+ let preference_temporary:string=text.concat(preference_file,text.concat(".",text.concat(path.basename(app.root),".tmp")))
+ var audition:listen.State=listen.empty()
+ audition.selection=string.copy(state.input)
+ audition.root=string.copy(state.output)
+ var retained:option<cache.Cache>=option.none()
+ var lists:input_lists.State=input_lists.empty()
+ var paired:paired_panel.State=paired_panel.empty()
+ var input_activation_file:bool=false
+ var catalog_state:model_panel.State=model_panel.empty(root)
+ if path.is_absolute(state.checkpoint){catalog_state.directory=path.dirname(state.checkpoint)}
+ var editor:model_editor.State=model_editor.empty()
+ var catalog_active:bool=false
+ var queue_active:bool=false
+ var audio_request:u64=0
+ var preset_file:string=""
+ var preset_identity:string=""
+ let cancel:string=path.join(str.view(app.root),"cancel")
+ let progress:string=path.join(str.view(app.root),"progress")
+ var previous_progress:string=string.new()
+ var cleanup_draft:string=string.copy(state.cleanup_threshold)
+ var mask_window_draft:string=string.copy(state.mask_window)
+ var mask_aggression_draft:string=string.copy(state.mask_aggression)
+ var inference_semitones_draft:string=string.copy(state.inference_semitones)
+ var recording_shifts_draft:string=string.copy(state.recording_shifts)
+ var recording_overlap_draft:string=string.copy(state.recording_overlap)
+ var recording_segment_draft:string=string.copy(state.recording_segment)
+ var gpu_index_draft:string=string.copy(state.gpu_index)
+ var recording_seed_draft:string=string.copy(state.recording_seed)
+ var answer:i32=0
+ task.scope{
+  var helpers:array<task<proc.Exit>>=[]
+  var jobs:array<task<job.Completed>>=[]
+  array.push(helpers,task.spawn(desk.plan(app),fn=proc.start))
+  match desk.connect(app){err(e)=>{io.ewrite(e)
+   answer=1},ok(_)=>{
+   preferences_display(app,state,lists,paired)
+       cleanup_draft=string.copy(state.cleanup_threshold)
+       mask_window_draft=string.copy(state.mask_window)
+       mask_aggression_draft=string.copy(state.mask_aggression)
+       inference_semitones_draft=string.copy(state.inference_semitones)
+       recording_shifts_draft=string.copy(state.recording_shifts)
+       recording_overlap_draft=string.copy(state.recording_overlap)
+       recording_segment_draft=string.copy(state.recording_segment)
+       recording_seed_draft=string.copy(state.recording_seed)
+       gpu_index_draft=string.copy(state.gpu_index)
+   let _=desk.shortcut(app,"<Control><Shift>F7","session_save")
+   let _=desk.shortcut(app,"<Control><Shift>F8","session_open")
+   let _=desk.shortcut(app,"<Control><Shift>F9","session_rename")
+   let _=desk.shortcut(app,"<Control><Shift>F10","session_delete")
+   let _=desk.shortcut(app,"<Control><Shift>r","model_preset_rename")
+   let _=desk.shortcut(app,"<Control><Shift>d","model_preset_delete")
+   match model_panel.refresh(app,catalog_state){ok(_)=>{},err(e)=>{let _=desk.set_text(app,"catalog_status",e)}}
+   let _=desk.shortcut(app,"<Control><Shift>F1","catalog_page")
+   let _=desk.shortcut(app,"<Control><Shift>F2","catalog_focus_directory")
+   let _=desk.shortcut(app,"<Control><Shift>F3","catalog_focus_profiles")
+   let _=desk.shortcut(app,"<Control><Shift>F4","catalog_verify")
+   let _=desk.shortcut(app,"<Control><Shift>F5","catalog_use")
+   let _=desk.shortcut(app,"<Control><Shift>F6","catalog_acquire")
+   let _=desk.shortcut(app,"<Control>r","catalog_refresh")
+   let _=desk.set_text(app,"audio_file",audition.selection)
+   let _=desk.set_text(app,"audio_folder",audition.root)
+   let _=desk.shortcut(app,"<Control>F7","listen_page")
+   let _=desk.shortcut(app,"<Control><Shift>i","audio_focus")
+   let _=desk.shortcut(app,"<Control><Shift>u","audio_choose")
+   let _=desk.shortcut(app,"<Control>F8","audio_input")
+   let _=desk.shortcut(app,"F8","audio_toggle")
+   let _=desk.shortcut(app,"F9","audio_stop")
+   let _=desk.shortcut(app,"<Control>F9","audio_refresh")
+   let _=desk.shortcut(app,"<Control>F10","audio_choose_folder")
+   let _=desk.shortcut(app,"<Control>F11","audio_focus_mute")
+   let _=desk.shortcut(app,"<Control><Shift>F11","audio_focus_results")
+   let _=desk.shortcut(app,"<Control>F12","audio_focus_seek")
+   let _=desk.shortcut(app,"<Control><Shift>F12","audio_focus_volume")
+   if str.len(preference_warning)>0{
+    let message:string=text.concat("Preferences were not restored: ",text.concat(preference_warning,". Save preferences to replace the saved file, or restore defaults."))
+    let _=desk.set_text(app,"status",message)
+    io.ewrite(text.concat(message,"\n"))}
+   let _=desk.shortcut(app,"<Control><Alt><Shift>s","preferences_save")
+   let _=desk.shortcut(app,"<Control><Alt><Shift>r","preferences_reset")
+   let _=desk.shortcut(app,"<Control>Return","separate")
+   let _=desk.shortcut(app,"<Control>q","quit")
+   let _=desk.shortcut(app,"Escape","cancel")
+   let _=desk.shortcut(app,"<Control>e","ensemble_add")
+   let _=desk.shortcut(app,"<Control><Alt>n","focus_audio_inputs")
+   let _=desk.shortcut(app,"<Control><Alt>q","focus_queue_inputs")
+   let _=desk.shortcut(app,"<Control><Shift>e","ensemble_current")
+   let _=desk.shortcut(app,"<Control>1","ensemble_min")
+   let _=desk.shortcut(app,"<Control>2","ensemble_max")
+   let _=desk.shortcut(app,"<Control>3","ensemble_average")
+   let _=desk.shortcut(app,"<Control>4","tool_combine")
+   let _=desk.shortcut(app,"<Control>5","tool_mix")
+   let _=desk.shortcut(app,"<Control>6","tool_reduce")
+   let _=desk.shortcut(app,"<Control><Alt>4","tool_spectral")
+   let _=desk.shortcut(app,"<Control>7","focus_tool_amount")
+   let _=desk.shortcut(app,"<Control><Alt>5","tool_pitch")
+   let _=desk.shortcut(app,"<Control><Alt>7","focus_pitch_amount")
+   let _=desk.shortcut(app,"<Control><Alt>6","alignment_run")
+   let _=desk.shortcut(app,"<Control><Alt>a","recording_alignment_run")
+   let _=desk.shortcut(app,"<Control><Alt>f","focus_alignment_first")
+   let _=desk.shortcut(app,"<Control><Alt>g","focus_alignment_second")
+   let _=desk.shortcut(app,"<Control><Alt>h","focus_alignment_polarity")
+   let _=desk.shortcut(app,"<Control><Alt>j","focus_alignment_save")
+   let _=desk.shortcut(app,"<Control><Alt>t","tool_tempo")
+   let _=desk.shortcut(app,"<Control><Alt>i","tool_pitch_preserve")
+   let _=desk.shortcut(app,"<Control><Alt>u","focus_tempo_amount")
+   let _=desk.shortcut(app,"<Control><Alt>y","focus_pitch_preserve_amount")
+   let _=desk.shortcut(app,"<Control>m","model_add")
+   let _=desk.shortcut(app,"<Control><Alt>e","model_processing_add")
+   let _=desk.shortcut(app,"<Control><Alt><Shift>e","model_processing_clear")
+   let _=desk.shortcut(app,"<Control><Shift>s","model_preset_save")
+   let _=desk.shortcut(app,"<Control><Alt>o","model_preset_open")
+   let _=desk.shortcut(app,"<Control><Shift>Return","model_run")
+   let _=desk.shortcut(app,"<Control>k","focus_settings")
+   let _=desk.shortcut(app,"<Control><Shift>k","focus_checkpoint")
+   let _=desk.shortcut(app,"<Control><Shift>o","focus_output")
+   let _=desk.shortcut(app,"<Control>F1","single_page")
+   let _=desk.shortcut(app,"<Control>F2","models_page")
+   let _=desk.shortcut(app,"<Control>F3","audio_page")
+   let _=desk.shortcut(app,"<Control>F4","queue_page")
+   let _=desk.shortcut(app,"<Control>F5","secondary_page")
+   let _=desk.shortcut(app,"<Control>8","secondary_assign")
+   let _=desk.shortcut(app,"<Control>9","focus_secondary_weight")
+   let _=desk.shortcut(app,"<Control><Alt>Return","secondary_run")
+   let _=desk.shortcut(app,"<Control>0","focus_secondary_outputs")
+   let _=desk.shortcut(app,"<Control><Alt>p","preprocess_assign")
+   let _=desk.shortcut(app,"<Control><Shift>p","preprocess_clear")
+   let _=desk.shortcut(app,"<Control>F6","vocal_page")
+   let _=desk.shortcut(app,"<Control><Alt>w","focus_export_subtype")
+   let _=desk.shortcut(app,"<Control><Alt>c","focus_output_container")
+   let _=desk.shortcut(app,"<Control><Alt>r","focus_mp3_bitrate")
+   let _=desk.shortcut(app,"<Control><Alt>d","focus_codec_directory")
+   let _=desk.shortcut(app,"<Control><Alt>0","focus_single_outputs")
+   let _=desk.shortcut(app,"<Control><Alt>8","focus_single_complement")
+   let _=desk.shortcut(app,"<Control><Shift>m","focus_model_outputs")
+   let _=desk.shortcut(app,"<Control><Alt>l","vocal_assign")
+   let _=desk.shortcut(app,"<Control><Shift>l","vocal_clear")
+   let _=desk.shortcut(app,"<Control><Alt>9","focus_vocal_amount")
+   let _=desk.shortcut(app,"<Control>b","queue_add")
+   let _=desk.shortcut(app,"<Control><Shift>b","queue_single")
+   let _=desk.shortcut(app,"<Control><Alt>b","queue_ensemble")
+   let _=desk.shortcut(app,"<Control><Shift>a","queue_current")
+   let _=desk.shortcut(app,"<Control><Alt>s","queue_secondary")
+   loop{
+    match tasks.join_next<job.Completed>(jobs,0){none=>{},some(completed)=>{
+     var finished:job.Completed=completed
+     retained=struct.replace(finished,option.none(),field=retained)
+     if str.len(finished.mastering_report)>0{io.write(text.concat("Reference mastering report: ",text.concat(finished.mastering_report,"\n")))}
+     if str.len(finished.paired_snapshot)>0{
+      state.paired_snapshot=string.copy(finished.paired_snapshot)
+      preference_dirty=true
+      paired_panel.refresh(app,state,paired)}
+     if str.len(finished.paired_report)>0{
+      io.write(text.concat("Paired recording report: ",text.concat(finished.paired_report,"\n")))
+      let _=desk.set_text(app,"pairs_report",text.concat(match paired_state.decode(state.paired_snapshot){ok(saved)=>match paired_panel.details(saved){ok(value)=>value,err(error)=>error},err(error)=>error},text.concat("\n",finished.message)))}
+     if str.len(finished.sample_report)>0{
+      match sample.Envelope_decode(finished.sample_report){err(e)=>{finished.message=codec.describe(e)},ok(report)=>{
+       var sampled:sample.Envelope=report
+       let details:string=sample_panel.details(sampled)
+       let _=desk.set_text(app,if sampled.queue{"queue_verification_details"}else{"ensemble_verification_details"},details)
+       io.write(text.concat(details,"\n"))}}}
+     if str.len(finished.verification_report)>0{
+      match verification_data.Envelope_decode(finished.verification_report){err(e)=>{finished.message=codec.describe(e)},ok(report)=>{
+       var verified:verification_data.Envelope=report
+       let details:string=verification.details(verified)
+       let _=desk.set_text(app,if verified.queue{"queue_verification_details"}else{"ensemble_verification_details"},details)
+       io.write(text.concat(details,"\n"))
+       if verified.report.completed{
+        let applied:result<unit,string>=if verified.queue{
+         verification.apply_queue(verified,struct.borrow(state,field=queue_items),lists.queue.generation)}else{
+         verification.apply_audio(verified,struct.borrow(state,field=ensemble_inputs),lists.audio.generation)}
+        match applied{err(e)=>{finished.message=e},ok(_)=>{
+         preference_dirty=true
+         if verified.queue{queue_list(app,state.queue_items,lists)}else{ensemble_list(app,state.ensemble_inputs,lists)}}}
+       }}}}
+     if catalog_active{
+      catalog_active=false
+      if finished.ok and str.len(finished.catalog_settings)>0{
+       var selected_settings:string=string.copy(finished.catalog_settings)
+       var selected_definition:string=""
+       let default_selection:result<unit,string>=match model_catalog.find(catalog_state.entries,finished.catalog_profile){none=>result.err("Verified model is no longer in the admitted catalog"),some(index)=>{
+        match model_draft.selected(state.model_defaults,array.borrow(catalog_state.entries,index),root){err(e)=>result.err(e),ok(binding)=>{
+         match binding{none=>{},some(value)=>{selected_settings=string.copy(value.configuration)
+          selected_definition=string.copy(value.definition)}}
+         result.ok(())}}}}
+       match default_selection{err(e)=>{finished.message=text.concat("Model verified but saved defaults were not applied: ",e)},ok(_)=>{
+        state.settings=selected_settings
+        state.model_definition=selected_definition
+        state.checkpoint=string.copy(finished.catalog_checkpoint)
+        preference_dirty=true
+        let _=desk.set_text(app,"settings",state.settings)
+        let _=desk.set_text(app,"checkpoint",state.checkpoint)
+        model_editor.close(app,editor)}}}
+      match model_panel.refresh(app,catalog_state){ok(_)=>{},err(e)=>{io.ewrite(text.concat(e,"\n"))}}
+      let _=desk.set_text(app,"catalog_status",finished.message)
+      if str.len(finished.catalog_report)>0{io.write(text.concat("Model acquisition report: ",text.concat(finished.catalog_report,"\n")))}}
+     if str.len(finished.directory)>0{
+      match listen.refresh(app,audition,finished.directory){ok(_)=>{},err(e)=>{let _=desk.set_text(app,"audio_results_status",e)}}}
+
+     match finished.queue_report{none=>{},some(report)=>{state.queue_items=queue_pending(state.queue_items,report)
+      state.queue_recording_state=string.copy(finished.recording_state)
+      if array.len(state.queue_items)==0{state.queue_model_snapshot=""
+     state.queue_cleanup_snapshot=""
+     state.queue_learned_snapshot=""
+     state.queue_inference_snapshot=""
+     state.queue_recording_snapshot=""
+     state.queue_recording_state=""
+       state.queue_naming_snapshot=""}
+      preference_dirty=true
+      queue_list(app,state.queue_items,lists)}}
+     queue_active=false
+     let _=desk.set_text(app,"status",str.view(finished.message))
+     busy(app,false)
+     let _=desk.set_bool(app,"cleanup_threshold","sensitive",state.cleanup_enabled)
+     export_controls(app,state)
+     io.write(text.concat(str.view(finished.message),"\n"))
+    },}
+    if array.len(jobs)>0{
+     match files.read_text(str.view(progress)){err(_)=>{},ok(value)=>{
+      var text:string=value
+      if queue_active{match files.read_text(text.concat(progress,".queue")){err(_)=>{},ok(overall)=>{text=text.concat(overall,text.concat("\n",text))}}}
+      if text!=previous_progress{previous_progress=text
+       let _=desk.set_text(app,"status",str.view(previous_progress))
+       if catalog_active{let _=desk.set_text(app,"catalog_status",previous_progress)}}
+     },}}
+    if preference_writable and preference_dirty{
+     match preferences.persist(state,preference_file,preference_temporary,preference_serialized){ok(raw)=>{preference_serialized=raw
+      preference_dirty=false},err(e)=>{
+      preference_writable=false
+      let _=desk.set_text(app,"status",e)
+      io.ewrite(text.concat(e,"\n"))}}}
+    var event:json.Document=match desk.next(app,100){ok(value)=>match value{some(v)=>v,none=>{continue},},err(e)=>{io.ewrite(e)
+     answer=1
+     break},}
+    let kind:string=desk.field(event,"event")
+    let id:string=desk.field(event,"id")
+    if kind=="window" and id=="window"{
+     let width:f64=desk.number(event,"width")
+     let height:f64=desk.number(event,"height")
+     if fp.is_finite(width) and fp.is_finite(height) and width>=320.0 and height>=240.0 and
+        width<=32768.0 and height<=32768.0 and fp.floor(width)==width and fp.floor(height)==height{
+      let maximized:bool=desk.boolean(event,"maximized")
+      if not maximized or state.window_width==0{state.window_width=cast.sat(width)
+       state.window_height=cast.sat(height)}
+      state.window_maximized=maximized
+      preference_dirty=true}
+     continue}
+    if kind=="change" and id=="workflow"{
+     let page:f64=desk.number(event,"value")
+     if fp.is_finite(page) and page>=0.0 and page<=7.0 and fp.floor(page)==page{
+      state.workflow_page=page
+      preference_dirty=true}
+     continue}
+    if kind=="dialog" and (id=="session_rename" or id=="session_delete" or id=="model_preset_rename" or id=="model_preset_delete"){
+     preset_file=""
+     preset_identity=""
+     if array.len(jobs)>0 or desk.boolean(event,"cancelled"){continue}
+     let file:string=desk.field(event,"value")
+     if str.len(file)==0{continue}
+     let ensemble:bool=id=="model_preset_rename" or id=="model_preset_delete"
+     let identity:result<string,string>=if ensemble{presets.identity(file)}else{session_presets.identity(file)}
+     match identity{err(e)=>{let _=desk.set_text(app,"status",e)},ok(digest)=>{
+      preset_file=file
+      preset_identity=digest
+      if id=="session_rename" or id=="model_preset_rename"{
+       let _=desk.prompt(app,if ensemble{"model_preset_rename_name"}else{"session_rename_name"},if ensemble{"Rename ensemble preset"}else{"Rename session preset"},path.basename(preset_file),"Rename","Cancel")}
+      else{let _=desk.confirm(app,if ensemble{"model_preset_delete_confirm"}else{"session_delete_confirm"},if ensemble{"Delete this ensemble preset?"}else{"Delete this session preset?"},preset_file,"Delete preset","Cancel")}}}
+     continue}
+    if (kind=="prompt" and (id=="session_rename_name" or id=="model_preset_rename_name")) or
+       (kind=="confirm" and (id=="session_delete_confirm" or id=="model_preset_delete_confirm")){
+     let file:string=ref.swap(preset_file,string.new())
+     let digest:string=ref.swap(preset_identity,string.new())
+     if array.len(jobs)>0 or str.len(file)==0{continue}
+     let ensemble:bool=id=="model_preset_rename_name" or id=="model_preset_delete_confirm"
+     if kind=="prompt"{
+      if desk.boolean(event,"cancelled"){continue}
+      let name:string=desk.field(event,"value")
+      let renamed:result<string,string>=if ensemble{presets.rename(file,name,digest)}else{session_presets.rename(file,name,digest)}
+      match renamed{ok(destination)=>{let _=desk.set_text(app,"status",text.concat(if ensemble{"Ensemble preset renamed: "}else{"Session preset renamed: "},destination))},err(e)=>{let _=desk.set_text(app,"status",e)}}
+     }else{if desk.boolean(event,"confirmed"){
+      let removed:result<unit,string>=if ensemble{presets.remove(file,digest)}else{session_presets.remove(file,digest)}
+      match removed{ok(_)=>{let _=desk.set_text(app,"status",if ensemble{"Ensemble preset deleted; active settings unchanged"}else{"Session preset deleted; active session unchanged"})},err(e)=>{let _=desk.set_text(app,"status",e)}}}}
+     continue}
+    if kind=="dialog" and (id=="session_save" or id=="session_open"){
+     if array.len(jobs)>0 or desk.boolean(event,"cancelled"){continue}
+     let file:string=desk.field(event,"value")
+     if str.len(file)==0{continue}
+     if id=="session_save"{
+      match session_presets.save(state,file){ok(_)=>{let _=desk.set_text(app,"status","Session preset saved with settings and file references")},err(e)=>{let _=desk.set_text(app,"status",e)}}
+     }else{
+      match session_presets.read(file){err(e)=>{let _=desk.set_text(app,"status",e)},ok(selected)=>{
+       let _=listen.stop(app,audition)
+       state=selected
+       model_editor.close(app,editor)
+       preferences_display(app,state,lists,paired)
+       cleanup_draft=string.copy(state.cleanup_threshold)
+       mask_window_draft=string.copy(state.mask_window)
+       mask_aggression_draft=string.copy(state.mask_aggression)
+       inference_semitones_draft=string.copy(state.inference_semitones)
+       recording_shifts_draft=string.copy(state.recording_shifts)
+       recording_overlap_draft=string.copy(state.recording_overlap)
+       recording_segment_draft=string.copy(state.recording_segment)
+       recording_seed_draft=string.copy(state.recording_seed)
+       gpu_index_draft=string.copy(state.gpu_index)
+       audition.selection=string.copy(state.input)
+       let _=desk.set_text(app,"audio_file",state.input)
+       let _=listen.clear_results(app,audition,state.output)
+       if str.len(state.output)>0{let _=listen.refresh(app,audition,state.output)}
+       if path.is_absolute(state.checkpoint){catalog_state.directory=path.dirname(state.checkpoint)
+        let _=desk.set_text(app,"catalog_directory",catalog_state.directory)
+        let _=model_panel.refresh(app,catalog_state)}
+       preference_dirty=true
+       let _=desk.set_text(app,"status","Session preset opened; no processing started")}}
+     }
+     continue}
+    if (kind=="select" or kind=="activate") and id=="catalog_profiles"{
+     if array.len(jobs)==0{let selected:string=desk.field(event,"value")
+      if option.is_some(model_catalog.find(catalog_state.entries,selected)){
+       model_editor.close(app,editor)
+       catalog_state.selected=selected
+       io.write(text.concat("Model preview: ",text.concat(catalog_state.selected,"\n")))
+       model_panel.details(app,catalog_state)}}
+     continue}
+    if (kind=="change" or kind=="dialog") and id=="catalog_directory"{
+     if array.len(jobs)==0 and not desk.boolean(event,"cancelled"){
+      model_editor.close(app,editor)
+      catalog_state.directory=desk.field(event,"value")
+      if kind=="dialog"{let _=desk.set_text(app,"catalog_directory",catalog_state.directory)}
+      io.write(text.concat("Model folder: ",text.concat(catalog_state.directory,"\n")))
+      let _=desk.set_text(app,"catalog_status","Folder changed. Refresh offline presence or verify the selected model.")}
+     continue}
+    if (kind=="change" or kind=="dialog") and (id=="alignment_first" or id=="alignment_second"){
+     if array.len(jobs)==0 and not desk.boolean(event,"cancelled"){
+      let value:string=desk.field(event,"value")
+      if id=="alignment_first"{state.alignment_first=string.copy(value)}else{state.alignment_second=string.copy(value)}
+      if kind=="dialog"{let _=desk.set_text(app,id,value)}
+      preference_dirty=true}
+     continue}
+    if kind=="change" and (id=="ensemble_activation_file" or id=="queue_activation_file"){
+     if array.len(jobs)>0{continue}
+     input_activation_file=desk.boolean(event,"value")
+     let _=desk.set_bool(app,if id=="ensemble_activation_file"{"queue_activation_file"}else{"ensemble_activation_file"},"active",input_activation_file)
+     continue}
+    if (kind=="activate" and (id=="ensemble_rows" or id=="queue_rows")) or
+     (kind=="action" and (id=="ensemble_open_file" or id=="ensemble_open_folder" or id=="queue_open_file" or id=="queue_open_folder")){
+     if array.len(jobs)>0{continue}
+     let audio_list:bool=id=="ensemble_rows" or id=="ensemble_open_file" or id=="ensemble_open_folder"
+     let key:string=if kind=="activate"{desk.field(event,"value")}else{""}
+     let selected:result<string,string>=if audio_list{input_navigation.audio_target(struct.borrow(lists,field=audio),state.ensemble_inputs,key)}else{input_navigation.queue_target(struct.borrow(lists,field=queue),state.queue_items,key)}
+     let folder:bool=if kind=="activate"{not input_activation_file}else{id=="ensemble_open_folder" or id=="queue_open_folder"}
+     match selected{err(e)=>{let _=desk.set_text(app,"status",e)},ok(file)=>{
+      match input_navigation.open(file,folder){ok(_)=>{let _=desk.set_text(app,"status",if folder{"Requested the recording folder in the file manager"}else{"Requested the recording in its default application"})},err(e)=>{let _=desk.set_text(app,"status",e)}}}}
+     continue}
+    if kind=="selection" and (id=="ensemble_rows" or id=="queue_rows"){
+     if array.len(jobs)==0{
+      let outcome:result<unit,string>=if id=="ensemble_rows"{input_selection.receive(struct.borrow(lists,field=audio),event)}else{input_selection.receive(struct.borrow(lists,field=queue),event)}
+      match outcome{ok(_)=>{},err(e)=>{let _=desk.set_text(app,"status",e)}}}
+     continue}
+    if array.len(state.queue_items)==0{state.queue_model_snapshot=""
+     state.queue_cleanup_snapshot=""
+     state.queue_learned_snapshot=""
+     state.queue_inference_snapshot=""
+     state.queue_recording_snapshot=""
+     state.queue_recording_state=""
+     state.queue_naming_snapshot=""}
+    if model_actions.handles(id,kind){
+     let snapshot:string=if id=="model_editor_save" or id=="model_restore"{match capture_models(state){ok(v)=>v,err(e)=>{
+      let _=desk.set_text(app,"model_editor_status",e)
+      continue}}}else{""}
+     match model_actions.receive(app,editor,catalog_state,state,retained,event,root,preference_file,preference_temporary,
+      preference_serialized,preference_dirty,preference_writable,snapshot,array.len(jobs)>0){ok(_)=>{},err(e)=>{
+       let _=desk.set_text(app,"model_editor_status",e)
+       let _=desk.set_text(app,"catalog_status",e)}}
+     continue}
+    if paired_panel.handles(id,kind){
+     match paired_panel.receive(app,state,paired,event,root,array.len(jobs)>0){ok(changed)=>{if changed{preference_dirty=true}},err(error)=>{let _=desk.set_text(app,"status",error)}}
+     continue}
+    if kind=="change" or kind=="dialog" or kind=="action"{preference_dirty=true}
+    if id=="audio_player" and (kind=="video" or kind=="error"){listen.observe(app,audition,event)
+     continue}
+    if kind=="change"{
+     match listen.change(app,audition,event){ok(handled)=>{if handled{continue}},err(e)=>{listen.report(app,e)
+      continue}}}
+    if (kind=="select" or kind=="activate") and id=="audio_results"{
+     let selected:string=desk.field(event,"value")
+     if listen.selected(audition,selected){match listen.load(app,audition,selected,kind=="activate"){ok(_)=>{},err(e)=>{listen.report(app,e)}}}
+     continue}
+    if kind=="dialog" and (id=="audio_choose" or id=="audio_choose_folder"){
+     let selected:string=desk.field(event,"value")
+     if str.len(selected)==0 or desk.boolean(event,"cancelled"){continue}
+     if id=="audio_choose"{match listen.load(app,audition,selected,false){ok(_)=>{},err(e)=>{listen.report(app,e)}}
+     }else{match listen.refresh(app,audition,selected){ok(_)=>{},err(e)=>{let _=desk.set_text(app,"audio_results_status",e)}}}
+     continue}
+    if kind=="action"{
+     if id=="listen_page"{show_page(app,state,6.0)
+      continue}
+     if id=="audio_focus_results"{show_page(app,state,6.0)
+      if array.len(audition.files)>0{let first:string=string.copy(array.get(audition.files,0))
+       let _=desk.select(app,"audio_results",first)}
+      let _=desk.focus(app,"audio_results")
+      continue}
+     if id=="audio_focus_mute" or id=="audio_focus_seek" or id=="audio_focus_volume"{show_page(app,state,6.0)
+      let _=desk.focus(app,if id=="audio_focus_mute"{"audio_muted"}else{if id=="audio_focus_seek"{"audio_seek"}else{"audio_volume"}})
+      continue}
+     if id=="audio_focus"{show_page(app,state,6.0)
+      let _=desk.focus(app,"audio_file")
+      continue}
+     if id=="audio_choose"{let _=desk.dialog(app,"audio_choose","open","Choose audio to listen to","",root)
+      continue}
+     if id=="audio_choose_folder" and array.len(jobs)==0{let _=desk.dialog(app,"audio_choose_folder","folder","Choose results folder","",root)
+      continue}
+     if id=="audio_refresh" and array.len(jobs)==0{match listen.refresh(app,audition,state.output){ok(_)=>{},err(e)=>{let _=desk.set_text(app,"audio_results_status",e)}}
+      continue}
+     if id=="audio_open_folder"{match listen.open_folder(audition.root){ok(_)=>{let _=desk.set_text(app,"audio_results_status","Requested the results folder in the file manager")},err(e)=>{let _=desk.set_text(app,"audio_results_status",e)}}
+      continue}
+     if id=="audio_reveal"{match listen.reveal(audition.selection){ok(_)=>{let _=desk.set_text(app,"audio_results_status","Requested the selected file's folder in the file manager")},err(e)=>{let _=desk.set_text(app,"audio_results_status",e)}}
+      continue}
+     if id=="audio_external"{match listen.open_external(audition.selection){ok(_)=>{let _=desk.set_text(app,"audio_status","Requested the selected audio in its default application")},err(e)=>{listen.report(app,e)}}
+      continue}
+     if id=="audio_input"{show_page(app,state,6.0)
+      match listen.load(app,audition,state.input,true){ok(_)=>{},err(e)=>{listen.report(app,e)}}
+      continue}
+     if id=="audio_play" or id=="audio_toggle"{
+      if id=="audio_toggle" and audition.playing{let _=desk.pause(app,"audio_player",false)
+      }else{match listen.play(app,audition){ok(_)=>{},err(e)=>{listen.report(app,e)}}}
+      continue}
+     if id=="audio_pause"{let _=desk.pause(app,"audio_player",false)
+      continue}
+     if id=="audio_stop"{match listen.stop(app,audition){ok(_)=>{},err(e)=>{listen.report(app,e)}}
+      continue}}
+    if kind=="close" or id=="quit"{break}
+    if kind=="error"{let _=desk.set_text(app,"status",desk.field(event,"message"))
+     continue}
+    if kind=="change" or kind=="dialog"{
+     let value:string=desk.field(event,"value")
+     if kind=="dialog" and (id=="ensemble_sample_library" or id=="queue_sample_library" or id=="mastering_library" or id=="noise_checkpoint" or id=="room_checkpoint") and desk.boolean(event,"cancelled"){continue}
+     if id=="processing_sample"{state.processing_sample=desk.boolean(event,"value")
+      continue}
+     if id=="ensemble_sample_seconds" or id=="queue_sample_seconds" or id=="processing_sample_seconds"{
+      if str.view(struct.borrow(state,field=sample_seconds))!=str.view(value){
+       state.sample_seconds=string.copy(value)
+       if id!="ensemble_sample_seconds"{let _=desk.set_text(app,"ensemble_sample_seconds",value)}
+       if id!="queue_sample_seconds"{let _=desk.set_text(app,"queue_sample_seconds",value)}
+       if id!="processing_sample_seconds"{let _=desk.set_text(app,"processing_sample_seconds",value)}}
+      continue}
+     if id=="ensemble_sample_library" or id=="queue_sample_library" or id=="mastering_library"{
+      if str.view(struct.borrow(state,field=sample_library))!=str.view(value) or kind=="dialog"{
+       state.sample_library=string.copy(value)
+       if id!="ensemble_sample_library"{let _=desk.set_text(app,"ensemble_sample_library",value)}
+       if id!="queue_sample_library"{let _=desk.set_text(app,"queue_sample_library",value)}
+       if id!="mastering_library"{let _=desk.set_text(app,"mastering_library",value)}
+       if kind=="dialog"{let _=desk.set_text(app,id,value)}}
+      continue}
+     if kind=="dialog" and id=="queue_inputs"{
+      let chosen:array<string>=desk.dialog_paths(event)
+      var i:u64=0
+      loop{if i==array.len(chosen){break}
+       queue_append(state,array.get(chosen,i))
+       i+=1}
+      queue_list(app,state.queue_items,lists)
+      continue}
+     if kind=="dialog" and id=="ensemble_inputs"{
+      var chosen:array<string>=desk.dialog_paths(event)
+      var i:u64=0
+      loop{if i==array.len(chosen){break}
+       array.push(state.ensemble_inputs,string.copy(array.get(chosen,i)))
+       i+=1}
+      ensemble_list(app,state.ensemble_inputs,lists)
+      continue}
+     if kind=="dialog" and id=="model_preset_save"{
+      if str.len(value)==0{continue}
+      if array.len(jobs)>0{continue}
+
+      var selected:model_config.Recipe=model_recipe(state)
+      match presets.save(selected,value){ok(_)=>{let _=desk.set_text(app,"status","Ensemble preset saved")},err(e)=>{let _=desk.set_text(app,"status",e)}}
+      continue}
+     if kind=="dialog" and id=="model_preset_open"{
+      if str.len(value)==0{continue}
+      if array.len(jobs)>0{continue}
+      match presets.read(value){err(e)=>{let _=desk.set_text(app,"status",e)},ok(selected)=>{
+       state.model_paired=selected.paired
+       state.model_primary=selected.primary
+       state.model_secondary=selected.secondary
+       state.model_wave=selected.wave
+       state.model_normalize=selected.recipe.options.normalize
+       state.model_keep=selected.recipe.options.keep_members
+       state.model_residual=selected.residual
+       state.model_spectral=selected.spectral
+       state.ensemble_models=struct.replace(struct.borrow(selected,field=recipe),[],field=models)
+       state.secondary_rules=[]
+       state.preprocess_model=0
+       state.vocal_model=0
+       model_list(app,state.ensemble_models)
+       secondary_list(app,state.secondary_rules)
+       preprocess_list(app,0)
+       vocal_list(app,0)
+       let _=desk.set_number(app,"model_outputs","selected",if state.model_paired{1.0}else{0.0})
+       let _=desk.set_number(app,"model_primary","selected",state.model_primary)
+       let _=desk.set_number(app,"model_secondary","selected",state.model_secondary)
+       let _=desk.set_bool(app,"model_wave","active",state.model_wave)
+       let _=desk.set_bool(app,"model_normalize","active",state.model_normalize)
+       let _=desk.set_bool(app,"model_keep","active",state.model_keep)
+       let _=desk.set_bool(app,"model_residual","active",state.model_residual)
+       let _=desk.set_bool(app,"model_spectral","active",state.model_spectral)
+       show_page(app,state,1.0)
+       let _=desk.set_text(app,"status","Ensemble preset loaded; secondary and vocal assignments cleared")}}
+      continue}
+     if kind=="dialog" and id=="model_processing"{
+      if array.len(state.ensemble_models)>0 and str.len(value)>0{
+       let last:u64=array.len(state.ensemble_models)-1
+       let attached:result<string,string>=processing_app.attachment(array.borrow(state.ensemble_models,last),value)
+       match attached{ok(encoded)=>{let member:ref<model_config.Model>=array.borrow(state.ensemble_models,last)
+        member.processing=encoded
+        model_list(app,state.ensemble_models)
+        let _=desk.set_text(app,"status","Processing attached to the last ensemble member; ensemble output settings apply")},err(e)=>{let _=desk.set_text(app,"status",e)}}}
+      continue}
+     if id=="settings"{if str.view(state.settings)!=str.view(value){state.model_definition=""
+       model_editor.close(app,editor)}
+      state.settings=string.copy(str.view(value))}
+     if id=="checkpoint"{if str.view(state.checkpoint)!=str.view(value){state.model_definition=""
+       model_editor.close(app,editor)}
+      state.checkpoint=string.copy(str.view(value))}
+     if id=="input"{state.input=string.copy(str.view(value))}
+     if id=="tool_amount"{state.tool_amount=string.copy(value)}
+     if id=="pitch_amount"{state.pitch_amount=string.copy(value)}
+     if id=="tempo_amount"{state.tempo_amount=string.copy(value)}
+     if id=="pitch_preserve_amount"{state.pitch_preserve_amount=string.copy(value)}
+     if id=="alignment_polarity"{state.alignment_polarity=desk.number(event,"value")}
+     if id=="alignment_windows"{state.alignment_windows=desk.number(event,"value")
+      export_controls(app,state)}
+     if id=="alignment_intros"{state.alignment_intros=desk.number(event,"value")}
+     if id=="alignment_gain"{state.alignment_gain=desk.number(event,"value")}
+     if id=="alignment_phase"{state.alignment_phase=desk.number(event,"value")}
+     if id=="alignment_initial_polarity"{state.alignment_initial_polarity=desk.number(event,"value")}
+     if id=="alignment_match_silence"{state.alignment_match_silence=desk.boolean(event,"value")}
+     if id=="alignment_spectral_match"{state.alignment_spectral_match=desk.boolean(event,"value")}
+     if id=="naming_append_model"{state.naming_append_model=desk.boolean(event,"value")}
+     if id=="naming_model_folder"{state.naming_model_folder=desk.boolean(event,"value")}
+     if id=="naming_testing"{state.naming_testing=desk.boolean(event,"value")}
+     if id=="naming_append_ensemble"{state.naming_append_ensemble=desk.boolean(event,"value")}
+     if id=="naming_ensemble_label"{state.naming_ensemble_label=string.copy(value)}
+     if id=="export_subtype"{state.export_subtype=desk.number(event,"value")}
+     if id=="output_container"{state.output_container=desk.number(event,"value")
+      export_controls(app,state)}
+     if id=="mp3_bitrate"{state.mp3_bitrate=desk.number(event,"value")}
+     if id=="audio_budget"{state.audio_budget=desk.number(event,"value")}
+     if id=="codec_directory"{state.codec_directory=string.copy(value)}
+     if id=="alignment_save_aligned"{state.alignment_save_aligned=desk.boolean(event,"value")}
+     if id=="output"{state.output=string.copy(str.view(value))}
+     if id=="gpu"{state.use_gpu=desk.boolean(event,"value")}
+     if id=="high_band"{state.high_band=desk.boolean(event,"value")}
+     if id=="noise_reduction"{state.noise_reduction=desk.boolean(event,"value")
+      if state.noise_reduction and str.len(state.noise_checkpoint)==0{state.noise_checkpoint=path.join(root,"assets/cleanup-noise-v1.pth")
+       let _=desk.set_text(app,"noise_checkpoint",state.noise_checkpoint)}}
+     if id=="room_reduction"{state.room_reduction=desk.boolean(event,"value")
+      if state.room_reduction and str.len(state.room_checkpoint)==0{state.room_checkpoint=path.join(root,"assets/cleanup-room-v1.pth")
+       let _=desk.set_text(app,"room_checkpoint",state.room_checkpoint)}}
+     if id=="room_targets"{state.room_targets=desk.number(event,"value")}
+     if id=="noise_checkpoint"{state.noise_checkpoint=string.copy(value)}
+     if id=="room_checkpoint"{state.room_checkpoint=string.copy(value)}
+     if id=="cleanup_enabled"{state.cleanup_enabled=desk.boolean(event,"value")
+      let _=desk.set_bool(app,"cleanup_threshold","sensitive",state.cleanup_enabled)}
+     if id=="cleanup_threshold"{cleanup_draft=string.copy(value)
+      match cleanup_policy.edit_threshold(value,state.cleanup_threshold){ok(accepted)=>{state.cleanup_threshold=accepted},err(problem)=>{let _=desk.set_text(app,"status",problem)}}}
+     if id=="gpu_index"{gpu_index_draft=string.copy(value)
+      match device_selection.parse(value){ok(_)=>{state.gpu_index=string.copy(value)},err(problem)=>{let _=desk.set_text(app,"status",problem)}}}
+     if id=="inference_pitch"{state.inference_pitch=desk.boolean(event,"value")}
+     if id=="match_frequency"{state.match_frequency=desk.boolean(event,"value")}
+     if id=="inference_semitones"{inference_semitones_draft=string.copy(value)
+      match recording_policy.current_with_pitch(false,"2",true,"0.25","Default","Random",true,value,false){ok(_)=>{state.inference_semitones=string.copy(value)},err(problem)=>{let _=desk.set_text(app,"status",problem)}}}
+     if id=="recording_override"{state.recording_override=desk.boolean(event,"value")}
+     if id=="recording_split"{state.recording_split=desk.boolean(event,"value")}
+     if id=="recording_shifts"{recording_shifts_draft=string.copy(value)
+      match recording_policy.current(true,value,state.recording_split,recording_overlap_draft,recording_segment_draft,recording_seed_draft){ok(_)=>{state.recording_shifts=string.copy(value)},err(problem)=>{let _=desk.set_text(app,"status",problem)}}}
+     if id=="recording_overlap"{recording_overlap_draft=string.copy(value)
+      match recording_policy.current(true,recording_shifts_draft,state.recording_split,value,recording_segment_draft,recording_seed_draft){ok(_)=>{state.recording_overlap=string.copy(value)},err(problem)=>{let _=desk.set_text(app,"status",problem)}}}
+     if id=="recording_segment"{recording_segment_draft=string.copy(value)
+      match recording_policy.current(true,recording_shifts_draft,state.recording_split,recording_overlap_draft,value,recording_seed_draft){ok(_)=>{state.recording_segment=string.copy(value)},err(problem)=>{let _=desk.set_text(app,"status",problem)}}}
+     if id=="recording_seed"{recording_seed_draft=string.copy(value)
+      match recording_policy.current(true,recording_shifts_draft,state.recording_split,recording_overlap_draft,recording_segment_draft,value){ok(_)=>{state.recording_seed=string.copy(value)},err(problem)=>{let _=desk.set_text(app,"status",problem)}}}
+     if id=="mask_tta"{state.mask_tta=desk.number(event,"value")}
+     if id=="mask_window"{mask_window_draft=string.copy(value)
+      match inference_policy.edit_window(value,state.mask_window){ok(accepted)=>{state.mask_window=accepted},err(problem)=>{let _=desk.set_text(app,"status",problem)}}}
+     if id=="mask_aggression"{mask_aggression_draft=string.copy(value)
+      match inference_policy.edit_aggression(value,state.mask_aggression){ok(accepted)=>{state.mask_aggression=accepted},err(problem)=>{let _=desk.set_text(app,"status",problem)}}}
+     if id=="ensemble_wave"{state.ensemble_wave=desk.boolean(event,"value")}
+     if id=="ensemble_normalize"{state.ensemble_normalize=desk.boolean(event,"value")}
+     if id=="model_outputs"{state.model_paired=desk.number(event,"value")==1.0}
+     if id=="model_primary"{state.model_primary=desk.number(event,"value")}
+     if id=="model_secondary"{state.model_secondary=desk.number(event,"value")}
+     if id=="model_wave"{state.model_wave=desk.boolean(event,"value")}
+     if id=="model_normalize"{state.model_normalize=desk.boolean(event,"value")}
+     if id=="model_keep"{state.model_keep=desk.boolean(event,"value")}
+     if id=="single_outputs"{state.single_outputs=desk.number(event,"value")}
+     if id=="single_complement"{state.single_complement=desk.number(event,"value")}
+     if id=="single_normalize"{state.single_normalize=desk.boolean(event,"value")}
+     if id=="single_keep"{state.single_keep=desk.boolean(event,"value")}
+     if id=="model_residual"{state.model_residual=desk.boolean(event,"value")
+      if state.model_residual{state.model_spectral=false
+       let _=desk.set_bool(app,"model_spectral","active",false)}}
+     if id=="model_spectral"{state.model_spectral=desk.boolean(event,"value")
+      if state.model_spectral{state.model_residual=false
+       let _=desk.set_bool(app,"model_residual","active",false)}}
+     if id=="queue_continue"{state.queue_continue=desk.boolean(event,"value")}
+     if id=="secondary_target"{state.secondary_target=desk.number(event,"value")}
+     if id=="secondary_weight"{state.secondary_weight=string.copy(value)}
+     if id=="secondary_outputs" or id=="vocal_outputs"{state.secondary_outputs=desk.number(event,"value")
+      let _=desk.set_number(app,if id=="secondary_outputs"{"vocal_outputs"}else{"secondary_outputs"},"selected",state.secondary_outputs)}
+     if id=="secondary_normalize" or id=="vocal_normalize"{state.secondary_normalize=desk.boolean(event,"value")
+      let _=desk.set_bool(app,if id=="secondary_normalize"{"vocal_normalize"}else{"secondary_normalize"},"active",state.secondary_normalize)}
+     if id=="secondary_keep" or id=="vocal_keep"{state.secondary_keep=desk.boolean(event,"value")
+      let _=desk.set_bool(app,if id=="secondary_keep"{"vocal_keep"}else{"secondary_keep"},"active",state.secondary_keep)}
+     if id=="vocal_amount"{state.vocal_weight=string.copy(value)}
+     if id=="vocal_mixes"{state.vocal_options.mixes=desk.boolean(event,"value")}
+     if id=="vocal_mix_only"{state.vocal_options.mix_only=desk.boolean(event,"value")
+      if state.vocal_options.mix_only{state.vocal_options.mixes=true
+       state.vocal_options.vocal_only=false
+       let _=desk.set_bool(app,"vocal_mixes","active",true)
+       let _=desk.set_bool(app,"vocal_save_only","active",false)}}
+     if id=="vocal_save_only"{state.vocal_options.vocal_only=desk.boolean(event,"value")
+      if state.vocal_options.vocal_only{state.vocal_options.mix_only=false
+       let _=desk.set_bool(app,"vocal_mix_only","active",false)}}
+     if id=="secondary_residual"{state.secondary_residual=desk.boolean(event,"value")
+      if state.secondary_residual{state.secondary_spectral=false
+       let _=desk.set_bool(app,"secondary_spectral","active",false)}}
+     if id=="secondary_spectral"{state.secondary_spectral=desk.boolean(event,"value")
+      if state.secondary_spectral{state.secondary_residual=false
+       let _=desk.set_bool(app,"secondary_residual","active",false)}}
+     if id=="preprocess_residual"{state.preprocess_residual=desk.boolean(event,"value")
+      if state.preprocess_residual{state.preprocess_spectral=false
+       let _=desk.set_bool(app,"preprocess_spectral","active",false)}}
+     if id=="preprocess_spectral"{state.preprocess_spectral=desk.boolean(event,"value")
+      if state.preprocess_spectral{state.preprocess_residual=false
+       let _=desk.set_bool(app,"preprocess_residual","active",false)}}
+     if id=="preprocess_extra"{state.preprocess_extra=desk.boolean(event,"value")}
+     if kind=="dialog"{let _=desk.set_text(app,str.view(id),str.view(value))}
+    }
+    if kind!="action"{continue}
+    if id=="cancel" and array.len(jobs)>0{let _=files.write_text(str.view(cancel),"cancel")
+     let _=desk.set_text(app,"status","Cancelling after the current operation…")
+     continue}
+    if array.len(jobs)>0{continue}
+    if id=="choose_noise_checkpoint" or id=="choose_room_checkpoint"{
+     let _=desk.dialog(app,if id=="choose_noise_checkpoint"{"noise_checkpoint"}else{"room_checkpoint"},"open",if id=="choose_noise_checkpoint"{"Choose noise reduction weights"}else{"Choose room reduction weights"},"",root)
+     continue}
+    if id=="ensemble_sample_library_pick" or id=="queue_sample_library_pick" or id=="mastering_library_pick"{
+     let _=desk.dialog(app,if id=="mastering_library_pick"{"mastering_library"}else{if id=="ensemble_sample_library_pick"{"ensemble_sample_library"}else{"queue_sample_library"}},"open","Choose sound-file decoder library","",root)
+     continue}
+    if id=="ensemble_sample" or id=="queue_sample"{
+     let queued:bool=id=="queue_sample"
+     let selected:array<sample.Selection>=match if queued{
+      sample_panel.queued(struct.borrow(lists,field=queue),struct.borrow(state,field=queue_items))
+     }else{sample_panel.audio(struct.borrow(lists,field=audio),struct.borrow(state,field=ensemble_inputs))}{
+      ok(value)=>value,err(e)=>{let _=desk.set_text(app,"status",e)
+       continue}}
+     audio_request+=1
+     let scratch:string=path.join(app.root,text.concat("sample-",string.from_int(audio_request)))
+     let options:sample.Options=match sample_runtime.options(root,state.codec_directory,state.sample_library,state.sample_seconds,state.output,cast.sat(state.audio_budget),scratch,cancel){
+      ok(value)=>value,err(e)=>{let _=desk.set_text(app,"status",e)
+       continue}}
+     let work:sample_job.Work=sample_job.Work{retained:ref.swap(retained,option.none()),selection:selected,queue:queued,
+      generation:if queued{lists.queue.generation}else{lists.audio.generation},options:options,progress:string.copy(progress)}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=""
+     let _=desk.set_text(app,if queued{"queue_verification_details"}else{"ensemble_verification_details"},"Creating selected recording samples…")
+     array.push(jobs,task.spawn(work,fn=desktop_sample_job.run))
+     busy(app,true)
+     let _=desk.set_text(app,"status","Creating selected recording samples…")
+     continue}
+    if id=="ensemble_verify" or id=="queue_verify"{
+     let queued:bool=id=="queue_verify"
+     var inputs:array<string>=[]
+     var i:u64=0
+     if queued{loop{if i==array.len(state.queue_items){break}
+      array.push(inputs,string.copy(array.borrow(state.queue_items,i).input))
+      i+=1}}else{loop{if i==array.len(state.ensemble_inputs){break}
+      array.push(inputs,string.copy(array.get(state.ensemble_inputs,i)))
+      i+=1}}
+     if array.len(inputs)==0{let _=desk.set_text(app,"status","No inputs to verify")
+      continue}
+     audio_request+=1
+     let scratch:string=path.join(app.root,text.concat("verify-",string.from_int(audio_request)))
+     let policy:checked_input.Options=match audio_io.input(root,state.codec_directory,cast.sat(state.audio_budget),scratch,cancel){
+      ok(value)=>value,err(e)=>{let _=desk.set_text(app,"status",e)
+       continue}}
+     let work:verification_job.Work=verification_job.Work{retained:ref.swap(retained,option.none()),inputs:inputs,
+      queue:queued,generation:if queued{lists.queue.generation}else{lists.audio.generation},policy:policy,progress:string.copy(progress)}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=""
+     let _=desk.set_text(app,if queued{"queue_verification_details"}else{"ensemble_verification_details"},"Verifying all listed recordings…")
+     array.push(jobs,task.spawn(work,fn=verification_job.run))
+     busy(app,true)
+     let _=desk.set_text(app,"status","Verifying all listed recordings…")
+     continue}
+    if id=="pairs_accept"{
+     match paired_runtime.accept(state,root){err(error)=>{let _=desk.set_text(app,"status",error)},ok(raw)=>{
+      state.paired_snapshot=raw
+      preference_dirty=true
+      paired_panel.refresh(app,state,paired)
+      let _=desk.set_text(app,"status","Paired recordings and current options accepted")}}
+     continue}
+    if id=="pairs_run" or id=="pairs_remaining"{
+     audio_request+=1
+     let scratch:string=path.join(app.root,text.concat("paired-decode-",string.from_int(audio_request)))
+     var request:paired_job.Request=match paired_runtime.prepare(state,root,id=="pairs_remaining",scratch,cancel,progress){ok(value)=>value,err(error)=>{
+      let _=desk.set_text(app,"status",error)
+      continue}}
+     match request.work{none=>{let _=desk.set_text(app,"status","Paired task payload is unavailable")
+      continue},some(work)=>{work.retained=ref.swap(retained,option.none())}}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=""
+     array.push(jobs,task.spawn(request,fn=paired_job.dispatch))
+     busy(app,true)
+     let _=desk.set_text(app,"status",if id=="pairs_remaining"{"Running unfinished recording pairs…"}else{"Running accepted recording pairs…"})
+     continue}
+    if id=="mastering_run" or id=="mastering_pairs_run"{
+     var targets:array<string>=[]
+     var references:array<string>=[]
+     if id=="mastering_run"{
+      if str.len(state.alignment_first)==0 or str.len(state.alignment_second)==0{let _=desk.set_text(app,"status","Choose a reference and a second recording to master")
+       continue}
+      array.push(references,string.copy(state.alignment_first))
+      array.push(targets,string.copy(state.alignment_second))
+     }else{
+      var row:u64=0
+      loop{if row==array.len(state.paired_first_inputs){break}
+       array.push(references,string.copy(array.get(state.paired_first_inputs,row)))
+       row+=1}
+      row=0
+      loop{if row==array.len(state.paired_second_inputs){break}
+       array.push(targets,string.copy(array.get(state.paired_second_inputs,row)))
+       row+=1}}
+     let recipe:string=match codec_runtime.settings(root,state.codec_directory,cast.sat(state.output_container),cast.sat(state.export_subtype),cast.sat(state.mp3_bitrate)){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     let prefix:string=naming.testing_prefix(state.naming_testing)
+     let request=match mastering_runtime.request(root,state.sample_library,state.codec_directory,targets,references,state.output,prefix,cast.sat(state.audio_budget),cast.sat(state.export_subtype),recipe,cancel,progress){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=""
+     let work:mastering_job.Work=mastering_job.Work{retained:ref.swap(retained,option.none()),request:request,directory:string.copy(state.output)}
+     array.push(jobs,task.spawn(work,fn=mastering_job.run))
+     busy(app,true)
+     let _=desk.set_text(app,"status","Matching tone and loudness to the reference…")
+     continue}
+    var selected_device:u32=0
+    if processing_action(id) or id=="queue_use_current" or id=="session_save" or id=="preferences_save"{
+     selected_device=match device_selection.parse(gpu_index_draft){ok(value)=>value,err(problem)=>{let _=desk.set_text(app,"status",problem)
+      continue}}}
+    var selected_cleanup:cleanup.Settings=cleanup.disabled()
+    var selected_inference:string=""
+    var selected_recording:string=""
+    var selected_learned:string=""
+    if (id=="separate" or id=="secondary_run" or id=="vocal_run" or id=="model_run" or id=="queue_single" or id=="queue_ensemble" or id=="queue_secondary") and (not (id=="queue_single" or id=="queue_ensemble" or id=="queue_secondary") or str.len(state.queue_model_snapshot)==0){
+     selected_learned=match learned_policy.current(state.noise_reduction,state.room_reduction,state.room_targets,state.noise_checkpoint,state.room_checkpoint){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}}
+    if processing_action(id) and (not (id=="queue_single" or id=="queue_ensemble" or id=="queue_secondary") or str.len(state.queue_model_snapshot)==0){
+     let recording_raw:string=match recording_policy.current_with_pitch(state.recording_override,recording_shifts_draft,state.recording_split,recording_overlap_draft,recording_segment_draft,recording_seed_draft,state.inference_pitch,inference_semitones_draft,state.match_frequency){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     selected_recording=match recording_policy.accept(recording_raw){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     selected_inference=match inference_policy.current(state.mask_tta,mask_window_draft,mask_aggression_draft){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     selected_cleanup=match cleanup_policy.current(state.cleanup_enabled,cleanup_draft){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}}
+    let codec_recipe:string=if processing_action(id){match codec_runtime.settings(root,state.codec_directory,
+     cast.sat(state.output_container),cast.sat(state.export_subtype),cast.sat(state.mp3_bitrate)){ok(v)=>v,err(e)=>{
+      let _=desk.set_text(app,"status",e)
+      continue}}}else{""}
+    var input_policy:option<checked_input.Options>=option.none()
+    var sample_policy:option<sample.Options>=option.none()
+    var output_limits:compressed_export.Limits=compressed_export.Limits{max_frames:0,max_stage_bytes:0,max_encoded_bytes:0}
+    if processing_action(id){
+     audio_request+=1
+     let scratch:string=path.join(app.root,text.concat("decode-",string.from_int(audio_request)))
+     input_policy=option.some(match audio_io.input(root,state.codec_directory,cast.sat(state.audio_budget),scratch,cancel){ok(value)=>value,err(e)=>{
+      let _=desk.set_text(app,"status",e)
+      continue}})
+     if state.processing_sample and sample_processing_action(id){
+      sample_policy=option.some(match sample_runtime.options(root,state.codec_directory,state.sample_library,state.sample_seconds,state.output,cast.sat(state.audio_budget),scratch,cancel){ok(value)=>value,err(e)=>{
+       let _=desk.set_text(app,"status",e)
+       continue}})}
+     output_limits=match audio_io.output(cast.sat(state.audio_budget),str.len(codec_recipe)>0){ok(value)=>value,err(e)=>{
+      let _=desk.set_text(app,"status",e)
+      continue}}}
+    if id=="focus_tempo_amount" or id=="focus_pitch_preserve_amount"{
+     show_page(app,state,2.0)
+     let _=desk.focus(app,if id=="focus_tempo_amount"{"tempo_amount"}else{"pitch_preserve_amount"})}
+    if id=="tool_tempo" or id=="tool_pitch_preserve"{
+     if (str.len(state.input)==0 and array.len(state.queue_items)==0) or str.len(state.output)==0{
+      let _=desk.set_text(app,"status","Choose a recording and an existing output folder")
+      continue}
+     let parsed:option<f64>=if id=="tool_tempo"{text.parse_f64(state.tempo_amount)}else{text.parse_f64(state.pitch_preserve_amount)}
+     let amount:f64=match parsed{some(v)=>v,none=>{
+      let _=desk.set_text(app,"status",if id=="tool_tempo"{"Enter a tempo greater than zero and at most 10"}else{"Enter a pitch shift between -10 and 10 semitones"})
+      continue}}
+     var work:job.TimeWork=job.TimeWork{codec_recipe:string.copy(codec_recipe),wav_choice:cast.sat(state.export_subtype),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes,retained:option.none(),
+      settings:match time_runtime.settings(root,if id=="tool_tempo"{"tempo"}else{"pitch-preserve-duration"},amount,state.ensemble_normalize){ok(v)=>v,err(e)=>{
+       let _=desk.set_text(app,"status",e)
+       continue}},input:string.copy(state.input),output:string.copy(state.output),cancel:string.copy(cancel),progress:string.copy(progress)}
+     if array.len(state.queue_items)>0{
+      let recipe:string=match audio_time.encode(struct.borrow(work,field=settings)){ok(v)=>v,err(e)=>{let _=desk.set_text(app,"status",e)
+       continue}}
+      let queued:queue.Work=queue.Work{retained:ref.swap(retained,option.none()),items:queue_config.copy_items(struct.borrow(state,field=queue_items)),settings:"",checkpoint:"",ensemble:option.none(),secondary:option.none(),directory:string.copy(state.output),cancel:string.copy(cancel),progress:string.copy(progress),use_gpu:false,continue_on_error:state.queue_continue,audio_time_recipe:recipe,wav_choice:cast.sat(state.export_subtype),codec_recipe:string.copy(codec_recipe),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes}
+      let _=files.remove(cancel)
+      let _=files.remove(progress)
+      previous_progress=string.new()
+      array.push(jobs,task.spawn(audio_jobs.Queue{work:option.some(queued),policy:ref.swap(input_policy,option.none()),sample:ref.swap(sample_policy,option.none())},fn=audio_jobs.run_Queue))
+      busy(app,true)
+      let _=desk.set_text(app,"status","Processing queued recordings with the selected audio tool…")
+      continue}
+     work.retained=ref.swap(retained,option.none())
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=string.new()
+     array.push(jobs,task.spawn(audio_jobs.Time{work:option.some(work),policy:ref.swap(input_policy,option.none()),sample:ref.swap(sample_policy,option.none())},fn=audio_jobs.run_Time))
+     busy(app,true)
+     let _=desk.set_text(app,"status",if id=="tool_tempo"{"Changing tempo without changing pitch…"}else{"Changing pitch while preserving duration…"})
+     continue}
+    if id=="focus_alignment_first" or id=="focus_alignment_second" or id=="focus_alignment_polarity" or id=="focus_alignment_save"{
+     show_page(app,state,2.0)
+     let _=desk.focus(app,if id=="focus_alignment_first"{"alignment_first"}else{if id=="focus_alignment_second"{"alignment_second"}else{if id=="focus_alignment_polarity"{"alignment_polarity"}else{"alignment_save_aligned"}}})}
+    if id=="alignment_first_pick" or id=="alignment_second_pick"{
+     let _=desk.dialog(app,if id=="alignment_first_pick"{"alignment_first"}else{"alignment_second"},"open",if id=="alignment_first_pick"{"Choose reference recording"}else{"Choose second recording"},"",root)}
+    if id=="recording_alignment_run"{
+     if str.len(state.alignment_first)==0 or str.len(state.alignment_second)==0{
+      let _=desk.set_text(app,"status","Choose both alignment recordings")
+      continue}
+     let recipe:alignment_choices.Recipe=match alignment_choices.from_full_indices(state.alignment_windows,state.alignment_intros,state.alignment_gain,state.alignment_phase,state.alignment_save_aligned,state.alignment_initial_polarity,state.alignment_match_silence,state.alignment_spectral_match){ok(value)=>value,err(e)=>{
+      let _=desk.set_text(app,"status",e)
+      continue}}
+     let bytes:u64=match audio_io.budget(cast.sat(state.audio_budget)){ok(value)=>value,err(e)=>{
+      let _=desk.set_text(app,"status",e)
+      continue}}
+     let settings:recording_alignment.Settings=match recording_runtime.settings_for_windows(root,recipe.windows,state.alignment_save_aligned,bytes*4,bytes*2,bytes*4){ok(value)=>value,err(e)=>{
+      let _=desk.set_text(app,"status",e)
+      continue}}
+     let selection:option<alignment_choices.Recipe>=if state.alignment_windows==2.0 and state.alignment_intros==0.0 and state.alignment_gain==2.0 and state.alignment_phase==0.0 and state.alignment_initial_polarity==0.0 and state.alignment_match_silence and not state.alignment_spectral_match{option.none()}else{option.some(recipe)}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=string.new()
+     let work:job.RecordingAlignmentWork=job.RecordingAlignmentWork{selection:selection,codec_recipe:string.copy(codec_recipe),wav_choice:cast.sat(state.export_subtype),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes,retained:ref.swap(retained,option.none()),settings:settings,
+      first:string.copy(state.alignment_first),second:string.copy(state.alignment_second),output:string.copy(state.output),cancel:string.copy(cancel),progress:string.copy(progress)}
+     array.push(jobs,task.spawn(audio_jobs.RecordingAlignment{work:option.some(work),policy:ref.swap(input_policy,option.none())},fn=audio_jobs.run_RecordingAlignment))
+     busy(app,true)
+     let _=desk.set_text(app,"status","Aligning recording timing and gain…")
+     continue}
+    if id=="alignment_run"{
+     if str.len(state.alignment_first)==0 or str.len(state.alignment_second)==0{
+      let _=desk.set_text(app,"status","Choose both alignment recordings")
+      continue}
+     if not fp.is_finite(state.alignment_polarity) or state.alignment_polarity<0.0 or state.alignment_polarity>2.0 or fp.floor(state.alignment_polarity)!=state.alignment_polarity{
+      let _=desk.set_text(app,"status","Choose unchanged, inverted or automatic polarity")
+      continue}
+     let settings:alignment.Settings=match alignment_runtime.settings_for_polarity(root,cast.sat(state.alignment_polarity),state.alignment_save_aligned){ok(v)=>v,err(e)=>{
+      let _=desk.set_text(app,"status",e)
+      continue}}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=string.new()
+     let work:job.AlignmentWork=job.AlignmentWork{codec_recipe:string.copy(codec_recipe),wav_choice:cast.sat(state.export_subtype),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes,retained:ref.swap(retained,option.none()),settings:settings,
+      first:string.copy(state.alignment_first),second:string.copy(state.alignment_second),output:string.copy(state.output),cancel:string.copy(cancel),progress:string.copy(progress)}
+     array.push(jobs,task.spawn(audio_jobs.Alignment{work:option.some(work),policy:ref.swap(input_policy,option.none())},fn=audio_jobs.run_Alignment))
+     busy(app,true)
+     let _=desk.set_text(app,"status","Aligning and subtracting audio…")
+     continue}
+    if id=="catalog_page"{show_page(app,state,7.0)}
+    if id=="catalog_focus_directory"{show_page(app,state,7.0)
+     let _=desk.focus(app,"catalog_directory")}
+    if id=="catalog_focus_profiles"{show_page(app,state,7.0)
+     if array.len(catalog_state.entries)>0{
+      catalog_state.selected=string.copy(array.borrow(catalog_state.entries,0).profile)
+      let _=desk.select(app,"catalog_profiles",catalog_state.selected)
+      model_panel.details(app,catalog_state)}
+     let _=desk.focus(app,"catalog_profiles")}
+    if id=="catalog_choose"{let _=desk.dialog(app,"catalog_directory","folder","Choose model folder","",catalog_state.directory)}
+    if id=="catalog_refresh"{match model_panel.refresh(app,catalog_state){ok(_)=>{let _=desk.set_text(app,"catalog_status","Offline model presence refreshed; select Verify to check identity")},err(e)=>{let _=desk.set_text(app,"catalog_status",e)}}}
+    if id=="catalog_verify" or id=="catalog_use" or id=="catalog_acquire"{
+     let index:u64=match model_catalog.find(catalog_state.entries,catalog_state.selected){some(v)=>v,none=>{
+      let _=desk.set_text(app,"catalog_status","Select an admitted model first")
+      continue}}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=string.new()
+     let model_directory:string=string.copy(catalog_state.directory)
+     let request:model_selection.Request=model_selection.request(array.borrow(catalog_state.entries,index),root,model_directory,
+      if id=="catalog_acquire"{"acquire"}else{if id=="catalog_use"{"use"}else{"verify"}})
+     let payload:job.CatalogWork=job.CatalogWork{retained:ref.swap(retained,option.none()),request:request,cancel:string.copy(cancel),progress:string.copy(progress)}
+     array.push(jobs,task.spawn(payload,fn=job.run_catalog))
+     catalog_active=true
+     busy(app,true)
+     let _=desk.set_text(app,"catalog_status","Working with the selected model; Cancel waits for bounded connect/read or identity verification to finish")
+     continue}
+    if id=="session_save" or id=="preferences_save"{match cleanup_policy.parse_threshold(cleanup_draft){ok(_)=>{},err(problem)=>{
+     let _=desk.set_text(app,"status",problem)
+     continue}}}
+    if id=="session_save" or id=="preferences_save"{match inference_policy.current(state.mask_tta,mask_window_draft,mask_aggression_draft){ok(_)=>{},err(problem)=>{
+     let _=desk.set_text(app,"status",problem)
+     continue}}}
+    if id=="session_save" or id=="preferences_save"{match recording_policy.current_with_pitch(state.recording_override,recording_shifts_draft,state.recording_split,recording_overlap_draft,recording_segment_draft,recording_seed_draft,state.inference_pitch,inference_semitones_draft,state.match_frequency){ok(_)=>{},err(problem)=>{
+     let _=desk.set_text(app,"status",problem)
+     continue}}}
+    if id=="session_save"{let _=desk.dialog(app,"session_save","save","Save session preset","session.stemair.json",root)
+     continue}
+    if id=="session_open"{let _=desk.dialog(app,"session_open","open","Open session preset","",root)
+     continue}
+    if id=="session_rename" or id=="session_delete" or id=="model_preset_rename" or id=="model_preset_delete"{
+     preset_file=""
+     preset_identity=""
+     let title:str=if id=="session_rename"{"Choose session preset to rename"}else{if id=="session_delete"{"Choose session preset to delete"}else{if id=="model_preset_rename"{"Choose ensemble preset to rename"}else{"Choose ensemble preset to delete"}}}
+     let _=desk.dialog(app,id,"open",title,"",root)
+     continue}
+    if id=="preferences_save" or id=="preferences_reset"{
+     if id=="preferences_reset"{match cpu_close.retained_all(retained){err(e)=>{let _=desk.set_text(app,"status",e)
+       continue},ok(_)=>{}}
+      model_editor.close(app,editor)
+      state=preferences.defaults(root)
+      preferences_display(app,state,lists,paired)
+       cleanup_draft=string.copy(state.cleanup_threshold)
+       mask_window_draft=string.copy(state.mask_window)
+       mask_aggression_draft=string.copy(state.mask_aggression)
+       inference_semitones_draft=string.copy(state.inference_semitones)
+       recording_shifts_draft=string.copy(state.recording_shifts)
+       recording_overlap_draft=string.copy(state.recording_overlap)
+       recording_segment_draft=string.copy(state.recording_segment)
+       recording_seed_draft=string.copy(state.recording_seed)
+       gpu_index_draft=string.copy(state.gpu_index)}
+     match preferences.persist(state,preference_file,preference_temporary,""){ok(raw)=>{
+      preference_serialized=raw
+      preference_writable=true
+      let _=desk.set_text(app,"status",if id=="preferences_reset"{"Default preferences restored and saved"}else{"Desktop preferences saved"})},err(e)=>{
+      preference_writable=false
+      let _=desk.set_text(app,"status",e)}}
+     continue}
+
+    if id=="focus_settings"{let _=desk.focus(app,"settings")}
+    if id=="focus_audio_inputs"{show_page(app,state,2.0)
+     let _=desk.focus(app,"ensemble_rows")}
+    if id=="focus_queue_inputs"{show_page(app,state,3.0)
+     let _=desk.focus(app,"queue_rows")}
+    if id=="focus_checkpoint"{let _=desk.focus(app,"checkpoint")}
+    if id=="focus_output"{let _=desk.focus(app,"output")}
+    if id=="focus_secondary_weight"{let _=desk.focus(app,"secondary_weight")}
+    if id=="focus_secondary_outputs"{let _=desk.focus(app,"secondary_outputs")}
+    if id=="focus_vocal_amount"{let _=desk.focus(app,"vocal_amount")}
+    if id=="focus_export_subtype"{let _=desk.focus(app,"export_subtype")}
+    if id=="focus_output_container"{let _=desk.focus(app,"output_container")}
+    if id=="focus_mp3_bitrate"{let _=desk.focus(app,"mp3_bitrate")}
+    if id=="focus_codec_directory"{let _=desk.focus(app,"codec_directory")}
+    if id=="focus_single_outputs"{let _=desk.focus(app,"single_outputs")}
+    if id=="focus_single_complement"{let _=desk.focus(app,"single_complement")}
+    if id=="focus_model_outputs"{let _=desk.focus(app,"model_outputs")}
+    if id=="focus_tool_amount"{let _=desk.focus(app,"tool_amount")}
+    if id=="focus_pitch_amount"{show_page(app,state,2.0)
+     let _=desk.focus(app,"pitch_amount")}
+    if id=="single_page"{show_page(app,state,0.0)}
+    if id=="models_page"{show_page(app,state,1.0)}
+    if id=="audio_page"{show_page(app,state,2.0)}
+    if id=="queue_page"{show_page(app,state,3.0)}
+    if id=="secondary_page"{show_page(app,state,4.0)}
+    if id=="vocal_page"{show_page(app,state,5.0)}
+    if id=="choose_settings"{let _=desk.dialog(app,"settings","open","Choose model configuration","",root)}
+    if id=="choose_checkpoint"{let _=desk.dialog(app,"checkpoint","open","Choose model weights","",root)}
+    if id=="choose_input"{let _=desk.dialog(app,"input","open","Choose recording","",root)}
+    if id=="choose_output"{let _=desk.dialog(app,"output","folder","Choose output folder","",root)}
+    if id=="choose_codec_directory"{let _=desk.dialog(app,"codec_directory","folder","Choose supported audio codec tools folder","",root)}
+    if id=="model_preset_save"{let _=desk.dialog(app,"model_preset_save","save","Save ensemble preset","ensemble.json",root)}
+    if id=="model_preset_open"{let _=desk.dialog(app,"model_preset_open","open","Open ensemble preset","",root)}
+    if id=="model_processing_add"{
+     if array.len(state.ensemble_models)==0{let _=desk.set_text(app,"status","Add an ensemble member before attaching processing")
+     }else{let _=desk.dialog(app,"model_processing","open","Choose secondary or preprocessing settings for the last member","",root)}}
+    if id=="model_processing_clear" and array.len(state.ensemble_models)>0{
+     let last:u64=array.len(state.ensemble_models)-1
+     let member:ref<model_config.Model>=array.borrow(state.ensemble_models,last)
+     member.processing=""
+     model_list(app,state.ensemble_models)
+     let _=desk.set_text(app,"status","Processing cleared from the last ensemble member")}
+    if id=="ensemble_add"{let _=desk.dialog_multiple(app,"ensemble_inputs","Choose audio inputs",root)}
+    if id=="ensemble_remove_selected" or id=="ensemble_keep_selected"{
+     match input_lists.edit_audio(struct.borrow(lists,field=audio),struct.borrow(state,field=ensemble_inputs),id=="ensemble_keep_selected"){
+      ok(_)=>{ensemble_list(app,state.ensemble_inputs,lists)
+       let _=desk.set_text(app,"status","Audio input list updated")},err(e)=>{let _=desk.set_text(app,"status",e)}}
+     continue}
+    if id=="queue_remove_selected" or id=="queue_keep_selected"{
+     match input_lists.edit_queue(struct.borrow(lists,field=queue),struct.borrow(state,field=queue_items),id=="queue_keep_selected"){
+      ok(_)=>{if array.len(state.queue_items)==0{state.queue_model_snapshot=""
+     state.queue_cleanup_snapshot=""
+     state.queue_learned_snapshot=""
+     state.queue_inference_snapshot=""
+     state.queue_recording_snapshot=""
+     state.queue_recording_state=""
+        state.queue_naming_snapshot=""}
+       queue_list(app,state.queue_items,lists)
+       let _=desk.set_text(app,"status","Pending recordings updated; output folder names preserved")},err(e)=>{let _=desk.set_text(app,"status",e)}}
+     continue}
+    if id=="ensemble_current"{
+     if str.len(state.input)>0{array.push(state.ensemble_inputs,string.copy(state.input))
+      ensemble_list(app,state.ensemble_inputs,lists)}else{let _=desk.set_text(app,"status","Choose a recording above first")}}
+    if id=="ensemble_remove"{let _=array.pop(state.ensemble_inputs)
+     ensemble_list(app,state.ensemble_inputs,lists)}
+    if id=="ensemble_swap"{
+     if array.len(state.ensemble_inputs)==2{
+      let first:string=string.copy(array.get(state.ensemble_inputs,0))
+      let second:string=string.copy(array.get(state.ensemble_inputs,1))
+      array.set(state.ensemble_inputs,0,second)
+      array.set(state.ensemble_inputs,1,first)
+      ensemble_list(app,state.ensemble_inputs,lists)}else{let _=desk.set_text(app,"status","Select exactly two inputs to swap the pair")}}
+    if id=="tool_pitch"{
+     let amount:f64=match text.parse_f64(state.pitch_amount){some(v)=>v,none=>{
+      let _=desk.set_text(app,"status","Enter a pitch shift between -10 and 10 semitones")
+      continue}}
+     if not fp.is_finite(amount) or amount< -10.0 or amount>10.0{
+      let _=desk.set_text(app,"status","Enter a pitch shift between -10 and 10 semitones")
+      continue}
+     if array.len(state.queue_items)>0{
+      let settings:pitch.Settings=pitch.Settings{semitones:amount,normalize:state.ensemble_normalize}
+      let recipe:string=match pitch.Settings_encode(settings){ok(v)=>v,err(e)=>{let _=desk.set_text(app,"status",codec.describe(e))
+       continue}}
+      let queued:queue.Work=queue.Work{retained:ref.swap(retained,option.none()),items:queue_config.copy_items(struct.borrow(state,field=queue_items)),settings:"",checkpoint:"",ensemble:option.none(),secondary:option.none(),directory:string.copy(state.output),cancel:string.copy(cancel),progress:string.copy(progress),use_gpu:false,continue_on_error:state.queue_continue,pitch_recipe:recipe,wav_choice:cast.sat(state.export_subtype),codec_recipe:string.copy(codec_recipe),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes}
+      let _=files.remove(cancel)
+      let _=files.remove(progress)
+      previous_progress=string.new()
+      array.push(jobs,task.spawn(audio_jobs.Queue{work:option.some(queued),policy:ref.swap(input_policy,option.none()),sample:ref.swap(sample_policy,option.none())},fn=audio_jobs.run_Queue))
+      busy(app,true)
+      let _=desk.set_text(app,"status","Changing pitch and duration for queued recordings…")
+      continue}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=string.new()
+     let work:job.PitchWork=job.PitchWork{codec_recipe:string.copy(codec_recipe),wav_choice:cast.sat(state.export_subtype),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes,retained:ref.swap(retained,option.none()),settings:pitch.Settings{semitones:amount,normalize:state.ensemble_normalize},
+      input:string.copy(state.input),output:string.copy(state.output),cancel:string.copy(cancel),progress:string.copy(progress)}
+     array.push(jobs,task.spawn(audio_jobs.Pitch{work:option.some(work),policy:ref.swap(input_policy,option.none()),sample:ref.swap(sample_policy,option.none())},fn=audio_jobs.run_Pitch))
+     busy(app,true)
+     let _=desk.set_text(app,"status","Changing pitch and duration…")}
+    if id=="tool_combine" or id=="tool_mix" or id=="tool_reduce" or id=="tool_spectral"{
+     let amount:f64=if id=="tool_spectral"{0.0}else{match text.parse_f64(state.tool_amount){some(v)=>v,none=>{
+      let _=desk.set_text(app,"status","Enter an audio tool amount between 0 and 1")
+      continue}}}
+     var inputs:array<string>=[]
+     var i:u64=0
+     loop{if i==array.len(state.ensemble_inputs){break}
+      array.push(inputs,string.copy(array.get(state.ensemble_inputs,i)))
+      i+=1}
+     var selected:audio_tools.Settings=audio_tools.Settings{operation:if id=="tool_combine"{"combine"}else{if id=="tool_mix"{"mix"}else{if id=="tool_spectral"{"spectral-residual"}else{"reduce"}}},amount:amount,inputs:inputs}
+     match audio_tools.validate(selected){err(e)=>{let _=desk.set_text(app,"status",e)
+      continue},ok(_)=>{}}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=string.new()
+     let work:job.AudioToolWork=job.AudioToolWork{codec_recipe:string.copy(codec_recipe),wav_choice:cast.sat(state.export_subtype),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes,retained:ref.swap(retained,option.none()),settings:selected,output:string.copy(state.output),cancel:string.copy(cancel),progress:string.copy(progress)}
+     array.push(jobs,task.spawn(audio_jobs.AudioTool{work:option.some(work),policy:ref.swap(input_policy,option.none())},fn=audio_jobs.run_AudioTool))
+     busy(app,true)
+     let _=desk.set_text(app,"status","Processing audio…")}
+    if id=="queue_add"{let _=desk.dialog_multiple(app,"queue_inputs","Choose recordings for the queue",root)}
+    if id=="queue_current"{let current:string=string.copy(state.input)
+     queue_append(state,current)
+     queue_list(app,state.queue_items,lists)}
+    if id=="queue_remove"{let _=array.pop(state.queue_items)
+     if array.len(state.queue_items)==0{state.queue_model_snapshot=""
+     state.queue_cleanup_snapshot=""
+     state.queue_learned_snapshot=""
+     state.queue_inference_snapshot=""
+     state.queue_recording_snapshot=""
+     state.queue_recording_state=""
+      state.queue_naming_snapshot=""}
+     queue_list(app,state.queue_items,lists)}
+    if id=="queue_clear"{state.queue_items=[]
+     state.queue_model_snapshot=""
+     state.queue_cleanup_snapshot=""
+     state.queue_learned_snapshot=""
+     state.queue_inference_snapshot=""
+     state.queue_recording_snapshot=""
+     state.queue_recording_state=""
+     state.queue_naming_snapshot=""
+     state.queue_index=0
+     queue_list(app,state.queue_items,lists)}
+    if id=="queue_use_settings"{
+     let encoded_learned:string=match learned_policy.current(state.noise_reduction,state.room_reduction,state.room_targets,state.noise_checkpoint,state.room_checkpoint){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     let recording_raw:string=match recording_policy.current_with_pitch(state.recording_override,recording_shifts_draft,state.recording_split,recording_overlap_draft,recording_segment_draft,recording_seed_draft,state.inference_pitch,inference_semitones_draft,state.match_frequency){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     let encoded_recording:string=match recording_policy.accept(recording_raw){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     let encoded_inference:string=match inference_policy.current(state.mask_tta,mask_window_draft,mask_aggression_draft){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     if not preference_writable{let _=desk.set_text(app,"status","Save or restore desktop preferences before replacing pending queue settings")
+      continue}
+     let previous:string=ref.swap(state.queue_model_snapshot,string.new())
+     let previous_naming:string=string.copy(state.queue_naming_snapshot)
+     let previous_cleanup:string=string.copy(state.queue_cleanup_snapshot)
+     let previous_learned:string=string.copy(state.queue_learned_snapshot)
+     let previous_inference:string=string.copy(state.queue_inference_snapshot)
+     let previous_recording:string=string.copy(state.queue_recording_snapshot)
+     let previous_gpu_index:string=string.copy(state.queue_gpu_index)
+     let previous_recording_state:string=string.copy(state.queue_recording_state)
+     var current_cleanup:cleanup.Settings=match cleanup_policy.current(state.cleanup_enabled,cleanup_draft){ok(value)=>value,err(problem)=>{
+      state.queue_model_snapshot=previous
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     let encoded_cleanup:string=match cleanup_policy.encode(current_cleanup){ok(value)=>value,err(problem)=>{
+      state.queue_model_snapshot=previous
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     match capture_models(state){ok(snapshot)=>{state.queue_model_snapshot=snapshot
+      state.queue_cleanup_snapshot=encoded_cleanup
+      state.queue_learned_snapshot=encoded_learned
+      state.queue_inference_snapshot=encoded_inference
+      state.queue_gpu_index=string.copy(state.gpu_index)
+      state.queue_recording_snapshot=encoded_recording
+      state.queue_recording_state=""
+      state.queue_naming_snapshot=""
+      match preferences.persist_synced(state,preference_file,preference_temporary){ok(raw)=>{
+       preference_serialized=raw
+       preference_dirty=false
+       preference_writable=true
+       let _=desk.set_text(app,"status","Pending queue now uses current model and naming settings")},err(e)=>{
+        state.queue_model_snapshot=string.copy(previous)
+        state.queue_naming_snapshot=string.copy(previous_naming)
+        state.queue_cleanup_snapshot=string.copy(previous_cleanup)
+        state.queue_learned_snapshot=string.copy(previous_learned)
+        state.queue_inference_snapshot=string.copy(previous_inference)
+        state.queue_recording_snapshot=string.copy(previous_recording)
+        state.queue_gpu_index=string.copy(previous_gpu_index)
+        state.queue_recording_state=string.copy(previous_recording_state)
+        let _=desk.set_text(app,"status",e)}}},err(e)=>{
+       state.queue_model_snapshot=previous
+       let _=desk.set_text(app,"status",e)}}
+     continue}
+    if id=="queue_single" or id=="queue_ensemble" or id=="queue_secondary"{
+     if not preference_writable{let _=desk.set_text(app,"status","Save or restore desktop preferences before accepting a recoverable queue")
+      continue}
+     if id=="queue_secondary" and state.vocal_model>0{match vocal_amount(struct.borrow(state,field=vocal_options),state.vocal_weight){ok(_)=>{},err(e)=>{let _=desk.set_text(app,"status",e)
+      continue}}}
+     var queue_settings:string=string.copy(state.settings)
+     var queue_checkpoint:string=string.copy(state.checkpoint)
+     var queue_definition:string=string.copy(state.model_definition)
+     var accepted_ensemble:string=""
+     var accepted_secondary:string=""
+     if str.len(state.queue_model_snapshot)>0{
+      var snapshot:model_snapshot.Snapshot=match model_snapshot.decode(state.queue_model_snapshot){ok(v)=>v,err(e)=>{let _=desk.set_text(app,"status",e)
+       continue}}
+      match model_snapshot.verify(snapshot){ok(_)=>{},err(e)=>{let _=desk.set_text(app,"status",e)
+       continue}}
+      queue_settings=string.copy(snapshot.settings)
+      queue_checkpoint=string.copy(snapshot.checkpoint)
+      queue_definition=string.copy(snapshot.model_definition)
+      accepted_ensemble=string.copy(snapshot.ensemble)
+      accepted_secondary=string.copy(snapshot.secondary)}
+     var items:array<queue_config.Item>=[]
+     var i:u64=0
+     loop{if i==array.len(state.queue_items){break}
+      let item:ref<queue_config.Item>=array.borrow(state.queue_items,i)
+      array.push(items,queue_config.Item{input:string.copy(item.input),folder:string.copy(item.folder)})
+      i+=1}
+     let ensemble:option<model_config.Recipe>=if id=="queue_ensemble"{
+      if str.len(accepted_ensemble)>0{option.some(match model_config.Recipe_decode(accepted_ensemble){ok(v)=>v,err(e)=>{let _=desk.set_text(app,"status",codec.describe(e))
+        continue}})}else{option.some(model_recipe(state))}
+     }else{option.none()}
+     let secondary:option<secondary_config.Recipe>=if id=="queue_secondary"{
+      if str.len(accepted_secondary)>0{option.some(match secondary_config.Recipe_decode(accepted_secondary){ok(v)=>v,err(e)=>{let _=desk.set_text(app,"status",codec.describe(e))
+        continue}})}else{option.some(secondary_recipe(state))}
+     }else{if id=="queue_single" and str.len(state.queue_naming_snapshot)>0{
+      if str.len(accepted_secondary)>0{option.some(match secondary_config.Recipe_decode(accepted_secondary){ok(value)=>value,err(e)=>{let _=desk.set_text(app,"status",codec.describe(e))
+       continue}})}else{option.none()}
+     }else{if id=="queue_single" and (state.single_outputs!=0.0 or state.single_complement!=0.0 or state.single_normalize or state.single_keep){
+      option.some(single_recipe(queue_settings,queue_checkpoint,state.single_outputs,state.single_complement,state.single_normalize,state.single_keep))
+     }else{option.none()}}}
+     if str.len(state.queue_naming_snapshot)==0 and id!="queue_single"{queue_definition=""}
+     var accepted:queue_acceptance.Accepted=match queue_acceptance.accept(state,queue_settings,queue_checkpoint,queue_definition,ensemble,secondary,items){ok(value)=>value,err(e)=>{let _=desk.set_text(app,"status",e)
+      continue}}
+     if str.len(state.queue_model_snapshot)>0{selected_recording=string.copy(state.queue_recording_snapshot)
+      selected_device=match device_selection.parse(state.queue_gpu_index){ok(value)=>value,err(problem)=>{let _=desk.set_text(app,"status",problem)
+       continue}}}
+     let previous_gpu_index:string=string.copy(state.queue_gpu_index)
+     let previous_models:string=string.copy(state.queue_model_snapshot)
+     let previous_recording:string=string.copy(state.queue_recording_snapshot)
+     let previous_naming:string=string.copy(state.queue_naming_snapshot)
+     let previous_cleanup:string=string.copy(state.queue_cleanup_snapshot)
+     let previous_learned:string=string.copy(state.queue_learned_snapshot)
+     let previous_inference:string=string.copy(state.queue_inference_snapshot)
+     selected_cleanup=match cleanup_policy.decode(accepted.cleanup){ok(value)=>value,err(problem)=>{
+      let _=desk.set_text(app,"status",problem)
+      continue}}
+     state.queue_cleanup_snapshot=string.copy(accepted.cleanup)
+     selected_learned=string.copy(accepted.learned)
+     state.queue_learned_snapshot=string.copy(accepted.learned)
+     selected_inference=string.copy(accepted.inference)
+     state.queue_inference_snapshot=string.copy(accepted.inference)
+     state.queue_gpu_index=string.from_int(selected_device)
+     state.queue_recording_snapshot=string.copy(selected_recording)
+     state.queue_model_snapshot=string.copy(accepted.models)
+     state.queue_naming_snapshot=string.copy(accepted.names)
+     match preferences.persist_synced(state,preference_file,preference_temporary){ok(raw)=>{
+      preference_serialized=raw
+      preference_dirty=false
+      preference_writable=true},err(e)=>{
+       state.queue_gpu_index=previous_gpu_index
+       state.queue_model_snapshot=previous_models
+       state.queue_naming_snapshot=previous_naming
+       state.queue_cleanup_snapshot=previous_cleanup
+       state.queue_learned_snapshot=previous_learned
+       state.queue_inference_snapshot=previous_inference
+       state.queue_recording_snapshot=previous_recording
+       let _=desk.set_text(app,"status",e)
+       continue}}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=string.new()
+     let work:queue.Work=queue.Work{recording_state:string.copy(state.queue_recording_state),application_root:string.copy(root),mask_high_band:mask_policy.checkbox(state.high_band),mask_controls:string.copy(selected_inference),learned_controls:string.copy(selected_learned),recording_controls:string.copy(selected_recording),gpu_index:selected_device,mask_cleanup:selected_cleanup.enabled,mask_cleanup_threshold:selected_cleanup.threshold,codec_recipe:string.copy(codec_recipe),wav_choice:cast.sat(state.export_subtype),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes,retained:ref.swap(retained,option.none()),items:items,settings:queue_settings,checkpoint:queue_checkpoint,
+      ensemble:ensemble,secondary:secondary,directory:string.copy(state.output),cancel:string.copy(cancel),progress:string.copy(progress),use_gpu:state.use_gpu,continue_on_error:state.queue_continue}
+     array.push(jobs,task.spawn(audio_jobs.Queue{work:option.some(work),policy:ref.swap(input_policy,option.none()),sample:ref.swap(sample_policy,option.none()),naming_snapshot:struct.replace(accepted,string.new(),field=names)},fn=audio_jobs.run_Queue))
+     queue_active=true
+     busy(app,true)
+     let _=desk.set_text(app,"status","Preparing recording queue…")}
+    if id=="ensemble_clear"{state.ensemble_inputs=[]
+     ensemble_list(app,state.ensemble_inputs,lists)}
+    if id=="model_add" or id=="secondary_model_add" or id=="vocal_model_add"{
+     match add_model(state.ensemble_models,state.settings,state.checkpoint,state.model_definition){ok(_)=>{model_list(app,state.ensemble_models)
+      let _=desk.set_text(app,"status","Model added. Choose different weights above to add another.")},err(e)=>{let _=desk.set_text(app,"status",e)
+      io.write(text.concat(e,"\n"))}}}
+    if id=="model_remove" or id=="secondary_model_remove" or id=="vocal_model_remove"{let _=array.pop(state.ensemble_models)
+     var valid:array<secondary_config.Adjustment>=[]
+     var i:u64=0
+     loop{if i==array.len(state.secondary_rules){break}
+      let rule:ref<secondary_config.Adjustment>=array.borrow(state.secondary_rules,i)
+      if rule.model<array.len(state.ensemble_models){array.push(valid,secondary_config.Adjustment{target:string.copy(rule.target),model:rule.model,primary_weight:rule.primary_weight})}
+      i+=1}
+     state.secondary_rules=valid
+     if state.preprocess_model>=array.len(state.ensemble_models){state.preprocess_model=0}
+     if state.vocal_model>=array.len(state.ensemble_models){state.vocal_model=0}
+     vocal_list(app,state.vocal_model)
+     preprocess_list(app,state.preprocess_model)
+     secondary_list(app,state.secondary_rules)
+     model_list(app,state.ensemble_models)}
+    if id=="model_clear" or id=="secondary_model_clear" or id=="vocal_model_clear"{state.ensemble_models=[]
+     state.secondary_rules=[]
+     state.preprocess_model=0
+     state.vocal_model=0
+     vocal_list(app,state.vocal_model)
+     preprocess_list(app,state.preprocess_model)
+     secondary_list(app,state.secondary_rules)
+     model_list(app,state.ensemble_models)}
+    if id=="secondary_clear"{state.secondary_rules=[]
+     secondary_list(app,state.secondary_rules)}
+    if id=="preprocess_assign"{
+     if array.len(state.ensemble_models)<2{let _=desk.set_text(app,"status","Add the primary model first, then a two-source vocal/instrumental preprocessor")
+      continue}
+     state.preprocess_model=array.len(state.ensemble_models)-1
+     preprocess_list(app,state.preprocess_model)}
+    if id=="preprocess_clear"{state.preprocess_model=0
+     preprocess_list(app,state.preprocess_model)}
+    if id=="vocal_assign"{
+     if array.len(state.ensemble_models)<2{let _=desk.set_text(app,"status","Add the primary model first, then a lead/backing vocal splitter")
+      continue}
+     state.vocal_model=array.len(state.ensemble_models)-1
+     state.secondary_outputs=1.0
+     let _=desk.set_number(app,"secondary_outputs","selected",1.0)
+     let _=desk.set_number(app,"vocal_outputs","selected",1.0)
+     vocal_list(app,state.vocal_model)}
+    if id=="vocal_clear"{state.vocal_model=0
+     vocal_list(app,state.vocal_model)}
+    if id=="secondary_assign"{
+     if array.len(state.ensemble_models)<2{let _=desk.set_text(app,"status","Add a primary model first, then at least one secondary model")
+      continue}
+     let weight:f64=match text.parse_f64(state.secondary_weight){some(v)=>v,none=>{
+      let _=desk.set_text(app,"status","Enter a primary weight between 0 and 1")
+      continue}}
+     if not fp.is_finite(weight) or weight<0.0 or weight>1.0{let _=desk.set_text(app,"status","Enter a primary weight between 0 and 1")
+      continue}
+     let target:str=secondary_name(state.secondary_target)
+     let next:secondary_config.Adjustment=secondary_config.Adjustment{target:string.copy(target),model:array.len(state.ensemble_models)-1,primary_weight:weight}
+     var found:option<u64>=option.none()
+     var i:u64=0
+     loop{if i==array.len(state.secondary_rules){break}
+      if str.view(array.borrow(state.secondary_rules,i).target)==target{found=option.some(i)}
+      i+=1}
+     match found{some(index)=>array.set(state.secondary_rules,index,next),none=>array.push(state.secondary_rules,next)}
+     secondary_list(app,state.secondary_rules)}
+    if id=="secondary_run" or id=="vocal_run"{
+     if state.vocal_model>0{match vocal_amount(struct.borrow(state,field=vocal_options),state.vocal_weight){ok(_)=>{},err(e)=>{let _=desk.set_text(app,"status",e)
+      continue}}}
+     let recipe:secondary_config.Recipe=secondary_recipe(state)
+     let naming_snapshot:string=match naming.secondary(state,recipe,""){ok(value)=>value,err(e)=>{let _=desk.set_text(app,"status",e)
+      continue}}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=string.new()
+     let work:job.SecondaryWork=job.SecondaryWork{application_root:string.copy(root),mask_high_band:mask_policy.checkbox(state.high_band),mask_controls:string.copy(selected_inference),learned_controls:string.copy(selected_learned),recording_controls:string.copy(selected_recording),gpu_index:selected_device,mask_cleanup:selected_cleanup.enabled,mask_cleanup_threshold:selected_cleanup.threshold,codec_recipe:string.copy(codec_recipe),wav_choice:cast.sat(state.export_subtype),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes,retained:ref.swap(retained,option.none()),settings:recipe,input:string.copy(state.input),output:string.copy(state.output),
+      cancel:string.copy(cancel),progress:string.copy(progress),use_gpu:state.use_gpu}
+     array.push(jobs,task.spawn(audio_jobs.Secondary{work:option.some(work),policy:ref.swap(input_policy,option.none()),sample:ref.swap(sample_policy,option.none()),naming_snapshot:naming_snapshot},fn=audio_jobs.run_Secondary))
+     busy(app,true)
+     let _=desk.set_text(app,"status",if state.vocal_model>0{"Preparing vocal chain…"}else{"Preparing secondary models…"})}
+    if id=="model_run"{
+     let recipe:model_config.Recipe=model_recipe(state)
+     let naming_snapshot:string=match naming.ensemble(state,recipe){ok(value)=>value,err(e)=>{let _=desk.set_text(app,"status",e)
+      continue}}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=string.new()
+     let work:job.ModelEnsembleWork=job.ModelEnsembleWork{application_root:string.copy(root),mask_high_band:mask_policy.checkbox(state.high_band),mask_controls:string.copy(selected_inference),learned_controls:string.copy(selected_learned),recording_controls:string.copy(selected_recording),gpu_index:selected_device,mask_cleanup:selected_cleanup.enabled,mask_cleanup_threshold:selected_cleanup.threshold,codec_recipe:string.copy(codec_recipe),wav_choice:cast.sat(state.export_subtype),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes,retained:ref.swap(retained,option.none()),settings:recipe,
+      input:string.copy(state.input),output:string.copy(state.output),cancel:string.copy(cancel),progress:string.copy(progress),use_gpu:state.use_gpu}
+     array.push(jobs,task.spawn(audio_jobs.ModelEnsemble{work:option.some(work),policy:ref.swap(input_policy,option.none()),sample:ref.swap(sample_policy,option.none()),naming_snapshot:naming_snapshot},fn=audio_jobs.run_ModelEnsemble))
+     busy(app,true)
+     let _=desk.set_text(app,"status","Preparing selected models…")}
+    if id=="ensemble_min" or id=="ensemble_max" or id=="ensemble_average"{
+     var inputs:array<string>=[]
+     var i:u64=0
+     loop{if i==array.len(state.ensemble_inputs){break}
+      array.push(inputs,string.copy(array.get(state.ensemble_inputs,i)))
+      i+=1}
+     let ensemble_settings:ensemble_app.Settings=ensemble_app.Settings{inputs:inputs,
+      method:if id=="ensemble_min"{"minimum"}else{if id=="ensemble_max"{"maximum"}else{"average"}},
+      domain:if state.ensemble_wave{"waveform"}else{"spectrum"},normalize:state.ensemble_normalize}
+     let _=files.remove(cancel)
+     let _=files.remove(progress)
+     previous_progress=string.new()
+     let work:job.EnsembleWork=job.EnsembleWork{codec_recipe:string.copy(codec_recipe),wav_choice:cast.sat(state.export_subtype),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes,retained:ref.swap(retained,option.none()),settings:ensemble_settings,
+      output:string.copy(state.output),cancel:string.copy(cancel),progress:string.copy(progress)}
+     array.push(jobs,task.spawn(audio_jobs.Ensemble{work:option.some(work),policy:ref.swap(input_policy,option.none())},fn=audio_jobs.run_Ensemble))
+     busy(app,true)
+     let _=desk.set_text(app,"status","Combining selected audio…")}
+    if id=="reload"{match cpu_close.retained_all(retained){err(e)=>{let _=desk.set_text(app,"status",e)
+      continue},ok(_)=>{}}
+     let _=desk.set_text(app,"status","Models released. They will load for the next recording.")}
+    if id=="separate"{
+     let _=files.remove(str.view(cancel))
+     let _=files.remove(str.view(progress))
+     previous_progress=string.new()
+     if state.single_outputs!=0.0 or state.single_complement!=0.0 or state.single_normalize or state.single_keep{
+      let recipe:secondary_config.Recipe=single_recipe(state.settings,state.checkpoint,state.single_outputs,state.single_complement,state.single_normalize,state.single_keep)
+      let definition:string=string.copy(state.model_definition)
+      let naming_snapshot:string=match naming.secondary(state,recipe,definition){ok(value)=>value,err(e)=>{let _=desk.set_text(app,"status",e)
+       continue}}
+      let work:job.SecondaryWork=job.SecondaryWork{application_root:string.copy(root),mask_high_band:mask_policy.checkbox(state.high_band),mask_controls:string.copy(selected_inference),learned_controls:string.copy(selected_learned),recording_controls:string.copy(selected_recording),gpu_index:selected_device,mask_cleanup:selected_cleanup.enabled,mask_cleanup_threshold:selected_cleanup.threshold,codec_recipe:string.copy(codec_recipe),wav_choice:cast.sat(state.export_subtype),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes,retained:ref.swap(retained,option.none()),settings:recipe,input:string.copy(state.input),output:string.copy(state.output),cancel:string.copy(cancel),progress:string.copy(progress),use_gpu:state.use_gpu}
+      array.push(jobs,task.spawn(audio_jobs.Secondary{work:option.some(work),policy:ref.swap(input_policy,option.none()),sample:ref.swap(sample_policy,option.none()),naming_snapshot:naming_snapshot},fn=audio_jobs.run_Secondary))
+      busy(app,true)
+      let _=desk.set_text(app,"status","Preparing selected sources…")
+      continue}
+     let naming_snapshot:string=match naming.single(state){ok(value)=>value,err(e)=>{let _=desk.set_text(app,"status",e)
+      continue}}
+     let payload:job.Work=job.Work{application_root:string.copy(root),mask_high_band:mask_policy.checkbox(state.high_band),mask_controls:string.copy(selected_inference),learned_controls:string.copy(selected_learned),recording_controls:string.copy(selected_recording),gpu_index:selected_device,mask_cleanup:selected_cleanup.enabled,mask_cleanup_threshold:selected_cleanup.threshold,codec_recipe:string.copy(codec_recipe),wav_choice:cast.sat(state.export_subtype),export_max_frames:output_limits.max_frames,export_max_stage_bytes:output_limits.max_stage_bytes,export_max_encoded_bytes:output_limits.max_encoded_bytes,retained:ref.swap(retained,option.none()),settings:string.copy(str.view(state.settings)),checkpoint:string.copy(str.view(state.checkpoint)),input:string.copy(str.view(state.input)),output:string.copy(str.view(state.output)),cancel:string.copy(str.view(cancel)),progress:string.copy(str.view(progress)),use_gpu:state.use_gpu}
+     array.push(jobs,task.spawn(audio_jobs.Single{work:option.some(payload),policy:ref.swap(input_policy,option.none()),sample:ref.swap(sample_policy,option.none()),naming_snapshot:naming_snapshot},fn=audio_jobs.run_Single))
+     busy(app,true)
+     let _=desk.set_text(app,"status","Preparing recording…")
+    }
+   }
+  },}
+  if array.len(jobs)>0{let _=files.write_text(str.view(cancel),"cancel")
+   let _=desk.set_text(app,"status","Finishing the current operation before closing…")
+   loop{match array.pop(jobs){none=>{break},some(handle)=>{
+    var finished:job.Completed=task.join(handle)
+    match cpu_close.retained_all(struct.borrow(finished,field=retained)){ok(_)=>{},err(e)=>{io.ewrite(text.concat("Session close failed while ending the application: ",e))}}}}}}
+  match cpu_close.retained_all(retained){ok(_)=>{},err(e)=>{io.ewrite(text.concat("Session close failed while ending the application: ",e))}}
+  let _=desk.clear_video(app,"audio_player")
+  desk.close(app)
+  let _=proc.settle(helpers,str.view(app.root),2000,300)
+ }
+ let _=files.remove(cancel)
+ let _=files.remove(progress)
+ let _=files.remove(text.concat(progress,".tmp"))
+ let _=files.remove(text.concat(progress,".queue"))
+ let _=files.remove(text.concat(progress,".queue.tmp"))
+ desk.cleanup(app)
+ answer
+}

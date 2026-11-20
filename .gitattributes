@@ -1,0 +1,7 @@
+* text=auto eol=lf
+/licenses/** -text -whitespace
+/assets/** -text -whitespace
+/configs/** -text -whitespace
+*.pth -text
+*.npz -text
+*.png -text

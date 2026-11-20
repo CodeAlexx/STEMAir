@@ -1,0 +1,257 @@
+module stemair.attention.transformer
+import "../weights.ai" as weights
+import "../device_ops.ai" as ops
+import "../control.ai" as control
+import std.tensor as tensor
+import std.layer_norm_vectorized as row_norm
+import std.compute as compute
+import std.text as text
+import std.float as fp
+
+pub type Observer<O>=struct{callback:option<fn(ref<O>,str,view<u64>,view<f32>)->result<unit,string> effects {alloc}>}
+fn observe<O>(stream:ref<GpuStream>,observer:ref<Observer<O>>,observations:ref<O>,prefix:str,name:str,value:ref<tensor.Tensor>)->result<unit,string> effects {alloc,gpu}{
+ if prefix==""{return result.ok(())}
+ match observer.callback{none=>result.ok(()),some(invoke)=>{
+  let values:array<f32>=try tensor.to_f32(stream,value) map_err ops.error
+  invoke(observations,text.concat(prefix,name),array.view(value.dimensions),array.view(values))}}}
+
+pub type Linear=struct{weight:u64,bias:u64,input:u64,output:u64,start:u64=0,sliced:bool=false}
+pub type Norm=struct{weight:u64,bias:u64,group:bool=false}
+pub type Attention=struct{query:Linear,key:Linear,value:Linear,projection:Linear,width:u64,heads:u64}
+pub type Block=struct{attention:Attention,cross:bool,norm1:Norm,norm2:Norm,norm3:option<Norm>,
+ final_norm:Norm,first:Linear,second:Linear,gamma1:u64,gamma2:u64}
+pub fn bind_linear(w:ref<weights.Model>,name:str,input:u64,output:u64)->result<Linear,string> effects {alloc} {
+ let shape:array<u64>=[output,input]
+ let bias_shape:array<u64>=[output]
+ result.ok(Linear{weight:try weights.index(w,text.concat(name,".weight"),array.view(shape)),
+  bias:try weights.index(w,text.concat(name,".bias"),array.view(bias_shape)),input:input,output:output})
+}
+pub fn bind_norm(w:ref<weights.Model>,name:str,width:u64,group:bool)->result<Norm,string> effects {alloc} {
+ let shape:array<u64>=[width]
+ result.ok(Norm{weight:try weights.index(w,text.concat(name,".weight"),array.view(shape)),
+  bias:try weights.index(w,text.concat(name,".bias"),array.view(shape)),group:group})
+}
+pub fn bind_attention(w:ref<weights.Model>,name:str,width:u64,heads:u64)->result<Attention,string> effects {alloc} {
+ if width==0 or width>8192 or heads==0 or heads>64 or width%heads!=0{return result.err("Invalid attention feature geometry")}
+ let shape:array<u64>=[3*width,width]
+ let bias_shape:array<u64>=[3*width]
+ let weight:u64=try weights.index(w,text.concat(name,".in_proj_weight"),array.view(shape))
+ let bias:u64=try weights.index(w,text.concat(name,".in_proj_bias"),array.view(bias_shape))
+ result.ok(Attention{query:Linear{weight:weight,bias:bias,input:width,output:width,start:0,sliced:true},
+  key:Linear{weight:weight,bias:bias,input:width,output:width,start:width,sliced:true},
+  value:Linear{weight:weight,bias:bias,input:width,output:width,start:2*width,sliced:true},
+  projection:try bind_linear(w,text.concat(name,".out_proj"),width,width),width:width,heads:heads})
+}
+// This binding is the inspected dense, pre-normalized, output-group-normalized
+// block with learned residual scales and GELU. Dropout is disabled in inference.
+pub fn bind(w:ref<weights.Model>,name:str,width:u64,heads:u64,cross:bool)->result<Block,string> effects {alloc} {
+ let shape:array<u64>=[width]
+ var third:option<Norm>=option.none()
+ if cross{third=option.some(try bind_norm(w,text.concat(name,".norm3"),width,false))}
+ result.ok(Block{attention:try bind_attention(w,text.concat(name,if cross{".cross_attn"}else{".self_attn"}),width,heads),cross:cross,
+  norm1:try bind_norm(w,text.concat(name,".norm1"),width,false),
+  norm2:try bind_norm(w,text.concat(name,".norm2"),width,false),norm3:third,
+  final_norm:try bind_norm(w,text.concat(name,".norm_out"),width,true),
+  first:try bind_linear(w,text.concat(name,".linear1"),width,width*4),
+  second:try bind_linear(w,text.concat(name,".linear2"),width*4,width),
+  gamma1:try weights.index(w,text.concat(name,".gamma_1.scale"),array.view(shape)),
+  gamma2:try weights.index(w,text.concat(name,".gamma_2.scale"),array.view(shape))})
+}
+pub fn linear_with_execution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,p:Linear,state:ref<ops.ExecutionState>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let batch:u64=array.get(x.dimensions,0)
+ let time:u64=array.get(x.dimensions,1)
+ let flat_shape:array<u64>=[batch*time,p.input]
+ var input:tensor.Tensor=try tensor.reshape(x,array.view(flat_shape)) map_err ops.error
+ var weight:tensor.Tensor=try tensor.view(array.borrow(parameters,p.weight)) map_err ops.error
+ var bias:tensor.Tensor=try tensor.view(array.borrow(parameters,p.bias)) map_err ops.error
+ if p.sliced{
+  weight=try ops.slice(context,stream,weight,0,p.start,p.output)
+  bias=try ops.slice(context,stream,bias,0,p.start,p.output)}
+ let output_shape:array<u64>=[batch*time,p.output]
+ var output:tensor.Tensor=try ops.empty(context,array.view(output_shape))
+ if state.projection.recipe==ops.ProjectionRecipe.EagerF32{
+  let _=try compute.linear_bias_eager_f32(stream,input,weight,bias,output,state.projection.workspace_bytes) map_err ops.error
+ }else{let _=try compute.linear_bias(stream,input,weight,bias,output) map_err ops.error}
+ let shape:array<u64>=[batch,time,p.output]
+ result.ok(try tensor.reshape(output,array.view(shape)) map_err ops.error)
+}
+pub fn normalize_with_execution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,n:Norm,state:ref<ops.ExecutionState>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if n.group{
+  let batch:u64=array.get(x.dimensions,0)
+  let time:u64=array.get(x.dimensions,1)
+  let channels:u64=array.get(x.dimensions,2)
+  var transposed:tensor.Tensor=try ops.transpose(context,stream,x,[0,2,1])
+  let shape:array<u64>=[batch,channels,1,time]
+  var expanded:tensor.Tensor=try tensor.reshape(transposed,array.view(shape)) map_err ops.error
+  var normalized:tensor.Tensor=try ops.normalize_with_execution(context,stream,parameters,expanded,ops.Normalization{weight:n.weight,bias:n.bias,groups:1},state)
+  let flat:array<u64>=[batch,channels,time]
+  normalized=try tensor.reshape(normalized,array.view(flat)) map_err ops.error
+  return ops.transpose(context,stream,normalized,[0,2,1])}
+ var output:tensor.Tensor=try ops.empty(context,array.view(x.dimensions))
+ var weight:tensor.Tensor=try tensor.view(array.borrow(parameters,n.weight)) map_err ops.error
+ var bias:tensor.Tensor=try tensor.view(array.borrow(parameters,n.bias)) map_err ops.error
+ match state.row_normalizer{none=>{},some(engine)=>{
+  var normalized:row_norm.Normalization=try row_norm.normalize_affine(engine,context,stream,x,weight,bias,0.00001) map_err ops.error
+  return result.ok(struct.replace(normalized,output,field=output))}}
+ let _=try compute.layer_norm(stream,x,weight,bias,output,0.00001) map_err ops.error
+ result.ok(output)
+}
+fn split_heads(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,heads:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let batch:u64=array.get(x.dimensions,0)
+ let time:u64=array.get(x.dimensions,1)
+ let features:u64=array.get(x.dimensions,2)/heads
+ let shape:array<u64>=[batch,time,heads,features]
+ var expanded:tensor.Tensor=try tensor.reshape(x,array.view(shape)) map_err ops.error
+ var transposed:tensor.Tensor=try ops.transpose(context,stream,expanded,[0,2,1,3])
+ let flat:array<u64>=[batch*heads,time,features]
+ result.ok(try tensor.reshape(transposed,array.view(flat)) map_err ops.error)
+}
+pub fn attend_observed<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,a:Attention,q:ref<tensor.Tensor>,k:ref<tensor.Tensor>,state:ref<ops.ExecutionState>,self_attention:bool,observer:ref<Observer<O>>,observations:ref<O>,prefix:str)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if tensor.rank(q)!=3 or tensor.rank(k)!=3 or q.dtype!=tensor.DType.F32 or k.dtype!=tensor.DType.F32 or
+  array.get(q.dimensions,0)!=array.get(k.dimensions,0) or array.get(q.dimensions,2)!=a.width or array.get(k.dimensions,2)!=a.width{
+  return result.err("Invalid attention input geometry or dtype")}
+ let batch:u64=array.get(q.dimensions,0)
+ let queries:u64=array.get(q.dimensions,1)
+ let keys:u64=array.get(k.dimensions,1)
+ if batch==0 or batch>32 or queries==0 or queries>8192 or keys==0 or keys>8192 or batch*a.heads*queries*keys>134217728{
+  return result.err("Attention workspace limit exceeded")}
+ var query:tensor.Tensor=try tensor.view(q) map_err ops.error
+ var key:tensor.Tensor=try tensor.view(k) map_err ops.error
+ var value:tensor.Tensor=try tensor.view(k) map_err ops.error
+ if state.projection.recipe==ops.ProjectionRecipe.EagerF32{
+  if self_attention{
+   if queries!=keys{return result.err("Self attention requires equal token counts")}
+   let packed:Linear=Linear{weight:a.query.weight,bias:a.query.bias,input:a.width,output:3*a.width}
+   var projected:tensor.Tensor=try linear_with_execution(context,stream,parameters,q,packed,state)
+   query=try ops.slice(context,stream,projected,2,0,a.width)
+   key=try ops.slice(context,stream,projected,2,a.width,a.width)
+   value=try ops.slice(context,stream,projected,2,2*a.width,a.width)
+  }else{
+   query=try linear_with_execution(context,stream,parameters,q,a.query,state)
+   let packed:Linear=Linear{weight:a.key.weight,bias:a.key.bias,input:a.width,output:2*a.width,start:a.width,sliced:true}
+   var projected:tensor.Tensor=try linear_with_execution(context,stream,parameters,k,packed,state)
+   key=try ops.slice(context,stream,projected,2,0,a.width)
+   value=try ops.slice(context,stream,projected,2,a.width,a.width)
+  }
+ }else{
+  query=try linear_with_execution(context,stream,parameters,q,a.query,state)
+  key=try linear_with_execution(context,stream,parameters,k,a.key,state)
+  value=try linear_with_execution(context,stream,parameters,k,a.value,state)
+ }
+ let _=try observe(stream,observer,observations,prefix,"query",query)
+ let _=try observe(stream,observer,observations,prefix,"key",key)
+ let _=try observe(stream,observer,observations,prefix,"value",value)
+ if state.transformer_recipe==ops.TransformerRecipe.EfficientF32{
+  let features:u64=a.width/a.heads
+  let query_shape:array<u64>=[batch,queries,a.heads,features]
+  let key_shape:array<u64>=[batch,keys,a.heads,features]
+  query=try tensor.reshape(query,array.view(query_shape)) map_err ops.error
+  key=try tensor.reshape(key,array.view(key_shape)) map_err ops.error
+  value=try tensor.reshape(value,array.view(key_shape)) map_err ops.error
+  var output:tensor.Tensor=try ops.empty(context,array.view(query_shape))
+  let dimension:f64=cast.float(features)
+  let scale:f32=cast.float(1.0/fp.sqrt(dimension))
+  let _=try compute.attention_memory_efficient_cross_f32(stream,query,key,value,output,scale) map_err ops.error
+  let joined_shape:array<u64>=[batch,queries,a.width]
+  var joined:tensor.Tensor=try tensor.reshape(output,array.view(joined_shape)) map_err ops.error
+  let _=try observe(stream,observer,observations,prefix,"weighted",joined)
+  return linear_with_execution(context,stream,parameters,joined,a.projection,state)
+ }
+ query=try split_heads(context,stream,query,a.heads)
+ key=try split_heads(context,stream,key,a.heads)
+ value=try split_heads(context,stream,value,a.heads)
+ let features:u64=a.width/a.heads
+ let feature_count:f32=cast.float(features)
+ let scale:f32=1.0/fp.sqrt(feature_count)
+ var multiplier:tensor.Tensor=try tensor.full(context,stream,array.view(query.dimensions),scale,tensor.DType.F32) map_err ops.error
+ var scaled:tensor.Tensor=try ops.empty(context,array.view(query.dimensions))
+ let _=try compute.mul(stream,query,multiplier,scaled) map_err ops.error
+ let score_shape:array<u64>=[batch*a.heads,queries,keys]
+ var scores:tensor.Tensor=try ops.empty(context,array.view(score_shape))
+ let _=try compute.matmul_batched(stream,scaled,key,scores,false,true) map_err ops.error
+ var probabilities:tensor.Tensor=try ops.empty(context,array.view(score_shape))
+ let _=try compute.softmax(stream,scores,probabilities) map_err ops.error
+ let result_shape:array<u64>=[batch*a.heads,queries,features]
+ var weighted:tensor.Tensor=try ops.empty(context,array.view(result_shape))
+ let _=try compute.matmul_batched(stream,probabilities,value,weighted,false,false) map_err ops.error
+ let shape:array<u64>=[batch,a.heads,queries,features]
+ var expanded:tensor.Tensor=try tensor.reshape(weighted,array.view(shape)) map_err ops.error
+ var transposed:tensor.Tensor=try ops.transpose(context,stream,expanded,[0,2,1,3])
+ let joined_shape:array<u64>=[batch,queries,a.width]
+ var joined:tensor.Tensor=try tensor.reshape(transposed,array.view(joined_shape)) map_err ops.error
+ let _=try observe(stream,observer,observations,prefix,"weighted",joined)
+ linear_with_execution(context,stream,parameters,joined,a.projection,state)
+}
+pub fn attend_with_execution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,a:Attention,q:ref<tensor.Tensor>,k:ref<tensor.Tensor>,state:ref<ops.ExecutionState>,self_attention:bool)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var observations:unit=()
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ attend_observed(context,stream,parameters,a,q,k,state,self_attention,observer,observations,"")
+}
+fn scale(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,parameter:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let channels:u64=array.get(x.dimensions,2)
+ let rows:u64=array.get(x.dimensions,0)*array.get(x.dimensions,1)
+ let shape:array<u64>=[rows,channels]
+ var expanded:tensor.Tensor=try ops.empty(context,array.view(shape))
+ let _=try compute.broadcast_rows(stream,array.borrow(parameters,parameter),expanded) map_err ops.error
+ var flat:tensor.Tensor=try tensor.reshape(x,array.view(shape)) map_err ops.error
+ var output:tensor.Tensor=try ops.empty(context,array.view(shape))
+ let _=try compute.mul(stream,flat,expanded,output) map_err ops.error
+ result.ok(try tensor.reshape(output,array.view(x.dimensions)) map_err ops.error)
+}
+pub fn forward_observed<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,block:Block,input:ref<tensor.Tensor>,other:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,observer:ref<Observer<O>>,observations:ref<O>,prefix:str)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if tensor.rank(input)!=3 or input.dtype!=tensor.DType.F32 or array.get(input.dimensions,0)==0 or
+  array.get(input.dimensions,1)==0 or array.get(input.dimensions,1)>8192 or array.get(input.dimensions,2)!=block.attention.width{
+  return result.err("Invalid transformer input geometry or dtype")}
+ if block.cross{
+  if tensor.rank(other)!=3 or other.dtype!=tensor.DType.F32 or array.get(other.dimensions,0)!=array.get(input.dimensions,0) or
+   array.get(other.dimensions,1)==0 or array.get(other.dimensions,1)>8192 or array.get(other.dimensions,2)!=block.attention.width{
+   return result.err("Invalid transformer context geometry or dtype")}}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var query:tensor.Tensor=try normalize_with_execution(context,stream,parameters,input,block.norm1,state)
+ let _=try observe(stream,observer,observations,prefix,"norm1",query)
+ var keys:tensor.Tensor=if block.cross{try normalize_with_execution(context,stream,parameters,other,block.norm2,state)}else{
+  try tensor.view(query) map_err ops.error}
+ var attention:tensor.Tensor=try attend_observed(context,stream,parameters,block.attention,query,keys,state,not block.cross,observer,observations,prefix)
+ let _=try observe(stream,observer,observations,prefix,"attention",attention)
+ attention=try scale(context,stream,parameters,attention,block.gamma1)
+ let _=try observe(stream,observer,observations,prefix,"gamma1",attention)
+ var x:tensor.Tensor=try ops.add(context,stream,input,attention)
+ let form:Norm=if block.cross{match block.norm3{some(v)=>v,none=>{return result.err("Cross-layer third norm missing")}}}else{block.norm2}
+ var mlp:tensor.Tensor=try normalize_with_execution(context,stream,parameters,x,form,state)
+ let _=try observe(stream,observer,observations,prefix,"mlp-norm",mlp)
+ mlp=try linear_with_execution(context,stream,parameters,mlp,block.first,state)
+ let _=try observe(stream,observer,observations,prefix,"linear1",mlp)
+ mlp=try ops.gelu_with_execution(context,stream,mlp,state)
+ let _=try observe(stream,observer,observations,prefix,"activation",mlp)
+ mlp=try linear_with_execution(context,stream,parameters,mlp,block.second,state)
+ let _=try observe(stream,observer,observations,prefix,"linear2",mlp)
+ mlp=try scale(context,stream,parameters,mlp,block.gamma2)
+ let _=try observe(stream,observer,observations,prefix,"gamma2",mlp)
+ x=try ops.add(context,stream,x,mlp)
+ let _=try observe(stream,observer,observations,prefix,"final-norm-input",x)
+ normalize_with_execution(context,stream,parameters,x,block.final_norm,state)
+}
+pub fn forward_with_execution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,block:Block,input:ref<tensor.Tensor>,other:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observations:unit=()
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ forward_observed(context,stream,parameters,block,input,other,cancel,state,observer,observations,"")
+}
+pub fn linear(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,p:Linear)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var state:ops.ExecutionState=ops.current_execution(ops.ConvolutionPolicy{})
+ linear_with_execution(context,stream,parameters,x,p,state)
+}
+
+pub fn normalize(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,n:Norm)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var state:ops.ExecutionState=ops.current_execution(ops.ConvolutionPolicy{})
+ normalize_with_execution(context,stream,parameters,x,n,state)
+}
+
+pub fn attend(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,a:Attention,q:ref<tensor.Tensor>,k:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var state:ops.ExecutionState=ops.current_execution(ops.ConvolutionPolicy{})
+ attend_with_execution(context,stream,parameters,a,q,k,state,false)
+}
+
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,block:Block,input:ref<tensor.Tensor>,other:ref<tensor.Tensor>,cancel:str)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var state:ops.ExecutionState=ops.current_execution(ops.ConvolutionPolicy{})
+ forward_with_execution(context,stream,parameters,block,input,other,cancel,state)
+}

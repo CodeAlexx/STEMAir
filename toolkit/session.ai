@@ -1,0 +1,100 @@
+module stemair.session
+import "config.ai" as config
+import "network.ai" as network
+import "ops.ai" as ops
+import "spectral.ai" as spectral
+import "chunks.ai" as chunks
+import "numeric.ai" as num
+import "control.ai" as control
+
+pub type Session=struct{config:config.Config,network:network.Network,plan:spectral.Plan,requests:u64=0}
+pub fn open(checkpoint:str,settings:config.Config own)->result<Session,string> effects {alloc,fs.read} {
+ var c:config.Config=settings
+ let _=try config.validate(c)
+ let n:network.Network=try network.open(checkpoint,c)
+ let plan:spectral.Plan=spectral.plan(c.n_fft,c.hop,spectral.hann(c.n_fft))
+ result.ok(Session{config:c,network:n,plan:plan})
+}
+pub fn analyze(plan:ref<spectral.Plan>,input:view<f32>,samples:u64,bins:u64,bands:u64)->result<ops.Tensor,string> effects {alloc} {
+ if view.len(input)!=2*samples or bins>plan.n/2+1 or bands==0 or bins%bands!=0{return result.err("Invalid stereo spectral packing")}
+ let frames:u64=spectral.frame_count(plan,samples)
+ var packed:array<f32>=num.zeros(4*bins*frames)
+ var c:u64=0
+ loop{if c>=2{break}
+  let wave:view<f32>=view.slice(input,c*samples,(c+1)*samples)
+  let _=try spectral.validate(plan,wave)
+  var t:u64=0
+  loop{if t>=frames{break}
+   let frame:array<f32>=spectral.analyze_frame(plan,wave,t)
+   var f:u64=0
+   loop{if f>=bins{break}
+    array.set(packed,((2*c)*bins+f)*frames+t,array.get(frame,2*f))
+    array.set(packed,((2*c+1)*bins+f)*frames+t,array.get(frame,2*f+1))
+    f+=1}
+   t+=1}
+  c+=1}
+ result.ok(ops.tensor(4*bands,bins/bands,frames,packed))
+}
+pub fn synthesize(plan:ref<spectral.Plan>,output:ref<ops.Tensor>,samples:u64,bins:u64,bands:u64,targets:u64)->result<array<f32>,string> effects {alloc} {
+ let frames:u64=spectral.frame_count(plan,samples)
+ if output.c!=4*bands*targets or output.h!=bins/bands or output.w!=frames{return result.err("Network returned the wrong spectral geometry")}
+ var wave:array<f32>=[]
+ array.reserve(wave,targets*2*samples)
+ var stream:u64=0
+ loop{if stream>=targets*2{break}
+  var overlap:spectral.Overlap=spectral.overlap(plan,samples)
+  var t:u64=0
+  loop{if t>=frames{break}
+   var frame:array<f32>=num.zeros(2*(plan.n/2+1))
+   var f:u64=0
+   loop{if f>=bins{break}
+    array.set(frame,2*f,array.get(output.data,((2*stream)*bins+f)*frames+t))
+    array.set(frame,2*f+1,array.get(output.data,((2*stream+1)*bins+f)*frames+t))
+    f+=1}
+   let _=try spectral.add_frame(plan,overlap,array.view(frame))
+   t+=1}
+  let channel:array<f32>=try spectral.finish(plan,overlap)
+  var i:u64=0
+  loop{if i>=samples{break}
+   array.push(wave,array.get(channel,i))
+   i+=1}
+  stream+=1}
+ result.ok(wave)
+}
+pub fn chunk(s:ref<Session>,input:view<f32>)->result<array<f32>,string> effects {alloc,fs.meta} {chunk_controlled(s,input,"")}
+pub fn chunk_controlled(s:ref<Session>,input:view<f32>,cancel:str)->result<array<f32>,string> effects {alloc,fs.meta} {
+ let samples:u64=s.config.hop*(s.config.frames-1)
+ if view.len(input)!=2*samples or not num.finite(input){return result.err("Invalid model chunk waveform")}
+ // Every convolution is bias-free. The final gate multiplies by the first
+ // convolution, so an all-zero mix produces exactly zero after the full graph.
+ var silent:bool=true
+ var i:u64=0
+ loop{if i>=view.len(input){break}
+  if view.get(input,i)!=0.0{silent=false
+   break}
+  i+=1}
+ if silent{return result.ok(num.zeros(2*array.len(s.config.targets)*samples))}
+ let packed:ops.Tensor=try analyze(struct.borrow(s,field=plan),input,samples,s.config.frequency_bins,s.config.bands)
+ var predicted:ops.Tensor=try network.forward_controlled(struct.borrow(s,field=network),packed,cancel)
+ synthesize(struct.borrow(s,field=plan),predicted,samples,s.config.frequency_bins,s.config.bands,array.len(s.config.targets))
+}
+// Pure in-process retained inference; never opens files or reloads checkpoints.
+pub fn separate(s:ref<Session>,input:view<f32>)->result<array<f32>,string> effects {alloc,fs.meta,fs.write} {separate_controlled(s,input,"","")}
+pub fn separate_controlled(s:ref<Session>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,fs.meta,fs.write} {
+ if view.len(input)==0 or view.len(input)%2!=0 or not num.finite(input){return result.err("Expected finite planar stereo audio")}
+ let samples:u64=view.len(input)/2
+ let p:chunks.Plan=try chunks.plan(samples,s.config.hop*(s.config.frames-1),s.config.overlap)
+ var accumulator:chunks.Accumulator=try chunks.accumulator(p,2*array.len(s.config.targets))
+ var i:u64=0
+ loop{if i>=p.count{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  control.report(progress,i,p.count)
+  let input:array<f32>=try chunks.extract_finite(p,input,2,i)
+  let output:array<f32>=try chunk_controlled(s,array.view(input),cancel)
+  let _=try chunks.add(p,accumulator,array.view(output))
+  i+=1}
+ let output:array<f32>=try chunks.finish(p,accumulator)
+ control.report(progress,p.count,p.count)
+ s.requests+=1
+ result.ok(output)
+}

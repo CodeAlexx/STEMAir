@@ -1,0 +1,35 @@
+module stemair.learned_cleanup_request
+import std.codec as codec
+import std.text as text
+import std.path as path
+pub type Settings=struct{noise:bool=false,room:bool=false,room_targets:string="vocals",noise_checkpoint:string="",room_checkpoint:string=""} derive codec(strict)
+pub fn disabled()->Settings effects {alloc}{Settings{}}
+pub fn validate(value:ref<Settings>)->result<unit,string> effects {alloc}{
+ if value.room_targets!="vocals" and value.room_targets!="lead" and value.room_targets!="backing" and value.room_targets!="all"{return result.err("Room cleanup target must be vocals, lead, backing or all")}
+ if text.contains(value.noise_checkpoint,"\x{00}") or text.contains(value.room_checkpoint,"\x{00}"){return result.err("Learned cleanup checkpoint paths contain a null character")}
+ if value.noise and str.len(value.noise_checkpoint)==0{return result.err("Noise cleanup requires its checkpoint path")}
+ if value.room and str.len(value.room_checkpoint)==0{return result.err("Room cleanup requires its checkpoint path")}
+ result.ok(())
+}
+pub fn decode(raw:str)->result<Settings,string> effects {alloc}{
+ if str.len(raw)==0{return result.ok(disabled())}
+ var value:Settings=try Settings_decode(raw) map_err codec.describe
+ let _=try validate(value)
+ result.ok(value)
+}
+pub fn encode(value:ref<Settings>)->result<string,string> effects {alloc}{
+ let _=try validate(value)
+ result.ok(try Settings_encode(value) map_err codec.describe)
+}
+pub fn decode_root(raw:str,application_root:str)->result<Settings,string> effects {alloc}{
+ var value:Settings=if str.len(raw)==0{disabled()}else{try Settings_decode(raw) map_err codec.describe}
+ if str.len(application_root)>0{
+  if value.noise and str.len(value.noise_checkpoint)==0{value.noise_checkpoint=path.join(application_root,"assets/cleanup-noise-v1.pth")}
+  if value.room and str.len(value.room_checkpoint)==0{value.room_checkpoint=path.join(application_root,"assets/cleanup-room-v1.pth")}}
+ let _=try validate(value)
+ result.ok(value)
+}
+pub fn resolve(raw:str,application_root:str)->result<string,string> effects {alloc}{
+ let value:Settings=try decode_root(raw,application_root)
+ encode(value)
+}

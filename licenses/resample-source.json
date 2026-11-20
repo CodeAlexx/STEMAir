@@ -1,0 +1,12 @@
+{
+  "component": "sinc-resample",
+  "source": "https://github.com/libsndfile/libsamplerate",
+  "revision": "f6730d03c3e7660bb6ecad8816f1b09c5825142a",
+  "version": "0.1.9",
+  "coefficient_file": "src/fastest_coeffs.h",
+  "coefficient_sha256": "cccf85ae60186d0740796558c053e292731dbbd2559bc42ff9f77f6b2f7dc258",
+  "coefficients": 2464,
+  "source_precision": "F32 coefficients, F64 interpolation and accumulation, 12-bit fractional index",
+  "notice": "sinc-resample-BSD-2-Clause.txt",
+  "runtime": "Native AIR only; original library used solely by the development oracle"
+}

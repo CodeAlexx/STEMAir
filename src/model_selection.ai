@@ -1,0 +1,59 @@
+module stemair.model_selection
+import "model_catalog.ai" as catalog
+import "../toolkit/asset_acquisition.ai" as acquisition
+import "../toolkit/control.ai" as control
+import std.files as files
+import std.path as path
+import std.text as text
+
+pub type Request=struct{entry:catalog.Entry,root:string,directory:string,operation:string}
+pub type Outcome=struct{profile:string,settings:string,checkpoint:string,message:string,report:option<acquisition.Report>}
+pub fn request(entry:ref<catalog.Entry>,root:str,directory:str,operation:str)->Request effects {alloc} {
+ let asset:ref<acquisition.Asset>=struct.borrow(entry,field=asset)
+ var dependencies:array<acquisition.Asset>=[]
+ var i:u64=0
+ loop{if i==array.len(entry.dependencies){break}
+  let value:ref<acquisition.Asset>=array.borrow(entry.dependencies,i)
+  array.push(dependencies,acquisition.Asset{filename:string.copy(value.filename),url:string.copy(value.url),bytes:value.bytes,sha256:string.copy(value.sha256)})
+  i+=1}
+ Request{entry:catalog.Entry{profile:string.copy(entry.profile),configuration:string.copy(entry.configuration),
+  manifest:string.copy(entry.manifest),credit:string.copy(entry.credit),dependencies:dependencies,asset:acquisition.Asset{
+   filename:string.copy(asset.filename),url:string.copy(asset.url),bytes:asset.bytes,sha256:string.copy(asset.sha256)}},
+  root:string.copy(root),directory:string.copy(directory),operation:string.copy(operation)}
+}
+pub fn run(work:ref<Request>,options:ref<acquisition.Options>,cancel:str,progress:str)->result<Outcome,string>
+ effects {alloc,fs.read,fs.write,fs.meta,net,random,time} {
+ if work.operation!="verify" and work.operation!="use" and work.operation!="acquire"{return result.err("Unknown model catalog operation")}
+ if not catalog.supported(work.entry.profile){return result.err("Model profile is not admitted")}
+ if not path.is_absolute(work.directory){return result.err("Choose an absolute model folder")}
+ if control.cancelled(cancel){return result.err("Model operation cancelled")}
+ let target:string=path.join(work.directory,work.entry.asset.filename)
+ var report:option<acquisition.Report>=option.none()
+ var retained_stage:string=""
+ var dependency:u64=0
+ loop{if dependency==array.len(work.entry.dependencies){break}
+  let asset:ref<acquisition.Asset>=array.borrow(work.entry.dependencies,dependency)
+  if work.operation=="acquire"{
+   match files.mkdirs(work.directory){ok(_)=>{},err(_)=>{return result.err("Cannot create the selected model folder")}}
+   let _=try acquisition.acquire(asset,work.directory,options,cancel,progress)
+  }else{let _=try acquisition.verify(asset,path.join(work.directory,asset.filename))}
+  dependency+=1}
+ if work.operation=="acquire"{
+  match files.mkdirs(work.directory){ok(_)=>{},err(_)=>{return result.err("Cannot create the selected model folder")}}
+  let acquired:acquisition.Report=try acquisition.acquire(struct.borrow(struct.borrow(work,field=entry),field=asset),work.directory,options,cancel,progress)
+  if not acquired.staging_removed{retained_stage=string.copy(acquired.staging_path)}
+  report=option.some(acquired)
+ }else{
+  control.status(progress,"Verifying pinned model identity")
+  let _=try acquisition.verify(struct.borrow(struct.borrow(work,field=entry),field=asset),target)}
+ if control.cancelled(cancel){return result.err("Model operation cancelled; the chosen model is unchanged")}
+ let apply:bool=work.operation!="verify"
+ var message:string=if apply{"Model ready and selected"}else{"Model identity verified; chosen model unchanged"}
+ if str.len(retained_stage)>0{string.append(message,text.concat("; retained staging file: ",retained_stage))}
+ result.ok(Outcome{profile:string.copy(work.entry.profile),settings:if apply{path.join(work.root,work.entry.configuration)}else{""},
+  checkpoint:if apply{string.copy(target)}else{""},message:message,report:report})
+}
+pub fn staging_note(work:ref<Request>)->string effects {alloc,fs.meta} {
+ let stage:string=text.concat(path.join(work.directory,work.entry.asset.filename),".download")
+ match files.symlink_metadata(stage){err(_)=>"",ok(_)=>text.concat("; staging file remains at ",text.concat(stage," (left intact; ownership is not inferred)"))}
+}

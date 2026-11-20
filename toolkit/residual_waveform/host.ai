@@ -1,0 +1,145 @@
+module stemair.residual_waveform.host
+import "network.ai" as network
+import "../hybrid/host_ops.ai" as ops
+import "../hybrid/host_prepared.ai" as prepared
+import "../hybrid/host_residual.ai" as residual
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "../windowed_sinc.ai" as sinc
+import std.cpu_moments as moments
+import std.system as system
+import std.float as fp
+import "capacity.ai" as capacity
+
+pub fn limits(bank:ref<prepared.Backend>)->capacity.Limits effects {}{
+ capacity.Limits{tensor_elements:bank.max_tensor_elements,convolution_elements:bank.max_convolution_elements,
+  transpose_elements:bank.max_transpose_elements,transpose_matrix_elements:bank.max_transpose_matrix_elements,
+  matrix_input_bytes:bank.max_matrix_input_bytes,matrix_output_elements:bank.max_matrix_output_elements,
+  local_steps:bank.max_local_steps,local_elements:bank.max_local_elements}
+}
+pub fn prepare(n:ref<network.Network>)->result<prepared.Backend,string> effects {alloc,fs.read}{
+ let seconds:f64=n.constructor.kwargs.segment
+ if not fp.is_finite(seconds) or seconds<=0.0 or seconds*44100.0>134217728.0{return result.err("Residual CPU source segment is invalid")}
+ let frames:u64=cast.sat(seconds*44100.0)
+ var plan:capacity.Plan=try capacity.plan(frames,n.constructor.kwargs.rewrite)
+ var selected:capacity.Limits=try capacity.recipe(plan)
+ let budget:u64=if capacity.expanded(selected){plan.working_bytes}else{0}
+ prepare_with_capacity(n,frames,selected,budget)
+}
+pub fn prepare_with_capacity(n:ref<network.Network>,frames:u64,selected:ref<capacity.Limits>,max_activation_bytes:u64)->result<prepared.Backend,string> effects {alloc,fs.read}{
+ var plan:capacity.Plan=try capacity.plan(frames,n.constructor.kwargs.rewrite)
+ try capacity.validate(plan,selected)
+ if (capacity.expanded(selected) or max_activation_bytes!=0) and max_activation_bytes<plan.working_bytes{return result.err("Residual CPU selected activation reservation is insufficient")}
+ if max_activation_bytes!=0{
+ var resident:u64=0
+ var parameter:u64=0
+ loop{if parameter==array.len(n.weights.parameters.values){break}
+  let count:u64=array.len(array.borrow(n.weights.parameters.values,parameter).values)
+  if count>268435456 or resident>1073741824-4*count{return result.err("Residual CPU retained weight extent exceeds limit")}
+  resident+=4*count
+  parameter+=1}
+ let available:system.Memory=match system.memory(){ok(v)=>v,err(_)=>{return result.err("Cannot query residual CPU activation capacity")}}
+ if max_activation_bytes>available.available_bytes or resident+536870912>available.available_bytes-max_activation_bytes{
+  return result.err("Not enough RAM for selected residual CPU weights and activation reservation")}
+ }
+ var transposed:array<u64>=[]
+ var dense:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(n.decoder){break}
+  array.push(transposed,array.get(n.decoder,i).conv.weight)
+  i+=1}
+ i=0
+ loop{if i==array.len(n.residuals){break}
+  var j:u64=0
+  loop{if j==array.len(array.borrow(n.residuals,i).branches){break}
+   match array.get(array.borrow(n.residuals,i).branches,j).recurrence{some(r)=>{array.push(dense,r.weight)},none=>{}}
+   j+=1}
+  i+=1}
+ var backend:prepared.Backend=try prepared.prepare_indexed(struct.borrow(n,field=weights),array.view(transposed),array.view(dense))
+ backend.max_convolution_elements=selected.convolution_elements
+ backend.max_tensor_elements=selected.tensor_elements
+ backend.max_transpose_elements=selected.transpose_elements
+ backend.max_transpose_matrix_elements=selected.transpose_matrix_elements
+ backend.max_matrix_input_bytes=selected.matrix_input_bytes
+ backend.max_matrix_output_elements=selected.matrix_output_elements
+ backend.max_local_steps=selected.local_steps
+ backend.max_local_elements=selected.local_elements
+ backend.max_activation_bytes=max_activation_bytes
+ result.ok(backend)
+}
+pub fn forward(n:ref<network.Network>,bank:ref<prepared.Backend>,library:ref<CAbiLibrary>,input:view<f32>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta}{
+ if view.len(input)<4 or view.len(input)%2!=0 or not num.finite(input){return result.err("Residual waveform requires finite stereo input")}
+ let length:u64=view.len(input)/2
+ var plan:capacity.Plan=try capacity.plan(length,n.constructor.kwargs.rewrite)
+ var selected:capacity.Limits=limits(bank)
+ try capacity.validate(plan,selected)
+ if bank.max_activation_bytes!=0 and plan.working_bytes>bank.max_activation_bytes{
+  return result.err("Residual CPU recording exceeds its prepared activation reservation")}
+ let padded:u64=try network.valid_length(struct.borrow(n.constructor,field=kwargs),length)
+ var mono:array<f32>=[]
+ var i:u64=0
+ loop{if i==length{break}
+  array.push(mono,(view.get(input,i)+view.get(input,length+i))/2.0)
+  i+=1}
+ let stats:moments.Moments=try moments.moments_f32_avx2_openmp(array.view(mono),2,1)
+ let denominator:f32=stats.deviation+0.00001
+ var packed:array<f32>=num.zeros(2*padded)
+ let offset:u64=(padded-length)/2
+ var c:u64=0
+ loop{if c==2{break}
+  i=0
+  loop{if i==length{break}
+   array.set(packed,c*padded+offset+i,(view.get(input,c*length+i)-stats.mean)/denominator)
+   i+=1}
+  c+=1}
+ let up:array<f32>=try sinc.apply(struct.borrow(n,field=upsample),array.view(packed),2)
+ var x:ops.Tensor=try ops.make_limited(1,2,1,2*padded,up,bank.max_tensor_elements)
+ var saved:array<ops.Tensor>=[]
+ i=0
+ loop{if i==array.len(n.encoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let block:network.Encoder=array.get(n.encoder,i)
+  x=try prepared.convolve_weights(struct.borrow(n,field=weights),bank,library,x,block.conv)
+  x=try ops.normalize(struct.borrow(n,field=weights),x,block.norm)
+  x=ops.gelu(x)
+  match block.residual{some(index)=>{x=try residual.forward_block(struct.borrow(n,field=weights),bank,library,array.borrow(n.residuals,index),x,cancel)},none=>{}}
+  match block.rewrite{some(form)=>{
+   x=try prepared.convolve_weights(struct.borrow(n,field=weights),bank,library,x,form)
+   x=try ops.normalize(struct.borrow(n,field=weights),x,block.rewrite_norm)
+   x=try ops.glu(x)
+  },none=>{}}
+  array.push(saved,ops.copy(x))
+  i+=1}
+ i=0
+ loop{if i==array.len(n.decoder){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var skip:ops.Tensor=match array.pop(saved){some(v)=>v,none=>{return result.err("Residual waveform skip state missing")}}
+  if skip.w<x.w{return result.err("Residual waveform skip extent differs")}
+  let crop:u64=(skip.w-x.w)/2
+  skip=try ops.crop(skip,3,crop,x.w)
+  x=try ops.add(x,skip)
+  let block:network.Decoder=array.get(n.decoder,i)
+  match block.rewrite{some(form)=>{
+   x=try prepared.convolve_weights(struct.borrow(n,field=weights),bank,library,x,form)
+   x=try ops.normalize(struct.borrow(n,field=weights),x,block.rewrite_norm)
+   x=try ops.glu(x)
+  },none=>{}}
+  x=try prepared.convolve_weights(struct.borrow(n,field=weights),bank,library,x,block.conv)
+  x=try ops.normalize(struct.borrow(n,field=weights),x,block.norm)
+  if not block.last{x=ops.gelu(x)}
+  i+=1}
+ let down:array<f32>=try sinc.apply(struct.borrow(n,field=downsample),array.view(x.data),8)
+ let width:u64=array.len(down)/8
+ if width<length{return result.err("Residual waveform output extent is too short")}
+ var output:array<f32>=num.zeros(8*length)
+ c=0
+ loop{if c==8{break}
+  i=0
+  loop{if i==length{break}
+   let scaled:f32=array.get(down,c*width+(width-length)/2+i)*stats.deviation
+   array.set(output,c*length+i,scaled+stats.mean)
+   i+=1}
+  c+=1}
+ if not num.finite(array.view(output)){return result.err("Residual waveform output is not finite")}
+ ops.make_limited(1,8,1,length,output,bank.max_tensor_elements)
+}

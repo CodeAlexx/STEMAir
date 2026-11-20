@@ -1,0 +1,178 @@
+module stemair.waveform.host_resampled_audio
+import "../chunks.ai" as chunks
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../control.ai" as control
+import std.float as fp
+import "../recording_shifts.ai" as shifts
+
+fn segment<N,P>(
+ n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,input:view<f32>,offset:u64,count:u64,cancel:str,predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc},channels:u64)->result<array<f32>,string> effects {alloc,ffi,fs.meta} {
+ let target:u64=try length_for(n,count)
+ let padded:array<f32>=try chunks.context_finite(input,2,offset,count,target)
+ var packed:ops.Tensor=ops.tensor(2,1,target,padded)
+ var output:ops.Tensor=try predictor(n,prepared,library,packed,cancel)
+ if output.c!=channels or output.w<count{return result.err("Resampled waveform output geometry differs")}
+ let crop:u64=(output.w-count)/2
+ var result:array<f32>=[]
+ array.reserve(result,channels*count)
+ var channel:u64=0
+ loop{if channel==channels{break}
+  var time:u64=0
+  loop{if time==count{break}
+   array.push(result,array.get(output.data,channel*output.w+crop+time))
+   time+=1}
+  channel+=1}
+ result.ok(result)
+}
+fn shifted<N,P,C>(
+ n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,c:ref<C>,input:view<f32>,offset:u64,count:u64,cancel:str,predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc},channels:u64)->result<array<f32>,string> effects {alloc,ffi,fs.meta} {
+ predict_group(n,prepared,library,array.view(c.shift_offsets),array.len(c.shift_offsets),input,offset,count,cancel,predictor,length_for,channels)
+}
+fn predict_group<N,P>(
+ n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,offsets:view<u64>,divisor_count:u64,input:view<f32>,offset:u64,count:u64,cancel:str,predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc},channels:u64)->result<array<f32>,string> effects {alloc,ffi,fs.meta} {
+ if view.len(offsets)==0{return segment(n,prepared,library,input,offset,count,cancel,predictor,length_for,channels)}
+ let half:u64=22050
+ let padded:array<f32>=try chunks.context_finite(input,2,offset,count,count+2*half)
+ var output:array<f32>=num.zeros(channels*count)
+ var shift:u64=0
+ loop{if shift==view.len(offsets){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let start:u64=view.get(offsets,shift)
+  let length:u64=count+half-start
+  let predicted:array<f32>=try segment(n,prepared,library,array.view(padded),start,length,cancel,predictor,length_for,channels)
+  var channel:u64=0
+  loop{if channel==channels{break}
+   var time:u64=0
+   loop{if time==count{break}
+    let at:u64=channel*count+time
+    array.set(output,at,array.get(output,at)+array.get(predicted,channel*length+half-start+time))
+    time+=1}
+   channel+=1}
+  shift+=1}
+ let divisor:f32=cast.float(divisor_count)
+ var i:u64=0
+ loop{if i==array.len(output){break}
+  array.set(output,i,array.get(output,i)/divisor)
+  i+=1}
+ result.ok(output)
+}
+// Source-generation overlap uses triangle weights and available neighboring
+// recording context. It does not use the preceding generation's zero-padded
+// non-overlapping chunks or its different shifted-input length.
+// Validated settings and segment size are explicit so other engines can share
+// the same overlap math while keeping their own shift ordering and defaults.
+pub fn separate<N,P,C>(
+ n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,c:ref<C>,size:u64,input:view<f32>,cancel:str,progress:str,predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ separate_sources(n,prepared,library,c,size,4,input,cancel,progress,predictor,length_for)
+}
+pub fn separate_sources<N,P,C>(
+ n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,c:ref<C>,size:u64,sources:u64,input:view<f32>,cancel:str,progress:str,predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if sources==0 or sources>8{return result.err("Invalid recording source count")}
+ let channels:u64=2*sources
+ let length:u64=view.len(input)/2
+ if not c.split{return shifted(n,prepared,library,c,input,0,length,cancel,predictor,length_for,channels)}
+ let stride:u64=cast.sat((1.0-c.overlap)*cast.float(size))
+ if stride==0{return result.err("Waveform overlap leaves no chunk stride")}
+ let total:u64=(length+stride-1)/stride
+ var weights:array<f32>=[]
+ array.reserve(weights,size)
+ var time:u64=0
+ loop{if time==size{break}
+  let triangle:u64=if time<size/2{time+1}else{size-time}
+  let linear:f32=cast.float(triangle)/cast.float((size+1)/2)
+  let power:f32=cast.float(c.transition_power)
+  array.push(weights,if power==1.0{linear}else{fp.pow(linear,power)})
+  time+=1}
+ var result:array<f32>=num.zeros(channels*length)
+ var accumulated:array<f32>=num.zeros(length)
+ var offset:u64=0
+ loop{if offset>=length{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let count:u64=if length-offset<size{length-offset}else{size}
+  let predicted:array<f32>=try shifted(n,prepared,library,c,input,offset,count,cancel,predictor,length_for,channels)
+  var channel:u64=0
+  loop{if channel==channels{break}
+   time=0
+   loop{if time==count{break}
+    let at:u64=channel*length+offset+time
+    array.set(result,at,array.get(result,at)+array.get(predicted,channel*count+time)*array.get(weights,time))
+    time+=1}
+   channel+=1}
+  time=0
+  loop{if time==count{break}
+   let at:u64=offset+time
+   array.set(accumulated,at,array.get(accumulated,at)+array.get(weights,time))
+   time+=1}
+  control.report(progress,offset/stride+1,total)
+  offset+=stride}
+ var channel:u64=0
+ loop{if channel==channels{break}
+  time=0
+  loop{if time==length{break}
+   let weight:f32=array.get(accumulated,time)
+   if weight<=0.0{return result.err("Waveform overlap weights do not cover the recording")}
+   let at:u64=channel*length+time
+   array.set(result,at,array.get(result,at)/weight)
+   time+=1}
+  channel+=1}
+ result.ok(result)
+}
+
+// Request-scoped RNG traversal; the legacy fixed-offset entry above is unchanged.
+pub fn separate_scheduled<N,P,C>(
+ n:ref<N>,prepared:ref<P>,library:ref<CAbiLibrary>,c:ref<C>,schedule:ref<shifts.Schedule>,size:u64,input:view<f32>,cancel:str,progress:str,predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let length:u64=view.len(input)/2
+ let _=try shifts.require_geometry(schedule,shifts.Family.Second,length,c.split,size,c.overlap)
+ if not c.split{
+  let group:shifts.Group=try shifts.next_group(schedule)
+  let _=try shifts.reserve_group(schedule,group)
+  return predict_group(n,prepared,library,array.view(group.offsets),group.divisor,input,0,length,cancel,predictor,length_for,8)}
+ let stride:u64=cast.sat((1.0-c.overlap)*cast.float(size))
+ if stride==0{return result.err("Waveform overlap leaves no chunk stride")}
+ let total:u64=(length+stride-1)/stride
+ var weights:array<f32>=[]
+ array.reserve(weights,size)
+ var time:u64=0
+ loop{if time==size{break}
+  let triangle:u64=if time<size/2{time+1}else{size-time}
+  let linear:f32=cast.float(triangle)/cast.float((size+1)/2)
+  let power:f32=cast.float(c.transition_power)
+  array.push(weights,if power==1.0{linear}else{fp.pow(linear,power)})
+  time+=1}
+ var result:array<f32>=num.zeros(8*length)
+ var accumulated:array<f32>=num.zeros(length)
+ var offset:u64=0
+ loop{if offset>=length{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let count:u64=if length-offset<size{length-offset}else{size}
+  let group:shifts.Group=try shifts.next_group(schedule)
+  let _=try shifts.reserve_group(schedule,group)
+  let predicted:array<f32>=try predict_group(n,prepared,library,array.view(group.offsets),group.divisor,input,offset,count,cancel,predictor,length_for,8)
+  var channel:u64=0
+  loop{if channel==8{break}
+   time=0
+   loop{if time==count{break}
+    let at:u64=channel*length+offset+time
+    array.set(result,at,array.get(result,at)+array.get(predicted,channel*count+time)*array.get(weights,time))
+    time+=1}
+   channel+=1}
+  time=0
+  loop{if time==count{break}
+   let at:u64=offset+time
+   array.set(accumulated,at,array.get(accumulated,at)+array.get(weights,time))
+   time+=1}
+  control.report(progress,offset/stride+1,total)
+  offset+=stride}
+ var channel:u64=0
+ loop{if channel==8{break}
+  time=0
+  loop{if time==length{break}
+   let weight:f32=array.get(accumulated,time)
+   if weight<=0.0{return result.err("Waveform overlap weights do not cover the recording")}
+   let at:u64=channel*length+time
+   array.set(result,at,array.get(result,at)/weight)
+   time+=1}
+  channel+=1}
+ result.ok(result)
+}

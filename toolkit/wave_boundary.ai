@@ -1,0 +1,83 @@
+module stemair.wave_boundary
+import "audio_result.ai" as samples
+import std.audio as audio
+import "numeric.ai" as numeric
+
+pub type Limits=struct{max_working_bytes:u64=268435456}
+fn bounded(source:ref<samples.Samples>,extra:u64,limits:Limits)->result<u64,string> effects {alloc} {
+ let _=try samples.validate(source)
+ let count:u64=samples.count(source)
+ let width:u64=if source.precision==samples.Precision.Float64{8}else{4}
+ let budget:u64=limits.max_working_bytes
+ if (budget<64) or count>(budget-64)/(width+extra){return result.err("Waveform conversion exceeds its selected working-byte limit")}
+ result.ok(count)
+}
+// Model-entry casts do not modify the retained master waveform.
+pub fn model_f32(source:ref<samples.Samples>,limits:Limits)->result<array<f32>,string> effects {alloc} {
+ let count:u64=try bounded(source,4,limits)
+ var out:array<f32>=[]
+ array.reserve(out,count)
+ var index:u64=0
+ loop{if index==count{break}
+  array.push(out,if source.precision==samples.Precision.Float32{array.get(source.single,index)}else{cast.float(array.get(source.wide,index))})
+  index+=1}
+ result.ok(out)
+}
+fn encode(source:ref<samples.Samples>,rate:u32,channels:u16,kind:audio.WavSubtype)->result<bytes,string> effects {alloc} {
+ let count:u64=samples.count(source)
+ let frames:u64=count/cast.wrap(channels)
+ if source.precision==samples.Precision.Float64{
+  var interleaved:array<f64>=[]
+  array.reserve(interleaved,count)
+  var frame:u64=0
+  loop{if frame==frames{break}
+   var channel:u64=0
+   loop{if channel==cast.wrap(channels){break}
+    array.push(interleaved,array.get(source.wide,channel*frames+frame))
+    channel+=1}
+   frame+=1}
+  let encoded:bytes=try audio.encode_wav_f64_as(array.view(interleaved),rate,channels,kind) map_err audio.message
+  return result.ok(encoded)}
+ var interleaved:array<f32>=[]
+ array.reserve(interleaved,count)
+ var frame:u64=0
+ loop{if frame==frames{break}
+  var channel:u64=0
+  loop{if channel==cast.wrap(channels){break}
+   array.push(interleaved,array.get(source.single,channel*frames+frame))
+   channel+=1}
+  frame+=1}
+ let buffer:audio.AudioBuffer=audio.AudioBuffer{samples:interleaved,rate:rate,channels:channels}
+ let encoded:bytes=try audio.encode_wav_as(buffer,kind) map_err audio.message
+ result.ok(encoded)
+}
+// Emulate selected WAV storage followed by F32 reload, without disk I/O.
+// Resampling and model inference remain separate, explicit caller operations.
+pub fn serialized_f32(source:ref<samples.Samples>,rate:u32,channels:u16,kind:audio.WavSubtype,limits:Limits)->result<array<f32>,string> effects {alloc} {
+ let count:u64=samples.count(source)
+ if rate==0 or channels==0 or count%cast.wrap(channels)!=0{return result.err("Invalid waveform serialization layout")}
+ let width:u64=match kind{PcmU8=>1,Pcm16=>2,Pcm24=>3,Pcm32=>4,Float32=>4,Float64=>8}
+ if count>4294967259/width{return result.err("Serialized waveform exceeds its container extent")}
+ if kind==audio.WavSubtype.Float32 or kind==audio.WavSubtype.Float64{
+  let converted:array<f32>=try model_f32(source,limits)
+  if not numeric.finite(array.view(converted)){return result.err("Reloaded audio is not finite everywhere")}
+  return result.ok(converted)}
+ // Conservatively cover retained source, interleaving, encoded bytes, decoded
+ // samples and planar result; helper-local interleaving can die earlier.
+ let _=try bounded(source,20,limits)
+ let encoded:bytes=try encode(source,rate,channels,kind)
+ let decoded:audio.AudioBuffer=try audio.decode_wav(bytes.view(encoded)) map_err audio.message
+ if decoded.rate!=rate or decoded.channels!=channels or array.len(decoded.samples)!=count{return result.err("Serialized waveform geometry changed")}
+ let frames:u64=count/cast.wrap(channels)
+ var out:array<f32>=[]
+ array.reserve(out,count)
+ var channel:u64=0
+ loop{if channel==cast.wrap(channels){break}
+  var frame:u64=0
+  loop{if frame==frames{break}
+   array.push(out,array.get(decoded.samples,frame*cast.wrap(channels)+channel))
+   frame+=1}
+  channel+=1}
+ if not numeric.finite(array.view(out)){return result.err("Reloaded audio is not finite everywhere")}
+ result.ok(out)
+}

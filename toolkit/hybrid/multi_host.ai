@@ -1,0 +1,68 @@
+module stemair.hybrid.multi_host
+import "host_ops.ai" as host
+pub fn span(x:ref<host.Tensor>,start:u64,count:u64,left:u64,right:u64)->result<host.Tensor,string> effects {alloc}{
+ if count==0 or start>x.h or count>x.h-start or left>x.max_elements-count or right>x.max_elements-count-left{return result.err("Frequency band span exceeds input")}
+ let height:u64=left+count+right
+ let size:u64=try host.extent(x.n,x.c,height,x.w,x.max_elements)
+ var out:array<f32>=[]
+ array.reserve(out,size)
+ var row:u64=0
+ loop{if row==x.n*x.c{break}
+  var h:u64=0
+  loop{if h==height{break}
+   var t:u64=0
+   loop{if t==x.w{break}
+    array.push(out,if h<left or h>=left+count{0.0}else{array.get(x.data,(row*x.h+start+h-left)*x.w+t)})
+    t+=1}
+   h+=1}
+  row+=1}
+ host.make_limited(x.n,x.c,height,x.w,out,x.max_elements)
+}
+pub fn join(parts:ref<array<host.Tensor>>)->result<host.Tensor,string> effects {alloc}{
+ if array.len(parts)==0{return result.err("No frequency bands to concatenate")}
+ let first:ref<host.Tensor>=array.borrow(parts,0)
+ let n:u64=first.n
+ let c:u64=first.c
+ let w:u64=first.w
+ let maximum:u64=first.max_elements
+ var h:u64=0
+ var i:u64=0
+ loop{if i==array.len(parts){break}
+  let part:ref<host.Tensor>=array.borrow(parts,i)
+  if part.n!=n or part.c!=c or part.w!=w or part.h>maximum-h{return result.err("Frequency band concatenation geometry differs")}
+  h+=part.h
+  i+=1}
+ let size:u64=try host.extent(n,c,h,w,maximum)
+ var out:array<f32>=[]
+ array.reserve(out,size)
+ var row:u64=0
+ loop{if row==n*c{break}
+  i=0
+  loop{if i==array.len(parts){break}
+   let part:ref<host.Tensor>=array.borrow(parts,i)
+   var j:u64=0
+   loop{if j==part.h*w{break}
+    array.push(out,array.get(part.data,row*part.h*w+j))
+    j+=1}
+   i+=1}
+  row+=1}
+ host.make_limited(n,c,h,w,out,maximum)
+}
+pub fn overlap(previous:ref<host.Tensor>,following:ref<host.Tensor>,bias:view<f32>,stride:u64)->result<unit,string> effects {alloc}{
+ if previous.n!=following.n or previous.c!=following.c or previous.w!=following.w or stride==0 or
+  previous.h<stride or following.h<stride or view.len(bias)!=following.c{return result.err("Frequency overlap geometry differs")}
+ var row:u64=0
+ loop{if row==previous.n*previous.c{break}
+  var h:u64=0
+  loop{if h==stride{break}
+   var t:u64=0
+   loop{if t==previous.w{break}
+    let offset:u64=(row*previous.h+previous.h-stride+h)*previous.w+t
+    let removed:f32=array.get(following.data,(row*following.h+h)*following.w+t)-view.get(bias,row%previous.c)
+    let added:f32=array.get(previous.data,offset)+removed
+    array.set(previous.data,offset,added)
+    t+=1}
+   h+=1}
+  row+=1}
+ result.ok(())
+}

@@ -1,0 +1,100 @@
+module stemair.ensemble_presets
+import "model_ensemble_application.ai" as application
+import "ensemble_processing_application.ai" as processing
+import "../toolkit/model_ensemble_config.ai" as config
+import "../toolkit/model_ensemble.ai" as ensemble
+import "../toolkit/engine.ai" as engine
+import std.codec as codec
+import std.files as files
+import std.text as text
+import "preset_names.ai" as names
+
+pub type Selection=struct{recipe:config.Recipe,paired:bool,primary:f64,secondary:f64,wave:bool,residual:bool,spectral:bool}
+fn method(name:str)->f64 effects {} {
+ if name=="minimum"{1.0}else{if name=="maximum"{2.0}else{0.0}}
+}
+// A desktop preset must be fully expressible by its controls. Do not silently
+// discard CLI-only stem selections or exclusions when loading a recipe.
+fn validate(c:ref<config.Recipe>)->result<unit,string> effects {alloc,fs.read} {
+ let _=try application.validate(c)
+ if array.len(c.options.outputs)!=0{
+  if array.len(c.options.outputs)!=2{return result.err("This preset uses stem selections unavailable in the ensemble controls")}
+  let primary:ref<config.Target>=array.borrow(c.options.outputs,0)
+  let secondary:ref<config.Target>=array.borrow(c.options.outputs,1)
+  if str.view(primary.target)!="vocals" or str.view(secondary.target)!="instrumental" or
+     str.len(primary.exclude)>0 or str.len(secondary.exclude)>0 or
+     (str.len(primary.method)>0 and str.view(primary.method)!=str.view(c.options.method)){
+   return result.err("This preset uses stem selections unavailable in the ensemble controls")}}
+ var profiles:array<engine.Profile>=[]
+ var index:u64=0
+ loop{if index==array.len(c.models){break}
+  let member:ref<config.Model>=array.borrow(c.models,index)
+  array.push(profiles,try engine.read(member.config))
+  if str.len(member.processing)>0{
+   // Snapshot attached files, including their auxiliary settings, into the
+   // preset. Opening it later never depends on those attachment files.
+   let previous:string=string.copy(member.processing)
+   member.processing=try processing.attachment(member,previous)}
+  index+=1}
+ let _=try ensemble.materialize(profiles,struct.borrow(c,field=options))
+ result.ok(())
+}
+pub fn select(input:config.Recipe own)->result<Selection,string> effects {alloc,fs.read} {
+ var c:config.Recipe=input
+ let _=try validate(c)
+ let paired:bool=array.len(c.options.outputs)>0
+ var secondary:f64=method(c.options.method)
+ if paired{
+  let selected:str=array.borrow(c.options.outputs,1).method
+  if str.len(selected)>0{secondary=method(selected)}}
+ let primary:f64=method(c.options.method)
+ let wave:bool=str.view(c.options.domain)=="waveform"
+ let residual:bool=str.view(c.options.complement)=="residual"
+ let spectral:bool=str.view(c.options.complement)=="spectral"
+ result.ok(Selection{recipe:c,paired:paired,primary:primary,secondary:secondary,wave:wave,residual:residual,spectral:spectral})
+}
+pub fn read(file:str)->result<Selection,string> effects {alloc,fs.read} {
+ var c:config.Recipe=try application.read(file)
+ select(c)
+}
+pub fn save(c:ref<config.Recipe>,file:str)->result<unit,string> effects {alloc,fs.read,fs.write} {
+ let raw:string=try config.Recipe_encode(c) map_err codec.describe
+ var copied:config.Recipe=try config.Recipe_decode(raw) map_err codec.describe
+ var checked:Selection=try select(copied)
+ let encoded:string=try config.Recipe_encode(struct.borrow(checked,field=recipe)) map_err codec.describe
+ match files.write_new_text(file,encoded){ok(_)=>result.ok(()),err(_)=>result.err("Cannot save ensemble preset; choose a new file in an existing folder")}
+}
+
+fn file_error(e:fs.error)->string effects {alloc} {string.copy(fs.error.message(e))}
+fn rename_error(e:fs.error)->string effects {alloc} {
+ text.concat("Cannot rename this preset on the selected filesystem: ",fs.error.message(e))
+}
+// File management validates the stored recipe without opening referenced models.
+// Presets can still be managed when their profiles or weights are offline.
+pub fn identity(file:str)->result<string,string> effects {alloc,fs.read,fs.meta} {
+ let info:fs.meta=try files.symlink_metadata(file) map_err file_error
+ if not info.is_file or info.is_symlink{return result.err("Choose a regular ensemble preset file")}
+ let raw:bytes=match files.read_limited(file,4194304){ok(value)=>value,err(_)=>{
+  return result.err("Cannot read the ensemble preset within its 4 MiB limit")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(value)=>value,none=>{
+  return result.err("The ensemble preset is not UTF-8")}}
+ var recipe:config.Recipe=try config.Recipe_decode(source) map_err codec.describe
+ let _=try application.validate(recipe)
+ result.ok(try files.sha256(file) map_err file_error)
+}
+fn unchanged(file:str,expected:str)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ let current:string=try identity(file)
+ if current!=expected{return result.err("The selected preset changed; choose it again")}
+ result.ok(())
+}
+pub fn rename(file:str,name:str,expected:str)->result<string,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let destination:string=try names.renamed_path(file,name)
+ let _=try unchanged(file,expected)
+ let _=try files.rename_new(file,destination) map_err rename_error
+ result.ok(destination)
+}
+pub fn remove(file:str,expected:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let _=try unchanged(file,expected)
+ let _=try files.remove(file) map_err file_error
+ result.ok(())
+}

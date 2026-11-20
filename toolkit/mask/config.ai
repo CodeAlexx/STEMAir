@@ -1,0 +1,56 @@
+module stemair.mask.config
+import std.files as files
+import std.codec as codec
+import std.float as fp
+import "../channel_modes.ai" as channels
+import "../wave_channel_modes.ai" as wave_channels
+import "../high_band.ai" as high_band
+pub type Band=struct{sample_rate:u32,n_fft:u64,hop:u64,crop_start:u64,crop_stop:u64,
+ low_start:u64=0,low_stop:u64=0,high_start:u64=0,high_stop:u64=0,input_resample:string="polyphase",channel_mode:string="stereo"} derive codec(strict)
+pub type Config=struct{engine:string="mask",architecture:string="cascade",recurrent_width:u64=128,sample_rate:u32,bins:u64,channels:u64,levels:u64,branches:u64,
+ window:u64=512,tta:bool=false,aggression:f64=0.05,primary_foreground:bool=false,channel_mode:string="stereo",high_band:string="none",
+ pre_filter_start:u64=0,pre_filter_stop:u64=0,bands:array<Band>,targets:array<string>} derive codec(strict)
+pub fn validate(c:ref<Config>)->result<unit,string> effects {alloc} {
+ let recurrent:bool=str.view(c.architecture)=="recurrent"
+ if str.view(c.architecture)!="cascade" and not recurrent{return result.err("Unknown cascaded architecture")}
+ if not wave_channels.valid(c.channel_mode) or (recurrent and c.channel_mode!="stereo"){return result.err("Unsupported global waveform channel mode")}
+ if str.view(c.engine)!="mask" or c.sample_rate<8000 or c.sample_rate>192000 or c.bins<64 or c.bins>8192 or c.bins%(if recurrent{32}else{64})!=0 or
+  (not recurrent and c.channels!=16 and c.channels!=32 and c.channels!=64) or c.channels<8 or c.channels>128 or c.channels%4!=0 or
+  (recurrent and (c.levels!=4 or c.branches!=5 or c.recurrent_width<16 or c.recurrent_width>1024 or c.recurrent_width%4!=0)) or
+  c.levels<4 or c.levels>5 or c.branches<5 or c.branches>7 or
+  c.window<=256 or c.window>4096 or c.window%32!=0 or not fp.is_finite(c.aggression) or c.aggression<0.0 or c.aggression>1.0 or
+  array.len(c.bands)==0 or array.len(c.bands)>8 or array.len(c.targets)!=2{return result.err("Invalid cascaded mask configuration")}
+ let first:string=string.copy(array.get(c.targets,0))
+ let second:string=string.copy(array.get(c.targets,1))
+ if first==second or str.len(str.view(first))==0 or str.len(str.view(second))==0 or str.len(str.view(first))>64 or str.len(str.view(second))>64{
+  return result.err("Two bounded distinct source names are required")}
+ if c.pre_filter_start!=0 and (c.pre_filter_start>=c.pre_filter_stop or c.pre_filter_stop>c.bins){return result.err("Invalid combined pre-filter range")}
+ let last:ref<Band>=array.borrow(c.bands,array.len(c.bands)-1)
+ let last_rate:u64=cast.wrap(last.sample_rate)
+ let last_hop:u64=last.hop
+ if last.sample_rate!=c.sample_rate{return result.err("Highest band must match the profile sample rate")}
+ if not high_band.valid(c.high_band){return result.err("Unknown high-band reconstruction mode")}
+ if c.high_band!="none"{let _=try high_band.extent(last.n_fft/2,last.crop_stop,c.pre_filter_start,c.pre_filter_stop)}
+ var bins:u64=0
+ var i:u64=0
+ loop{if i>=array.len(c.bands){break}
+  let b:ref<Band>=array.borrow(c.bands,i)
+  if b.sample_rate<1000 or b.sample_rate>192000 or b.n_fft<32 or b.n_fft>32768 or b.n_fft%2!=0 or
+   b.hop==0 or b.hop>b.n_fft or b.crop_start>=b.crop_stop or b.crop_stop>b.n_fft/2+1 or
+   b.hop*last_rate!=last_hop*cast.wrap(b.sample_rate) or
+   (b.low_start!=0 and (b.low_start>=b.low_stop or b.low_stop>b.n_fft/2+1)) or
+   (b.high_start!=0 and (b.high_stop==0 or b.high_stop>=b.high_start or b.high_start>b.n_fft/2)){
+   return result.err("Invalid multiband transform geometry or filters")}
+  if str.view(b.input_resample)!="polyphase" and str.view(b.input_resample)!="sinc-fast"{return result.err("Unknown band resampling method")}
+  if not channels.valid(b.channel_mode) or (not recurrent and str.view(b.channel_mode)!="stereo"){return result.err("Unsupported band channel mode")}
+  bins+=b.crop_stop-b.crop_start
+  i+=1}
+ if bins>c.bins{return result.err("Combined frequency bands exceed the network input")}
+ result.ok(())
+}
+pub fn read(path:str)->result<Config,string> effects {alloc,fs.read} {
+ let raw:string=match files.read_text(path){ok(v)=>v,err(_)=>{return result.err("Cannot read mask configuration")},}
+ var c:Config=match Config_decode(str.view(raw)){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+ let _=try validate(c)
+ result.ok(c)
+}

@@ -1,0 +1,234 @@
+module stemair.device_engine
+import "engine.ai" as engine
+import "attention/bundle.ai" as attention_bundle
+import "attention/bundle_config.ai" as bundle_config
+import "config.ai" as spectral_config
+import "device.ai" as spectral_device
+import "spectral_device_retained.ai" as spectral_session
+import "exchange/config.ai" as exchange_config
+import "exchange/device.ai" as exchange_device
+import "exchange/session.ai" as exchange_session
+import "spectral.ai" as spectral
+import "mask/config.ai" as mask_config
+import "mask/request.ai" as mask_request
+import "mask/device.ai" as mask_device
+import "mask/device_session.ai" as mask_session
+import "mask/bands.ai" as mask_bands
+import std.complex_norm_f32 as mask_norm
+import std.system as system
+import "mask/recurrent_device.ai" as recurrent_mask_device
+import "mask/recurrent_session.ai" as recurrent_mask_session
+import "waveform/config.ai" as waveform_config
+import "waveform/device.ai" as waveform_device
+import "waveform/session.ai" as waveform_session
+import "temporal/device.ai" as temporal_device
+import "temporal/session.ai" as temporal_session
+import "residual_waveform/config.ai" as residual_config
+import "residual_waveform/session.ai" as residual_session
+import "hybrid/config.ai" as hybrid_config
+import "hybrid/session.ai" as hybrid_session
+import "hybrid/retained_session.ai" as hybrid_retained
+import "hybrid/frontend.ai" as hybrid_frontend
+import std.mkl_vml as window_math
+import "attention/config.ai" as attention_config
+import "attention/session.ai" as attention_session
+import "attention/retained_session.ai" as attention_retained
+import "device_ops.ai" as device_ops
+import "complex_spectral.ai" as complex_spectral
+import std.codec as codec
+import std.gpu as devicegpu
+import std.tensor as tensor
+import "audio_result.ai" as audio_result
+import "recording_bag_gpu.ai" as recording_bag_gpu
+import "recording_bag_request.ai" as recording_bag_request
+import "recording_context.ai" as recording_context
+
+fn separate_recording_bag(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,index:u32,transform_bytes:u64)->result<array<f32>,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ if array.len(s.recording_bags)!=1{return result.err("Recording bundle retained state is unavailable")}
+ var controls:recording_context.Context=recording_context.disabled()
+ controls.device_index=index
+ controls.transform_bytes=transform_bytes
+ let limits:recording_bag_request.Limits=recording_bag_request.Limits{max_waveform_bytes:controls.waveform_bytes,max_frontends:65,transform_bytes:controls.transform_bytes}
+ var output:recording_bag_request.Output=try recording_bag_gpu.separate(array.borrow(s.recording_bags,0),input,controls,limits,cancel,progress)
+ s.requests+=1
+ result.ok(struct.replace(output,[],field=values))
+}
+
+pub fn separate(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu} {
+ separate_with_high_band(s,input,cancel,progress,mask_request.HighBand.Profile)
+}
+pub fn separate_with_high_band(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu} {
+ separate_with_request(s,input,cancel,progress,high_band,mask_request.Foreground.Profile)
+}
+pub fn separate_with_request(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,foreground:mask_request.Foreground)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu} {
+ separate_with_request_on_device(s,input,cancel,progress,high_band,foreground,0)
+}
+pub fn separate_with_request_on_device(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,foreground:mask_request.Foreground,index:u32)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu} {
+ if s.profile.kind=="recording-bundle"{return separate_recording_bag(s,input,cancel,progress,index,1073741824)}
+ var context:GpuContext=match devicegpu.open(index){ok(v)=>v,err(e)=>{return result.err(string.copy(e.message))},}
+ var stream:GpuStream=match devicegpu.compute_stream(context){ok(v)=>v,err(e)=>{return result.err(string.copy(e.message))},}
+ let identity:string=string.copy(str.view(s.profile.identity))
+ var output:array<f32>=[]
+ match s.spectral{none=>{},some(v)=>{
+  var c:spectral_config.Config=match spectral_config.Config_decode(str.view(identity)){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  var parameters:array<tensor.Tensor>=try spectral_device.upload(context,stream,struct.borrow(v,field=network))
+  var plan:spectral.Plan=spectral.plan(c.n_fft,c.hop,spectral.hann(c.n_fft))
+  output=try spectral_session.separate(context,stream,parameters,struct.borrow(v,field=network),c,input,cancel,progress)
+ },}
+ match s.exchange{none=>{},some(v)=>{
+  var c:exchange_config.Config=match exchange_config.Config_decode(str.view(identity)){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))},}
+  let _=try exchange_config.validate(c)
+  var parameters:array<tensor.Tensor>=try exchange_device.upload(context,stream,struct.borrow(v,field=graph))
+  var plan:spectral.Plan=spectral.plan(c.n_fft,c.hop,spectral.hann(c.n_fft))
+  output=try exchange_session.separate(context,stream,parameters,struct.borrow(v,field=graph),plan,c,input,cancel,progress)
+ },}
+ match s.mask{none=>{},some(v)=>{
+  var c:mask_config.Config=try mask_request.settings_with_foreground(identity,high_band,foreground)
+  var parameters:array<tensor.Tensor>=try mask_device.upload(context,stream,struct.borrow(v,field=network))
+  var plans:array<complex_spectral.Plan>=try mask_bands.plans(c)
+  output=try mask_session.separate(context,stream,parameters,struct.borrow(v,field=network),plans,c,input,cancel,progress)
+ },}
+ match s.recurrent_mask{none=>{},some(v)=>{
+  var c:mask_config.Config=try mask_request.settings_with_foreground(identity,high_band,foreground)
+  var parameters:array<tensor.Tensor>=try recurrent_mask_device.upload(context,stream,struct.borrow(v,field=network))
+  var plans:array<complex_spectral.Plan>=try mask_bands.plans(c)
+  output=try recurrent_mask_session.separate(context,stream,parameters,struct.borrow(v,field=network),plans,c,input,cancel,progress)
+ },}
+ match s.waveform{none=>{},some(v)=>{
+  var c:waveform_config.Config=try waveform_config.Config_decode(str.view(identity)) map_err codec.describe
+  var parameters:array<tensor.Tensor>=try waveform_session.upload(context,stream,v)
+  let recurrent_limits:waveform_session.GpuLimits=waveform_session.gpu_limits()
+  output=try waveform_session.separate_prepared_state(context,stream,parameters,v,c,input,cancel,progress,recurrent_limits)
+ },}
+ match s.temporal{none=>{},some(v)=>{
+  var c:waveform_config.Config=try waveform_config.Config_decode(str.view(identity)) map_err codec.describe
+  var parameters:array<tensor.Tensor>=try temporal_device.upload(context,stream,struct.borrow(v,field=network))
+  output=try temporal_session.separate(context,stream,parameters,struct.borrow(v,field=network),c,input,cancel,progress)
+ },}
+ match s.residual{none=>{},some(v)=>{
+  var c:residual_config.Config=try residual_config.Config_decode(identity) map_err codec.describe
+  var parameters:array<tensor.Tensor>=try device_ops.upload(context,stream,struct.borrow(struct.borrow(v,field=network),field=weights))
+  output=try residual_session.separate_once(context,stream,parameters,v,c,input,cancel,progress)
+ },}
+ match s.hybrid{none=>{},some(v)=>{
+  var c:hybrid_config.Config=try hybrid_config.Config_decode(str.view(identity)) map_err codec.describe
+  var parameters:array<tensor.Tensor>=try device_ops.upload(context,stream,struct.borrow(struct.borrow(v,field=network),field=weights))
+  output=try hybrid_retained.separate_once(context,stream,parameters,v,window_math.default_runtime(),c,input,cancel,progress)
+ },}
+ match s.attention{none=>{},some(v)=>{
+  var c:attention_config.Config=try attention_config.Config_decode(str.view(identity)) map_err codec.describe
+  var parameters:array<tensor.Tensor>=try device_ops.upload(context,stream,struct.borrow(struct.borrow(v,field=network),field=weights))
+  output=try attention_retained.separate_once(context,stream,parameters,v,window_math.default_runtime(),c,input,cancel,progress)
+ },}
+ match s.bundle{none=>{},some(value)=>{
+  var c:bundle_config.Config=try bundle_config.decode(identity)
+  output=try attention_bundle.separate_gpu(context,stream,value,window_math.default_runtime(),struct.borrow(c,field=model),input,cancel,progress)}}
+ if array.len(output)==0{return result.err("Model session unavailable")}
+ s.requests+=1
+ result.ok(output)
+}
+pub fn separate_typed_with_request(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,foreground:mask_request.Foreground)->result<audio_result.Samples,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu} {
+ separate_typed_with_request_on_device(s,input,cancel,progress,high_band,foreground,0)
+}
+pub fn separate_typed_with_request_on_device(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,foreground:mask_request.Foreground,index:u32)->result<audio_result.Samples,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu} {
+ let mask:bool=match s.mask{none=>false,some(_)=>true}
+ let recurrent:bool=match s.recurrent_mask{none=>false,some(_)=>true}
+ if mask or recurrent{
+  var policy:mask_request.Policy=mask_request.defaults()
+  policy.high_band=high_band
+  policy.foreground=foreground
+  return separate_typed_with_policy_and_band_input_on_device(s,input,cancel,progress,policy,[],index)}
+ let identity:string=string.copy(s.profile.identity)
+ match s.exchange{none=>{},some(v)=>{
+  var c:exchange_config.Config=try exchange_config.Config_decode(identity) map_err codec.describe
+  let _=try exchange_config.validate_typed(c)
+  var context:GpuContext=match devicegpu.open(index){ok(v)=>v,err(e)=>{return result.err(string.copy(e.message))}}
+  var stream:GpuStream=match devicegpu.compute_stream(context){ok(v)=>v,err(e)=>{return result.err(string.copy(e.message))}}
+  var parameters:array<tensor.Tensor>=try exchange_device.upload(context,stream,struct.borrow(v,field=graph))
+  var plan:spectral.Plan=spectral.plan(c.n_fft,c.hop,spectral.hann(c.n_fft))
+  let output:audio_result.Samples=try exchange_session.separate_typed(context,stream,parameters,struct.borrow(v,field=graph),plan,c,input,cancel,progress)
+  s.requests+=1
+  return result.ok(output)}}
+ result.ok(audio_result.from_single(try separate_with_request_on_device(s,input,cancel,progress,high_band,foreground,index)))
+}
+pub fn separate_with_policy(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu} {
+ let _=try mask_request.validate_policy(policy)
+ let mask:bool=match s.mask{none=>false,some(_)=>true}
+ let recurrent:bool=match s.recurrent_mask{none=>false,some(_)=>true}
+ if not mask and not recurrent{return separate_with_request(s,input,cancel,progress,policy.high_band,policy.foreground)}
+ var context:GpuContext=match devicegpu.open(0){ok(v)=>v,err(e)=>{return result.err(string.copy(e.message))}}
+ var stream:GpuStream=match devicegpu.compute_stream(context){ok(v)=>v,err(e)=>{return result.err(string.copy(e.message))}}
+ var settings:mask_config.Config=try mask_request.settings_with_policy(s.profile.identity,policy)
+ var plans:array<complex_spectral.Plan>=try mask_bands.plans(settings)
+ var output:array<f32>=[]
+ match s.mask{none=>{},some(value)=>{
+  var parameters:array<tensor.Tensor>=try mask_device.upload(context,stream,struct.borrow(value,field=network))
+  output=try mask_session.separate_with_cleanup(context,stream,parameters,struct.borrow(value,field=network),plans,settings,input,cancel,progress,struct.borrow(policy,field=cleanup))}}
+ match s.recurrent_mask{none=>{},some(value)=>{
+  var parameters:array<tensor.Tensor>=try recurrent_mask_device.upload(context,stream,struct.borrow(value,field=network))
+  output=try recurrent_mask_session.separate_with_cleanup(context,stream,parameters,struct.borrow(value,field=network),plans,settings,input,cancel,progress,struct.borrow(policy,field=cleanup))}}
+ if array.len(output)==0{return result.err("Model session unavailable")}
+ s.requests+=1
+ result.ok(output)
+}
+pub fn separate_typed_with_policy(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>)->result<audio_result.Samples,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu} {
+ var lower:array<f32>=[]
+ separate_typed_with_policy_and_band_input(s,input,cancel,progress,policy,array.view(lower))
+}
+pub fn separate_typed_with_policy_and_band_input(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,lower:view<f32>)->result<audio_result.Samples,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu} {
+ separate_typed_with_policy_and_band_input_on_device(s,input,cancel,progress,policy,lower,0)
+}
+pub fn separate_typed_with_policy_and_band_input_on_device(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,lower:view<f32>,index:u32)->result<audio_result.Samples,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu} {
+ let _=try mask_request.validate_policy(policy)
+ let mask:bool=match s.mask{none=>false,some(_)=>true}
+ let recurrent:bool=match s.recurrent_mask{none=>false,some(_)=>true}
+ if not mask and not recurrent{if view.len(lower)>0{return result.err("Lower-band recording input requires a mask model")}
+  return separate_typed_with_request_on_device(s,input,cancel,progress,policy.high_band,policy.foreground,index)}
+ var context:GpuContext=match devicegpu.open(index){ok(v)=>v,err(e)=>{return result.err(string.copy(e.message))}}
+ var stream:GpuStream=match devicegpu.compute_stream(context){ok(v)=>v,err(e)=>{return result.err(string.copy(e.message))}}
+ var settings:mask_config.Config=try mask_request.settings_with_policy(s.profile.identity,policy)
+ var plans:array<complex_spectral.Plan>=try mask_bands.plans(settings)
+ var output:array<f64>=[]
+ match s.mask{none=>{},some(value)=>{
+  var parameters:array<tensor.Tensor>=try mask_device.upload(context,stream,struct.borrow(value,field=network))
+  if settings.channels==16 and settings.levels==4 and settings.branches==5 and settings.bins==768{
+   let platform:string=system.platform()
+   if platform!="windows" and platform!="linux"{return result.err("Mask GPU requires a qualified host arithmetic policy")}
+   let recipe:mask_norm.Recipe=if platform=="linux"{mask_norm.Recipe.ScaledFma}else{mask_norm.Recipe.WideHypot}
+   output=try mask_session.separate_original_wide_with_band_input(context,stream,parameters,struct.borrow(value,field=network),plans,settings,input,cancel,progress,struct.borrow(policy,field=cleanup),lower,recipe)
+  }else{output=try mask_session.separate_wide_with_cleanup_and_band_input(context,stream,parameters,struct.borrow(value,field=network),plans,settings,input,cancel,progress,struct.borrow(policy,field=cleanup),lower)}}}
+ match s.recurrent_mask{none=>{},some(value)=>{
+  var parameters:array<tensor.Tensor>=try recurrent_mask_device.upload(context,stream,struct.borrow(value,field=network))
+  output=try recurrent_mask_session.separate_wide_with_cleanup_and_band_input(context,stream,parameters,struct.borrow(value,field=network),plans,settings,input,cancel,progress,struct.borrow(policy,field=cleanup),lower)}}
+ if array.len(output)==0{return result.err("Model session unavailable")}
+ s.requests+=1
+ result.ok(audio_result.from_wide(output))
+}
+// Explicit retained-transform policy, independent of decoded-input limits.
+// Other model families retain their existing typed policy/precision routes.
+pub fn separate_typed_with_transform_budget(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,transform_bytes:u64)->result<audio_result.Samples,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ separate_typed_with_transform_budget_and_band_input(s,input,cancel,progress,policy,transform_bytes,[])
+}
+pub fn separate_typed_with_transform_budget_and_band_input(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,transform_bytes:u64,lower:view<f32>)->result<audio_result.Samples,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ separate_typed_with_device_transform_budget_and_band_input(s,input,cancel,progress,policy,transform_bytes,lower,0)
+}
+pub fn separate_typed_with_device_transform_budget_and_band_input(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,transform_bytes:u64,lower:view<f32>,index:u32)->result<audio_result.Samples,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ if s.profile.kind=="recording-bundle"{
+  let _=try mask_request.validate_policy(policy)
+  if view.len(lower)>0{return result.err("Lower-band recording input requires a mask model")}
+  return result.ok(audio_result.from_single(try separate_recording_bag(s,input,cancel,progress,index,transform_bytes)))}
+ if s.profile.kind!="hybrid"{return separate_typed_with_policy_and_band_input_on_device(s,input,cancel,progress,policy,lower,index)}
+ let _=try mask_request.validate_policy(policy)
+ if transform_bytes==0 or transform_bytes>9223372036854775807{return result.err("Invalid explicit transform allocation allowance")}
+ let limits:hybrid_frontend.Limits=hybrid_frontend.Limits{workspace_bytes:67108864,clone_bytes:transform_bytes,retained_bytes:transform_bytes}
+ let identity:string=string.copy(s.profile.identity)
+ var context:GpuContext=try devicegpu.open(index) map_err gpu_message
+ var stream:GpuStream=try devicegpu.compute_stream(context) map_err gpu_message
+ match s.hybrid{none=>result.err("Hybrid model session unavailable"),some(value)=>{
+  var settings:hybrid_config.Config=try hybrid_config.Config_decode(identity) map_err codec.describe
+  var parameters:array<tensor.Tensor>=try device_ops.upload(context,stream,struct.borrow(struct.borrow(value,field=network),field=weights))
+  let output:array<f32>=try hybrid_retained.separate_once_with_limits(context,stream,parameters,value,window_math.default_runtime(),settings,input,cancel,progress,limits)
+  s.requests+=1
+  result.ok(audio_result.from_single(output))}}
+}
+fn gpu_message(e:gpu.error)->string effects {alloc}{string.copy(e.message)}

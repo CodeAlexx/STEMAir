@@ -1,0 +1,12 @@
+module stemair.mask_request_policy
+import "../toolkit/mask/request.ai" as request
+
+// Zero preserves public worker constructors that use the profile's own policy.
+pub fn from_choice(value:u32)->result<request.HighBand,string> effects {alloc} {
+ if value==0{return result.ok(request.HighBand.Profile)}
+ if value==1{return result.ok(request.HighBand.Disabled)}
+ if value==2{return result.ok(request.HighBand.Phase)}
+ if value==3{return result.ok(request.HighBand.Scaled)}
+ result.err("High-frequency reconstruction choice is unavailable")
+}
+pub fn checkbox(enabled:bool)->u32 effects {} {if enabled{2}else{1}}

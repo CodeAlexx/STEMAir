@@ -1,0 +1,33 @@
+module stemair.windowed_sinc_device
+import "windowed_sinc.ai" as sinc
+import std.tensor as tensor
+import std.compute as compute
+
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+pub fn upload(context:ref<GpuContext>,stream:ref<GpuStream>,p:ref<sinc.Plan>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let shape:array<u64>=[p.phases,1,1,2*p.width+p.step]
+ result.ok(try tensor.from_f32(context,stream,array.view(p.kernel),array.view(shape),tensor.DType.F32) map_err error)
+}
+pub fn apply(context:ref<GpuContext>,stream:ref<GpuStream>,p:ref<sinc.Plan>,kernel:ref<tensor.Tensor>,input:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if tensor.rank(input)!=4 or array.get(input.dimensions,0)!=1 or array.get(input.dimensions,2)!=1 or input.dtype!=tensor.DType.F32{
+  return result.err("Expected F32 planar resampling tensor")}
+ let channels:u64=array.get(input.dimensions,1)
+ let length:u64=array.get(input.dimensions,3)
+ let count:u64=length*p.phases/p.step
+ let host:array<f32>=try tensor.to_f32(stream,input) map_err error
+ let padded:array<f32>=try sinc.padded(p,array.view(host),channels)
+ let shape:array<u64>=[channels,1,1,length+2*p.width+p.step]
+ var packed:tensor.Tensor=try tensor.from_f32(context,stream,array.view(padded),array.view(shape),tensor.DType.F32) map_err error
+ let steps:u64=length/p.step+1
+ let predicted_shape:array<u64>=[channels,p.phases,1,steps]
+ var predicted:tensor.Tensor=try tensor.empty(context,array.view(predicted_shape),tensor.DType.F32) map_err error
+ let bias_shape:array<u64>=[p.phases]
+ var bias:tensor.Tensor=try tensor.zeros(context,stream,array.view(bias_shape),tensor.DType.F32) map_err error
+ let _=try compute.conv2d_torch_f32_general(stream,packed,kernel,bias,predicted,1,p.step,0,0,1,1,1,268435456,false,true) map_err error
+ var interleaved:tensor.Tensor=try tensor.permute(predicted,[0,2,3,1]) map_err error
+ interleaved=try tensor.contiguous(context,stream,interleaved) map_err error
+ let flat_shape:array<u64>=[1,channels,1,steps*p.phases]
+ var flat:tensor.Tensor=try tensor.reshape(interleaved,array.view(flat_shape)) map_err error
+ var cropped:tensor.Tensor=try tensor.narrow(flat,3,0,count) map_err error
+ result.ok(try tensor.contiguous(context,stream,cropped) map_err error)
+}

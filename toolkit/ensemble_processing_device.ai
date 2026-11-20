@@ -1,0 +1,67 @@
+module stemair.ensemble_processing_device
+import "mask/request.ai" as mask_request
+import "ensemble_processing.ai" as processing
+import "secondary.ai" as secondary
+import "model_ensemble.ai" as ensemble
+import "model_ensemble_config.ai" as config
+import "model_cache.ai" as models
+import "engine.ai" as engine
+import "device_engine.ai" as device
+import "control.ai" as control
+import std.audio as audio
+pub fn separate(bank:ref<models.Cache>,members:ref<array<processing.Member>>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str)->result<processing.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ separate_with_high_band(bank,members,c,input,cancel,progress,mask_request.HighBand.Profile)
+}
+pub fn separate_with_high_band(bank:ref<models.Cache>,members:ref<array<processing.Member>>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand)->result<processing.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ separate_with_high_band_as(bank,members,c,input,cancel,progress,high_band,audio.WavSubtype.Float32)
+}
+pub fn separate_with_high_band_as(bank:ref<models.Cache>,members:ref<array<processing.Member>>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,kind:audio.WavSubtype)->result<processing.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ var policy:mask_request.Policy=mask_request.defaults()
+ policy.high_band=high_band
+ separate_with_policy_as(bank,members,c,input,cancel,progress,policy,kind)
+}
+pub fn separate_with_policy_as(bank:ref<models.Cache>,members:ref<array<processing.Member>>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,kind:audio.WavSubtype)->result<processing.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ let _=try mask_request.validate_policy(policy)
+ let _=try processing.validate_options(members,c)
+ let _=try processing.validate_bank(bank,members,false)
+ var cache:processing.Recording=processing.empty()
+ var acc:ensemble.Accumulator=try ensemble.begin_as(c,kind)
+ var processed:array<secondary.Output>=[]
+ var index:u64=0
+ loop{if index==array.len(members){break}
+  let member:ref<processing.Member>=array.borrow(members,index)
+  var stages:array<secondary.Stage>=secondary.stages(struct.borrow(member,field=plan),struct.borrow(member,field=recipe))
+  var raw:array<secondary.Prediction>=[]
+  var inputs:array<secondary.StageInput>=[]
+  var at:u64=0
+  loop{if at==array.len(stages){break}
+   if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+   let stage:ref<secondary.Stage>=array.borrow(stages,at)
+   let selected:u64=try secondary.binding(struct.borrow(member,field=bindings),stage.model)
+   if selected>=array.len(bank.entries){return result.err("An ensemble processing binding is out of range")}
+   let identity:string=try processing.key(member,stage)
+   let cached:u64=match processing.find(cache,selected,identity){some(v)=>v,none=>{
+    let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,selected),field=model)
+    let targets:array<string>=ensemble.names(struct.borrow(struct.borrow(model,field=profile),field=targets))
+    var filtered:array<f32>=[]
+    let predicted:array<f32>=if stage.source=="instrumental"{
+     filtered=try secondary.instrumental_input(raw,struct.borrow(member,field=recipe),input)
+     try device.separate_with_policy(model,array.view(filtered),cancel,progress,policy)
+    }else{try device.separate_with_policy(model,input,cancel,progress,policy)}
+    if not member.recipe.keep_members{filtered=[]}
+    try processing.store(cache,selected,identity,targets,predicted,filtered)}}
+   let _=try processing.restore(cache,cached,stage,raw,inputs)
+   at+=1}
+  let primary:u64=try secondary.binding(struct.borrow(member,field=bindings),0)
+  let kind:str=array.borrow(bank.entries,primary).model.profile.kind
+  let waveform:bool=kind=="waveform" or kind=="temporal" or kind=="residual-waveform" or kind=="hybrid" or kind=="attention"
+  if waveform{let _=try processing.publish_source(cache,primary,raw,inputs,struct.borrow(member,field=recipe))}
+  var output:secondary.Output=try secondary.finish(raw,struct.borrow(member,field=plan),struct.borrow(member,field=recipe),input,cancel,progress)
+  output.inputs=inputs
+  if waveform{let _=try processing.export_feedback(cache,primary,struct.borrow(member,field=recipe),output)}
+  let _=try processing.append(cache,acc,c,output,cancel)
+  if c.keep_members{array.push(processed,output)}
+  index+=1}
+ let combined:ensemble.Output=try ensemble.finish_processed(acc,c,cancel,progress)
+ result.ok(processing.Output{combined:combined,processed:processed})
+}

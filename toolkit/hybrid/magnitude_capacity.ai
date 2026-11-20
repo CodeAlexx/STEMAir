@@ -1,0 +1,19 @@
+module stemair.hybrid.magnitude_capacity
+import std.system as system
+pub type Plan=struct{frames:u64,steps:u64,rewrite_words:u64,local_words:u64,working_bytes:u64}
+pub fn plan(frames:u64)->result<Plan,string> effects {alloc}{
+ if frames==0 or frames>16711680{return result.err("Magnitude model callback exceeds retained model geometry")}
+ let steps:u64=(frames+1023)/1024
+ let rewrite:u64=96*512*steps
+ let complex:u64=16*2048*steps
+ let time:u64=96*((frames+3)/4)
+ let peak:u64=if rewrite>complex{rewrite}else{complex}
+ let largest:u64=if peak>time{peak}else{time}
+ result.ok(Plan{frames:frames,steps:steps,rewrite_words:largest,local_words:4*steps*steps,working_bytes:6*largest*4+3*8*frames*4+2*2*frames*4})
+}
+pub fn require_memory(p:ref<Plan>,maximum:u64)->result<unit,string> effects {alloc}{
+ if maximum==0 or p.working_bytes>maximum{return result.err("Magnitude forward exceeds its explicit working-byte reservation")}
+ let available:system.Memory=match system.memory(){ok(v)=>v,err(_)=>{return result.err("Cannot query RAM for magnitude forward")}}
+ if p.working_bytes+536870912>available.available_bytes{return result.err("Not enough RAM for retained magnitude forward")}
+ result.ok(())
+}

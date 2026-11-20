@@ -1,0 +1,109 @@
+module stemair.residual_waveform.capacity
+// Logical extents and a conservative activation reservation, not an RSS promise.
+pub type Plan=struct{frames:u64,padded_frames:u64,peak_tensor_elements:u64,
+ peak_transpose_elements:u64,peak_transpose_matrix_elements:u64,peak_matrix_input_elements:u64,
+ peak_local_steps:u64,peak_local_head_elements:u64,peak_local_total_elements:u64,working_bytes:u64}
+pub type Limits=struct{tensor_elements:u64=134217728,convolution_elements:u64=134217728,
+ transpose_elements:u64=67108864,transpose_matrix_elements:u64=134217728,
+ matrix_input_bytes:u64=268435456,matrix_output_elements:u64=67108864,
+ local_steps:u64=8192,local_elements:u64=67108864}
+fn count(a:u64,b:u64)->result<u64,string> effects {alloc}{
+ if a==0 or b==0 or a>2147483647/b{return result.err("Residual CPU geometry exceeds checked index extent")}
+ result.ok(a*b)
+}
+fn maximum(a:u64,b:u64)->u64 effects {}{if a>b{a}else{b}}
+fn bucket(value:u64,minimum:u64)->result<u64,string> effects {alloc}{
+ var out:u64=minimum
+ loop{if out>=value{break}
+  if out>1073741823{return result.err("Residual CPU capacity exceeds checked index extent")}
+  out*=2}
+ result.ok(out)
+}
+pub fn plan(frames:u64,rewrite:bool)->result<Plan,string> effects {alloc}{
+ if frames==0 or frames>134217728{return result.err("Residual CPU planning frame extent is invalid")}
+ var width:u64=2*frames
+ var i:u64=0
+ loop{if i==6{break}
+  width=if width<=8{1}else{(width-8+3)/4+1}
+  i+=1}
+ i=0
+ loop{if i==6{break}
+  width=(width-1)*4+8
+  i+=1}
+ let padded:u64=(width+1)/2
+ var peak:u64=try count(2,width)
+ var local_steps:u64=1
+ var local_head:u64=1
+ var local_total:u64=1
+ var matrix_input:u64=1
+ var channels:u64=64
+ i=0
+ loop{if i==6{break}
+  width=(width-8)/4+1
+  let activation:u64=try count(channels,width)
+  peak=maximum(peak,activation)
+  // Every residual branch projects hidden channels to 2C before GLU.
+  peak=maximum(peak,try count(2,activation))
+  if rewrite{peak=maximum(peak,try count(2,activation))}
+  if i>=4{
+   local_steps=maximum(local_steps,width)
+   let head:u64=try count(width,width)
+   local_head=maximum(local_head,head)
+   local_total=maximum(local_total,try count(4,head))
+   matrix_input=maximum(matrix_input,head)}
+  channels*=2
+  i+=1}
+ var transpose:u64=1
+ var transpose_matrix:u64=1
+ i=0
+ loop{if i==6{break}
+  let level:u64=5-i
+  channels=64*(1 << cast.wrap(level))
+  let output:u64=if level==0{8}else{channels/2}
+  matrix_input=maximum(matrix_input,try count(channels,width))
+  if rewrite{peak=maximum(peak,try count(2,try count(channels,width)))}
+  transpose_matrix=maximum(transpose_matrix,try count(try count(output,8),width))
+  width=(width-1)*4+8
+  let extent:u64=try count(output,width)
+  transpose=maximum(transpose,extent)
+  peak=maximum(peak,extent)
+  i+=1}
+ // Six largest live activation extents plus two dense local-head extents.
+ // Allocator reserves, native-library state and process RSS remain distinct.
+ let working:u64=24*peak+8*local_head
+ result.ok(Plan{frames:frames,padded_frames:padded,peak_tensor_elements:peak,
+  peak_transpose_elements:transpose,peak_transpose_matrix_elements:transpose_matrix,
+  peak_matrix_input_elements:matrix_input,peak_local_steps:local_steps,
+  peak_local_head_elements:local_head,peak_local_total_elements:local_total,working_bytes:working})
+}
+pub fn recipe(p:ref<Plan>)->result<Limits,string> effects {alloc}{
+ result.ok(Limits{tensor_elements:try bucket(p.peak_tensor_elements,134217728),
+  convolution_elements:try bucket(p.peak_tensor_elements,134217728),
+  transpose_elements:try bucket(p.peak_transpose_elements,67108864),
+  transpose_matrix_elements:try bucket(p.peak_transpose_matrix_elements,134217728),
+  matrix_input_bytes:4*(try bucket(p.peak_matrix_input_elements,67108864)),
+  matrix_output_elements:try bucket(p.peak_local_head_elements,67108864),
+  local_steps:try bucket(p.peak_local_steps,8192),local_elements:try bucket(p.peak_local_total_elements,67108864)})
+}
+pub fn validate(p:ref<Plan>,limits:ref<Limits>)->result<unit,string> effects {alloc}{
+ if limits.tensor_elements==0 or limits.tensor_elements>2147483647 or
+  limits.convolution_elements==0 or limits.convolution_elements>2147483647 or
+  limits.transpose_elements==0 or limits.transpose_elements>2147483647 or
+  limits.transpose_matrix_elements==0 or limits.transpose_matrix_elements>2147483647 or
+  limits.matrix_output_elements==0 or limits.matrix_output_elements>2147483647 or
+  limits.matrix_input_bytes<4 or limits.matrix_input_bytes>8589934588 or
+  limits.local_steps==0 or limits.local_steps>2147483647 or limits.local_elements==0 or limits.local_elements>2147483647{
+  return result.err("Residual CPU selected capacity is invalid")}
+ if p.peak_tensor_elements>limits.tensor_elements or p.peak_tensor_elements>limits.convolution_elements or
+  p.peak_transpose_elements>limits.transpose_elements or p.peak_transpose_matrix_elements>limits.transpose_matrix_elements or
+  p.peak_matrix_input_elements>limits.matrix_input_bytes/4 or p.peak_local_head_elements>limits.matrix_output_elements or
+  p.peak_local_steps>limits.local_steps or p.peak_local_total_elements>limits.local_elements{
+  return result.err("Residual CPU recording exceeds the prepared capacity recipe")}
+ result.ok(())
+}
+pub fn expanded(limits:ref<Limits>)->bool effects {}{
+ limits.tensor_elements>134217728 or limits.convolution_elements>134217728 or
+ limits.transpose_elements>67108864 or limits.transpose_matrix_elements>134217728 or
+ limits.matrix_input_bytes>268435456 or limits.matrix_output_elements>67108864 or
+ limits.local_steps>8192 or limits.local_elements>67108864
+}

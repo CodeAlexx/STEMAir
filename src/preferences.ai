@@ -1,0 +1,571 @@
+module stemair.preferences
+import std.codec as codec
+import std.json as json
+import std.files as files
+import std.path as path
+import std.system as system
+import std.float as fp
+import std.text as text
+import "../toolkit/model_ensemble_config.ai" as model_config
+import "../toolkit/secondary_config.ai" as secondary_config
+import "../toolkit/vocal_chain.ai" as vocal
+import "queue_config.ai" as queue_config
+import "paired_panel_state.ai" as paired
+import "output_naming.ai" as output_naming
+import "queue_naming.ai" as queue_naming
+import "model_defaults.ai" as model_defaults
+import "model_queue_snapshot.ai" as model_queue
+import "artifact_cleanup_policy.ai" as cleanup_policy
+import "learned_controls_policy.ai" as learned_policy
+import "../toolkit/learned_cleanup_request.ai" as learned_request
+import "mask_inference_policy.ai" as inference_policy
+import "recording_inference_policy.ai" as recording_policy
+import "../toolkit/recording_state.ai" as recording_state
+import "../toolkit/recording_context.ai" as recording_context
+import "../toolkit/device_selection.ai" as device_selection
+
+// This is also the live desktop state. Checkpoint tensors and running jobs are
+// session-owned and never serialized here.
+pub type State=struct{
+ version:u64=22,
+ workflow_page:f64=0.0,
+ window_width:u64=0,
+ window_height:u64=0,
+ window_maximized:bool=false,
+ settings:string="",
+ checkpoint:string="",
+ input:string="",
+ output:string="",
+ use_gpu:bool=false,
+ gpu_index:string="0",queue_gpu_index:string="0",
+ high_band:bool=false,
+ noise_reduction:bool=false,room_reduction:bool=false,room_targets:f64=0.0,noise_checkpoint:string="",room_checkpoint:string="",queue_learned_snapshot:string="",
+ cleanup_enabled:bool=false,
+ cleanup_threshold:string="0.2",
+ queue_cleanup_snapshot:string="",
+ mask_tta:f64=0.0,
+ mask_window:string="Default",
+ mask_aggression:string="Default",
+ queue_inference_snapshot:string="",
+ inference_pitch:bool=false,inference_semitones:string="0",match_frequency:bool=false,recording_override:bool=false,recording_shifts:string="2",recording_split:bool=true,recording_overlap:string="0.25",recording_segment:string="Default",recording_seed:string="Random",
+ queue_recording_snapshot:string="",queue_recording_state:string="",
+ model_defaults:string="",
+ model_definition:string="",
+ queue_model_snapshot:string="",
+ naming_append_model:bool=false,
+ naming_model_folder:bool=false,
+ naming_testing:bool=false,
+ naming_append_ensemble:bool=false,
+ naming_ensemble_label:string="",
+ queue_naming_snapshot:string="",
+ single_outputs:f64=0.0,
+ single_complement:f64=0.0,
+ single_normalize:bool=false,
+ single_keep:bool=false,
+ ensemble_inputs:array<string>,
+ ensemble_wave:bool=false,
+ ensemble_normalize:bool=false,
+ tool_amount:string="0.5",
+ pitch_amount:string="0",
+ tempo_amount:string="1",
+ pitch_preserve_amount:string="0",
+ export_subtype:f64=1.0,
+ output_container:f64=0.0,
+ mp3_bitrate:f64=5.0,
+ codec_directory:string="",
+ sample_seconds:string="30",
+ sample_library:string="",
+ processing_sample:bool=false,
+ audio_budget:f64=1.0,
+ paired_first_inputs:array<string>,paired_second_inputs:array<string>,paired_snapshot:string="",paired_continue:bool=false,
+ alignment_first:string="",
+ alignment_second:string="",
+ alignment_polarity:f64=0.0,
+ alignment_save_aligned:bool=true,
+ alignment_windows:f64=2.0,
+ alignment_intros:f64=0.0,
+ alignment_gain:f64=2.0,
+ alignment_phase:f64=0.0,
+ alignment_initial_polarity:f64=0.0,
+ alignment_match_silence:bool=true,
+ alignment_spectral_match:bool=false,
+ ensemble_models:array<model_config.Model>,
+ model_paired:bool=false,
+ model_primary:f64=0.0,
+ model_secondary:f64=0.0,
+ model_wave:bool=false,
+ model_normalize:bool=false,
+ model_keep:bool=false,
+ model_residual:bool=false,
+ model_spectral:bool=false,
+ secondary_rules:array<secondary_config.Adjustment>,
+ secondary_target:f64=0.0,
+ secondary_weight:string="0.5",
+ secondary_outputs:f64=0.0,
+ secondary_normalize:bool=false,
+ secondary_keep:bool=false,
+ secondary_residual:bool=false,
+ secondary_spectral:bool=false,
+ preprocess_model:u64=0,
+ preprocess_residual:bool=false,
+ preprocess_spectral:bool=false,
+ preprocess_extra:bool=false,
+ vocal_model:u64=0,
+ vocal_options:vocal.Settings,
+ vocal_weight:string="0.9",
+ queue_items:array<queue_config.Item>,
+ queue_index:u64=0,
+ queue_continue:bool=false
+}
+
+pub fn defaults(root:str)->State effects {alloc} {
+ State{settings:path.join(root,"configs/mask-small-v1.json"),checkpoint:path.join(root,"assets/mask-small-v1.pth"),
+  paired_first_inputs:[],paired_second_inputs:[],ensemble_inputs:[],ensemble_models:[],secondary_rules:[],vocal_options:vocal.Settings{rebalance:0.9},queue_items:[]}
+}
+pub fn location()->result<string,string> effects {alloc,env} {
+ match env.get("STEMAIR_CONFIG_HOME"){none=>{},some(base)=>{
+  if not path.is_absolute(base){return result.err("STEMAIR_CONFIG_HOME must be an absolute directory")}
+  return result.ok(path.join(base,"preferences.json"))}}
+ if system.platform()=="windows"{
+  match env.get("LOCALAPPDATA"){some(base)=>{if path.is_absolute(base){return result.ok(path.join(path.join(base,"StemAIR"),"preferences.json"))}},none=>{}}
+  return result.err("Desktop preferences unavailable: LOCALAPPDATA is not an absolute directory")}
+ match env.get("XDG_CONFIG_HOME"){some(base)=>{if path.is_absolute(base){return result.ok(path.join(path.join(base,"stemair"),"preferences.json"))}},none=>{}}
+ match system.home_directory(){some(base)=>{if path.is_absolute(base){return result.ok(path.join(path.join(base,".config/stemair"),"preferences.json"))}},none=>{}}
+ result.err("Desktop preferences unavailable: no absolute user configuration directory")
+}
+fn choice(value:f64,maximum:f64)->bool effects {} {
+ fp.is_finite(value) and value>=0.0 and value<=maximum and fp.floor(value)==value
+}
+pub fn validate(c:ref<State>)->result<unit,string> effects {alloc} {
+ if c.version!=22{return result.err("Saved preferences use an unsupported version")}
+ let _=try device_selection.parse(c.gpu_index)
+ let _=try device_selection.parse(c.queue_gpu_index)
+ let _=try inference_policy.current(c.mask_tta,c.mask_window,c.mask_aggression)
+ let _=try recording_policy.current_with_pitch(c.recording_override,c.recording_shifts,c.recording_split,c.recording_overlap,c.recording_segment,c.recording_seed,c.inference_pitch,c.inference_semitones,c.match_frequency)
+ if str.len(c.inference_semitones)>64 or str.len(c.recording_shifts)>64 or str.len(c.recording_overlap)>64 or str.len(c.recording_segment)>64 or str.len(c.recording_seed)>64 or str.len(c.queue_recording_snapshot)>1024 or str.len(c.queue_recording_state)>65536{return result.err("Saved recording controls exceed their text bounds")}
+ var recording:recording_context.Context=try recording_policy.resolve(c.queue_recording_snapshot,2147483648)
+ let _=try recording_state.restore(recording,c.queue_recording_state)
+ let _=try inference_policy.decode(c.queue_inference_snapshot)
+ if str.len(c.noise_checkpoint)>4096 or str.len(c.room_checkpoint)>4096 or str.len(c.queue_learned_snapshot)>12288{return result.err("Saved learned cleanup settings exceed their text bounds")}
+ let _=try learned_policy.current(c.noise_reduction,c.room_reduction,c.room_targets,c.noise_checkpoint,c.room_checkpoint)
+ let _=try learned_request.decode(c.queue_learned_snapshot)
+ let _=try cleanup_policy.current(c.cleanup_enabled,c.cleanup_threshold)
+ if str.len(c.queue_cleanup_snapshot)>0{let _=try cleanup_policy.decode(c.queue_cleanup_snapshot)}
+ if str.len(c.naming_ensemble_label)>4096{return result.err("Ensemble output label exceeds its text bound")}
+ if str.len(c.queue_naming_snapshot)>3145728{return result.err("Pending naming snapshot exceeds 3 MiB")}
+ if str.len(c.queue_naming_snapshot)>0{
+  var accepted:output_naming.Queue=try output_naming.decode_queue(c.queue_naming_snapshot)
+  let _=try queue_naming.validate(accepted)}
+ let _=try model_defaults.decode_bindings(c.model_defaults)
+ if str.len(c.model_definition)>0 and (str.len(c.model_definition)>4096 or not path.is_absolute(c.model_definition)){return result.err("Selected model definition must use a bounded absolute path")}
+ if str.len(c.queue_model_snapshot)>0{let _=try model_queue.decode(c.queue_model_snapshot)}
+ if not choice(c.alignment_initial_polarity,3.0){return result.err("Saved preferences contain unavailable initial polarity")}
+ if not choice(c.alignment_windows,10.0) or not choice(c.alignment_intros,7.0) or not choice(c.alignment_gain,4.0) or not choice(c.alignment_phase,6.0){return result.err("Saved preferences contain unavailable detailed alignment options")}
+ if not choice(c.workflow_page,7.0){return result.err("Saved preferences contain an unavailable desktop tab")}
+ if (c.window_width==0)!=(c.window_height==0) or c.window_width>32768 or c.window_height>32768 or
+    (c.window_width>0 and (c.window_width<320 or c.window_height<240)) or
+    (c.window_maximized and c.window_width==0){return result.err("Saved preferences contain invalid window dimensions")}
+ if not choice(c.audio_budget,3.0){return result.err("Saved preferences contain an unavailable audio buffer limit")}
+ if not choice(c.single_outputs,4.0) or not choice(c.single_complement,1.0) or
+    not choice(c.model_primary,2.0) or not choice(c.model_secondary,2.0) or
+    not choice(c.secondary_target,4.0) or not choice(c.secondary_outputs,4.0) or
+    not choice(c.alignment_polarity,2.0) or not choice(c.export_subtype,5.0) or
+    not choice(c.output_container,2.0) or not choice(c.mp3_bitrate,5.0){return result.err("Saved preferences contain an unavailable selection")}
+ if (c.model_residual and c.model_spectral) or (c.secondary_residual and c.secondary_spectral) or
+    (c.preprocess_residual and c.preprocess_spectral){return result.err("Saved preferences select conflicting complements")}
+ let _=try vocal.validate(struct.borrow(c,field=vocal_options))
+ let count:u64=array.len(c.ensemble_models)
+ if count>1024 or array.len(c.ensemble_inputs)>4096 or array.len(c.secondary_rules)>128 or
+    array.len(c.queue_items)>4096 or c.queue_index>1000000{return result.err("Saved preference lists exceed the desktop limits")}
+ if (c.preprocess_model>0 and c.preprocess_model>=count) or
+    (c.vocal_model>0 and c.vocal_model>=count){return result.err("Saved model assignments refer to an unavailable member")}
+ var definition_index:u64=0
+ loop{if definition_index==array.len(c.ensemble_models){break}
+  let member:ref<model_config.Model>=array.borrow(c.ensemble_models,definition_index)
+  if str.len(member.definition)>0 and (str.len(member.definition)>4096 or not path.is_absolute(member.definition)){return result.err("Accepted model definition must use a bounded absolute path")}
+  definition_index+=1}
+ var i:u64=0
+ loop{if i==array.len(c.secondary_rules){break}
+  let rule:ref<secondary_config.Adjustment>=array.borrow(c.secondary_rules,i)
+  if rule.model>=count or not fp.is_finite(rule.primary_weight) or rule.primary_weight<0.0 or rule.primary_weight>1.0{
+   return result.err("Saved secondary assignments are invalid")}
+  i+=1}
+ if array.len(c.paired_first_inputs)>4096 or array.len(c.paired_second_inputs)>4096{return result.err("Saved paired lists exceed the desktop entry limit")}
+ var side:u64=0
+ loop{if side==2{break}
+  let count:u64=if side==0{array.len(c.paired_first_inputs)}else{array.len(c.paired_second_inputs)}
+  var row:u64=0
+  loop{if row==count{break}
+   let empty:bool=if side==0{str.len(array.get(c.paired_first_inputs,row))==0}else{str.len(array.get(c.paired_second_inputs,row))==0}
+   if empty{return result.err("Saved paired input row is empty")}
+   row+=1}
+  side+=1}
+ if str.len(c.paired_snapshot)>0{let _=try paired.decode(c.paired_snapshot)}
+ if array.len(c.queue_items)>0{let _=try queue_config.validate(c.queue_items)}
+ result.ok(())
+}
+pub fn encode(c:ref<State>)->result<string,string> effects {alloc} {
+ let _=try validate(c)
+ let raw:string=try State_encode(c) map_err codec.describe
+ if str.len(raw)>4194304{return result.err("Desktop preferences exceed the 4 MiB limit")}
+ result.ok(raw)
+}
+pub fn decode(raw:str)->result<State,string> effects {alloc} {
+ if str.len(raw)>4194304{return result.err("Desktop preferences exceed the 4 MiB limit")}
+ var c:State=try State_decode(raw) map_err codec.describe
+ let _=try validate(c)
+ result.ok(c)
+}
+pub fn load(file:str,root:str)->result<State,string> effects {alloc,fs.read,fs.meta} {
+ let exists:bool=match files.exists(file){ok(v)=>v,err(_)=>{return result.err("Cannot inspect saved preferences; the file will be left untouched")}}
+ if not exists{return result.ok(defaults(root))}
+ let raw:bytes=match files.read_limited(file,4194304){ok(v)=>v,err(_)=>{return result.err("Cannot read saved preferences within the 4 MiB limit; the file will be left untouched")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("Saved preferences are not UTF-8; the file will be left untouched")}}
+ decode(source)
+}
+// An exclusively owned sibling temporary publishes complete JSON in one rename.
+// Callers keep the previous serialized value and invoke this only on changes.
+pub fn publish(file:str,temporary:str,raw:str)->result<unit,string> effects {alloc,fs.write} {
+ if str.len(file)==0{return result.err("No desktop preference location is available")}
+ let _=try files.mkdirs(path.dirname(file)) map_err write_error
+ let _=try files.write_atomic(file,temporary,raw) map_err write_error
+ result.ok(())
+}
+pub fn persist(c:ref<State>,file:str,temporary:str,previous:str)->result<string,string> effects {alloc,fs.write} {
+ let raw:string=try encode(c)
+ if raw==previous{return result.ok(raw)}
+ let _=try publish(file,temporary,raw)
+ result.ok(raw)
+}
+// Explicit model-session transitions flush the complete preference file before
+// atomic replacement. Directory synchronization follows the shared sink's
+// best-effort policy; this does not claim power-loss durability on every FS.
+pub fn persist_synced(c:ref<State>,file:str,temporary:str)->result<string,string> effects {alloc,fs.read,fs.write} {
+ if str.len(file)==0{return result.err("No writable desktop preference location is available")}
+ let raw:string=try encode(c)
+ let _=try files.mkdirs(path.dirname(file)) map_err write_error
+ var sink:files.Sink=try files.sink_create(file,temporary) map_err write_error
+ match files.sink_write(sink,str.bytes(raw)){ok(_)=>{},err(e)=>{let _=files.sink_discard(sink)
+  return result.err(write_error(e))}}
+ let _=try files.sink_publish(sink,true) map_err write_error
+ result.ok(raw)
+}
+fn write_error(error:fs.error)->string effects {alloc} {
+ "Cannot save desktop preferences; the previous file is preserved"
+}
+
+// Explicit codecs compose imported application/core records through std.codec.
+// Derivation supports nested records only when declared in the same module.
+pub fn State_encode(c:ref<State>)->result<string,codec.Error> effects {alloc} {
+ var w:codec.Writer=codec.writer()
+ codec.begin_object(w)
+ codec.field_u64(w,"version",c.version)
+ codec.field_f64(w,"workflow_page",c.workflow_page)
+ codec.field_u64(w,"window_width",c.window_width)
+ codec.field_u64(w,"window_height",c.window_height)
+ codec.field_bool(w,"window_maximized",c.window_maximized)
+ codec.field_text(w,"settings",c.settings)
+ codec.field_text(w,"checkpoint",c.checkpoint)
+ codec.field_text(w,"input",c.input)
+ codec.field_text(w,"output",c.output)
+ codec.field_bool(w,"use_gpu",c.use_gpu)
+ codec.field_text(w,"gpu_index",c.gpu_index)
+ codec.field_text(w,"queue_gpu_index",c.queue_gpu_index)
+ codec.field_bool(w,"high_band",c.high_band)
+ codec.field_bool(w,"noise_reduction",c.noise_reduction)
+ codec.field_bool(w,"room_reduction",c.room_reduction)
+ codec.field_f64(w,"room_targets",c.room_targets)
+ codec.field_text(w,"noise_checkpoint",c.noise_checkpoint)
+ codec.field_text(w,"room_checkpoint",c.room_checkpoint)
+ codec.field_text(w,"queue_learned_snapshot",c.queue_learned_snapshot)
+ codec.field_bool(w,"cleanup_enabled",c.cleanup_enabled)
+ codec.field_text(w,"cleanup_threshold",c.cleanup_threshold)
+ codec.field_text(w,"queue_cleanup_snapshot",c.queue_cleanup_snapshot)
+ codec.field_f64(w,"mask_tta",c.mask_tta)
+ codec.field_text(w,"mask_window",c.mask_window)
+ codec.field_text(w,"mask_aggression",c.mask_aggression)
+ codec.field_text(w,"queue_inference_snapshot",c.queue_inference_snapshot)
+ codec.field_bool(w,"inference_pitch",c.inference_pitch)
+ codec.field_text(w,"inference_semitones",c.inference_semitones)
+ codec.field_bool(w,"match_frequency",c.match_frequency)
+ codec.field_bool(w,"recording_override",c.recording_override)
+ codec.field_text(w,"recording_shifts",c.recording_shifts)
+ codec.field_bool(w,"recording_split",c.recording_split)
+ codec.field_text(w,"recording_overlap",c.recording_overlap)
+ codec.field_text(w,"recording_segment",c.recording_segment)
+ codec.field_text(w,"recording_seed",c.recording_seed)
+ codec.field_text(w,"queue_recording_snapshot",c.queue_recording_snapshot)
+ codec.field_text(w,"queue_recording_state",c.queue_recording_state)
+ codec.field_text(w,"model_defaults",c.model_defaults)
+ codec.field_text(w,"model_definition",c.model_definition)
+ codec.field_text(w,"queue_model_snapshot",c.queue_model_snapshot)
+ codec.field_bool(w,"naming_append_model",c.naming_append_model)
+ codec.field_bool(w,"naming_model_folder",c.naming_model_folder)
+ codec.field_bool(w,"naming_testing",c.naming_testing)
+ codec.field_bool(w,"naming_append_ensemble",c.naming_append_ensemble)
+ codec.field_text(w,"naming_ensemble_label",c.naming_ensemble_label)
+ codec.field_text(w,"queue_naming_snapshot",c.queue_naming_snapshot)
+ codec.field_f64(w,"single_outputs",c.single_outputs)
+ codec.field_f64(w,"single_complement",c.single_complement)
+ codec.field_bool(w,"single_normalize",c.single_normalize)
+ codec.field_bool(w,"single_keep",c.single_keep)
+ codec.field_text_array(w,"ensemble_inputs",c.ensemble_inputs)
+ codec.field_bool(w,"ensemble_wave",c.ensemble_wave)
+ codec.field_bool(w,"ensemble_normalize",c.ensemble_normalize)
+ codec.field_text(w,"tool_amount",c.tool_amount)
+ codec.field_text(w,"pitch_amount",c.pitch_amount)
+ codec.field_text(w,"tempo_amount",c.tempo_amount)
+ codec.field_text(w,"pitch_preserve_amount",c.pitch_preserve_amount)
+ codec.field_f64(w,"export_subtype",c.export_subtype)
+ codec.field_f64(w,"output_container",c.output_container)
+ codec.field_f64(w,"mp3_bitrate",c.mp3_bitrate)
+ codec.field_text(w,"codec_directory",c.codec_directory)
+ codec.field_text(w,"sample_seconds",c.sample_seconds)
+ codec.field_text(w,"sample_library",c.sample_library)
+ codec.field_bool(w,"processing_sample",c.processing_sample)
+ codec.field_f64(w,"audio_budget",c.audio_budget)
+ codec.field_text_array(w,"paired_first_inputs",c.paired_first_inputs)
+ codec.field_text_array(w,"paired_second_inputs",c.paired_second_inputs)
+ codec.field_text(w,"paired_snapshot",c.paired_snapshot)
+ codec.field_bool(w,"paired_continue",c.paired_continue)
+ codec.field_text(w,"alignment_first",c.alignment_first)
+ codec.field_text(w,"alignment_second",c.alignment_second)
+ codec.field_f64(w,"alignment_polarity",c.alignment_polarity)
+ codec.field_bool(w,"alignment_save_aligned",c.alignment_save_aligned)
+ codec.field_f64(w,"alignment_windows",c.alignment_windows)
+ codec.field_f64(w,"alignment_intros",c.alignment_intros)
+ codec.field_f64(w,"alignment_gain",c.alignment_gain)
+ codec.field_f64(w,"alignment_phase",c.alignment_phase)
+ codec.field_f64(w,"alignment_initial_polarity",c.alignment_initial_polarity)
+ codec.field_bool(w,"alignment_match_silence",c.alignment_match_silence)
+ codec.field_bool(w,"alignment_spectral_match",c.alignment_spectral_match)
+ codec.key(w,"ensemble_models")
+ codec.begin_array(w)
+ var i_ensemble_models:u64=0
+ loop{if i_ensemble_models==array.len(c.ensemble_models){break}
+  let item:ref<model_config.Model>=array.borrow(c.ensemble_models,i_ensemble_models)
+  codec.begin_object(w)
+  codec.field_text(w,"config",item.config)
+  codec.field_text(w,"checkpoint",item.checkpoint)
+  codec.field_text(w,"processing",item.processing)
+  if str.len(item.definition)>0{codec.field_text(w,"definition",item.definition)}
+  codec.end_object(w)
+  i_ensemble_models+=1}
+ codec.end_array(w)
+ codec.field_bool(w,"model_paired",c.model_paired)
+ codec.field_f64(w,"model_primary",c.model_primary)
+ codec.field_f64(w,"model_secondary",c.model_secondary)
+ codec.field_bool(w,"model_wave",c.model_wave)
+ codec.field_bool(w,"model_normalize",c.model_normalize)
+ codec.field_bool(w,"model_keep",c.model_keep)
+ codec.field_bool(w,"model_residual",c.model_residual)
+ codec.field_bool(w,"model_spectral",c.model_spectral)
+ codec.key(w,"secondary_rules")
+ codec.begin_array(w)
+ var i_secondary_rules:u64=0
+ loop{if i_secondary_rules==array.len(c.secondary_rules){break}
+  let item:ref<secondary_config.Adjustment>=array.borrow(c.secondary_rules,i_secondary_rules)
+  codec.begin_object(w)
+  codec.field_text(w,"target",item.target)
+  codec.field_u64(w,"model",item.model)
+  codec.field_f64(w,"primary_weight",item.primary_weight)
+  codec.end_object(w)
+  i_secondary_rules+=1}
+ codec.end_array(w)
+ codec.field_f64(w,"secondary_target",c.secondary_target)
+ codec.field_text(w,"secondary_weight",c.secondary_weight)
+ codec.field_f64(w,"secondary_outputs",c.secondary_outputs)
+ codec.field_bool(w,"secondary_normalize",c.secondary_normalize)
+ codec.field_bool(w,"secondary_keep",c.secondary_keep)
+ codec.field_bool(w,"secondary_residual",c.secondary_residual)
+ codec.field_bool(w,"secondary_spectral",c.secondary_spectral)
+ codec.field_u64(w,"preprocess_model",c.preprocess_model)
+ codec.field_bool(w,"preprocess_residual",c.preprocess_residual)
+ codec.field_bool(w,"preprocess_spectral",c.preprocess_spectral)
+ codec.field_bool(w,"preprocess_extra",c.preprocess_extra)
+ codec.field_u64(w,"vocal_model",c.vocal_model)
+ codec.key(w,"vocal_options")
+ codec.begin_object(w)
+ codec.field_f64(w,"rebalance",c.vocal_options.rebalance)
+ codec.field_bool(w,"mixes",c.vocal_options.mixes)
+ codec.field_bool(w,"mix_only",c.vocal_options.mix_only)
+ codec.field_bool(w,"vocal_only",c.vocal_options.vocal_only)
+ codec.field_bool(w,"normalize",c.vocal_options.normalize)
+ codec.end_object(w)
+ codec.field_text(w,"vocal_weight",c.vocal_weight)
+ codec.key(w,"queue_items")
+ codec.begin_array(w)
+ var i_queue_items:u64=0
+ loop{if i_queue_items==array.len(c.queue_items){break}
+  let item:ref<queue_config.Item>=array.borrow(c.queue_items,i_queue_items)
+  codec.begin_object(w)
+  codec.field_text(w,"input",item.input)
+  codec.field_text(w,"folder",item.folder)
+  codec.end_object(w)
+  i_queue_items+=1}
+ codec.end_array(w)
+ codec.field_u64(w,"queue_index",c.queue_index)
+ codec.field_bool(w,"queue_continue",c.queue_continue)
+ codec.end_object(w)
+ codec.finish(w)
+}
+pub fn State_decode(raw:str)->result<State,codec.Error> effects {alloc} {
+ var document:json.Document=match json.parse(raw){ok(v)=>v,err(_)=>{
+  return result.err(codec.error(codec.Code.Invalid,"","valid JSON","invalid JSON"))}}
+ var reader:codec.Reader=codec.root_reader(codec.strict())
+ var c:State=defaults("")
+ c.version=try codec.u64_field(document,reader,"version")
+ if c.version<1 or c.version>22{return result.err(codec.error(codec.Code.Invalid,"version","supported preference version","unsupported preference version"))}
+ if c.version>=22{
+  c.inference_pitch=try codec.bool_field(document,reader,"inference_pitch")
+  c.inference_semitones=try codec.text_field(document,reader,"inference_semitones")
+  c.match_frequency=try codec.bool_field(document,reader,"match_frequency")}
+ if c.version>=21{
+  c.gpu_index=try codec.text_field(document,reader,"gpu_index")
+  c.queue_gpu_index=try codec.text_field(document,reader,"queue_gpu_index")}
+ // Versions before four had an implicit Float32 output setting. Preserve
+ // that existing session policy while fresh/reset state starts with PCM16.
+ if c.version<4{c.export_subtype=4.0}
+ if c.version>=20{
+  c.noise_reduction=try codec.bool_field(document,reader,"noise_reduction")
+  c.room_reduction=try codec.bool_field(document,reader,"room_reduction")
+  c.room_targets=try codec.f64_field(document,reader,"room_targets")
+  c.noise_checkpoint=try codec.text_field(document,reader,"noise_checkpoint")
+  c.room_checkpoint=try codec.text_field(document,reader,"room_checkpoint")
+  c.queue_learned_snapshot=try codec.text_field(document,reader,"queue_learned_snapshot")}
+ if c.version>=19{
+  c.recording_override=try codec.bool_field(document,reader,"recording_override")
+  c.recording_shifts=try codec.text_field(document,reader,"recording_shifts")
+  c.recording_split=try codec.bool_field(document,reader,"recording_split")
+  c.recording_overlap=try codec.text_field(document,reader,"recording_overlap")
+  c.recording_segment=try codec.text_field(document,reader,"recording_segment")
+  c.recording_seed=try codec.text_field(document,reader,"recording_seed")
+  c.queue_recording_snapshot=try codec.text_field(document,reader,"queue_recording_snapshot")
+  c.queue_recording_state=try codec.text_field(document,reader,"queue_recording_state")}
+ if c.version>=18{
+  c.mask_tta=try codec.f64_field(document,reader,"mask_tta")
+  c.mask_window=try codec.text_field(document,reader,"mask_window")
+  c.mask_aggression=try codec.text_field(document,reader,"mask_aggression")
+  c.queue_inference_snapshot=try codec.text_field(document,reader,"queue_inference_snapshot")}
+ if c.version>=17{
+  c.cleanup_enabled=try codec.bool_field(document,reader,"cleanup_enabled")
+  c.cleanup_threshold=try codec.text_field(document,reader,"cleanup_threshold")
+  c.queue_cleanup_snapshot=try codec.text_field(document,reader,"queue_cleanup_snapshot")}
+ if c.version>=16{
+  c.naming_append_model=try codec.bool_field(document,reader,"naming_append_model")
+  c.naming_model_folder=try codec.bool_field(document,reader,"naming_model_folder")
+  c.naming_testing=try codec.bool_field(document,reader,"naming_testing")
+  c.naming_append_ensemble=try codec.bool_field(document,reader,"naming_append_ensemble")
+  c.naming_ensemble_label=try codec.text_field(document,reader,"naming_ensemble_label")
+  c.queue_naming_snapshot=try codec.text_field(document,reader,"queue_naming_snapshot")}
+ if c.version>=15{c.alignment_spectral_match=try codec.bool_field(document,reader,"alignment_spectral_match")}
+ if c.version>=14{
+  c.model_defaults=try codec.text_field(document,reader,"model_defaults")
+  c.model_definition=try codec.text_field(document,reader,"model_definition")
+  c.queue_model_snapshot=try codec.text_field(document,reader,"queue_model_snapshot")}
+ if c.version>=12{
+  c.paired_first_inputs=try codec.text_array_field(document,reader,"paired_first_inputs")
+  c.paired_second_inputs=try codec.text_array_field(document,reader,"paired_second_inputs")
+  c.paired_snapshot=try codec.text_field(document,reader,"paired_snapshot")
+  c.paired_continue=try codec.bool_field(document,reader,"paired_continue")}
+ if c.version>=11{c.processing_sample=try codec.bool_field(document,reader,"processing_sample")}
+ if c.version>=10{
+  c.sample_seconds=try codec.text_field(document,reader,"sample_seconds")
+  c.sample_library=try codec.text_field(document,reader,"sample_library")}
+ if c.version>=9{
+  c.alignment_initial_polarity=try codec.f64_field(document,reader,"alignment_initial_polarity")
+  c.alignment_match_silence=try codec.bool_field(document,reader,"alignment_match_silence")}
+ if c.version>=8{
+  c.alignment_windows=try codec.f64_field(document,reader,"alignment_windows")
+  c.alignment_intros=try codec.f64_field(document,reader,"alignment_intros")
+  c.alignment_gain=try codec.f64_field(document,reader,"alignment_gain")
+  c.alignment_phase=try codec.f64_field(document,reader,"alignment_phase")}
+ if c.version>=7{
+  c.workflow_page=try codec.f64_field(document,reader,"workflow_page")
+  c.window_width=try codec.u64_field(document,reader,"window_width")
+  c.window_height=try codec.u64_field(document,reader,"window_height")
+  c.window_maximized=try codec.bool_field(document,reader,"window_maximized")}
+ c.settings=try codec.text_field(document,reader,"settings")
+ c.checkpoint=try codec.text_field(document,reader,"checkpoint")
+ c.input=try codec.text_field(document,reader,"input")
+ c.output=try codec.text_field(document,reader,"output")
+ c.use_gpu=try codec.bool_field(document,reader,"use_gpu")
+ if c.version>=13{c.high_band=try codec.bool_field(document,reader,"high_band")}
+ c.single_outputs=try codec.f64_field(document,reader,"single_outputs")
+ c.single_complement=try codec.f64_field(document,reader,"single_complement")
+ c.single_normalize=try codec.bool_field(document,reader,"single_normalize")
+ c.single_keep=try codec.bool_field(document,reader,"single_keep")
+ c.ensemble_inputs=try codec.text_array_field(document,reader,"ensemble_inputs")
+ c.ensemble_wave=try codec.bool_field(document,reader,"ensemble_wave")
+ c.ensemble_normalize=try codec.bool_field(document,reader,"ensemble_normalize")
+ c.tool_amount=try codec.text_field(document,reader,"tool_amount")
+ if c.version>=2{c.pitch_amount=try codec.text_field(document,reader,"pitch_amount")}
+ if c.version>=4{
+  c.tempo_amount=try codec.text_field(document,reader,"tempo_amount")
+  c.pitch_preserve_amount=try codec.text_field(document,reader,"pitch_preserve_amount")
+  c.export_subtype=try codec.f64_field(document,reader,"export_subtype")}
+ if c.version>=5{
+  c.output_container=try codec.f64_field(document,reader,"output_container")
+  c.mp3_bitrate=try codec.f64_field(document,reader,"mp3_bitrate")
+  c.codec_directory=try codec.text_field(document,reader,"codec_directory")}
+ if c.version>=6{c.audio_budget=try codec.f64_field(document,reader,"audio_budget")}
+ if c.version>=3{
+  c.alignment_first=try codec.text_field(document,reader,"alignment_first")
+  c.alignment_second=try codec.text_field(document,reader,"alignment_second")
+  c.alignment_polarity=try codec.f64_field(document,reader,"alignment_polarity")
+  c.alignment_save_aligned=try codec.bool_field(document,reader,"alignment_save_aligned")}
+ var items_ensemble_models:codec.Items=try codec.items_field(document,reader,"ensemble_models",codec.strict())
+ loop{var item:codec.Reader=match try codec.next_object(document,items_ensemble_models){some(v)=>v,none=>{break}}
+  let config:string=try codec.text_field(document,item,"config")
+  let checkpoint:string=try codec.text_field(document,item,"checkpoint")
+  let processing:string=try codec.text_field(document,item,"processing")
+  let definition:string=try codec.text_or(document,item,"definition","")
+  let _=try codec.reader_finish(document,item)
+  array.push(c.ensemble_models,model_config.Model{config:config,checkpoint:checkpoint,processing:processing,definition:definition})}
+ c.model_paired=try codec.bool_field(document,reader,"model_paired")
+ c.model_primary=try codec.f64_field(document,reader,"model_primary")
+ c.model_secondary=try codec.f64_field(document,reader,"model_secondary")
+ c.model_wave=try codec.bool_field(document,reader,"model_wave")
+ c.model_normalize=try codec.bool_field(document,reader,"model_normalize")
+ c.model_keep=try codec.bool_field(document,reader,"model_keep")
+ c.model_residual=try codec.bool_field(document,reader,"model_residual")
+ c.model_spectral=try codec.bool_field(document,reader,"model_spectral")
+ var items_secondary_rules:codec.Items=try codec.items_field(document,reader,"secondary_rules",codec.strict())
+ loop{var item:codec.Reader=match try codec.next_object(document,items_secondary_rules){some(v)=>v,none=>{break}}
+  let target:string=try codec.text_field(document,item,"target")
+  let model:u64=try codec.u64_field(document,item,"model")
+  let primary_weight:f64=try codec.f64_field(document,item,"primary_weight")
+  let _=try codec.reader_finish(document,item)
+  array.push(c.secondary_rules,secondary_config.Adjustment{target:target,model:model,primary_weight:primary_weight})}
+ c.secondary_target=try codec.f64_field(document,reader,"secondary_target")
+ c.secondary_weight=try codec.text_field(document,reader,"secondary_weight")
+ c.secondary_outputs=try codec.f64_field(document,reader,"secondary_outputs")
+ c.secondary_normalize=try codec.bool_field(document,reader,"secondary_normalize")
+ c.secondary_keep=try codec.bool_field(document,reader,"secondary_keep")
+ c.secondary_residual=try codec.bool_field(document,reader,"secondary_residual")
+ c.secondary_spectral=try codec.bool_field(document,reader,"secondary_spectral")
+ c.preprocess_model=try codec.u64_field(document,reader,"preprocess_model")
+ c.preprocess_residual=try codec.bool_field(document,reader,"preprocess_residual")
+ c.preprocess_spectral=try codec.bool_field(document,reader,"preprocess_spectral")
+ c.preprocess_extra=try codec.bool_field(document,reader,"preprocess_extra")
+ c.vocal_model=try codec.u64_field(document,reader,"vocal_model")
+ var options:codec.Reader=try codec.object_field(document,reader,"vocal_options",codec.strict())
+ c.vocal_options.rebalance=try codec.f64_field(document,options,"rebalance")
+ c.vocal_options.mixes=try codec.bool_field(document,options,"mixes")
+ c.vocal_options.mix_only=try codec.bool_field(document,options,"mix_only")
+ c.vocal_options.vocal_only=try codec.bool_field(document,options,"vocal_only")
+ c.vocal_options.normalize=try codec.bool_field(document,options,"normalize")
+ let _=try codec.reader_finish(document,options)
+ c.vocal_weight=try codec.text_field(document,reader,"vocal_weight")
+ var items_queue_items:codec.Items=try codec.items_field(document,reader,"queue_items",codec.strict())
+ loop{var item:codec.Reader=match try codec.next_object(document,items_queue_items){some(v)=>v,none=>{break}}
+  let input:string=try codec.text_field(document,item,"input")
+  let folder:string=try codec.text_field(document,item,"folder")
+  let _=try codec.reader_finish(document,item)
+  array.push(c.queue_items,queue_config.Item{input:input,folder:folder})}
+ c.queue_index=try codec.u64_field(document,reader,"queue_index")
+ c.queue_continue=try codec.bool_field(document,reader,"queue_continue")
+ let _=try codec.reader_finish(document,reader)
+ c.version=22
+ result.ok(c)
+}

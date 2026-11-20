@@ -1,0 +1,237 @@
+module stemair.compressed_export
+import "codec_process.ai" as child
+import "export_audio.ai" as wave
+import "control.ai" as control
+import std.audio as audio
+import std.files as files
+import std.path as path
+import std.codec as codec
+import std.text as text
+pub type Settings=struct{format:string="flac",subtype:string="s16",bitrate:string="320k",normalize:bool=false,
+ durable:bool=false,retain_work:bool=false,timeout_ms:u64=30000,encoder:string,encoder_sha256:string,
+ probe:string,probe_sha256:string} derive codec(strict)
+pub type Limits=struct{max_frames:u64,max_stage_bytes:u64,max_encoded_bytes:u64} derive codec(strict)
+pub type FilePlan=struct{frames:u64,samples:u64,input_sample_bytes:u64,intermediate_bytes:u64,segment_bytes:u64,encoded_limit:u64} derive codec(strict)
+
+// File/sample accounting only; retained model memory and allocator overhead are separate.
+pub fn plan_extent(samples:u64,rate:u32,channels:u16,settings:ref<Settings>,limits:ref<Limits>)->result<FilePlan,string> effects {alloc} {
+ let _=try validate(settings)
+ if channels==0 or rate==0 or samples==0 or samples%cast.wrap(channels)!=0{return result.err("Compressed export requires complete nonempty audio frames")}
+ let frames:u64=samples/cast.wrap(channels)
+ if frames>limits.max_frames{return result.err("Compressed export exceeds the selected frame limit")}
+ let width:u64=if settings.subtype=="u8"{1}else{if settings.subtype=="s16"{2}else{if settings.subtype=="s24"{3}else{4}}}
+ let segment_width:u64=if settings.subtype=="s24"{4}else{width}
+ let channel_count:u64=cast.wrap(channels)
+ let source_alignment:u64=channel_count*width
+ let segment_alignment:u64=channel_count*segment_width
+ if source_alignment>65535 or segment_alignment>65535{return result.err("Compressed export exceeds the WAV block alignment field")}
+ let sample_rate:u64=cast.wrap(rate)
+ if sample_rate>4294967295/source_alignment or sample_rate>4294967295/segment_alignment{return result.err("Compressed export exceeds the WAV byte rate field")}
+ // Own native WAV plus the pinned codec's WAV metadata fit this header allowance.
+ if samples>(4294967295-4096)/segment_width{return result.err("Compressed export exceeds the supported RIFF stage extent")}
+ let intermediate:u64=samples*width+4096
+ let segment:u64=samples*segment_width+4096
+ if intermediate>limits.max_stage_bytes or segment>limits.max_stage_bytes{return result.err("Compressed export exceeds the selected stage byte limit")}
+ if limits.max_encoded_bytes<4{return result.err("Compressed export encoded byte limit must be at least four")}
+ result.ok(FilePlan{frames:frames,samples:samples,input_sample_bytes:samples*4,intermediate_bytes:intermediate,segment_bytes:segment,encoded_limit:limits.max_encoded_bytes})
+}
+pub fn plan_extent_f64(samples:u64,rate:u32,channels:u16,settings:ref<Settings>,limits:ref<Limits>)->result<FilePlan,string> effects {alloc} {
+ var plan:FilePlan=try plan_extent(samples,rate,channels,settings,limits)
+ plan.input_sample_bytes=samples*8
+ result.ok(plan)
+}
+pub type ChildReport=struct{argv:array<string>,pid:u64,code:i64,reaped:bool,stdout_bytes:u64,stderr_bytes:u64,
+ stdout_truncated:bool,stderr_truncated:bool} derive codec(strict)
+pub type Report=struct{path:string,format:string,subtype:string,intermediate_subtype:string,bitrate:string,
+ rate:u32,channels:u32,frames:u64,bytes:u64,work_retained:bool,work_path:string,staging_removed:bool,
+ staging_path:string,directory_sync_completed:bool,fallback_used:bool,children:array<ChildReport>} derive codec(strict)
+type Chain=struct{children:array<child.Capture>,fallback:bool,info:audio.WavInfo}
+type ProbeStream=struct{codec_type:string,codec_name:string,sample_fmt:string,bits_per_sample:u32=0} derive codec(lenient)
+type Probe=struct{streams:array<ProbeStream>} derive codec(lenient)
+fn failure(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+fn read_failure(error:files.ReadError)->string effects {alloc} {match error{Io(e)=>failure(e),TooLarge=>"Codec stage exceeds its byte bound"}}
+fn read(file:str,maximum:u64)->result<bytes,string> effects {alloc,fs.read} {result.ok(try files.read_limited(file,maximum) map_err read_failure)}
+fn retained(work:str,removed:bool)->string effects {alloc} {if removed{return ""}
+ text.concat("; codec workspace retained at ",work)}
+fn stage_note(stage:str)->string effects {alloc,fs.meta} {
+ match files.symlink_metadata(stage){err(e)=>{if e.code==1{return ""}},ok(_)=>{}}
+ text.concat("; export staging remains at ",stage)
+}
+fn context(problem:str,work:str,removed:bool,stage:str)->string effects {alloc,fs.meta} {
+ text.concat(problem,text.concat(retained(work,removed),stage_note(stage)))
+}
+pub fn validate(settings:ref<Settings>)->result<unit,string> effects {alloc} {
+ let _=try wave.subtype(settings.subtype)
+ if settings.format!="flac" and settings.format!="mp3"{return result.err("Choose FLAC or MP3 export")}
+ if settings.bitrate!="96k" and settings.bitrate!="128k" and settings.bitrate!="160k" and settings.bitrate!="224k" and settings.bitrate!="256k" and settings.bitrate!="320k"{return result.err("Choose a supported MP3 bitrate")}
+ if settings.timeout_ms==0 or settings.timeout_ms>300000{return result.err("Codec deadline must be 1..300000 ms")}
+ result.ok(())
+}
+fn chain(source:ref<audio.AudioBuffer>,wide:view<f64>,wide_input:bool,settings:ref<Settings>,work:str,cancel:str,progress:str,limits:ref<Limits>,lifetime:ref<child.Lifetime>)->result<Chain,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let deadline:u64=time.monotonic_ns()+settings.timeout_ms*1000000
+ let intermediate:string=if settings.subtype=="f64"{"f32"}else{string.copy(settings.subtype)}
+ let source_path:string=path.join(work,"source.wav")
+ let wav_settings:wave.Settings=wave.Settings{subtype:intermediate,normalize:settings.normalize}
+ let _=try if wide_input{wave.run_f64(wide,source.rate,source.channels,wav_settings,source_path,cancel,progress)}else{wave.run(source,wav_settings,source_path,cancel,progress)}
+ let raw:bytes=try read(source_path,limits.max_stage_bytes)
+ let info:audio.WavInfo=try audio.inspect_wav(bytes.view(raw)) map_err audio.message
+ var children:array<child.Capture>=[]
+ let segment:string=path.join(work,"segment.wav")
+ if info.subtype==audio.WavSubtype.Float32{
+  let probe_args:array<string>=[string.copy(settings.probe),"-of","json","-v","info","-show_format","-show_streams",string.copy(source_path)]
+  let observed:child.Capture=try child.run_observed(probe_args,work,path.join(work,"probe"),"",cancel,deadline,65536,lifetime)
+  if observed.code!=0 or observed.stdout_truncated{return result.err("Cannot inspect the intermediate float WAV with the selected probe")}
+  array.push(children,observed)
+  let json:bytes=try read(path.join(work,"probe.out"),65536)
+  let value:str=match str.from_bytes(bytes.view(json)){some(v)=>v,none=>{return result.err("Codec probe did not return UTF-8 JSON")}}
+  var probe:Probe=try Probe_decode(value) map_err codec.describe
+  if array.len(probe.streams)!=1{return result.err("Intermediate float WAV must have one audio stream")}
+  let stream:ref<ProbeStream>=array.borrow(struct.borrow(probe,field=streams),0)
+  if stream.codec_type!="audio" or stream.codec_name!="pcm_f32le" or stream.sample_fmt!="flt"{return result.err("Intermediate float WAV probe reported an unsupported format")}
+  let decode:array<string>=[string.copy(settings.encoder),"-y","-f","wav","-i",string.copy(source_path),"-acodec","pcm_s32le","-vn","-f","wav",string.copy(segment)]
+  let converted:child.Capture=try child.run_observed(decode,work,path.join(work,"decode"),segment,cancel,deadline,limits.max_stage_bytes,lifetime)
+  if converted.code!=0{return result.err("Intermediate float WAV decoding failed")}
+  array.push(children,converted)
+ }else{
+  let payload:view<byte>=view.slice(bytes.view(raw),info.data_offset,info.data_offset+info.data_bytes)
+  var packed:array<byte>=[]
+  let kind:audio.WavSubtype=if info.subtype==audio.WavSubtype.Pcm24{audio.WavSubtype.Pcm32}else{info.subtype}
+  var i:u64=0
+  loop{if i==view.len(payload){break}
+   if info.subtype==audio.WavSubtype.Pcm24{
+    let high:u8=cast.bits(view.get(payload,i+2))
+    let sign:u8=if high>=128{255}else{0}
+    array.push(packed,cast.bits(sign))
+    array.push(packed,view.get(payload,i))
+    array.push(packed,view.get(payload,i+1))
+    array.push(packed,view.get(payload,i+2))
+    i+=3
+   }else{array.push(packed,view.get(payload,i))
+    i+=1}}
+  let rewritten:bytes=try audio.encode_pcm_wav(array.view(packed),info.rate,info.channels,kind) map_err audio.message
+  let _=try files.write_new_bytes(segment,bytes.view(rewritten)) map_err failure
+ }
+ let segment_bytes:bytes=try read(segment,limits.max_stage_bytes)
+ let segment_info:audio.WavInfo=try audio.inspect_wav(bytes.view(segment_bytes)) map_err audio.message
+ let expected:audio.WavSubtype=if info.subtype==audio.WavSubtype.Pcm24 or info.subtype==audio.WavSubtype.Float32{audio.WavSubtype.Pcm32}else{info.subtype}
+ if segment_info.subtype!=expected or segment_info.rate!=info.rate or segment_info.channels!=info.channels or segment_info.frames!=info.frames{return result.err("Codec stage changed its required PCM shape or subtype")}
+ control.status(progress,"Encoding audio")
+ let output:string=path.join(work,"encoded.bin")
+ var argv:array<string>=[string.copy(settings.encoder),"-y","-f","wav","-i",string.copy(segment)]
+ if settings.format=="mp3"{array.push(argv,"-acodec")
+  array.push(argv,"libmp3lame")
+  array.push(argv,"-b:a")
+  array.push(argv,string.copy(settings.bitrate))}
+ array.push(argv,"-f")
+ array.push(argv,string.copy(settings.format))
+ array.push(argv,string.copy(output))
+ let encoded:child.Capture=try child.run_observed(argv,work,path.join(work,"encode"),output,cancel,deadline,limits.max_encoded_bytes,lifetime)
+ let retry:bool=encoded.code!=0 and settings.format=="mp3"
+ array.push(children,encoded)
+ if retry{
+  let fallback:array<string>=[string.copy(settings.encoder),"-y","-f","wav","-i",string.copy(segment),"-b:a",string.copy(settings.bitrate),"-f","mp3",string.copy(output)]
+  let retried:child.Capture=try child.run_observed(fallback,work,path.join(work,"fallback"),output,cancel,deadline,limits.max_encoded_bytes,lifetime)
+  if retried.code!=0{return result.err("Both MP3 encoder attempts failed")}
+  array.push(children,retried)
+ }else{if array.get(children,array.len(children)-1).code!=0{return result.err("FLAC encoding failed")}}
+ let complete:bytes=try read(output,limits.max_encoded_bytes)
+ if view.len(bytes.view(complete))<4{return result.err("Codec returned an empty or torn output")}
+ if settings.format=="flac"{
+  if view.get(bytes.view(complete),0)!=102 or view.get(bytes.view(complete),1)!=76 or view.get(bytes.view(complete),2)!=97 or view.get(bytes.view(complete),3)!=67{return result.err("Codec did not return a FLAC container")}
+ }else{
+  let first:u8=cast.bits(view.get(bytes.view(complete),0))
+  let second:u8=cast.bits(view.get(bytes.view(complete),1))
+  let tagged:bool=view.get(bytes.view(complete),0)==73 and view.get(bytes.view(complete),1)==68 and view.get(bytes.view(complete),2)==51
+  if not tagged and not(first==255 and (second & 224)==224){return result.err("Codec did not return an MP3 container")}}
+ // The private .bin stage must not select a filename-based demuxer.
+ let check_args:array<string>=[string.copy(settings.encoder),"-v","error","-xerror","-f",string.copy(settings.format),"-i",string.copy(output),"-f","null","-"]
+ let checked:child.Capture=try child.run_observed(check_args,work,path.join(work,"check"),"",cancel,deadline,65536,lifetime)
+ if checked.code!=0{return result.err("Encoded audio failed complete decode validation")}
+ array.push(children,checked)
+ result.ok(Chain{children:children,fallback:retry,info:info})
+}
+fn cleanup(work:str)->bool effects {alloc,fs.write,fs.meta} {
+ let names:array<string>=["source.wav","source.wav.export","segment.wav","encoded.bin","probe.out","probe.err","decode.out","decode.err","encode.out","encode.err","fallback.out","fallback.err","check.out","check.err"]
+ var i:u64=0
+ loop{if i==array.len(names){break}
+  let _=files.remove(path.join(work,array.get(names,i)))
+  i+=1}
+ let _=files.remove(work)
+ match files.symlink_metadata(work){err(e)=>e.code==1,ok(_)=>false}
+}
+fn run_impl(source:ref<audio.AudioBuffer>,wide:view<f64>,wide_input:bool,settings:ref<Settings>,target:str,cancel:str,progress:str,limits:ref<Limits>)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let _=try validate(settings)
+ if not path.is_absolute(target){return result.err("Choose an absolute compressed output path")}
+ if control.cancelled(cancel){return result.err("Audio export cancelled")}
+ match files.symlink_metadata(target){ok(_)=>{return result.err("An output already exists; existing files are preserved")},err(e)=>{if e.code!=1{return result.err("Cannot inspect compressed output path")}}}
+ let encoder:child.Tool=child.Tool{path:string.copy(settings.encoder),sha256:string.copy(settings.encoder_sha256)}
+ let probe:child.Tool=child.Tool{path:string.copy(settings.probe),sha256:string.copy(settings.probe_sha256)}
+ let _=try child.verify(encoder)
+ let _=try child.verify(probe)
+ let stage:string=text.concat(target,".export")
+ var sink:files.Sink=try files.sink_create(target,stage) map_err failure
+ let work:string=text.concat(target,".work")
+ match files.create_dir(work){ok(_)=>{},err(e)=>{let _=files.sink_discard(sink)
+  return result.err(text.concat(text.concat("Cannot create an exclusive codec workspace: ",failure(e)),stage_note(stage)))}}
+ var lifetime:child.Lifetime=child.Lifetime{}
+ let result:result<Chain,string>=chain(source,wide,wide_input,settings,work,cancel,progress,limits,lifetime)
+ var prepared:Chain=match result{ok(v)=>v,err(e)=>{
+  let _=files.sink_discard(sink)
+  let removed:bool=if settings.retain_work or not lifetime.quiescent{false}else{cleanup(work)}
+  return result.err(context(e,work,removed,stage))}}
+ let payload:bytes=match read(path.join(work,"encoded.bin"),limits.max_encoded_bytes){ok(v)=>v,err(e)=>{let _=files.sink_discard(sink)
+  let removed:bool=if settings.retain_work{false}else{cleanup(work)}
+  return result.err(context(e,work,removed,stage))}}
+ let written:result<unit,fs.error>=files.sink_write(sink,bytes.view(payload))
+ if not result.is_ok(written) or control.cancelled(cancel){let _=files.sink_discard(sink)
+  let removed:bool=if settings.retain_work{false}else{cleanup(work)}
+  return result.err(context("Audio export cancelled or stage write failed",work,removed,stage))}
+ let published:result<files.Publication,fs.error>=files.sink_publish_new(sink,settings.durable)
+ let removed:bool=if settings.retain_work{false}else{cleanup(work)}
+ let final:files.Publication=match published{ok(v)=>v,err(e)=>{return result.err(context(failure(e),work,removed,stage))}}
+ control.status(progress,"Audio export complete")
+ var children:array<ChildReport>=[]
+ var i:u64=0
+ loop{if i==array.len(prepared.children){break}
+  let captured:ref<child.Capture>=array.borrow(struct.borrow(prepared,field=children),i)
+  var argv:array<string>=[]
+  var j:u64=0
+  loop{if j==array.len(captured.argv){break}
+   array.push(argv,string.copy(array.get(captured.argv,j)))
+   j+=1}
+  array.push(children,ChildReport{argv:argv,pid:captured.pid,code:captured.code,reaped:captured.reaped,
+   stdout_bytes:captured.stdout_bytes,stderr_bytes:captured.stderr_bytes,stdout_truncated:captured.stdout_truncated,stderr_truncated:captured.stderr_truncated})
+  i+=1}
+ result.ok(Report{path:string.copy(target),format:string.copy(settings.format),subtype:string.copy(settings.subtype),
+ intermediate_subtype:if settings.subtype=="f64"{"f32"}else{string.copy(settings.subtype)},bitrate:string.copy(settings.bitrate),
+ rate:prepared.info.rate,channels:cast.wrap(prepared.info.channels),frames:prepared.info.frames,bytes:view.len(bytes.view(payload)),work_retained:not removed,
+ work_path:if removed{""}else{work},staging_removed:final.temporary_removed,staging_path:if final.temporary_removed{""}else{string.copy(final.temporary)},
+ directory_sync_completed:final.directory_sync_completed,fallback_used:prepared.fallback,children:children})
+}
+pub fn run_limited(source:ref<audio.AudioBuffer>,settings:ref<Settings>,target:str,cancel:str,progress:str,limits:ref<Limits>)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let _=try plan_extent(array.len(source.samples),source.rate,source.channels,settings,limits)
+ let wide:array<f64>=[]
+ run_impl(source,array.view(wide),false,settings,target,cancel,progress,limits)
+}
+pub fn run(source:ref<audio.AudioBuffer>,settings:ref<Settings>,target:str,cancel:str,progress:str)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ // Preserve the established entry point and byte policy; larger limits are explicit.
+ let limits:Limits=Limits{max_frames:18446744073709551615,max_stage_bytes:67112960,max_encoded_bytes:67112960}
+ let wide:array<f64>=[]
+ run_impl(source,array.view(wide),false,settings,target,cancel,progress,limits)
+}
+pub fn run_f64_limited(samples:view<f64>,rate:u32,channels:u16,settings:ref<Settings>,target:str,cancel:str,progress:str,limits:ref<Limits>)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let _=try plan_extent_f64(view.len(samples),rate,channels,settings,limits)
+ let shape:audio.AudioBuffer=audio.AudioBuffer{samples:[],rate:rate,channels:channels}
+ run_impl(shape,samples,true,settings,target,cancel,progress,limits)
+}
+pub fn run_f64(samples:view<f64>,rate:u32,channels:u16,settings:ref<Settings>,target:str,cancel:str,progress:str)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let limits:Limits=Limits{max_frames:18446744073709551615,max_stage_bytes:67112960,max_encoded_bytes:67112960}
+ let shape:audio.AudioBuffer=audio.AudioBuffer{samples:[],rate:rate,channels:channels}
+ run_impl(shape,samples,true,settings,target,cancel,progress,limits)
+}

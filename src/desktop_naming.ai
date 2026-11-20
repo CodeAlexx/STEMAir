@@ -1,0 +1,58 @@
+module stemair.desktop_naming
+import "preferences.ai" as prefs
+import "naming_application.ai" as application
+import "output_naming.ai" as naming
+import "queue_naming.ai" as queued
+import "queue_config.ai" as queue_config
+import "../toolkit/secondary_config.ai" as secondary_config
+import "../toolkit/model_ensemble_config.ai" as ensemble_config
+import std.text as text
+
+pub fn choices(state:ref<prefs.State>)->application.Choices effects {alloc} {
+ application.Choices{append_model:state.naming_append_model,model_folder:state.naming_model_folder,testing:state.naming_testing,
+  append_ensemble:state.naming_append_ensemble,ensemble_label:string.copy(state.naming_ensemble_label)}
+}
+fn timestamp()->u64 effects {time} {
+ let milliseconds:u64=time.now_ms()
+ let seconds:u64=milliseconds/1000
+ let fraction:u64=milliseconds%1000
+ if fraction>500 or (fraction==500 and seconds%2==1){seconds+1}else{seconds}
+}
+pub fn testing_prefix(enabled:bool)->string effects {alloc,time} {
+ if enabled{text.concat(string.from_int(timestamp()),"_")}else{""}
+}
+pub fn single(state:ref<prefs.State>)->result<string,string> effects {alloc,fs.read,fs.meta,time} {
+ let selected:application.Choices=choices(state)
+ var context:naming.Selection=naming.Selection.Single(try application.read_model(state.settings,state.checkpoint,state.model_definition,selected,1,timestamp()))
+ naming.encode_selection(context)
+}
+pub fn secondary(state:ref<prefs.State>,recipe:ref<secondary_config.Recipe>,definition:str)->result<string,string> effects {alloc,fs.read,fs.meta,time} {
+ let selected:application.Choices=choices(state)
+ var context:naming.Selection=naming.Selection.Secondary(try application.chain(recipe,definition,selected,1,timestamp()))
+ naming.encode_selection(context)
+}
+pub fn ensemble(state:ref<prefs.State>,recipe:ref<ensemble_config.Recipe>)->result<string,string> effects {alloc,fs.read,fs.meta,time} {
+ let selected:application.Choices=choices(state)
+ var context:naming.Selection=naming.Selection.ModelEnsemble(try application.ensemble(recipe,selected,1,timestamp()))
+ naming.encode_selection(context)
+}
+pub fn queue(state:ref<prefs.State>,configuration:str,checkpoint:str,definition:str,ensemble:ref<option<ensemble_config.Recipe>>,secondary:ref<option<secondary_config.Recipe>>,items:ref<array<queue_config.Item>>)->result<string,string>
+ effects {alloc,fs.read,fs.meta,time} {
+ let has_ensemble:bool=match ensemble{some(_)=>true,none=>false}
+ let has_secondary:bool=match secondary{some(_)=>true,none=>false}
+ if has_ensemble and has_secondary{return result.err("Choose one queue processing workflow")}
+ let kind:u32=if has_ensemble{2}else{if has_secondary{1}else{0}}
+ if str.len(state.queue_naming_snapshot)>0{
+  var accepted:naming.Queue=try naming.decode_queue(state.queue_naming_snapshot)
+  if queued.kind(struct.borrow(accepted,field=selection))!=kind{return result.err("Pending queue naming belongs to another workflow; explicitly use current settings")}
+  let _=try queued.project(accepted,items)
+  return result.ok(string.copy(state.queue_naming_snapshot))
+ }
+ let selected:application.Choices=choices(state)
+ let stamp:u64=timestamp()
+ let context:naming.Selection=match ensemble{some(recipe)=>naming.Selection.ModelEnsemble(try application.ensemble(recipe,selected,1,stamp)),none=>match secondary{
+  some(recipe)=>naming.Selection.Secondary(try application.chain(recipe,definition,selected,1,stamp)),
+  none=>naming.Selection.Single(try application.read_model(configuration,checkpoint,definition,selected,1,stamp))}}
+ var accepted:naming.Queue=try queued.accept(context,items)
+ naming.encode_queue(accepted)
+}

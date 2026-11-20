@@ -1,0 +1,9 @@
+{
+  "model": "mask-recurrent-v1",
+  "filename": "mask-recurrent-v1.pth",
+  "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-De-Echo-Normal.pth",
+  "bytes": 127139365,
+  "sha256": "b849dd575643b075c257fb7a96c2ef5a79d7a5e7df74a2b319ad47118f1ee769",
+  "reference_metadata_tail_md5": "f200a145434efc7dcf0cd093f517ed52",
+  "credit": "Recurrent vocal-remover architecture by tsurumeso and application contributors; original model credited to FoxJoy by Ultimate Vocal Remover"
+}

@@ -1,0 +1,65 @@
+module stemair.recording_alignment_io
+import "recording_alignment_application.ai" as application
+import "checked_input.ai" as checked
+import "container_export.ai" as container
+import "alignment_thread_policy.ai" as threads
+import "../toolkit/recording_alignment.ai" as core
+import "../toolkit/control.ai" as control
+import std.audio as audio
+import std.codec as codec
+import std.path as path
+
+type Manifest=struct{operation:string,first:string,second:string,frames:u64,channels:u64,sample_rate:u32,
+ lag_samples:i64,inverted:bool,silence_delta:i64,intro_index:u64,local_windows:u64,
+ residual:string,aligned:string,backend:string,checkpoint_loads:u64} derive codec(strict)
+
+fn run_impl(settings:ref<application.Settings>,first:str,second:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:ref<checked.Options>)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ let _=try application.validate(settings)
+ let _=try container.verify(plan)
+ let _=try container.require_directory(directory)
+ let start:u64=array.len(log.artifacts)
+ let _=try container.preflight_tracked(container.target(directory,"residual",plan),plan,log)
+ if settings.save_aligned{let _=try container.preflight_tracked(container.target(directory,"aligned",plan),plan,log)}
+ let _=try container.preflight_metadata_tracked(path.join(directory,"recording-alignment.json"),log)
+ let a:audio.AudioBuffer=try checked.buffer(first,44100,checked.queue_item(options,0,cancel))
+ let b:audio.AudioBuffer=try checked.buffer(second,44100,checked.queue_item(options,1,cancel))
+ var value:core.FactoryOutput=try application.compute_buffers(settings,a,b,cancel,progress,false)
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled before export")}
+ let frames:u64=value.preparation.frames
+ let channels:u64=value.preparation.channels
+ let manifest:Manifest=Manifest{operation:"recording-alignment-default",first:string.copy(first),second:string.copy(second),
+  frames:frames,channels:channels,sample_rate:44100,lag_samples:array.get(value.preparation.lags,0).samples,
+  inverted:value.preparation.decision.inverted,silence_delta:value.preparation.silence_delta,intro_index:value.preparation.intro_index,
+  local_windows:array.len(value.steps),residual:container.filename("residual",plan),
+  aligned:if settings.save_aligned{container.filename("aligned",plan)}else{""},backend:"native-air-cpu",checkpoint_loads:0}
+ let residual:audio.AudioBuffer=audio.AudioBuffer{samples:struct.replace(value,[],field=residual),rate:44100,channels:cast.wrap(channels)}
+ let _=try container.write_buffer(container.target(directory,"residual",plan),residual,plan,log,cancel,progress)
+ if settings.save_aligned{
+  let aligned:audio.AudioBuffer=audio.AudioBuffer{samples:struct.replace(value,[],field=aligned),rate:44100,channels:cast.wrap(channels)}
+  let _=try container.write_buffer(container.target(directory,"aligned",plan),aligned,plan,log,cancel,progress)}
+ let raw:string=try Manifest_encode(manifest) map_err codec.describe
+ container.write_metadata(path.join(directory,"recording-alignment.json"),raw,plan,log,start)
+}
+pub fn run(settings:ref<application.Settings>,first:str,second:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:ref<checked.Options>)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ let _=try run_guarded(settings,first,second,directory,cancel,progress,plan,log,options) map_err threads.describe
+ result.ok(())
+}
+// Desktop callers retain the structured restoration failure to quarantine CPU reuse.
+pub fn run_guarded(settings:ref<application.Settings>,first:str,second:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:ref<checked.Options>)->result<unit,threads.Failure>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ log.attempted=""
+ log.failure=""
+ if control.cancelled(cancel){return result.err(threads.failure("Recording alignment cancelled"))}
+ let _=try application.validate(settings) map_err threads.failure
+ let lease:threads.Lease=try threads.begin(settings.dot_runtime,settings.dot_sha256)
+ let outcome:result<unit,string>=run_impl(settings,first,second,directory,cancel,progress,plan,log,options)
+ match threads.finish(lease,outcome){ok(value)=>result.ok(value),err(problem)=>{
+  if str.len(log.failure)==0{container.record_failure(log,"",problem.message)}
+  result.err(problem)}}
+}

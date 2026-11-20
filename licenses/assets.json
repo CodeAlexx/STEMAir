@@ -1,0 +1,9 @@
+{
+  "model": "spectral-v1",
+  "filename": "spectral-v1.ckpt",
+  "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/MDX23C-8KFFT-InstVoc_HQ.ckpt",
+  "bytes": 448101203,
+  "sha256": "49d51472769e34a2501cd1da782346a3212555c3a5619fc2c53507445528d816",
+  "configuration": "configs/spectral-v1.json",
+  "credit": "UVR developers Anjok07 and aufr33; MDX23C network and weights credited to ZFTurbo by the application README"
+}

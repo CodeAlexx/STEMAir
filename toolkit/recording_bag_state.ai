@@ -1,0 +1,189 @@
+module stemair.recording_bag_state
+import "recording_bag_config.ai" as config
+import "attention/session.ai" as attention
+import "attention/config.ai" as attention_config
+import "hybrid/session.ai" as hybrid
+import "hybrid/config.ai" as hybrid_config
+import "hybrid/host_session.ai" as hybrid_host
+import "residual_waveform/session.ai" as residual
+import "residual_waveform/config.ai" as residual_config
+import std.files as files
+import std.path as path
+import std.codec as codec
+import std.yaml as yaml
+import std.json as json
+
+pub type Model=enum{Attention(attention.Session),Hybrid(hybrid.Session),Residual(residual.Session)}
+pub type Slot=struct{checkpoint:string,kind:string,identity:string,model:Model}
+pub type Member=struct{slot:u64,weights:array<f64>,segment_samples:u64=0}
+pub type State=struct{slots:array<Slot>,members:array<Member>,targets:array<string>,requests:u64=0}
+// Encoded checkpoint intake and caller work policy are separate allowances.
+pub type Limits=struct{max_members:u64,max_checkpoint_bytes:u64,max_definition_bytes:u64}
+pub type Intake=struct{definition_bytes:u64,checkpoint_bytes:u64,models:u64}
+fn error(e:fs.error)->string effects {alloc}{string.copy(fs.error.message(e))}
+// Metadata only; the caller applies its retained-host policy before open.
+pub fn inspect(file:str,c:ref<config.Config>)->result<Intake,string> effects {alloc,fs.meta}{
+ let _=try config.validate(c)
+ let definition:u64=try files.file_size(file) map_err error
+ if definition==0{return result.err("Empty recording bundle definition")}
+ var paths:array<string>=[]
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(c.members){break}
+  let row:ref<config.Member>=array.borrow(c.members,i)
+  let checkpoint:string=path.normalize(path.join(path.dirname(file),row.filename))
+  var duplicate:bool=false
+  var j:u64=0
+  loop{if j==array.len(paths){break}
+   if str.view(checkpoint)==array.get(paths,j){duplicate=true}
+   j+=1}
+  if not duplicate{
+   let count:u64=try files.file_size(checkpoint) map_err error
+   if count==0 or count>18446744073709551615-total{return result.err("Recording bundle checkpoint extent overflows")}
+   total+=count
+   array.push(paths,checkpoint)}
+  i+=1}
+ result.ok(Intake{definition_bytes:definition,checkpoint_bytes:total,models:array.len(paths)})
+}
+fn open_model(file:str,row:ref<config.Member>)->result<Model,string> effects {alloc,fs.read}{
+ if row.kind=="attention"{
+  var c:attention_config.Config=try attention_config.Config_decode(row.identity) map_err codec.describe
+  return result.ok(Model.Attention(try attention.open(file,c)))}
+ if row.kind=="hybrid"{
+  var c:hybrid_config.Config=try hybrid_config.Config_decode(row.identity) map_err codec.describe
+  return result.ok(Model.Hybrid(try hybrid.open(file,c)))}
+ if row.kind=="residual-waveform"{
+  var c:residual_config.Config=try residual_config.Config_decode(row.identity) map_err codec.describe
+  return result.ok(Model.Residual(try residual.open(file,c)))}
+ result.err("Recording bundle member family is unsupported")
+}
+pub fn open(file:str,c:ref<config.Config>,limits:ref<Limits>)->result<State,string> effects {alloc,fs.read,fs.meta}{
+ let _=try config.validate(c)
+ if limits.max_members==0 or array.len(c.members)>limits.max_members or limits.max_checkpoint_bytes==0 or limits.max_definition_bytes==0{return result.err("Recording bundle exceeds its explicit intake allowances")}
+ let raw:bytes=match files.read_limited(file,limits.max_definition_bytes){ok(value)=>value,err(_)=>{return result.err("Cannot read recording bundle within its definition allowance")}}
+ let text:str=match str.from_bytes(bytes.view(raw)){some(value)=>value,none=>{return result.err("Recording bundle definition must be UTF-8")}}
+ let document:json.Document=try yaml.parse(text) map_err yaml.message
+ var definition:config.Definition=try config.parse_definition(json.stringify(document))
+ let _=try config.validate_definition(c,definition)
+ var paths:array<string>=[]
+ var positions:array<u64>=[]
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(c.members){break}
+  let row:ref<config.Member>=array.borrow(c.members,i)
+  let checkpoint:string=path.normalize(path.join(path.dirname(file),row.filename))
+  var found:option<u64>=option.none()
+  var j:u64=0
+  loop{if j==array.len(paths){break}
+   if str.view(checkpoint)==array.get(paths,j){found=option.some(j)
+    break}
+   j+=1}
+  match found{some(index)=>array.push(positions,index),none=>{
+   let size:u64=try files.file_size(checkpoint) map_err error
+   if size==0 or size>limits.max_checkpoint_bytes-total{return result.err("Recording bundle checkpoints exceed their explicit retained intake allowance")}
+   total+=size
+   array.push(positions,array.len(paths))
+   array.push(paths,checkpoint)}}
+  i+=1}
+ var state:State=State{slots:[],members:[],targets:[]}
+ i=0
+ loop{if i==array.len(c.targets){break}
+  array.push(state.targets,string.copy(array.get(c.targets,i)))
+  i+=1}
+ i=0
+ loop{if i==array.len(c.members){break}
+  let row:ref<config.Member>=array.borrow(c.members,i)
+  let index:u64=array.get(positions,i)
+  if index==array.len(state.slots){
+   let checkpoint:str=array.get(paths,index)
+   let model:Model=try open_model(checkpoint,row)
+   array.push(state.slots,Slot{checkpoint:string.copy(checkpoint),kind:string.copy(row.kind),identity:string.copy(row.identity),model:model})}
+  var weights:array<f64>=[]
+  var source:u64=0
+  loop{if source==array.len(c.targets){break}
+   let value:f64=match definition.weights{none=>1.0,some(rows)=>array.get(array.borrow(rows,i),source)}
+   array.push(weights,value)
+   source+=1}
+  let segment:u64=match definition.segment{none=>0,some(seconds)=>cast.sat(seconds*44100.0)}
+  array.push(state.members,Member{slot:index,weights:weights,segment_samples:segment})
+  i+=1}
+ result.ok(state)
+}
+pub fn prepare_cpu(state:ref<State>,platform:str)->result<unit,string> effects {alloc,fs.read}{
+ var i:u64=0
+ loop{if i==array.len(state.slots){break}
+  let slot:ref<Slot>=array.borrow(state.slots,i)
+  match slot.model{
+   Attention(model)=>{let _=try attention.prepare_cpu(model,platform)},
+   Hybrid(model)=>{let _=try hybrid.prepare_cpu(model)},
+   Residual(model)=>{let _=try residual.prepare_cpu(model)}}
+  i+=1}
+ result.ok(())
+}
+pub fn cpu_ready(state:ref<State>)->bool effects {}{
+ if array.len(state.slots)==0{return false}
+ var i:u64=0
+ loop{if i==array.len(state.slots){break}
+  let ready:bool=match array.borrow(state.slots,i).model{Attention(model)=>array.len(model.cpu)==1,Hybrid(model)=>array.len(model.cpu)==1,Residual(model)=>array.len(model.cpu)==1}
+  if not ready{return false}
+  i+=1}
+ true
+}
+pub fn has_magnitude(state:ref<State>)->bool effects {}{
+ var i:u64=0
+ loop{if i==array.len(state.slots){break}
+  match array.borrow(state.slots,i).model{Hybrid(model)=>{if not model.network.constructor.kwargs.cac{return true}},Attention(_)=>{},Residual(_)=>{}}
+  i+=1}
+ false
+}
+pub fn configure_cpu_transform(state:ref<State>,runtime:str)->result<unit,string> effects {alloc}{
+ var i:u64=0
+ loop{if i==array.len(state.slots){break}
+  match array.borrow(state.slots,i).model{Hybrid(model)=>{if not model.network.constructor.kwargs.cac{
+   if str.len(runtime)==0 or array.len(model.cpu)!=1{return result.err("Magnitude bag member requires its prepared bank and selected transform runtime")}
+   let selected:ref<hybrid_host.Prepared>=array.borrow(model.cpu,0)
+   if str.len(selected.runtime)!=0 and str.view(selected.runtime)!=runtime{return result.err("Bag transform runtime changed; release models first")}}},Attention(_)=>{},Residual(_)=>{}}
+  i+=1}
+ i=0
+ loop{if i==array.len(state.slots){break}
+  match array.borrow(state.slots,i).model{Hybrid(model)=>{if not model.network.constructor.kwargs.cac{
+   let selected:ref<hybrid_host.Prepared>=array.borrow(model.cpu,0)
+   selected.runtime=string.copy(runtime)}},Attention(_)=>{},Residual(_)=>{}}
+  i+=1}
+ result.ok(())
+}
+pub fn close_cpu(state:ref<State>)->result<unit,string> effects {alloc,ffi}{
+ var i:u64=0
+ loop{if i==array.len(state.slots){break}
+  match array.borrow(state.slots,i).model{Hybrid(model)=>{
+   var j:u64=0
+   loop{if j==array.len(model.cpu){break}
+    let _=try hybrid_host.close_original(array.borrow(model.cpu,j))
+    j+=1}},Attention(_)=>{},Residual(_)=>{}}
+  i+=1}
+ result.ok(())
+}
+pub fn loads(state:ref<State>)->u64 effects {}{
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(state.slots){break}
+  match array.borrow(state.slots,i).model{Attention(model)=>{total+=model.network.weights.loads},Hybrid(model)=>{total+=model.network.weights.loads},Residual(model)=>{total+=model.network.weights.loads}}
+  i+=1}
+ total
+}
+pub fn bytes_read(state:ref<State>)->u64 effects {}{
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(state.slots){break}
+  match array.borrow(state.slots,i).model{Attention(model)=>{total+=model.network.weights.bytes_read},Hybrid(model)=>{total+=model.network.weights.bytes_read},Residual(model)=>{total+=model.network.weights.bytes_read}}
+  i+=1}
+ total
+}
+pub fn parameter_count(state:ref<State>)->u64 effects {}{
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(state.slots){break}
+  match array.borrow(state.slots,i).model{Attention(model)=>{total+=array.len(model.network.weights.parameters.values)},Hybrid(model)=>{total+=array.len(model.network.weights.parameters.values)},Residual(model)=>{total+=array.len(model.network.weights.parameters.values)}}
+  i+=1}
+ total
+}

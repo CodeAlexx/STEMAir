@@ -1,0 +1,156 @@
+// Retained centered real transform using shared FFT and ordered overlap synthesis.
+module stemair.spectral_device_frontend
+import std.mkl_vml as vml
+import "ops.ai" as ops
+import "numeric.ai" as num
+import std.compute as compute
+import std.tensor as tensor
+import std.gpu as agpu
+import std.text as text
+pub type Plan=struct{window:array<f32>,n:u64,hop:u64,frames:u64,bins:u64,bands:u64,targets:u64}
+pub type Prepared=struct{forward_workspace:u64,inverse_workspace:u64,clone_bytes:u64}
+fn problem(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+pub fn create(runtime:str,n:u64,hop:u64,frames:u64,bins:u64,bands:u64,targets:u64)->result<Plan,string> effects {alloc,ffi} {
+ if n<2 or n>32768 or n%2!=0 or hop==0 or hop>n or frames<2 or frames>2048 or bins==0 or bins>n/2+1 or bands==0 or bins%bands!=0 or targets==0 or targets>8{
+  return result.err("Invalid retained GPU transform geometry")}
+ var host:vml.Vml=try vml.open(runtime)
+ if not text.contains(host.version,"Version 2025.3-Product Build 20251007") and not text.contains(host.version,"Version 2024.2-Product Build 20240605"){return result.err("CPU Hann requires its unchanged qualified runtime build")}
+ let window:array<f32>=try vml.hann_f32(host,n,true)
+ result.ok(Plan{window:window,n:n,hop:hop,frames:frames,bins:bins,bands:bands,targets:targets})
+}
+pub fn prepare(stream:ref<GpuStream>,p:ref<Plan>)->result<Prepared,string> effects {alloc,gpu} {
+ let forward:u64=try compute.prepare_rfft_1d(stream,p.n,2*p.frames,67108864) map_err problem
+ let inverse:compute.IrfftPreparation=try compute.prepare_irfft_1d(stream,p.n,2*p.targets*p.frames,67108864,2*p.targets*p.frames*(p.n/2+1)*2*4) map_err problem
+ result.ok(Prepared{forward_workspace:forward,inverse_workspace:inverse.workspace_bytes,clone_bytes:inverse.clone_bytes})
+}
+pub fn analyze(context:ref<GpuContext>,stream:ref<GpuStream>,p:ref<Plan>,input:view<f32>)->result<ops.Tensor,string> effects {alloc,gpu} {
+ let samples:u64=p.hop*(p.frames-1)
+ if view.len(input)!=2*samples or samples<=p.n/2 or not num.finite(input){return result.err("Invalid retained GPU transform input")}
+ var windowed:array<f32>=[]
+ array.reserve(windowed,2*p.frames*p.n)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var frame:u64=0
+  loop{if frame==p.frames{break}
+   var i:u64=0
+   loop{if i==p.n{break}
+    let position:i64=cast.sat(frame*p.hop+i)-cast.sat(p.n/2)
+    let reflected:i64=if position<0{-position}else{if position>=cast.sat(samples){cast.sat(2*samples)-2-position}else{position}}
+    let value:f32=view.get(input,channel*samples+cast.sat(reflected))*array.get(p.window,i)
+    array.push(windowed,value)
+    i+=1}
+   frame+=1}
+  channel+=1}
+ let xs:array<u64>=[2*p.frames,p.n]
+ let ys:array<u64>=[2*p.frames,p.n/2+1,2]
+ var x:tensor.Tensor=try tensor.from_f32(context,stream,array.view(windowed),array.view(xs),tensor.DType.F32) map_err problem
+ var y:tensor.Tensor=try tensor.empty(context,array.view(ys),tensor.DType.F32) map_err problem
+ let _=try compute.rfft_1d(stream,x,y,67108864) map_err problem
+ let transformed:array<f32>=try tensor.to_f32(stream,y) map_err problem
+ let _=try tensor.close(x) map_err problem
+ let _=try tensor.close(y) map_err problem
+ let _=try agpu.sync_stream(stream) map_err problem
+ var packed:array<f32>=num.zeros(4*p.bins*p.frames)
+ channel=0
+ loop{if channel==2{break}
+  var frame:u64=0
+  loop{if frame==p.frames{break}
+   var frequency:u64=0
+   loop{if frequency==p.bins{break}
+    let at:u64=2*((channel*p.frames+frame)*(p.n/2+1)+frequency)
+    array.set(packed,(2*channel*p.bins+frequency)*p.frames+frame,array.get(transformed,at))
+    array.set(packed,((2*channel+1)*p.bins+frequency)*p.frames+frame,array.get(transformed,at+1))
+    frequency+=1}
+   frame+=1}
+  channel+=1}
+ result.ok(ops.tensor(4*p.bands,p.bins/p.bands,p.frames,packed))
+}
+// Materialized F32 scale and product precede ascending-fold overlap addition.
+pub fn compose_cpu(p:ref<Plan>,raw:view<f32>)->result<array<f32>,string> effects {alloc} {
+ let streams:u64=2*p.targets
+ if view.len(raw)!=streams*p.frames*p.n or not num.finite(raw){return result.err("Invalid retained inverse raw output")}
+ let samples:u64=p.hop*(p.frames-1)
+ let extent:u64=samples+p.n
+ let scale:f32=1.0/cast.float(p.n)
+ var scaled:array<f32>=[]
+ array.reserve(scaled,view.len(raw))
+ var i:u64=0
+ loop{if i==view.len(raw){break}
+  let value:f32=view.get(raw,i)*scale
+  array.push(scaled,value)
+  i+=1}
+ var product:array<f32>=[]
+ array.reserve(product,view.len(raw))
+ i=0
+ loop{if i==view.len(raw){break}
+  let value:f32=array.get(scaled,i)*array.get(p.window,i%p.n)
+  array.push(product,value)
+  i+=1}
+ var numerator:array<f32>=num.zeros(streams*extent)
+ var channel:u64=0
+ loop{if channel==streams{break}
+  var frame:u64=0
+  loop{if frame==p.frames{break}
+   i=0
+   loop{if i==p.n{break}
+    let at:u64=channel*extent+frame*p.hop+i
+    array.set(numerator,at,array.get(numerator,at)+array.get(product,(channel*p.frames+frame)*p.n+i))
+    i+=1}
+   frame+=1}
+  channel+=1}
+ var square:array<f32>=[]
+ i=0
+ loop{if i==p.n{break}
+  let value:f32=array.get(p.window,i)*array.get(p.window,i)
+  array.push(square,value)
+  i+=1}
+ var envelope:array<f32>=num.zeros(extent)
+ var frame:u64=0
+ loop{if frame==p.frames{break}
+  i=0
+  loop{if i==p.n{break}
+   let at:u64=frame*p.hop+i
+   array.set(envelope,at,array.get(envelope,at)+array.get(square,i))
+   i+=1}
+  frame+=1}
+ var output:array<f32>=[]
+ array.reserve(output,streams*samples)
+ channel=0
+ loop{if channel==streams{break}
+  i=0
+  loop{if i==samples{break}
+   let denominator:f32=array.get(envelope,i+p.n/2)
+   if denominator<0.00000000001{return result.err("Retained centered inverse window coverage failed")}
+   array.push(output,array.get(numerator,channel*extent+i+p.n/2)/denominator)
+   i+=1}
+  channel+=1}
+ if not num.finite(array.view(output)){return result.err("Retained centered inverse overflow")}
+ result.ok(output)
+}
+pub fn synthesize(context:ref<GpuContext>,stream:ref<GpuStream>,p:ref<Plan>,spectrum:ref<ops.Tensor>)->result<array<f32>,string> effects {alloc,gpu} {
+ if spectrum.c!=4*p.bands*p.targets or spectrum.h!=p.bins/p.bands or spectrum.w!=p.frames or not num.finite(array.view(spectrum.data)){
+  return result.err("Invalid retained GPU inverse spectrum")}
+ var input:array<f32>=[]
+ array.reserve(input,4*p.targets*p.frames*(p.n/2+1))
+ var channel:u64=0
+ loop{if channel==2*p.targets{break}
+  var frame:u64=0
+  loop{if frame==p.frames{break}
+   var frequency:u64=0
+   loop{if frequency==p.n/2+1{break}
+    array.push(input,if frequency<p.bins{array.get(spectrum.data,(2*channel*p.bins+frequency)*p.frames+frame)}else{0.0})
+    array.push(input,if frequency<p.bins{array.get(spectrum.data,((2*channel+1)*p.bins+frequency)*p.frames+frame)}else{0.0})
+    frequency+=1}
+   frame+=1}
+  channel+=1}
+ let xs:array<u64>=[2*p.targets*p.frames,p.n/2+1,2]
+ let ys:array<u64>=[2*p.targets*p.frames,p.n]
+ var x:tensor.Tensor=try tensor.from_f32(context,stream,array.view(input),array.view(xs),tensor.DType.F32) map_err problem
+ var y:tensor.Tensor=try tensor.empty(context,array.view(ys),tensor.DType.F32) map_err problem
+ let _=try compute.irfft_1d(stream,x,y,67108864) map_err problem
+ let raw:array<f32>=try tensor.to_f32(stream,y) map_err problem
+ let _=try tensor.close(x) map_err problem
+ let _=try tensor.close(y) map_err problem
+ let _=try agpu.sync_stream(stream) map_err problem
+ compose_cpu(p,array.view(raw))
+}

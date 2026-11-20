@@ -1,0 +1,168 @@
+module stemair.spectral_host_prepared
+import "network.ai" as network
+import "weights.ai" as weights
+import "ops.ai" as ops
+import "numeric.ai" as num
+import "control.ai" as control
+import std.cpu_conv2d as convolution
+import std.cpu_matmul as matrix
+import std.cpu_transpose_conv2d as transpose
+import std.system as system
+
+type Pack=enum{None,Forward(convolution.Prepared),Dense(matrix.Matrix),Transpose(transpose.Prepared)}
+// Immutable owned packs are bound to the same retained Network for its lifetime.
+// Library identity/lifetime and image-global thread policy belong to the caller.
+pub type Backend=struct{slots:array<Pack>,affines:array<weights.Parameter>,parameters:u64,packs:u64,bytes:u64}
+fn transposed(n:ref<network.Network>,id:u64)->bool effects {} {
+ var i:u64=0
+ loop{if i==array.len(n.decoder){break}
+  if array.borrow(n.decoder,i).conv==id{return true}
+  i+=1}
+ false
+}
+pub fn prepare(n:ref<network.Network>)->result<Backend,string> effects {alloc,fs.read} {
+ var bytes:u64=0
+ var count:u64=0
+ var i:u64=0
+ loop{if i==array.len(n.weights.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,i)
+  if array.len(p.shape)==1 or array.len(p.shape)==2 or array.len(p.shape)==4{
+   if array.len(p.values)>(18446744073709551615-bytes)/4{return result.err("Retained spectral pack extent overflows")}
+   bytes+=4*array.len(p.values)
+   if array.len(p.shape)!=1{count+=1}}
+  i+=1}
+ let memory:system.Memory=match system.memory(){ok(v)=>v,err(_)=>{return result.err("Cannot query memory for retained spectral preparation")}}
+ if bytes>9223372036317904895 or 1073741824+2*bytes>memory.available_bytes{return result.err("Not enough host RAM for retained spectral packs and bounded graph workspace")}
+ var slots:array<Pack>=[]
+ var affines:array<weights.Parameter>=[]
+ i=0
+ loop{if i==array.len(n.weights.parameters.values){break}
+  let up:bool=transposed(n,i)
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,i)
+  let pack:Pack=if array.len(p.shape)==2{
+   Pack.Dense(try matrix.prepare(array.view(p.values),array.get(p.shape,0),array.get(p.shape,1),matrix.Limits{}))
+  }else{if array.len(p.shape)==4{
+   if up{
+    if array.get(p.shape,2)!=2 or array.get(p.shape,3)!=2{return result.err("Spectral transpose kernel differs from source stride2 geometry")}
+    Pack.Transpose(try transpose.prepare(array.view(p.values),array.view(p.shape),1,transpose.Limits{matrix:matrix.Limits{}}))
+   }else{Pack.Forward(try convolution.prepare(array.view(p.values),array.view(p.shape)))}
+  }else{Pack.None}}
+  array.push(slots,pack)
+  if array.len(p.shape)==1{array.push(affines,weights.Parameter{shape:[array.len(p.values)],values:num.copy(array.view(p.values))})}else{array.push(affines,weights.Parameter{shape:[],values:[]})}
+  i+=1}
+ result.ok(Backend{slots:slots,affines:affines,parameters:array.len(n.weights.parameters.values),packs:count,bytes:bytes})
+}
+fn convolution(bank:ref<Backend>,library:ref<CAbiLibrary>,x:ref<ops.Tensor>,id:u64,stride:u64,pad:u64,up:bool)->result<ops.Tensor,string> effects {alloc,ffi} {
+ if id>=array.len(bank.slots){return result.err("Spectral convolution pack index exceeds retained bank")}
+ let shape:array<u64>=[1,x.c,x.h,x.w]
+ var bias:array<f32>=[]
+ if up{
+  if stride!=2 or pad!=0{return result.err("Spectral transpose geometry differs from retained source operation")}
+  let weight:ref<transpose.Prepared>=match array.borrow(bank.slots,id){Transpose(p)=>p,_=>{return result.err("Spectral transpose weight was not prepared")}}
+  let limits:transpose.Limits=transpose.Limits{matrix:matrix.Limits{}}
+  let g:transpose.Geometry=try transpose.geometry(array.view(shape),weight,limits)
+  let out:array<f32>=try transpose.convolve(library,array.view(x.data),array.view(shape),weight,array.view(bias),limits)
+  return result.ok(ops.tensor(g.output_channels,g.output_height,g.output_width,out))}
+ let weight:ref<convolution.Prepared>=match array.borrow(bank.slots,id){Forward(p)=>p,_=>{return result.err("Spectral convolution weight was not prepared")}}
+ let options:convolution.Options=convolution.Options{stride_height:stride,stride_width:stride,padding_height:pad,padding_width:pad}
+ let g:convolution.Geometry=try convolution.geometry(array.view(shape),array.view(weight.shape),options)
+ let out:array<f32>=try convolution.convolve_blas(library,array.view(x.data),array.view(shape),weight,array.view(bias),options,8388608)
+ result.ok(ops.tensor(g.output_channels,g.output_height,g.output_width,out))
+}
+fn linear(bank:ref<Backend>,library:ref<CAbiLibrary>,x:ref<ops.Tensor>,id:u64)->result<ops.Tensor,string> effects {alloc,ffi} {
+ if id>=array.len(bank.slots){return result.err("Spectral projection pack index exceeds retained bank")}
+ let weight:ref<matrix.Matrix>=match array.borrow(bank.slots,id){Dense(p)=>p,_=>{return result.err("Spectral projection weight was not prepared")}}
+ if weight.columns!=x.w{return result.err("Spectral projection input differs from retained weight")}
+ var activation:matrix.Matrix=try matrix.prepare(array.view(x.data),x.c*x.h,x.w,matrix.Limits{})
+ let out:array<f32>=try matrix.multiply(library,activation,matrix.Operation.Identity,weight,matrix.Operation.Transpose,matrix.Limits{})
+ result.ok(ops.tensor(x.c,x.h,weight.rows,out))
+}
+fn normalized(n:ref<network.Network>,bank:ref<Backend>,x:ref<ops.Tensor>,a:network.Affine)->ops.Tensor effects {alloc} {
+ let scale:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,a.weight)
+ let bias:ref<weights.Parameter>=array.borrow(bank.affines,a.bias)
+ let normalized:ops.Tensor=ops.normalize(x,scale,bias)
+ ops.gelu(normalized)
+}
+// Drop only already-consumed activation storage. Shape fields are not read
+// again; no numerical operation or retained parameter/pack is changed.
+fn release(x:ref<ops.Tensor>)->unit effects {alloc} {x.data=[]
+ ()}
+fn body(n:ref<network.Network>,bank:ref<Backend>,library:ref<CAbiLibrary>,input:ops.Tensor own,begin:u64,count:u64,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ var x:ops.Tensor=input
+ var i:u64=0
+ loop{if i==count{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let b:network.Block=array.get(n.blocks,begin+i)
+  var shortcut:ops.Tensor=try convolution(bank,library,x,b.shortcut,1,0,false)
+  var a:ops.Tensor=normalized(n,bank,x,b.norm1)
+  release(x)
+  var first:ops.Tensor=try convolution(bank,library,a,b.conv1,1,1,false)
+  release(a)
+  var norm1:ops.Tensor=normalized(n,bank,first,b.norm2)
+  var small:ops.Tensor=try linear(bank,library,norm1,b.linear1)
+  release(norm1)
+  var norm2:ops.Tensor=normalized(n,bank,small,b.norm3)
+  release(small)
+  var expanded:ops.Tensor=try linear(bank,library,norm2,b.linear2)
+  release(norm2)
+  var combined:ops.Tensor=ops.combine(first,expanded,false)
+  release(first)
+  release(expanded)
+  var norm3:ops.Tensor=normalized(n,bank,combined,b.norm4)
+  release(combined)
+  var second:ops.Tensor=try convolution(bank,library,norm3,b.conv2,1,1,false)
+  release(norm3)
+  x=ops.combine(second,shortcut,false)
+  release(second)
+  release(shortcut)
+  i+=1}
+ result.ok(x)
+}
+pub fn forward(n:ref<network.Network>,bank:ref<Backend>,library:ref<CAbiLibrary>,input:ops.Tensor own,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ if bank.parameters!=array.len(n.weights.parameters.values) or array.len(bank.slots)!=bank.parameters{return result.err("Prepared spectral bank differs from its retained network")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var packed:ops.Tensor=input
+ var first:ops.Tensor=try convolution(bank,library,packed,n.first,1,0,false)
+ var x:ops.Tensor=ops.transpose(first)
+ var saved:array<ops.Tensor>=[]
+ var i:u64=0
+ loop{if i==array.len(n.encoder){break}
+  let scale:network.Scale=array.get(n.encoder,i)
+  x=try body(n,bank,library,x,scale.begin,scale.count,cancel)
+  var norm:ops.Tensor=normalized(n,bank,x,scale.norm)
+  let down:ops.Tensor=try convolution(bank,library,norm,scale.conv,2,0,false)
+  release(norm)
+  array.push(saved,x)
+  x=down
+  i+=1}
+ x=try body(n,bank,library,x,n.middle_begin,n.middle_count,cancel)
+ i=0
+ loop{if i==array.len(n.decoder){break}
+  let scale:network.Scale=array.get(n.decoder,i)
+  var norm:ops.Tensor=normalized(n,bank,x,scale.norm)
+  release(x)
+  var up:ops.Tensor=try convolution(bank,library,norm,scale.conv,2,0,true)
+  release(norm)
+  var skip:ops.Tensor=ref.swap(array.borrow(saved,array.len(saved)-1-i),ops.Tensor{c:0,h:0,w:0,data:[]})
+  let joined:ops.Tensor=ops.concat(up,skip)
+  release(up)
+  release(skip)
+  x=try body(n,bank,library,joined,scale.begin,scale.count,cancel)
+  i+=1}
+ var transposed:ops.Tensor=ops.transpose(x)
+ release(x)
+ var gated:ops.Tensor=ops.combine(transposed,first,true)
+ release(transposed)
+ release(first)
+ var joined:ops.Tensor=ops.concat(packed,gated)
+ release(packed)
+ release(gated)
+ var last:ops.Tensor=try convolution(bank,library,joined,n.last1,1,0,false)
+ release(joined)
+ var activated:ops.Tensor=ops.gelu(last)
+ release(last)
+ let output:ops.Tensor=try convolution(bank,library,activated,n.last2,1,0,false)
+ release(activated)
+ if not num.finite(array.view(output.data)){return result.err("Non-finite separation network output")}
+ result.ok(output)
+}

@@ -1,0 +1,220 @@
+module stemair.temporal.device
+import "network.ai" as network
+import "../weights.ai" as weights
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../channel_statistics.ai" as stats
+import "../control.ai" as control
+import std.tensor as tensor
+import std.compute as compute
+import std.gpu as devicegpu
+import std.float as fp
+import std.cuda_dense_reduce as reduction
+
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+fn empty(context:ref<GpuContext>,shape:view<u64>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ result.ok(try tensor.empty(context,shape,tensor.DType.F32) map_err error)
+}
+pub fn upload(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>)->result<array<tensor.Tensor>,string> effects {alloc,gpu} {
+ var out:array<tensor.Tensor>=[]
+ var i:u64=0
+ loop{if i==array.len(n.weights.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,i)
+  array.push(out,try tensor.from_f32(context,stream,array.view(p.values),array.view(p.shape),tensor.DType.F32) map_err error)
+  i+=1}
+ let sizes:array<u64>=[n.options.features,n.options.bottleneck,n.options.hidden,n.options.sources*n.options.features]
+ i=0
+ loop{if i==array.len(sizes){break}
+  let shape:array<u64>=[array.get(sizes,i)]
+  array.push(out,try tensor.zeros(context,stream,array.view(shape),tensor.DType.F32) map_err error)
+  i+=1}
+ let _=try devicegpu.sync(context) map_err error
+ result.ok(out)
+}
+pub fn convolution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,x:ref<tensor.Tensor>,index:u64,stride:u64,padding:u64,dilation:u64,groups:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var original:tensor.Tensor=try tensor.view(array.borrow(parameters,index)) map_err error
+ let channels:u64=array.get(original.dimensions,0)
+ let kernel:u64=array.get(original.dimensions,2)
+ let width:u64=array.get(x.dimensions,3)
+ if array.get(original.dimensions,1)*groups!=array.get(x.dimensions,1) or width+2*padding<dilation*(kernel-1)+1{
+  return result.err("Temporal convolution geometry differs")}
+ let shape:array<u64>=[channels,array.get(original.dimensions,1),1,kernel]
+ var weight:tensor.Tensor=try tensor.reshape(original,array.view(shape)) map_err error
+ let output_shape:array<u64>=[1,channels,1,(width+2*padding-dilation*(kernel-1)-1)/stride+1]
+ var output:tensor.Tensor=try empty(context,array.view(output_shape))
+ let slot:u64=if channels==n.options.features{0}else{if channels==n.options.bottleneck{1}else{
+  if channels==n.options.hidden{2}else{if channels==n.options.sources*n.options.features{3}else{return result.err("Temporal zero-bias geometry differs")}}}}
+ let _=try compute.conv2d_torch_f32_general(stream,x,weight,array.borrow(parameters,n.original_parameters+slot),output,
+  1,stride,0,padding,1,dilation,groups,268435456,false,true) map_err error
+ result.ok(output)
+}
+fn parameter(n:ref<network.Network>,index:u64)->array<f32> effects {alloc} {
+ num.copy(array.view(array.borrow(n.weights.parameters.values,index).values))
+}
+fn normalize_legacy(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>,x:ref<tensor.Tensor>,
+ form:network.Normalization,slope:option<u64>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if form.kind==network.NormKind.Identity and not option.is_some(slope){return result.ok(try tensor.view(x) map_err error)}
+ let channels:u64=array.get(x.dimensions,1)
+ let width:u64=array.get(x.dimensions,3)
+ let raw:array<f32>=try tensor.to_f32(stream,x) map_err error
+ var host:ops.Tensor=ops.tensor(channels,1,width,raw)
+ match slope{some(index)=>{
+  let p:array<f32>=parameter(n,index)
+  host=try stats.prelu(host,array.get(p,0))},none=>{},}
+ if form.kind!=network.NormKind.Identity{
+  let gamma:array<f32>=parameter(n,form.gamma)
+  let beta:array<f32>=parameter(n,form.beta)
+  if form.kind==network.NormKind.Batch and n.options.generation==2{
+   let mean:array<f32>=parameter(n,form.mean)
+   let variance:array<f32>=parameter(n,form.variance)
+   var c:u64=0
+   loop{if c==channels{break}
+    let denominator:f32=fp.sqrt(array.get(variance,c)+0.00001)
+    var t:u64=0
+    loop{if t==width{break}
+     let centered:f32=array.get(host.data,c*width+t)-array.get(mean,c)
+     let scaled:f32=array.get(gamma,c)*centered
+     array.set(host.data,c*width+t,scaled/denominator+array.get(beta,c))
+     t+=1}
+    c+=1}
+  }else{
+   let kind:stats.Kind=if form.kind==network.NormKind.Channel{stats.Kind.Channel}else{
+    if form.kind==network.NormKind.Global{stats.Kind.Global}else{stats.Kind.Time}}
+   host=try stats.normalize(host,array.view(gamma),array.view(beta),kind,if form.kind==network.NormKind.Batch{0.00001}else{0.00000001})
+  }
+ }
+ let shape:array<u64>=[1,channels,1,width]
+ result.ok(try tensor.from_f32(context,stream,array.view(host.data),array.view(shape),tensor.DType.F32) map_err error)
+}
+pub fn normalize_prepared(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,engine:ref<reduction.Engine>,n:ref<network.Network>,x:ref<tensor.Tensor>,form:network.Normalization,slope:option<u64>)->result<tensor.Tensor,string> effects {alloc,gpu}{
+ if form.kind==network.NormKind.Batch{return normalize_legacy(context,stream,n,x,form,slope)}
+ let channels:u64=array.get(x.dimensions,1)
+ let width:u64=array.get(x.dimensions,3)
+ let shape:array<u64>=[channels,width]
+ var input:tensor.Tensor=try tensor.reshape(x,array.view(shape)) map_err error
+ match slope{some(index)=>{input=try reduction.prelu(engine,context,stream,input,array.get(array.borrow(n.weights.parameters.values,index).values,0))},none=>{},}
+ if form.kind==network.NormKind.Identity{return result.ok(try tensor.reshape(input,array.view(x.dimensions)) map_err error)}
+ var first:reduction.Moments=try reduction.axis0(engine,context,stream,input)
+ var mean:tensor.Tensor=try tensor.view(struct.borrow(first,field=mean)) map_err error
+ var variance:tensor.Tensor=try tensor.view(struct.borrow(first,field=variance)) map_err error
+ if form.kind==network.NormKind.Global{
+  mean=try reduction.mean_last(engine,context,stream,mean)
+  var squared:tensor.Tensor=try reduction.squared_deviation(engine,context,stream,input,mean)
+  var second:reduction.Moments=try reduction.axis0(engine,context,stream,squared)
+  variance=try reduction.mean_last(engine,context,stream,second.mean)
+ }else{if form.kind!=network.NormKind.Channel{return result.err("Temporal normalization source recipe is unsupported")}}
+ var gamma:tensor.Tensor=try tensor.view(array.borrow(parameters,form.gamma)) map_err error
+ var beta:tensor.Tensor=try tensor.view(array.borrow(parameters,form.beta)) map_err error
+ var normalized:tensor.Tensor=try reduction.center_affine(engine,context,stream,input,mean,variance,gamma,beta,0.00000001)
+ result.ok(try tensor.reshape(normalized,array.view(x.dimensions)) map_err error)
+}
+pub fn normalize(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>,x:ref<tensor.Tensor>,form:network.Normalization,slope:option<u64>)->result<tensor.Tensor,string> effects {alloc,gpu}{
+ var engine:reduction.Engine=try reduction.create(context) map_err error
+ var parameters:array<tensor.Tensor>=try upload(context,stream,n)
+ let output:result<tensor.Tensor,string>=normalize_prepared(context,stream,parameters,engine,n,x,form,slope)
+ let _=try reduction.close(engine) map_err error
+ output
+}
+pub fn relu(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var output:tensor.Tensor=try empty(context,array.view(x.dimensions))
+ let _=try compute.relu(stream,x,output) map_err error
+ result.ok(output)
+}
+fn slice(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,axis:u64,start:u64,count:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var part:tensor.Tensor=try tensor.narrow(x,axis,start,count) map_err error
+ result.ok(try tensor.contiguous(context,stream,part) map_err error)
+}
+fn forward_prepared(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,engine:ref<reduction.Engine>,
+ n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if tensor.rank(input)!=4 or array.get(input.dimensions,0)!=1 or array.get(input.dimensions,1)!=n.options.channels or
+  array.get(input.dimensions,2)!=1{return result.err("Invalid temporal input tensor")}
+ let length:u64=array.get(input.dimensions,3)
+ let _=try network.valid_length(n,length)
+ var encoded:tensor.Tensor=try convolution(context,stream,parameters,n,input,n.encoder,n.options.window/2,0,1,1)
+ encoded=try relu(context,stream,encoded)
+ var normalized:tensor.Tensor=try normalize_prepared(context,stream,parameters,engine,n,encoded,n.input_norm,option.none())
+ var x:tensor.Tensor=try convolution(context,stream,parameters,n,normalized,n.bottleneck,1,0,1,1)
+ var index:u64=0
+ loop{if index==array.len(n.blocks){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let block:network.Block=array.get(n.blocks,index)
+  var expanded:tensor.Tensor=try convolution(context,stream,parameters,n,x,block.expand,1,0,1,1)
+  expanded=try normalize_prepared(context,stream,parameters,engine,n,expanded,block.norm1,option.some(block.slope1))
+  var depth:tensor.Tensor=try convolution(context,stream,parameters,n,expanded,block.depthwise,1,block.padding,block.dilation,n.options.hidden)
+  if n.options.causal{depth=try slice(context,stream,depth,3,0,array.get(x.dimensions,3))}
+  depth=try normalize_prepared(context,stream,parameters,engine,n,depth,block.norm2,option.some(block.slope2))
+  var projected:tensor.Tensor=try convolution(context,stream,parameters,n,depth,block.project,1,0,1,1)
+  var result:tensor.Tensor=try empty(context,array.view(x.dimensions))
+  let _=try compute.add(stream,projected,x,result) map_err error
+  x=result
+  index+=1}
+ var score:tensor.Tensor=try convolution(context,stream,parameters,n,x,n.mask,1,0,1,1)
+ let time:u64=array.get(score.dimensions,3)
+ if n.options.mask==network.MaskKind.Relu{score=try relu(context,stream,score)}else{
+  var host:array<f32>=try tensor.to_f32(stream,score) map_err error
+  var feature:u64=0
+  loop{if feature==n.options.features{break}
+   var t:u64=0
+   loop{if t==time{break}
+    var maximum:f32=array.get(host,feature*time+t)
+    var source:u64=1
+    loop{if source==n.options.sources{break}
+     let value:f32=array.get(host,(source*n.options.features+feature)*time+t)
+     if value>maximum{maximum=value}
+     source+=1}
+    var sum:f32=0.0
+    source=0
+    loop{if source==n.options.sources{break}
+     let at:u64=(source*n.options.features+feature)*time+t
+     let value:f32=fp.exp(array.get(host,at)-maximum)
+     array.set(host,at,value)
+     sum+=value
+     source+=1}
+    source=0
+    loop{if source==n.options.sources{break}
+     let at:u64=(source*n.options.features+feature)*time+t
+     array.set(host,at,array.get(host,at)/sum)
+     source+=1}
+    t+=1}
+   feature+=1}
+  let shape:array<u64>=[1,n.options.sources*n.options.features,1,time]
+  score=try tensor.from_f32(context,stream,array.view(host),array.view(shape),tensor.DType.F32) map_err error
+ }
+ var output:array<f32>=num.zeros(n.options.sources*n.options.channels*length)
+ var source:u64=0
+ loop{if source==n.options.sources{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var mask:tensor.Tensor=try slice(context,stream,score,1,source*n.options.features,n.options.features)
+  var weighted:tensor.Tensor=try empty(context,array.view(encoded.dimensions))
+  let _=try compute.mul(stream,encoded,mask,weighted) map_err error
+  var rows:tensor.Tensor=try tensor.permute(weighted,[0,2,3,1]) map_err error
+  rows=try tensor.contiguous(context,stream,rows) map_err error
+  let row_shape:array<u64>=[time,n.options.features]
+  rows=try tensor.reshape(rows,array.view(row_shape)) map_err error
+  let frame_shape:array<u64>=[time,n.options.channels*n.options.window]
+  var frames:tensor.Tensor=try empty(context,array.view(frame_shape))
+  let _=try compute.linear_f32(stream,rows,array.borrow(parameters,n.basis),frames) map_err error
+  let values:array<f32>=try tensor.to_f32(stream,frames) map_err error
+  var frame:u64=0
+  loop{if frame==time{break}
+   var channel:u64=0
+   loop{if channel==n.options.channels{break}
+    var at:u64=0
+    loop{if at==n.options.window{break}
+     let destination:u64=(source*n.options.channels+channel)*length+frame*(n.options.window/2)+at
+     let value:f32=array.get(values,frame*n.options.channels*n.options.window+channel*n.options.window+at)
+     array.set(output,destination,array.get(output,destination)+value)
+     at+=1}
+    channel+=1}
+   frame+=1}
+  source+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite temporal decoder output")}
+ result.ok(ops.tensor(n.options.sources*n.options.channels,1,length,output))
+}
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta}{
+ var engine:reduction.Engine=try reduction.create(context) map_err error
+ let output:result<ops.Tensor,string>=forward_prepared(context,stream,parameters,engine,n,input,cancel)
+ let _=try reduction.close(engine) map_err error
+ output
+}

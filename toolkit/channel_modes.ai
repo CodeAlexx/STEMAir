@@ -1,0 +1,78 @@
+module stemair.channel_modes
+import "ops.ai" as ops
+import "numeric.ai" as num
+import std.float as fp
+
+pub fn valid(mode:str)->bool effects {} {
+ mode=="stereo" or mode=="mid-side" or mode=="cross-mid-side" or mode=="coupled-stereo"
+}
+// Complex stereo is packed as left-real, left-imaginary, right-real,
+// right-imaginary planes. Each scalar product rounds before the sum.
+pub fn analyze(input:ref<ops.Tensor>,mode:str)->result<ops.Tensor,string> effects {alloc} {
+ if not valid(mode) or input.c!=4 or input.h==0 or input.w==0 or input.h>134217728/input.w or
+  array.len(input.data)!=4*input.h*input.w or not num.finite(array.view(input.data)){
+  return result.err("Invalid stereo channel transform")}
+ var output:array<f32>=num.copy(array.view(input.data))
+ if mode=="stereo"{return result.ok(ops.tensor(4,input.h,input.w,output))}
+ let plane:u64=input.h*input.w
+ var component:u64=0
+ loop{if component==2{break}
+  var i:u64=0
+  loop{if i==plane{break}
+   let left:f32=array.get(input.data,component*plane+i)
+   let right:f32=array.get(input.data,(component+2)*plane+i)
+   var first:f32=0.0
+   var second:f32=0.0
+   if mode=="mid-side"{let sum:f32=left+right
+    first=sum/2.0
+    second=left-right
+   }else{
+    let scaled_right:f32=right*0.25
+    let scaled_left:f32=left*0.25
+    let sum:f32=left+scaled_right
+    if mode=="cross-mid-side"{first=sum
+     second=right-scaled_left
+    }else{let other:f32=right+scaled_left
+     // Complex-array scalar division uses a rounded F32 reciprocal.
+     let reciprocal:f32=1.0/0.9375
+     first=sum*reciprocal
+     second=other*reciprocal}}
+   array.set(output,component*plane+i,first)
+   array.set(output,(component+2)*plane+i,second)
+   i+=1}
+  component+=1}
+ if not num.finite(array.view(output)){return result.err("Stereo channel transform overflow")}
+ result.ok(ops.tensor(4,input.h,input.w,output))
+}
+// Restore after the inverse transform, preserving its F64 reconstruction.
+pub fn restore(input:array<f64> own,mode:str)->result<array<f64>,string> effects {alloc} {
+ var output:array<f64>=input
+ if not valid(mode) or array.len(output)==0 or array.len(output)%2!=0 or array.len(output)>536870912{
+  return result.err("Invalid inverse stereo channel transform")}
+ let frames:u64=array.len(output)/2
+ var i:u64=0
+ loop{if i==frames{break}
+  let left:f64=array.get(output,i)
+  let right:f64=array.get(output,frames+i)
+  if not fp.is_finite(left) or not fp.is_finite(right){return result.err("Nonfinite inverse stereo input")}
+  var first:f64=left
+  var second:f64=right
+  if mode=="mid-side"{let half:f64=right/2.0
+   first=left+half
+   second=left-half}
+  if mode=="cross-mid-side"{let left_main:f64=left/1.0625
+   let right_cross:f64=right/4.25
+   let right_main:f64=right/1.0625
+   let left_cross:f64=left/4.25
+   first=left_main-right_cross
+   second=right_main+left_cross}
+  if mode=="coupled-stereo"{let right_cross:f64=right*0.25
+   let left_cross:f64=left*0.25
+   first=left-right_cross
+   second=right-left_cross}
+  if not fp.is_finite(first) or not fp.is_finite(second){return result.err("Inverse stereo channel overflow")}
+  array.set(output,i,first)
+  array.set(output,frames+i,second)
+  i+=1}
+ result.ok(output)
+}

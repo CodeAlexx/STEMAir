@@ -1,0 +1,49 @@
+module stemair.profile_edit
+import "engine.ai" as engine
+import "config.ai" as spectral
+import "exchange/config.ai" as exchange
+import "mask/config.ai" as mask
+import "stem_names.ai" as names
+import std.codec as codec
+
+pub type Exchange=struct{n_fft:u64,frequency_bins:u64,frame_exponent:u32,compensation:f64,lock_geometry:bool=false}
+pub type Mask=struct{recurrent:bool,channels:u64,recurrent_width:u64}
+pub fn exchange_profile(base:ref<engine.Profile>,choice:ref<Exchange>,sources:ref<names.Pair>)->result<engine.Profile,string> effects {alloc} {
+ if base.kind!="exchange"{return result.err("Choose an interchange model profile")}
+ var c:exchange.Config=try exchange.Config_decode(base.identity) map_err codec.describe
+ if choice.frame_exponent<5 or choice.frame_exponent>12{return result.err("Frame exponent must describe a supported model input")}
+ let one:u64=1
+ let frames:u64=one<<cast.wrap(choice.frame_exponent)
+ if choice.lock_geometry and (c.n_fft!=choice.n_fft or c.frequency_bins!=choice.frequency_bins or c.frames!=frames){return result.err("Checkpoint model geometry is fixed by its startup metadata")}
+ c.n_fft=choice.n_fft
+ c.frequency_bins=choice.frequency_bins
+ c.frames=frames
+ c.compensation=choice.compensation
+ c.targets=[string.copy(sources.primary),string.copy(sources.secondary)]
+ let _=try exchange.validate(c)
+ engine.decode(try exchange.Config_encode(c) map_err codec.describe)
+}
+pub fn mask_profile(base:ref<engine.Profile>,parameters:ref<engine.Profile>,choice:ref<Mask>,sources:ref<names.Pair>)->result<engine.Profile,string> effects {alloc} {
+ if base.kind!="mask" or parameters.kind!="mask"{return result.err("Choose a mask model and a mask parameter profile")}
+ var c:mask.Config=try mask.Config_decode(base.identity) map_err codec.describe
+ var p:mask.Config=try mask.Config_decode(parameters.identity) map_err codec.describe
+ let _=try mask.validate(p)
+ c.sample_rate=p.sample_rate
+ c.bins=p.bins
+ c.pre_filter_start=p.pre_filter_start
+ c.pre_filter_stop=p.pre_filter_stop
+ c.channel_mode=string.copy(p.channel_mode)
+ c.bands=struct.replace(p,[],field=bands)
+ c.architecture=if choice.recurrent{"recurrent"}else{"cascade"}
+ c.channels=choice.channels
+ c.recurrent_width=choice.recurrent_width
+ c.primary_foreground=sources.primary_foreground
+ c.targets=[string.copy(sources.primary),string.copy(sources.secondary)]
+ let _=try mask.validate(c)
+ engine.decode(try mask.Config_encode(c) map_err codec.describe)
+}
+pub fn spectral_profile(selected:ref<engine.Profile>)->result<engine.Profile,string> effects {alloc} {
+ if selected.kind!="spectral"{return result.err("Choose a native spectral model configuration")}
+ // Preserve its full target order and every constructor setting.
+ engine.decode(selected.identity)
+}

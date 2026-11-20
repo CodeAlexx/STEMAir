@@ -1,0 +1,81 @@
+module stemair.codec_runtime
+import "wav_export.ai" as wav
+import "../toolkit/compressed_export.ai" as export
+import "../toolkit/codec_process.ai" as child
+import std.codec as codec
+import std.audio as audio
+import std.files as files
+import std.path as path
+import std.system as system
+import std.text as text
+
+type Profile=struct{version:string,encoder_sha256:string,probe_sha256:string} derive codec(strict)
+type Pins=struct{version:u64,windows:Profile,linux:Profile} derive codec(strict)
+fn copy_profile(value:ref<Profile>)->Profile effects {alloc} {
+ Profile{version:string.copy(value.version),encoder_sha256:string.copy(value.encoder_sha256),probe_sha256:string.copy(value.probe_sha256)}
+}
+pub fn bitrate(choice:u32)->result<string,string> effects {alloc} {
+ if choice==0{return result.ok("96k")}
+ if choice==1{return result.ok("128k")}
+ if choice==2{return result.ok("160k")}
+ if choice==3{return result.ok("224k")}
+ if choice==4{return result.ok("256k")}
+ if choice==5{return result.ok("320k")}
+ result.err("Choose a supported MP3 bitrate")
+}
+// Input conversion verifies the encoder only when conversion is actually needed.
+pub fn input_tool(root:str,directory:str)->result<option<child.Tool>,string> effects {alloc,env,fs.read} {
+ if str.len(directory)==0{return result.ok(option.none())}
+ if not path.is_absolute(directory){return result.err("Choose an absolute audio codec tools folder")}
+ let bytes:bytes=match files.read_limited(path.join(root,"licenses/codec-runtime-source.json"),16384){ok(v)=>v,err(_)=>{
+  return result.err("The supported audio codec identity is unavailable")}}
+ let raw:str=match str.from_bytes(bytes.view(bytes)){some(v)=>v,none=>{return result.err("The audio codec identity must be UTF-8")}}
+ var pins:Pins=try Pins_decode(raw) map_err codec.describe
+ if pins.version!=1{return result.err("The audio codec identity version is unsupported")}
+ let windows:bool=system.platform()=="windows"
+ let profile:Profile=if windows{copy_profile(struct.borrow(pins,field=windows))}else{copy_profile(struct.borrow(pins,field=linux))}
+ result.ok(option.some(child.Tool{path:path.join(directory,if windows{"ffmpeg.exe"}else{"ffmpeg"}),sha256:string.copy(profile.encoder_sha256)}))
+}
+// Metadata inspection has the same explicit installed-folder policy as input
+// conversion. The consumer verifies this pinned executable when it is needed.
+pub fn probe_tool(root:str,directory:str)->result<option<child.Tool>,string> effects {alloc,env,fs.read} {
+ if str.len(directory)==0{return result.ok(option.none())}
+ if not path.is_absolute(directory){return result.err("Choose an absolute audio codec tools folder")}
+ let bytes:bytes=match files.read_limited(path.join(root,"licenses/codec-runtime-source.json"),16384){ok(v)=>v,err(_)=>{
+  return result.err("The supported audio codec identity is unavailable")}}
+ let raw:str=match str.from_bytes(bytes.view(bytes)){some(v)=>v,none=>{return result.err("The audio codec identity must be UTF-8")}}
+ var pins:Pins=try Pins_decode(raw) map_err codec.describe
+ if pins.version!=1{return result.err("The audio codec identity version is unsupported")}
+ let windows:bool=system.platform()=="windows"
+ let profile:Profile=if windows{copy_profile(struct.borrow(pins,field=windows))}else{copy_profile(struct.borrow(pins,field=linux))}
+ result.ok(option.some(child.Tool{path:path.join(directory,if windows{"ffprobe.exe"}else{"ffprobe"}),sha256:string.copy(profile.probe_sha256)}))
+}
+// The user selects an installed folder. Deployment and identity policy stay
+// outside the reusable codec; no PATH search, download or runtime copy occurs.
+pub fn settings(root:str,directory:str,container:u32,working:u32,mp3_choice:u32)->result<string,string> effects {alloc,env,fs.read,fs.meta} {
+ if container>2{return result.err("Choose WAV, FLAC or MP3 output")}
+ let kind:audio.WavSubtype=try wav.from_choice(working)
+ let requested:string=try bitrate(mp3_choice)
+ if container==0{return result.ok("")}
+ if str.len(directory)==0{return result.err("Choose the audio codec tools folder to export FLAC or MP3")}
+ if not path.is_absolute(directory){return result.err("Choose an absolute audio codec tools folder")}
+ let ordinary:bool=match files.is_dir(directory){ok(v)=>v,err(_)=>false}
+ if not ordinary{return result.err("The selected audio codec tools folder is unavailable")}
+ let bytes:bytes=match files.read_limited(path.join(root,"licenses/codec-runtime-source.json"),16384){ok(v)=>v,err(_)=>{
+  return result.err("The supported audio codec identity is unavailable")}}
+ let raw:str=match str.from_bytes(bytes.view(bytes)){some(v)=>v,none=>{return result.err("The audio codec identity must be UTF-8")}}
+ var pins:Pins=try Pins_decode(raw) map_err codec.describe
+ if pins.version!=1{return result.err("The audio codec identity version is unsupported")}
+ let windows:bool=system.platform()=="windows"
+ let profile:Profile=if windows{copy_profile(struct.borrow(pins,field=windows))}else{copy_profile(struct.borrow(pins,field=linux))}
+ let encoder:string=path.join(directory,if windows{"ffmpeg.exe"}else{"ffmpeg"})
+ let probe:string=path.join(directory,if windows{"ffprobe.exe"}else{"ffprobe"})
+ let encoder_tool:child.Tool=child.Tool{path:string.copy(encoder),sha256:string.copy(profile.encoder_sha256)}
+ let probe_tool:child.Tool=child.Tool{path:string.copy(probe),sha256:string.copy(profile.probe_sha256)}
+ if not result.is_ok(child.verify(encoder_tool)) or not result.is_ok(child.verify(probe_tool)){
+  return result.err(text.concat("Choose the supported audio codec ",text.concat(profile.version," tools folder; its encoder or probe is unavailable or differs")))}
+ let selected:export.Settings=export.Settings{format:if container==1{"flac"}else{"mp3"},subtype:string.copy(wav.name(kind)),
+  bitrate:requested,normalize:false,encoder:encoder,encoder_sha256:string.copy(profile.encoder_sha256),probe:probe,probe_sha256:string.copy(profile.probe_sha256)}
+ let _=try export.validate(selected)
+ result.ok(try export.Settings_encode(selected) map_err codec.describe)
+}

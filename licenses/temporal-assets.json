@@ -1,0 +1,9 @@
+{
+  "model": "temporal-v2",
+  "filename": "temporal-v2.th",
+  "url": "https://dl.fbaipublicfiles.com/demucs/v3.0/tasnet-beb46fac.th",
+  "bytes": 44035981,
+  "sha256": "beb46fac044130652e64e0316447478762d76e03596cabf1cf483f4ac7cfbb0a",
+  "credit": "Conv-TasNet by Kaituo Xu; multichannel modifications by Alexandre Defossez and Facebook AI Research",
+  "license": "temporal-MIT.txt and waveform-MIT.txt"
+}

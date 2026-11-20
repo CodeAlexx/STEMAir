@@ -1,0 +1,235 @@
+module stemair.exchange.device
+import "plan.ai" as plan
+import "../weights.ai" as weights
+import "../control.ai" as control
+import std.gpu as devicegpu
+import std.tensor as tensor
+import std.compute as compute
+import std.group_norm_torch as stable
+
+pub type Backend=struct{normalizer:option<stable.Engine>}
+pub fn prepare(context:ref<GpuContext>,p:ref<plan.Plan>)->result<Backend,string> effects {alloc,gpu}{
+ var i:u64=0
+ loop{if i==array.len(p.nodes){break}
+  if array.borrow(p.nodes,i).operation==plan.Operation.GroupNormalization{
+   return result.ok(Backend{normalizer:option.some(try stable.create(context) map_err error)})}
+  i+=1}
+ result.ok(Backend{normalizer:option.none()})
+}
+
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+fn empty(context:ref<GpuContext>,dims:view<u64>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ result.ok(try tensor.empty(context,dims,tensor.DType.F32) map_err error)
+}
+pub fn upload(context:ref<GpuContext>,stream:ref<GpuStream>,p:ref<plan.Plan>)->result<array<tensor.Tensor>,string> effects {alloc,gpu} {
+ var out:array<tensor.Tensor>=[]
+ var i:u64=0
+ loop{if i>=array.len(p.weights.parameters.values){break}
+  let parameter:ref<weights.Parameter>=array.borrow(p.weights.parameters.values,i)
+  let value:tensor.Tensor=try tensor.from_f32(context,stream,array.view(parameter.values),array.view(parameter.shape),tensor.DType.F32) map_err error
+  array.push(out,value)
+  i+=1}
+ let _=try devicegpu.sync(context) map_err error
+ result.ok(out)
+}
+fn operand(parameters:ref<array<tensor.Tensor>>,pool:ref<array<option<tensor.Tensor>>>,id:u64,original:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if id<original{return result.ok(try tensor.view(array.borrow(parameters,id)) map_err error)}
+ if id-original>=array.len(pool){return result.err("Interchange operand is out of range")}
+ match array.borrow(pool,id-original){
+  none=>result.err("Interchange operand is not live"),
+  some(value)=>result.ok(try tensor.view(value) map_err error),}
+}
+fn convolution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,pool:ref<array<option<tensor.Tensor>>>,n:ref<plan.Node>,original:u64,up:bool)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ var x:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,0),original)
+ var w:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,1),original)
+ if tensor.rank(x)!=4 or tensor.rank(w)!=4 or n.groups==0{return result.err("Interchange convolution requires rank-four tensors and positive groups")}
+ let batch:u64=array.get(x.dimensions,0)
+ let channels:u64=array.get(x.dimensions,1)
+ let height:u64=array.get(x.dimensions,2)
+ let width:u64=array.get(x.dimensions,3)
+ let kh:u64=array.get(w.dimensions,2)
+ let kw:u64=array.get(w.dimensions,3)
+ if (n.kernel_h!=0 and n.kernel_h!=kh) or (n.kernel_w!=0 and n.kernel_w!=kw){return result.err("Declared convolution kernel does not match its parameter")}
+ let co:u64=if up{array.get(w.dimensions,1)*n.groups}else{array.get(w.dimensions,0)}
+ if channels%n.groups!=0 or co%n.groups!=0 or kh==0 or kw==0{return result.err("Interchange convolution group mismatch")}
+ if (not up and array.get(w.dimensions,1)*n.groups!=channels) or (up and array.get(w.dimensions,0)!=channels){return result.err("Interchange convolution channel mismatch")}
+ let eh:u64=(kh-1)*n.dilation_h+1
+ let ew:u64=(kw-1)*n.dilation_w+1
+ if height==0 or width==0 or (not up and (height+2*n.pad_h<eh or width+2*n.pad_w<ew)){
+  return result.err("Invalid interchange convolution extent")}
+ if up and ((height-1)*n.stride_h+eh<=2*n.pad_h or (width-1)*n.stride_w+ew<=2*n.pad_w){return result.err("Invalid interchange transpose convolution extent")}
+ let oh:u64=if up{(height-1)*n.stride_h+eh-2*n.pad_h}else{(height+2*n.pad_h-eh)/n.stride_h+1}
+ let ow:u64=if up{(width-1)*n.stride_w+ew-2*n.pad_w}else{(width+2*n.pad_w-ew)/n.stride_w+1}
+ let shape:array<u64>=[batch,co,oh,ow]
+ var output:tensor.Tensor=try empty(context,array.view(shape))
+ var bias:tensor.Tensor=if array.len(n.inputs)==3{
+  try operand(parameters,pool,array.get(n.inputs,2),original)
+ }else{let bs:array<u64>=[co]
+  try tensor.zeros(context,stream,array.view(bs),tensor.DType.F32) map_err error}
+ if tensor.rank(bias)!=1 or array.get(bias.dimensions,0)!=co{return result.err("Interchange convolution bias mismatch")}
+ if up{
+  let _=try compute.conv_transpose2d_torch_f32(stream,x,w,bias,output,n.stride_h,n.stride_w,n.pad_h,n.pad_w,n.dilation_h,n.dilation_w,n.groups,268435456,not n.checkpoint_arithmetic,n.checkpoint_arithmetic) map_err error
+ }else{
+  let _=try compute.conv2d_torch_f32_general(stream,x,w,bias,output,n.stride_h,n.stride_w,n.pad_h,n.pad_w,n.dilation_h,n.dilation_w,n.groups,268435456,not n.checkpoint_arithmetic,n.checkpoint_arithmetic) map_err error}
+ result.ok(output)
+}
+fn matmul(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,w:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let rank:u64=tensor.rank(x)
+ if rank<2 or tensor.rank(w)!=2{return result.err("Interchange matrix multiplication requires a constant rank-two right operand")}
+ let inner:u64=array.get(x.dimensions,rank-1)
+ if inner!=array.get(w.dimensions,0){return result.err("Interchange matrix inner dimensions do not match")}
+ let columns:u64=array.get(w.dimensions,1)
+ let rows:u64=tensor.elements(x)/inner
+ let flat_shape:array<u64>=[rows,inner]
+ var flat:tensor.Tensor=try tensor.reshape(x,array.view(flat_shape)) map_err error
+ let output_shape:array<u64>=[rows,columns]
+ var flat_out:tensor.Tensor=try empty(context,array.view(output_shape))
+ let _=try compute.matmul(stream,flat,w,flat_out,false,false) map_err error
+ var shape:array<u64>=[]
+ var i:u64=0
+ loop{if i>=rank{break}
+  array.push(shape,if i+1==rank{columns}else{array.get(x.dimensions,i)})
+  i+=1}
+ result.ok(try tensor.reshape(flat_out,array.view(shape)) map_err error)
+}
+fn transpose(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,order:view<u64>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if view.len(order)!=tensor.rank(x){return result.err("Interchange transpose rank mismatch")}
+ var i:u64=0
+ loop{if i>=view.len(order){break}
+  if view.get(order,i)>=view.len(order){return result.err("Interchange transpose axis is out of range")}
+  var j:u64=0
+  loop{if j>=i{break}
+   if view.get(order,i)==view.get(order,j){return result.err("Duplicate interchange transpose axis")}
+   j+=1}
+  i+=1}
+ var view:tensor.Tensor=try tensor.permute(x,order) map_err error
+ result.ok(try tensor.contiguous(context,stream,view) map_err error)
+}
+fn normalization(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,x:ref<tensor.Tensor>,scale_id:u64,bias_id:u64)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if tensor.rank(x)!=4{return result.err("Interchange normalization requires rank-four input")}
+ var scale:tensor.Tensor=try tensor.view(array.borrow(parameters,scale_id)) map_err error
+ var bias:tensor.Tensor=try tensor.view(array.borrow(parameters,bias_id)) map_err error
+ if array.get(scale.dimensions,0)!=array.get(x.dimensions,1){return result.err("Interchange normalization channel mismatch")}
+ var channels_last:tensor.Tensor=try transpose(context,stream,x,[0,2,3,1])
+ var out:tensor.Tensor=try empty(context,array.view(channels_last.dimensions))
+ let _=try compute.affine_last_dim(stream,channels_last,scale,bias,out) map_err error
+ transpose(context,stream,out,[0,3,1,2])
+}
+fn same_shape(a:ref<tensor.Tensor>,b:ref<tensor.Tensor>)->bool effects {} {
+ if tensor.rank(a)!=tensor.rank(b){return false}
+ var i:u64=0
+ loop{if i>=tensor.rank(a){break}
+  if array.get(a.dimensions,i)!=array.get(b.dimensions,i){return false}
+  i+=1}
+ true
+}
+fn execute(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,pool:ref<array<option<tensor.Tensor>>>,n:ref<plan.Node>,original:u64,backend:ref<Backend>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ match n.operation{
+  Convolution=>convolution(context,stream,parameters,pool,n,original,false),
+  Relu=>{
+   var x:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,0),original)
+   var out:tensor.Tensor=try empty(context,array.view(x.dimensions))
+   let _=try compute.relu(stream,x,out) map_err error
+   result.ok(out)
+  },
+  Transpose=>{
+   var x:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,0),original)
+   transpose(context,stream,x,array.view(n.permutation))
+  },
+  Matmul=>{
+   var x:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,0),original)
+   var w:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,1),original)
+   matmul(context,stream,x,w)
+  },
+  Dense=>{
+   var x:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,0),original)
+   var w:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,1),original)
+   if tensor.rank(x)<2 or tensor.rank(w)!=2{return result.err("Dense projection rank differs")}
+   let inner:u64=array.get(w.dimensions,1)
+   let columns:u64=array.get(w.dimensions,0)
+   if array.get(x.dimensions,tensor.rank(x)-1)!=inner{return result.err("Dense projection width differs")}
+   let rows:u64=tensor.elements(x)/inner
+   let input_shape:array<u64>=[rows,inner]
+   let output_shape:array<u64>=[rows,columns]
+   var flat:tensor.Tensor=try tensor.reshape(x,array.view(input_shape)) map_err error
+   var out:tensor.Tensor=try empty(context,array.view(output_shape))
+   if array.len(n.inputs)==3{
+    var bias:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,2),original)
+    let _=try compute.linear_bias_eager_f32(stream,flat,w,bias,out,1048576) map_err error
+   }else{let _=try compute.linear_eager_compat(stream,flat,w,out) map_err error}
+   var shape:array<u64>=[]
+   var i:u64=0
+   loop{if i==tensor.rank(x){break}
+    array.push(shape,if i+1==tensor.rank(x){columns}else{array.get(x.dimensions,i)})
+    i+=1}
+   result.ok(try tensor.reshape(out,array.view(shape)) map_err error)
+  },
+  GroupNormalization=>{
+   var x:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,0),original)
+   var gamma:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,1),original)
+   var beta:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,2),original)
+   var out:tensor.Tensor=try empty(context,array.view(x.dimensions))
+   match backend.normalizer{some(engine)=>{let _=try stable.forward(engine,context,stream,x,gamma,beta,out,n.groups,0.00001) map_err error},none=>{return result.err("Checkpoint group normalization must be prepared at session open")}}
+   result.ok(out)
+  },
+  RunningNormalization=>{
+   var x:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,0),original)
+   var gamma:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,1),original)
+   var beta:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,2),original)
+   var mean:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,3),original)
+   var variance:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,4),original)
+   var out:tensor.Tensor=try empty(context,array.view(x.dimensions))
+   let _=try compute.batch_norm_inference_spatial_f32(stream,x,gamma,beta,mean,variance,out,0.00001) map_err error
+   result.ok(out)
+  },
+  Add=>{
+   var a:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,0),original)
+   var b:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,1),original)
+   if not same_shape(a,b){return result.err("Interchange addition broadcast is not yet admitted")}
+   var out:tensor.Tensor=try empty(context,array.view(a.dimensions))
+   let _=try compute.add(stream,a,b,out) map_err error
+   result.ok(out)
+  },
+  TransposeConvolution=>convolution(context,stream,parameters,pool,n,original,true),
+  Mul=>{
+   var a:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,0),original)
+   var b:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,1),original)
+   if not same_shape(a,b){return result.err("Interchange multiplication broadcast is not yet admitted")}
+   var out:tensor.Tensor=try empty(context,array.view(a.dimensions))
+   let _=try compute.mul(stream,a,b,out) map_err error
+   result.ok(out)
+  },
+  Normalization=>{
+   var x:tensor.Tensor=try operand(parameters,pool,array.get(n.inputs,0),original)
+   normalization(context,stream,parameters,x,n.scale,n.bias)
+  },}
+}
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,p:ref<plan.Plan>,input:tensor.Tensor own,cancel:str)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var backend:Backend=Backend{normalizer:option.none()}
+ forward_prepared(context,stream,parameters,p,input,cancel,backend)
+}
+pub fn forward_prepared(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,p:ref<plan.Plan>,input:tensor.Tensor own,cancel:str,backend:ref<Backend>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var pool:array<option<tensor.Tensor>>=[]
+ var uses:array<u64>=[]
+ var i:u64=0
+ loop{if i>=p.values{break}
+  if i>=p.original_parameters{array.push(pool,option.none())}
+  array.push(uses,array.get(p.uses,i))
+  i+=1}
+ let _=ref.swap(array.borrow(pool,p.input-p.original_parameters),option.some(input))
+ i=0
+ loop{if i>=array.len(p.nodes){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let n:ref<plan.Node>=array.borrow(p.nodes,i)
+  let output:tensor.Tensor=try execute(context,stream,parameters,pool,n,p.original_parameters,backend)
+  let _=ref.swap(array.borrow(pool,n.output-p.original_parameters),option.some(output))
+  var j:u64=0
+  loop{if j>=array.len(n.inputs){break}
+   let id:u64=array.get(n.inputs,j)
+   let remaining:u64=array.get(uses,id)-1
+   array.set(uses,id,remaining)
+   if remaining==0 and id>=p.original_parameters{let _=ref.swap(array.borrow(pool,id-p.original_parameters),option.none())}
+   j+=1}
+  i+=1}
+ operand(parameters,pool,p.output,p.original_parameters)
+}

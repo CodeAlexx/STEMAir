@@ -1,0 +1,13 @@
+{
+  "model": "mask-small-v1",
+  "filename": "mask-small-v1.pth",
+  "url": "https://raw.githubusercontent.com/CodeAlexx/STEMAir/main/assets/mask-small-v1.pth",
+  "bytes": 31938951,
+  "sha256": "afb84b3d1da4a7e24033e5a0e85dbde2ac5f5e4b1e839788748735ac3bcc5046",
+  "reference_metadata_tail_md5": "74b3bc5fa2b69f29baf7839b858bc679",
+  "configuration": "configs/mask-small-v1.json",
+  "reference_architecture": 31191,
+  "reference_parameters": "4band_44100",
+  "credit": "Original vocal-remover architecture by tsurumeso; model distributed by Ultimate Vocal Remover, Anjok07 and aufr33",
+  "license": "MIT architecture notice retained in mask-reference-MIT.txt; original weight credit retained here"
+}

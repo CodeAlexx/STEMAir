@@ -1,0 +1,73 @@
+module stemair.attention.host_stack
+import "network.ai" as network
+import "host_layers.ai" as layers
+import "host_transformer.ai" as transformer
+import "position.ai" as position
+import "../control.ai" as control
+pub type Streams=struct{frequency:layers.Tensor,time:layers.Tensor}
+fn tokens(x:ref<layers.Tensor>)->transformer.Tensor effects {alloc} {
+ var values:array<f32>=[]
+ array.reserve(values,array.len(x.data))
+ var b:u64=0
+ loop{if b==x.n{break}
+  var t:u64=0
+  loop{if t==x.w{break}
+   var f:u64=0
+   loop{if f==x.h{break}
+    var c:u64=0
+    loop{if c==x.c{break}
+     array.push(values,array.get(x.data,((b*x.c+c)*x.h+f)*x.w+t))
+     c+=1}
+    f+=1}
+   t+=1}
+  b+=1}
+ transformer.Tensor{batch:x.n,tokens:x.h*x.w,width:x.c,values:values}
+}
+fn planar(x:ref<transformer.Tensor>,height:u64,width:u64)->layers.Tensor effects {alloc} {
+ var values:array<f32>=[]
+ array.reserve(values,array.len(x.values))
+ var b:u64=0
+ loop{if b==x.batch{break}
+  var c:u64=0
+  loop{if c==x.width{break}
+   var f:u64=0
+   loop{if f==height{break}
+    var t:u64=0
+    loop{if t==width{break}
+     array.push(values,array.get(x.values,((b*width+t)*height+f)*x.width+c))
+     t+=1}
+    f+=1}
+   c+=1}
+  b+=1}
+ layers.tensor(x.batch,x.width,height,width,values)
+}
+fn add_position(x:ref<transformer.Tensor>,position:view<f32>)->result<transformer.Tensor,string> effects {alloc} {
+ if view.len(position)!=x.tokens*x.width{return result.err("CPU attention position extent differs")}
+ var values:array<f32>=[]
+ array.reserve(values,array.len(x.values))
+ var i:u64=0
+ loop{if i==array.len(x.values){break}
+  array.push(values,array.get(x.values,i)+view.get(position,i%view.len(position)))
+  i+=1}
+ result.ok(transformer.Tensor{batch:x.batch,tokens:x.tokens,width:x.width,values:values})
+}
+pub fn forward(n:ref<network.Network>,backend:ref<transformer.Backend>,library:ref<CAbiLibrary>,frequency:ref<layers.Tensor>,time:ref<layers.Tensor>,cancel:str)->result<Streams,string> effects {alloc,ffi,fs.meta} {
+ if frequency.n==0 or frequency.n!=time.n or frequency.c!=n.transformer.width or time.c!=n.transformer.width or time.h!=1 or frequency.h==0 or frequency.w==0 or frequency.h*frequency.w>8192 or time.w==0 or time.w>8192{return result.err("CPU two-stream attention geometry differs")}
+ var x:transformer.Tensor=tokens(frequency)
+ var xt:transformer.Tensor=tokens(time)
+ x=try transformer.normalize(struct.borrow(n,field=weights),backend,x,n.transformer.norm)
+ xt=try transformer.normalize(struct.borrow(n,field=weights),backend,xt,n.transformer.norm_time)
+ let frequency_position:array<f32>=try position.spectral(frequency.h,frequency.w,n.transformer.width,10000.0)
+ let time_position:array<f32>=try position.temporal(time.w,n.transformer.width,0,10000.0)
+ x=try add_position(x,array.view(frequency_position))
+ xt=try add_position(xt,array.view(time_position))
+ var i:u64=0
+ loop{if i==5{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let next:transformer.Tensor=try transformer.forward(struct.borrow(n,field=weights),backend,library,array.get(n.transformer.layers,i),x,xt,cancel)
+  let next_time:transformer.Tensor=try transformer.forward(struct.borrow(n,field=weights),backend,library,array.get(n.transformer.time_layers,i),xt,x,cancel)
+  x=next
+  xt=next_time
+  i+=1}
+ result.ok(Streams{frequency:planar(x,frequency.h,frequency.w),time:planar(xt,1,time.w)})
+}

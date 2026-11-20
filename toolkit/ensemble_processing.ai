@@ -1,0 +1,323 @@
+module stemair.ensemble_processing
+import "mask/request.ai" as mask_request
+import "secondary.ai" as secondary
+import "secondary_config.ai" as settings
+import "model_ensemble.ai" as ensemble
+import "model_ensemble_config.ai" as config
+import "model_cache.ai" as models
+import "engine.ai" as engine
+import "numeric.ai" as num
+import "control.ai" as control
+import std.text as text
+import std.audio as audio
+
+pub type Member=struct{recipe:settings.Recipe,plan:secondary.Plan,bindings:array<secondary.Binding>}
+pub type Prediction=struct{member:u64,stage:string,targets:array<string>,values:array<f32>,input:array<f32>}
+pub type Recording=struct{predictions:array<Prediction>,sources:array<Prediction>,samples:u64,held:u64}
+pub type Output=struct{combined:ensemble.Output,processed:array<secondary.Output>}
+pub fn empty()->Recording effects {alloc} {Recording{predictions:[],sources:[],samples:0,held:0}}
+pub fn name(target:ref<config.Target>)->string effects {alloc} {
+ if str.len(target.exclude)>0{text.concat("no_",target.exclude)}else{string.copy(target.target)}
+}
+pub fn outputs(c:ref<config.Options>)->array<string> effects {alloc} {
+ var names:array<string>=[]
+ var index:u64=0
+ loop{if index==array.len(c.outputs){break}
+  let selected:string=name(array.borrow(c.outputs,index))
+  if not option.is_some(ensemble.find(names,selected)){array.push(names,selected)}
+  index+=1}
+ names
+}
+pub fn key(member:ref<Member>,stage:ref<secondary.Stage>)->result<string,string> effects {alloc} {
+ if stage.source=="recording"{return result.ok("recording")}
+ if stage.source!="instrumental" or member.recipe.preprocess==0{return result.err("Vocal splitting is disabled for ensemble members")}
+ let preprocessor:u64=try secondary.binding(struct.borrow(member,field=bindings),member.recipe.preprocess)
+ result.ok(text.concat("instrumental:",text.concat(string.from_int(preprocessor),text.concat(":",member.recipe.preprocess_complement))))
+}
+pub fn find(cache:ref<Recording>,member:u64,stage:str)->option<u64> effects {} {
+ var index:u64=0
+ loop{if index==array.len(cache.predictions){break}
+  let item:ref<Prediction>=array.borrow(cache.predictions,index)
+  if item.member==member and item.stage==stage{return option.some(index)}
+  index+=1}
+ option.none()
+}
+fn room(cache:ref<Recording>,additional:u64)->result<unit,string> effects {alloc} {
+ if cache.samples>536870912 or cache.held>536870912-cache.samples or additional>536870912-cache.samples-cache.held{
+  return result.err("Ensemble source cache exceeds its retained host memory bound")}
+ result.ok(())
+}
+pub fn store(cache:ref<Recording>,member:u64,stage:str,targets:array<string> own,values:array<f32> own,input:array<f32> own)->result<u64,string> effects {alloc} {
+ let count:u64=array.len(targets)
+ let size:u64=array.len(values)
+ if count==0 or count>16 or size==0 or size%(2*count)!=0 or not num.finite(array.view(values)) or
+    array.len(input)%2!=0 or not num.finite(array.view(input)){return result.err("Invalid cached ensemble prediction")}
+ if option.is_some(find(cache,member,stage)){return result.err("An ensemble input stage was predicted twice")}
+ if size>536870912 or array.len(input)>536870912-size{return result.err("Ensemble source cache exceeds its retained host memory bound")}
+ let _=try room(cache,size+array.len(input))
+ cache.samples+=size+array.len(input)
+ let index:u64=array.len(cache.predictions)
+ array.push(cache.predictions,Prediction{member:member,stage:string.copy(stage),targets:targets,values:values,input:input})
+ result.ok(index)
+}
+fn source_index(cache:ref<Recording>,member:u64)->option<u64> effects {} {
+ var index:u64=0
+ loop{if index==array.len(cache.sources){break}
+  if array.borrow(cache.sources,index).member==member{return option.some(index)}
+  index+=1}
+ option.none()
+}
+pub fn publish_source(cache:ref<Recording>,member:u64,raw:ref<array<secondary.Prediction>>,inputs:ref<array<secondary.StageInput>>,c:ref<settings.Recipe>)->result<unit,string> effects {alloc, env, ffi, fs.read} {
+ let used:u64=try secondary.cache_extent(raw,inputs)
+ if used>268435456{return result.err("Ensemble source cache exceeds its retained host memory bound")}
+ let _=try room(cache,used*2)
+ var primary:secondary.Prediction=try secondary.primary_prediction(raw,c)
+ let previous:option<u64>=source_index(cache,member)
+ let count:u64=array.len(primary.values)
+ let source:Prediction=Prediction{member:member,stage:"source",targets:struct.replace(primary,[],field=targets),values:struct.replace(primary,[],field=values),input:[]}
+ match previous{none=>{array.push(cache.sources,source)
+  cache.samples+=count},some(index)=>{
+  let before:u64=array.len(array.borrow(cache.sources,index).values)
+  array.set(cache.sources,index,source)
+  cache.samples=cache.samples-before+count}}
+ result.ok(())
+}
+pub fn export_feedback(cache:ref<Recording>,member:u64,c:ref<settings.Recipe>,output:ref<secondary.Output>)->result<unit,string> effects {alloc} {
+ let selected:u64=match source_index(cache,member){none=>{return result.ok(())},some(v)=>v}
+ let source:ref<Prediction>=array.borrow(cache.sources,selected)
+ let frames:u64=array.len(source.values)/(2*array.len(source.targets))
+ var index:u64=0
+ loop{if index==array.len(output.stems){break}
+  let stem:ref<secondary.Stem>=array.borrow(output.stems,index)
+  if not option.is_some(secondary.adjustment(c,stem.target)){
+   match ensemble.find(struct.borrow(source,field=targets),stem.target){none=>{},some(at)=>{
+    if stem.frames!=frames or array.len(stem.values)!=2*frames{return result.err("Cached native stem extent differs from its export")}
+    var sample:u64=0
+    loop{if sample==2*frames{break}
+     array.set(struct.borrow(source,field=values),at*2*frames+sample,array.get(stem.values,sample))
+     sample+=1}
+   }}
+  }
+  index+=1}
+ result.ok(())
+}
+fn restore_prediction(capacity:u64,cached:ref<Prediction>,stage:ref<secondary.Stage>,raw:ref<array<secondary.Prediction>>,inputs:ref<array<secondary.StageInput>>)->result<unit,string> effects {alloc} {
+ let used:u64=try secondary.cache_extent(raw,inputs)
+ let count:u64=array.len(cached.values)+array.len(cached.input)
+ if used>536870912 or count>536870912-used{return result.err("Ensemble source cache exceeds its retained host memory bound")}
+ if used+count>capacity{return result.err("Ensemble source cache exceeds its retained host memory bound")}
+ let _=try secondary.push_stage(raw,stage.model,ensemble.names(struct.borrow(cached,field=targets)),num.copy(array.view(cached.values)),stage.source)
+ if array.len(cached.input)>0{let _=try secondary.capture_input(raw,inputs,stage.model,stage.source,num.copy(array.view(cached.input)))}
+ result.ok(())
+}
+pub fn restore(cache:ref<Recording>,index:u64,stage:ref<secondary.Stage>,raw:ref<array<secondary.Prediction>>,inputs:ref<array<secondary.StageInput>>)->result<unit,string> effects {alloc} {
+ if index>=array.len(cache.predictions){return result.err("Cached ensemble prediction is unavailable")}
+ let _=try room(cache,0)
+ let capacity:u64=536870912-cache.samples-cache.held
+ let member:u64=array.borrow(cache.predictions,index).member
+ if stage.source=="recording"{
+  match source_index(cache,member){none=>{},some(source)=>{
+   return restore_prediction(capacity,array.borrow(cache.sources,source),stage,raw,inputs)
+  }}
+ }
+ restore_prediction(capacity,array.borrow(cache.predictions,index),stage,raw,inputs)
+}
+pub fn validate(members:ref<array<Member>>)->result<unit,string> effects {alloc} {
+ if array.len(members)<2 or array.len(members)>16{return result.err("Select between two and sixteen ensemble members")}
+ var index:u64=0
+ loop{if index==array.len(members){break}
+  let member:ref<Member>=array.borrow(members,index)
+  if member.recipe.vocal_split>0 or member.recipe.vocal_rebalance!=0.0 or member.recipe.vocal_mixes or member.recipe.vocal_mix_only or member.recipe.vocal_save_only{
+   return result.err("Vocal splitting is disabled for ensemble members")}
+  let _=try secondary.validate(struct.borrow(member,field=recipe))
+  if array.len(member.bindings)!=array.len(member.plan.required){return result.err("Ensemble processing bindings differ from the plan")}
+  var at:u64=0
+  loop{if at==array.len(member.plan.required){break}
+   let _=try secondary.binding(struct.borrow(member,field=bindings),array.get(member.plan.required,at))
+   var prior:u64=0
+   loop{if prior==at{break}
+    if array.borrow(member.bindings,prior).model==array.borrow(member.bindings,at).model{return result.err("Duplicate ensemble processing binding")}
+    prior+=1}
+   at+=1}
+  let primary:u64=try secondary.binding(struct.borrow(member,field=bindings),0)
+  at=0
+  loop{if at==index{break}
+   if primary==try secondary.binding(struct.borrow(array.borrow(members,at),field=bindings),0){return result.err("Ensemble primary models must be distinct")}
+   at+=1}
+  index+=1}
+ result.ok(())
+}
+pub fn validate_bank(bank:ref<models.Cache>,members:ref<array<Member>>,cpu:bool)->result<unit,string> effects {alloc} {
+ let _=try validate(members)
+ var index:u64=0
+ loop{if index==array.len(members){break}
+  let member:ref<Member>=array.borrow(members,index)
+  var at:u64=0
+  loop{if at==array.len(member.bindings){break}
+   let selected:u64=array.borrow(member.bindings,at).member
+   if selected>=array.len(bank.entries){return result.err("An ensemble processing binding is out of range")}
+   let kind:str=array.borrow(bank.entries,selected).model.profile.kind
+   if cpu and kind!="spectral" and kind!="exchange"{return result.err("A selected processing model currently requires GPU execution")}
+   at+=1}
+  index+=1}
+ result.ok(())
+}
+pub fn validate_options(members:ref<array<Member>>,c:ref<config.Options>)->result<unit,string> effects {alloc} {
+ let _=try ensemble.validate(c)
+ if array.len(c.outputs)==0{return result.err("Ensemble processing outputs have not been resolved")}
+ var index:u64=0
+ loop{if index==array.len(members){break}
+  let member:ref<Member>=array.borrow(members,index)
+  if member.recipe.normalize!=c.normalize or member.recipe.keep_members!=c.keep_members or str.view(member.recipe.complement)!=str.view(c.complement){return result.err("Ensemble member output policy differs from its reduction settings")}
+  var at:u64=0
+  loop{if at==array.len(c.outputs){break}
+   let requested:string=name(array.borrow(c.outputs,at))
+   if not option.is_some(ensemble.find(struct.borrow(struct.borrow(member,field=plan),field=outputs),requested)){return result.err("An ensemble member plan is missing a requested stem")}
+   at+=1}
+  index+=1}
+ result.ok(())
+}
+pub fn append(cache:ref<Recording>,acc:ref<ensemble.Accumulator>,c:ref<config.Options>,output:ref<secondary.Output>,cancel:str)->result<unit,string> effects {alloc,fs.meta} {
+ var selected:array<u64>=[]
+ var retained:u64=0
+ var index:u64=0
+ loop{if index==array.len(c.outputs){break}
+  let requested:string=name(array.borrow(c.outputs,index))
+  var found:option<u64>=option.none()
+  var at:u64=0
+  loop{if at==array.len(output.stems){break}
+   if array.borrow(output.stems,at).target==requested{found=option.some(at)}
+   at+=1}
+  let source:u64=match found{some(v)=>v,none=>{return result.err("Processed ensemble member is missing a requested stem")}}
+  let size:u64=array.len(array.borrow(output.stems,source).values)
+  if size>536870912-retained{return result.err("Ensemble source cache exceeds its retained host memory bound")}
+  retained+=size
+  array.push(selected,source)
+  index+=1}
+ if c.keep_members{
+  if retained>268435456{return result.err("Ensemble source cache exceeds its retained host memory bound")}
+  retained*=2
+  let raw:u64=try secondary.cache_extent(struct.borrow(output,field=saved),struct.borrow(output,field=inputs))
+  if raw>536870912-retained{return result.err("Ensemble source cache exceeds its retained host memory bound")}
+  retained+=raw
+  index=0
+  loop{if index==array.len(output.stems){break}
+   let size:u64=array.len(array.borrow(output.stems,index).values)
+   if size>536870912-retained{return result.err("Ensemble source cache exceeds its retained host memory bound")}
+   retained+=size
+   index+=1}}
+ let _=try room(cache,retained)
+ var waves:array<array<f32>>=[]
+ index=0
+ loop{if index==array.len(selected){break}
+  array.push(waves,num.copy(array.view(array.borrow(output.stems,array.get(selected,index)).values)))
+  index+=1}
+ let _=try ensemble.push_processed(acc,c,waves,cancel)
+ cache.held+=retained
+ result.ok(())
+}
+pub fn separate_cpu(bank:ref<models.Cache>,members:ref<array<Member>>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ separate_cpu_as(bank,members,c,input,cancel,progress,audio.WavSubtype.Float32)
+}
+pub fn separate_cpu_as(bank:ref<models.Cache>,members:ref<array<Member>>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,kind:audio.WavSubtype)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try models.require_cpu_policy(bank)
+ let _=try validate_options(members,c)
+ let _=try validate_bank(bank,members,true)
+ var cache:Recording=empty()
+ var acc:ensemble.Accumulator=try ensemble.begin_as(c,kind)
+ var processed:array<secondary.Output>=[]
+ var index:u64=0
+ loop{if index==array.len(members){break}
+  let member:ref<Member>=array.borrow(members,index)
+  var stages:array<secondary.Stage>=secondary.stages(struct.borrow(member,field=plan),struct.borrow(member,field=recipe))
+  var raw:array<secondary.Prediction>=[]
+  var inputs:array<secondary.StageInput>=[]
+  var at:u64=0
+  loop{if at==array.len(stages){break}
+   if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+   let stage:ref<secondary.Stage>=array.borrow(stages,at)
+   let selected:u64=try secondary.binding(struct.borrow(member,field=bindings),stage.model)
+   let identity:string=try key(member,stage)
+   let cached:u64=match find(cache,selected,identity){some(v)=>v,none=>{
+    let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,selected),field=model)
+    let targets:array<string>=ensemble.names(struct.borrow(struct.borrow(model,field=profile),field=targets))
+    var filtered:array<f32>=[]
+    let predicted:array<f32>=if stage.source=="instrumental"{
+     filtered=try secondary.instrumental_input(raw,struct.borrow(member,field=recipe),input)
+     try engine.separate_cpu(model,array.view(filtered),cancel,progress)
+    }else{try engine.separate_cpu(model,input,cancel,progress)}
+    if not member.recipe.keep_members{filtered=[]}
+    try store(cache,selected,identity,targets,predicted,filtered)}}
+   let _=try restore(cache,cached,stage,raw,inputs)
+   at+=1}
+  let primary:u64=try secondary.binding(struct.borrow(member,field=bindings),0)
+  let kind:str=array.borrow(bank.entries,primary).model.profile.kind
+  let waveform:bool=kind=="waveform" or kind=="temporal" or kind=="residual-waveform" or kind=="hybrid" or kind=="attention"
+  if waveform{let _=try publish_source(cache,primary,raw,inputs,struct.borrow(member,field=recipe))}
+  var output:secondary.Output=try secondary.finish(raw,struct.borrow(member,field=plan),struct.borrow(member,field=recipe),input,cancel,progress)
+  output.inputs=inputs
+  if waveform{let _=try export_feedback(cache,primary,struct.borrow(member,field=recipe),output)}
+  let _=try append(cache,acc,c,output,cancel)
+  if c.keep_members{array.push(processed,output)}
+  index+=1}
+ let combined:ensemble.Output=try ensemble.finish_processed(acc,c,cancel,progress)
+ result.ok(Output{combined:combined,processed:processed})
+}
+
+// Explicit retained CPU backend route; legacy CPU API stays dependency-free.
+pub fn separate_cpu_prepared(bank:ref<models.Cache>,members:ref<array<Member>>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ separate_cpu_prepared_with_high_band(bank,members,c,input,cancel,progress,mask_request.HighBand.Profile)
+}
+pub fn separate_cpu_prepared_with_high_band(bank:ref<models.Cache>,members:ref<array<Member>>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ separate_cpu_prepared_with_high_band_as(bank,members,c,input,cancel,progress,high_band,audio.WavSubtype.Float32)
+}
+pub fn separate_cpu_prepared_with_high_band_as(bank:ref<models.Cache>,members:ref<array<Member>>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,kind:audio.WavSubtype)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var policy:mask_request.Policy=mask_request.defaults()
+ policy.high_band=high_band
+ separate_cpu_prepared_with_policy_as(bank,members,c,input,cancel,progress,policy,kind)
+}
+pub fn separate_cpu_prepared_with_policy_as(bank:ref<models.Cache>,members:ref<array<Member>>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,kind:audio.WavSubtype)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try mask_request.validate_policy(policy)
+ let _=try models.require_cpu_policy(bank)
+ let _=try validate_options(members,c)
+ let _=try validate_bank(bank,members,false)
+ var cache:Recording=empty()
+ var acc:ensemble.Accumulator=try ensemble.begin_as(c,kind)
+ var processed:array<secondary.Output>=[]
+ var index:u64=0
+ loop{if index==array.len(members){break}
+  let member:ref<Member>=array.borrow(members,index)
+  var stages:array<secondary.Stage>=secondary.stages(struct.borrow(member,field=plan),struct.borrow(member,field=recipe))
+  var raw:array<secondary.Prediction>=[]
+  var inputs:array<secondary.StageInput>=[]
+  var at:u64=0
+  loop{if at==array.len(stages){break}
+   if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+   let stage:ref<secondary.Stage>=array.borrow(stages,at)
+   let selected:u64=try secondary.binding(struct.borrow(member,field=bindings),stage.model)
+   let identity:string=try key(member,stage)
+   let cached:u64=match find(cache,selected,identity){some(v)=>v,none=>{
+    let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,selected),field=model)
+    let targets:array<string>=ensemble.names(struct.borrow(struct.borrow(model,field=profile),field=targets))
+    var filtered:array<f32>=[]
+    let predicted:array<f32>=if stage.source=="instrumental"{
+     filtered=try secondary.instrumental_input(raw,struct.borrow(member,field=recipe),input)
+     try models.separate_cpu_with_policy(bank,selected,array.view(filtered),cancel,progress,policy)
+    }else{try models.separate_cpu_with_policy(bank,selected,input,cancel,progress,policy)}
+    if not member.recipe.keep_members{filtered=[]}
+    try store(cache,selected,identity,targets,predicted,filtered)}}
+   let _=try restore(cache,cached,stage,raw,inputs)
+   at+=1}
+  let primary:u64=try secondary.binding(struct.borrow(member,field=bindings),0)
+  let kind:str=array.borrow(bank.entries,primary).model.profile.kind
+  let waveform:bool=kind=="waveform" or kind=="temporal" or kind=="residual-waveform" or kind=="hybrid" or kind=="attention"
+  if waveform{let _=try publish_source(cache,primary,raw,inputs,struct.borrow(member,field=recipe))}
+  var output:secondary.Output=try secondary.finish(raw,struct.borrow(member,field=plan),struct.borrow(member,field=recipe),input,cancel,progress)
+  output.inputs=inputs
+  if waveform{let _=try export_feedback(cache,primary,struct.borrow(member,field=recipe),output)}
+  let _=try append(cache,acc,c,output,cancel)
+  if c.keep_members{array.push(processed,output)}
+  index+=1}
+ let combined:ensemble.Output=try ensemble.finish_processed(acc,c,cancel,progress)
+ result.ok(Output{combined:combined,processed:processed})
+}

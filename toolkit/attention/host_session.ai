@@ -1,0 +1,52 @@
+module stemair.attention.host_session
+import "network.ai" as network
+import "host.ai" as host
+import "config.ai" as config
+import "../host_recording_audio.ai" as recording
+import "../ops.ai" as ops
+import "../control.ai" as control
+import std.cpu_neural_f32 as neural
+import "../recording_shifts.ai" as shifts
+import "../host_recording_audio.ai" as request_recording
+import "../audio_normalization.ai" as normalization
+pub type Prepared=struct{backend:host.Backend,requests:u64=0,forward_calls:u64=0}
+pub fn prepare(n:ref<network.Network>,affine:neural.Affine)->result<Prepared,string> effects {alloc} {
+ result.ok(Prepared{backend:try host.prepare(n,affine)})
+}
+fn length_for(n:ref<network.Network>,length:u64)->result<u64,string> effects {alloc} {
+ if length==0 or length>n.training_length{return result.err("Attention chunk exceeds its training extent")}
+ result.ok(n.training_length)
+}
+fn predict(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ let output:ops.Tensor=try host.forward(n,struct.borrow(p,field=backend),library,input,cancel)
+ p.forward_calls+=1
+ result.ok(output)
+}
+pub fn separate(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{343980}
+ if n.training_length!=size{return result.err("CPU attention segment differs from retained network")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let output:array<f32>=try recording.separate_sources(n,p,library,c,size,n.source_count,input,cancel,progress,predict,length_for)
+ p.requests+=1
+ result.ok(output)
+}
+pub fn separate_normalized(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,c:ref<config.Config>,input:normalization.Prepared own,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{n.training_length}
+ if n.training_length!=size{return result.err("CPU attention segment differs from retained network")}
+ let output:array<f32>=try recording.separate_normalized_sources(n,p,library,c,size,n.source_count,input,cancel,progress,predict,length_for)
+ p.requests+=1
+ result.ok(output)
+}
+
+// Explicit request schedule; legacy fixed-offset separate remains available.
+pub fn separate_scheduled(n:ref<network.Network>,p:ref<Prepared>,library:ref<CAbiLibrary>,c:ref<config.Config>,schedule:ref<shifts.Schedule>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{343980}
+ if n.training_length!=size{return result.err("CPU attention segment differs from retained network")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let output:array<f32>=try request_recording.separate_scheduled_sources(n,p,library,c,schedule,size,n.source_count,input,cancel,progress,predict,length_for)
+ p.requests+=1
+ result.ok(output)
+}

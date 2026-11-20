@@ -1,0 +1,137 @@
+module stemair.exchange.audio
+import "config.ai" as config
+import "../numeric.ai" as num
+import "../ops.ai" as ops
+import "../session.ai" as host
+import "../spectral.ai" as spectral
+import std.float as fp
+import "../audio_result.ai" as audio_result
+
+// Both execution backends use this identical waveform envelope and transforms.
+pub type State=struct{samples:u64,length:u64,trim:u64,padded:u64,step:u64,total:u64,index:u64=0,windowed:bool,
+ values:array<f32>,divider:array<f32>}
+pub fn begin(c:ref<config.Config>,input:view<f32>)->result<State,string> effects {alloc} {
+ if view.len(input)==0 or view.len(input)%2!=0 or view.len(input)>317520000 or not num.finite(input){return result.err("Expected bounded finite planar stereo audio")}
+ let samples:u64=view.len(input)/2
+ let length:u64=c.hop*(c.frames-1)
+ let trim:u64=c.n_fft/2
+ let generated:u64=length-c.n_fft
+ let padding:u64=generated+trim-samples%generated
+ let padded:u64=trim+samples+padding
+ let fraction:bool=str.view(c.overlap_mode)=="fraction"
+ let step:u64=if fraction{cast.sat((1.0-c.overlap)*cast.float(length))}else{generated}
+ if step==0{return result.err("Overlap creates a zero chunk step")}
+ result.ok(State{samples:samples,length:length,trim:trim,padded:padded,step:step,total:(padded+step-1)/step,
+  windowed:not fraction or c.overlap!=0.0,values:num.zeros(2*samples),divider:num.zeros(samples)})
+}
+pub fn intersects(s:ref<State>)->bool effects {} {
+ let start:u64=s.index*s.step
+ let end:u64=if start+s.length<s.padded{start+s.length}else{s.padded}
+ start<s.trim+s.samples and end>s.trim
+}
+pub fn extract(s:ref<State>,input:view<f32>)->array<f32> effects {alloc} {
+ var out:array<f32>=num.zeros(2*s.length)
+ let start:u64=s.index*s.step
+ let end:u64=if start+s.length<s.padded{start+s.length}else{s.padded}
+ var channel:u64=0
+ loop{if channel>=2{break}
+  var t:u64=0
+  loop{if t>=end-start{break}
+   let pos:u64=start+t
+   if pos>=s.trim and pos-s.trim<s.samples{array.set(out,channel*s.length+t,view.get(input,channel*s.samples+pos-s.trim))}
+   t+=1}
+  channel+=1}
+ out
+}
+pub fn accumulate(s:ref<State>,output:view<f32>)->result<unit,string> effects {alloc} {
+ if view.len(output)!=2*s.length{return result.err("Wrong interchange chunk output length")}
+ let start:u64=s.index*s.step
+ let end:u64=if start+s.length<s.padded{start+s.length}else{s.padded}
+ let actual:u64=end-start
+ let first:u64=if start<s.trim{s.trim-start}else{0}
+ let stop:u64=if end>s.trim+s.samples{s.trim+s.samples-start}else{actual}
+ var t:u64=first
+ loop{if t>=stop{break}
+  let weight:f64=if s.windowed and actual>1{0.5-0.5*fp.cos(6.2831853071795864769*cast.float(t)/cast.float(actual-1))}else{1.0}
+  let dst:u64=start+t-s.trim
+  let previous:f64=cast.float(array.get(s.divider,dst))
+  array.set(s.divider,dst,cast.float(previous+weight))
+  var channel:u64=0
+  loop{if channel>=2{break}
+   let before:f64=cast.float(view.get(output,channel*s.length+t))
+   let sample:f32=cast.float(before*weight)
+   array.set(s.values,channel*s.samples+dst,array.get(s.values,channel*s.samples+dst)+sample)
+   channel+=1}
+  t+=1}
+ result.ok(())
+}
+pub fn finish(s:ref<State>,input:view<f32>,compensation:f64)->result<array<f32>,string> effects {alloc} {
+ var out:array<f32>=[]
+ array.reserve(out,4*s.samples)
+ let gain:f32=cast.float(compensation)
+ var i:u64=0
+ loop{if i>=2*s.samples{break}
+  let weight:f32=array.get(s.divider,i%s.samples)
+  if weight<=0.0{return result.err("Overlap window does not cover the requested audio")}
+  let value:f32=(array.get(s.values,i)/weight)*gain
+  if not fp.is_finite(value){return result.err("Non-finite interchange audio")}
+  array.push(out,value)
+  i+=1}
+ i=0
+ loop{if i>=2*s.samples{break}
+  array.push(out,view.get(input,i)-array.get(out,i))
+  i+=1}
+ result.ok(out)
+}
+// Scalar promotion occurs after the F32 overlap division. Preserve
+// both the primary and mixture subtraction at that selected precision.
+pub fn finish_typed(s:ref<State>,input:view<f32>,compensation:f64)->result<audio_result.Samples,string> effects {alloc} {
+ if s.samples==0 or s.samples>158760000 or array.len(s.values)!=2*s.samples or
+  array.len(s.divider)!=s.samples or view.len(input)!=2*s.samples{return result.err("Invalid interchange result extent")}
+ if not fp.is_finite(compensation) or compensation<0.0{return result.err("Invalid interchange compensation")}
+ if compensation<3.4e38{return result.ok(audio_result.from_single(try finish(s,input,compensation)))}
+ var out:array<f64>=[]
+ array.reserve(out,4*s.samples)
+ var i:u64=0
+ loop{if i==2*s.samples{break}
+  let weight:f32=array.get(s.divider,i%s.samples)
+  if weight<=0.0{return result.err("Overlap window does not cover the requested audio")}
+  let divided:f32=array.get(s.values,i)/weight
+  let promoted:f64=cast.float(divided)
+  let value:f64=promoted*compensation
+  if not fp.is_finite(value){return result.err("Non-finite interchange audio")}
+  array.push(out,value)
+  i+=1}
+ i=0
+ loop{if i==2*s.samples{break}
+  let mixture:f64=cast.float(view.get(input,i))
+  let residual:f64=mixture-array.get(out,i)
+  if not fp.is_finite(residual){return result.err("Non-finite interchange audio")}
+  array.push(out,residual)
+  i+=1}
+ result.ok(audio_result.from_wide(out))
+}
+pub fn analyze(stft:ref<spectral.Plan>,c:ref<config.Config>,wave:view<f32>)->result<ops.Tensor,string> effects {alloc} {
+ var packed:ops.Tensor=try host.analyze(stft,wave,c.hop*(c.frames-1),c.frequency_bins,1)
+ clear_low(packed,c)
+ result.ok(packed)
+}
+pub fn clear_low(packed:ref<ops.Tensor>,c:ref<config.Config>)->unit effects {alloc} {
+ var channel:u64=0
+ loop{if channel>=4{break}
+  var f:u64=0
+  loop{if f>=3{break}
+   var t:u64=0
+   loop{if t>=c.frames{break}
+    array.set(packed.data,(channel*c.frequency_bins+f)*c.frames+t,0.0)
+    t+=1}
+   f+=1}
+  channel+=1}
+ ()
+}
+pub fn synthesize(stft:ref<spectral.Plan>,c:ref<config.Config>,predicted:array<f32> own)->result<array<f32>,string> effects {alloc} {
+ if array.len(predicted)!=4*c.frequency_bins*c.frames{return result.err("Interchange graph returned the wrong spectral extent")}
+ if not num.finite(array.view(predicted)){return result.err("Non-finite interchange prediction")}
+ var output:ops.Tensor=ops.tensor(4,c.frequency_bins,c.frames,predicted)
+ host.synthesize(stft,output,c.hop*(c.frames-1),c.frequency_bins,1,1)
+}

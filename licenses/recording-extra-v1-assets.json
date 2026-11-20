@@ -1,0 +1,35 @@
+{
+  "model": "recording-extra-v1",
+  "filename": "recording-extra-v1.yaml",
+  "url": "https://raw.githubusercontent.com/facebookresearch/demucs/main/demucs/remote/mdx_extra.yaml",
+  "bytes": 68,
+  "sha256": "5e079e0b6f9b5a6c737b5a5c95b590a292f0c7a683323c7d0cde3860a0828356",
+  "configuration": "configs/recording-extra-v1.json",
+  "credit": "Original Demucs models by Meta Platforms and collaborators, MIT license; attention-MIT.txt, hybrid-MIT.txt and waveform-MIT.txt. Original identifiers preserve checkpoint compatibility.",
+  "dependencies": [
+    {
+      "filename": "hybrid-extra-1-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/e51eebcc-c1b80bdd.th",
+      "bytes": 167399275,
+      "sha256": "c1b80bdd6de58274abf359e66822a76f49ce2b9f086fc5dc917ac14598e6bebf"
+    },
+    {
+      "filename": "hybrid-magnitude-2-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/a1d90b5c-ae9d2452.th",
+      "bytes": 167391595,
+      "sha256": "ae9d245283bf24b552913ee233a1101dcd0aeaed59b1c0a2da0e1f6eda15101b"
+    },
+    {
+      "filename": "hybrid-magnitude-3-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/5d2d6c55-db83574e.th",
+      "bytes": 167391595,
+      "sha256": "db83574e05b2308f76e2764819da673f2d16d437b9e619f5fcb72f275fc0e24f"
+    },
+    {
+      "filename": "hybrid-extra-2-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/cfa93e08-61801ae1.th",
+      "bytes": 167399275,
+      "sha256": "61801ae1567d606c97a9c3469e943ae306d0a873eeb60d623ae7cfc7042b3f68"
+    }
+  ]
+}

@@ -1,0 +1,490 @@
+module stemair.secondary
+import "mask/request.ai" as mask_request
+import "model_roles.ai" as roles
+import "secondary_config.ai" as config
+import "model_ensemble_config.ai" as selection
+import "model_ensemble.ai" as stems
+import "model_cache.ai" as cache
+import "engine.ai" as engine
+import "audio_tools.ai" as tools
+import "ensemble.ai" as ensemble
+import "numeric.ai" as num
+import "control.ai" as control
+import "vocal_chain.ai" as vocal
+import "spectral_residual.ai" as residual
+import std.float as fp
+import std.text as text
+
+pub type Plan=struct{outputs:array<string>,required:array<u64>}
+pub type Binding=struct{model:u64,member:u64}
+pub type Prediction=struct{model:u64,targets:array<string>,values:array<f32>,frames:u64,stage:string="recording"}
+pub type Stage=struct{model:u64,source:string}
+pub type Stem=struct{target:string,values:array<f32>,frames:u64}
+pub type StageInput=struct{model:u64,source:string,values:array<f32>}
+pub type Output=struct{stems:array<Stem>,saved:array<Prediction>,inputs:array<StageInput>}
+pub fn cache_extent(raw:ref<array<Prediction>>,inputs:ref<array<StageInput>>)->result<u64,string> effects {alloc} {
+ var total:u64=0
+ var index:u64=0
+ loop{if index==array.len(raw)+array.len(inputs){break}
+  let count:u64=if index<array.len(raw){array.len(array.borrow(raw,index).values)}else{array.len(array.borrow(inputs,index-array.len(raw)).values)}
+  if count>536870912-total{return result.err("Processing source and input cache exceeds its retained host memory bound")}
+  total+=count
+  index+=1}
+ result.ok(total)
+}
+pub fn capture_input(raw:ref<array<Prediction>>,inputs:ref<array<StageInput>>,model:u64,source:str,values:array<f32> own)->result<unit,string> effects {alloc} {
+ let size:u64=array.len(values)
+ if size==0 or size%2!=0 or size>536870912 or not num.finite(array.view(values)){return result.err("Invalid captured processing input")}
+ let total:u64=try cache_extent(raw,inputs)
+ if size>536870912-total{return result.err("Processing source and input cache exceeds its retained host memory bound")}
+ array.push(inputs,StageInput{model:model,source:string.copy(source),values:values})
+ result.ok(())
+}
+fn vocal_settings(c:ref<config.Recipe>)->vocal.Settings effects {} {
+ vocal.Settings{rebalance:rebalance(c),mixes:c.vocal_mixes,mix_only:c.vocal_mix_only,vocal_only:c.vocal_save_only,normalize:c.normalize}
+}
+pub fn validate(c:ref<config.Recipe>)->result<unit,string> effects {alloc} {
+ if array.len(c.models)==0 or array.len(c.models)>16{return result.err("Processing needs between one and sixteen models")}
+ if (array.len(c.models)>1 and array.len(c.adjustments)==0 and c.preprocess==0 and vocal_model(c)==0 and array.borrow(c.models,0).role==0) or array.len(c.adjustments)>16 or array.len(c.outputs)>16{return result.err("Choose secondary adjustments, instrumental preprocessing or vocal splitting")}
+ if vocal_model(c)>=array.len(c.models){return result.err("The vocal splitter must refer to another selected model")}
+ var voice:vocal.Settings=vocal_settings(c)
+ let _=try vocal.validate(voice)
+ if c.preprocess>=array.len(c.models){return result.err("The preprocessor must refer to another selected model")}
+ if str.view(c.preprocess_complement)!="direct" and str.view(c.preprocess_complement)!="residual" and str.view(c.preprocess_complement)!="spectral"{return result.err("Unknown preprocessor instrumental mode")}
+ if str.view(c.complement)!="sum" and str.view(c.complement)!="residual" and str.view(c.complement)!="spectral"{return result.err("Unknown secondary complement mode")}
+ var i:u64=0
+ loop{if i==array.len(c.adjustments){break}
+  let adjustment:ref<config.Adjustment>=array.borrow(c.adjustments,i)
+  if adjustment.model==0 or adjustment.model>=array.len(c.models){return result.err("A secondary adjustment must refer to another selected model")}
+  if not fp.is_finite(adjustment.primary_weight) or adjustment.primary_weight<0.0 or adjustment.primary_weight>1.0{return result.err("Primary weight must be between 0 and 1")}
+  var j:u64=0
+  loop{if j==i{break}
+   if str.view(array.borrow(c.adjustments,j).target)==str.view(adjustment.target){return result.err("A stem has more than one secondary adjustment")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn adjustment(c:ref<config.Recipe>,target:str)->option<u64> effects {} {
+ var i:u64=0
+ loop{if i==array.len(c.adjustments){break}
+  if str.view(array.borrow(c.adjustments,i).target)==target{return option.some(i)}
+  i+=1}
+ option.none()
+}
+fn request(name:str)->selection.Target effects {alloc} {
+ selection.Target{target:string.copy(name),method:"",exclude:if str.starts_with(name,"no_") and str.len(name)>3{string.copy(str.slice(name,3,str.len(name)))}else{""}}
+}
+fn instrument(name:str)->bool effects {} {name=="bass" or name=="drums" or name=="other"}
+pub fn materialize(profiles:ref<array<engine.Profile>>,c:ref<config.Recipe>)->result<Plan,string> effects {alloc} {
+ let _=try validate(c)
+ if array.len(profiles)!=array.len(c.models){return result.err("Secondary profile count differs from selected models")}
+ var role_index:u64=0
+ loop{if role_index==array.len(profiles){break}
+  let _=try roles.validate(array.borrow(c.models,role_index),array.borrow(profiles,role_index))
+  role_index+=1}
+ var outputs:array<string>=if array.len(c.outputs)==0{stems.names(struct.borrow(array.borrow(profiles,0),field=targets))}else{stems.names(struct.borrow(c,field=outputs))}
+ if vocal_model(c)>0 and (c.vocal_mix_only or c.vocal_save_only){outputs=["vocals","instrumental"]}
+ if array.len(outputs)==0 or array.len(outputs)>16{return result.err("Invalid secondary output selection")}
+ var required:array<u64>=if c.preprocess>0{[c.preprocess,0]}else{[0]}
+ if c.preprocess>0{
+  let primary:ref<engine.Profile>=array.borrow(profiles,0)
+  let kind:str=primary.kind
+  if kind!="waveform" and kind!="temporal" and kind!="residual-waveform" and kind!="hybrid" and kind!="attention"{return result.err("Instrumental preprocessing requires a waveform-family primary model")}
+  let names:ref<array<string>>=struct.borrow(primary,field=targets)
+  if array.len(names)!=4 or not option.is_some(stems.find(names,"vocals")) or not option.is_some(stems.find(names,"bass")) or
+   not option.is_some(stems.find(names,"drums")) or not option.is_some(stems.find(names,"other")){return result.err("The primary must provide bass, drums, other and vocals")}
+  let prep:ref<engine.Profile>=array.borrow(profiles,c.preprocess)
+  let targets:ref<array<string>>=struct.borrow(prep,field=targets)
+  if array.len(targets)!=2 or not option.is_some(stems.find(targets,"vocals")) or not option.is_some(stems.find(targets,"instrumental")){return result.err("Choose a two-source vocal/instrumental preprocessor")}
+  var selected:bool=false
+  var at:u64=0
+  loop{if at==array.len(outputs){break}
+   if instrument(array.get(outputs,at)){selected=true}
+   at+=1}
+  if not selected{return result.err("Preprocessing requires instrument stems or all-stem outputs")}
+ }
+ var i:u64=0
+ loop{if i==array.len(outputs){break}
+  let name:str=array.get(outputs,i)
+  var target:selection.Target=request(name)
+  if not stems.provides(struct.borrow(array.borrow(profiles,0),field=targets),target){return result.err("The primary model does not provide a requested stem")}
+  var j:u64=0
+  loop{if j==i{break}
+   if name==array.get(outputs,j){return result.err("Duplicate secondary output stem")}
+   j+=1}
+  match adjustment(c,name){none=>{},some(index)=>{
+   let model:u64=array.borrow(c.adjustments,index).model
+   if not stems.provides(struct.borrow(array.borrow(profiles,model),field=targets),target){return result.err("A secondary model does not provide its assigned stem")}
+   var found:bool=false
+   j=0
+   loop{if j==array.len(required){break}
+    if array.get(required,j)==model{found=true}
+    j+=1}
+   if not found{array.push(required,model)}
+  }}
+  i+=1}
+ i=0
+ loop{if i==array.len(c.adjustments){break}
+  if not option.is_some(stems.find(outputs,array.borrow(c.adjustments,i).target)){return result.err("A secondary adjustment names an unselected output stem")}
+  i+=1}
+ if vocal_model(c)>0{
+  if not option.is_some(stems.find(outputs,"vocals")){return result.err("Select primary vocals for the vocal split chain")}
+  if (rebalance(c)>0.0 or c.vocal_mixes) and not option.is_some(stems.find(outputs,"instrumental")){return result.err("Select primary vocals and instrumental for vocal rebalance or mixed outputs")}
+  var split:array<string>=try roles.targets(array.borrow(profiles,vocal_model(c)),array.borrow(c.models,vocal_model(c)),"vocals")
+  if array.len(split)!=2 or not option.is_some(stems.find(split,"lead")) or not option.is_some(stems.find(split,"backing")){return result.err("Choose a vocal splitter profile with lead and backing stems")}
+  var found:bool=false
+  i=0
+  loop{if i==array.len(required){break}
+   if array.get(required,i)==vocal_model(c){found=true}
+   i+=1}
+  if not found{array.push(required,vocal_model(c))}}
+ i=0
+ loop{if i==array.len(required){break}
+  if array.borrow(profiles,array.get(required,i)).sample_rate!=44100{return result.err("Secondary models must use 44100 Hz")}
+  i+=1}
+ result.ok(Plan{outputs:outputs,required:required})
+}
+pub fn binding(bindings:ref<array<Binding>>,model:u64)->result<u64,string> effects {alloc} {
+ var i:u64=0
+ loop{if i==array.len(bindings){break}
+  if array.borrow(bindings,i).model==model{return result.ok(array.borrow(bindings,i).member)}
+  i+=1}
+ result.err("A required secondary model is not loaded")
+}
+fn prediction(raw:ref<array<Prediction>>,model:u64,stage:str)->result<u64,string> effects {alloc} {
+ var i:u64=0
+ loop{if i==array.len(raw){break}
+  if array.borrow(raw,i).model==model and str.view(array.borrow(raw,i).stage)==stage{return result.ok(i)}
+  i+=1}
+ result.err("A required secondary prediction is missing")
+}
+pub fn push(raw:ref<array<Prediction>>,model:u64,targets:array<string> own,values:array<f32> own)->result<unit,string> effects {alloc} {
+ push_stage(raw,model,targets,values,"recording")
+}
+pub fn push_stage(raw:ref<array<Prediction>>,model:u64,targets:array<string> own,values:array<f32> own,stage:str)->result<unit,string> effects {alloc} {
+ var held:array<f32>=values
+ let count:u64=array.len(targets)
+ if count==0 or count>16 or array.len(held)==0 or array.len(held)>536870912 or array.len(held)%(2*count)!=0 or not num.finite(array.view(held)){return result.err("Invalid secondary model prediction")}
+ var total:u64=array.len(held)
+ var i:u64=0
+ loop{if i==array.len(raw){break}
+  let item:ref<Prediction>=array.borrow(raw,i)
+  if item.model==model and str.view(item.stage)==stage{return result.err("A model prediction was computed twice for one input stage")}
+  if array.len(item.values)>536870912-total{return result.err("Secondary source cache exceeds its retained host memory bound")}
+  total+=array.len(item.values)
+  i+=1}
+ if total>536870912{return result.err("Secondary source cache exceeds its retained host memory bound")}
+ let frames:u64=array.len(held)/(2*count)
+ array.push(raw,Prediction{model:model,targets:targets,values:held,frames:frames,stage:string.copy(stage)})
+ result.ok(())
+}
+fn select(raw:ref<array<Prediction>>,model:u64,name:str,complement:str,input:view<f32>)->result<array<f32>,string> effects {alloc, env, ffi, fs.read} {
+ let index:u64=try prediction(raw,model,"recording")
+ let item:ref<Prediction>=array.borrow(raw,index)
+ var target:selection.Target=request(name)
+ stems.source_wave(struct.borrow(item,field=targets),struct.borrow(item,field=values),item.frames,target,complement,input)
+}
+pub fn stages(plan:ref<Plan>,c:ref<config.Recipe>)->array<Stage> effects {alloc} {
+ var output:array<Stage>=[]
+ if c.preprocess>0{
+  array.push(output,Stage{model:c.preprocess,source:"recording"})
+  array.push(output,Stage{model:0,source:"instrumental"})
+  array.push(output,Stage{model:0,source:"recording"})}
+ var i:u64=0
+ loop{if i==array.len(plan.required){break}
+  let model:u64=array.get(plan.required,i)
+  var original:bool=model!=vocal_model(c) or vocal_model(c)==0 or model==0 or model==c.preprocess
+  var rule:u64=0
+  loop{if rule==array.len(c.adjustments){break}
+   if array.borrow(c.adjustments,rule).model==model{original=true}
+   rule+=1}
+  if original and (c.preprocess==0 or (model!=0 and model!=c.preprocess)){array.push(output,Stage{model:model,source:"recording"})}
+  i+=1}
+ if vocal_model(c)>0{array.push(output,Stage{model:vocal_model(c),source:"vocals"})}
+ output
+}
+pub fn progress_message(c:ref<config.Recipe>,index:u64,total:u64)->string effects {alloc} {
+ text.concat(if c.preprocess>0 or vocal_model(c)>0{"Processing input stage "}else{"Separating model "},text.concat(string.from_int(index),text.concat(" / ",string.from_int(total))))
+}
+pub fn fit(input:view<f32>,frames:u64)->result<array<f32>,string> effects {alloc} {
+ num.fit_stereo(input,frames)
+}
+pub fn instrumental_input(raw:ref<array<Prediction>>,c:ref<config.Recipe>,input:view<f32>)->result<array<f32>,string> effects {alloc, env, ffi, fs.read} {
+ if c.preprocess==0{return result.err("No instrumental preprocessor is selected")}
+ if view.len(input)==0 or view.len(input)%2!=0 or not num.finite(input){return result.err("Preprocessing requires a finite stereo recording")}
+ if str.view(c.preprocess_complement)=="direct"{return select(raw,c.preprocess,"instrumental","sum",input)}
+ if c.preprocess_complement=="spectral"{return select(raw,c.preprocess,"instrumental","spectral",input)}
+ let raw_voice:array<f32>=try select(raw,c.preprocess,"vocals","sum",input)
+ let voice:array<f32>=try fit(array.view(raw_voice),view.len(input)/2)
+ var output:array<f32>=num.copy(input)
+ var i:u64=0
+ loop{if i==array.len(output){break}
+  array.set(output,i,array.get(output,i)-array.get(voice,i))
+  i+=1}
+ if not num.finite(array.view(output)){return result.err("Preprocessor residual overflow")}
+ result.ok(output)
+}
+fn compose(raw:ref<array<Prediction>>)->result<Prediction,string> effects {alloc, env, ffi, fs.read} {
+ let filtered:u64=try prediction(raw,0,"instrumental")
+ let empty:array<f32>=[]
+ let voice:array<f32>=try select(raw,0,"vocals","sum",array.view(empty))
+ let base:ref<Prediction>=array.borrow(raw,filtered)
+ let base_voice:u64=match stems.find(struct.borrow(base,field=targets),"vocals"){some(v)=>v,none=>{return result.err("Preprocessed vocals are missing")}}
+ let fitted:array<f32>=try fit(array.view(voice),base.frames)
+ var values:array<f32>=num.copy(array.view(base.values))
+ var i:u64=0
+ loop{if i==2*base.frames{break}
+  array.set(values,base_voice*2*base.frames+i,array.get(fitted,i))
+  i+=1}
+ result.ok(Prediction{model:0,targets:stems.names(struct.borrow(base,field=targets)),values:values,frames:base.frames,stage:"composed"})
+}
+pub fn primary_prediction(raw:ref<array<Prediction>>,c:ref<config.Recipe>)->result<Prediction,string> effects {alloc, env, ffi, fs.read} {
+ if c.preprocess>0{return compose(raw)}
+ let selected:u64=try prediction(raw,0,"recording")
+ let source:ref<Prediction>=array.borrow(raw,selected)
+ result.ok(Prediction{model:0,targets:stems.names(struct.borrow(source,field=targets)),values:num.copy(array.view(source.values)),frames:source.frames,stage:"recording"})
+}
+fn primary_wave(primary:ref<option<Prediction>>,raw:ref<array<Prediction>>,name:str,complement:str,input:view<f32>)->result<array<f32>,string> effects {alloc, env, ffi, fs.read} {
+ match primary{none=>select(raw,0,name,complement,input),some(value)=>{
+  var target:selection.Target=request(name)
+  if str.len(target.exclude)==0 and option.is_some(stems.find(struct.borrow(value,field=targets),name)){
+   return stems.source_wave(struct.borrow(value,field=targets),struct.borrow(value,field=values),value.frames,target,complement,input)}
+  if complement=="spectral"{return stems.source_wave(struct.borrow(value,field=targets),struct.borrow(value,field=values),value.frames,target,complement,input)}
+  let mixture:array<f32>=try fit(input,value.frames)
+  stems.source_wave(struct.borrow(value,field=targets),struct.borrow(value,field=values),value.frames,target,complement,array.view(mixture))}}
+}
+pub fn extra_instrumental(plan:ref<Plan>,c:ref<config.Recipe>)->bool effects {} {
+ c.preprocess>0 and c.save_instrumental_mix and array.len(plan.outputs)==2 and instrument(array.get(plan.outputs,0)) and
+  str.starts_with(array.get(plan.outputs,1),"no_") and str.slice(array.get(plan.outputs,1),3,str.len(array.get(plan.outputs,1)))==array.get(plan.outputs,0)
+}
+fn save_primary(name:str,c:ref<config.Recipe>)->bool effects {} {
+ vocal_model(c)==0 or (not (c.vocal_mix_only and name=="vocals") and not (c.vocal_save_only and name=="instrumental"))
+}
+pub fn output_count(plan:ref<Plan>,c:ref<config.Recipe>)->u64 effects {} {
+ var count:u64=if extra_instrumental(plan,c){1}else{0}
+ var i:u64=0
+ loop{if i==array.len(plan.outputs){break}
+  if save_primary(array.get(plan.outputs,i),c){count+=1}
+  i+=1}
+ if vocal_model(c)>0{if not c.vocal_mix_only{count+=2}
+  if c.vocal_mixes and not c.vocal_save_only{count+=2}}
+ count
+}
+// The final ordering follows finish(), including mixed vocals before split vocals.
+pub fn output_targets(plan:ref<Plan>,c:ref<config.Recipe>)->array<string> effects {alloc} {
+ var names:array<string>=[]
+ var index:u64=0
+ loop{if index==array.len(plan.outputs){break}
+  let name:str=array.get(plan.outputs,index)
+  if save_primary(name,c){array.push(names,string.copy(name))}
+  index+=1}
+ if extra_instrumental(plan,c){array.push(names,"other_instruments")}
+ if vocal_model(c)>0{
+  if c.vocal_mixes and not c.vocal_save_only{array.push(names,"instrumental_with_backing")
+   array.push(names,"instrumental_with_lead")}
+  if not c.vocal_mix_only{array.push(names,"backing")
+   array.push(names,"lead")}}
+ names
+}
+fn instrumental_remainder(primary:ref<option<Prediction>>,raw:ref<array<Prediction>>,plan:ref<Plan>,c:ref<config.Recipe>,input:view<f32>)->result<array<f32>,string> effects {alloc, env, ffi, fs.read} {
+ match primary{none=>result.err("Instrumental preprocessing is unavailable"),some(value)=>{
+  let chosen:str=array.get(plan.outputs,0)
+  if c.complement=="spectral"{
+   let mixture:array<f32>=try instrumental_input(raw,c,input)
+   let target:u64=match stems.find(struct.borrow(value,field=targets),chosen){some(v)=>v,none=>{return result.err("Selected instrument is missing")}}
+   let selected:array<f32>=num.copy(view.slice(array.view(value.values),target*2*value.frames,(target+1)*2*value.frames))
+   var reconstructed:residual.Output=try residual.waveform(array.view(mixture),array.view(selected))
+   return result.ok(struct.replace(reconstructed,[],field=values))}
+  var output:array<f32>=num.zeros(2*value.frames)
+  if str.view(c.complement)=="residual"{
+   let mixture:array<f32>=try instrumental_input(raw,c,input)
+   output=try fit(array.view(mixture),value.frames)
+   let target:u64=match stems.find(struct.borrow(value,field=targets),chosen){some(v)=>v,none=>{return result.err("Selected instrument is missing")}}
+   var i:u64=0
+   loop{if i==array.len(output){break}
+    array.set(output,i,array.get(output,i)-array.get(value.values,target*2*value.frames+i))
+    i+=1}
+  }else{
+   var source:u64=0
+   loop{if source==array.len(value.targets){break}
+    let name:str=array.get(value.targets,source)
+    if name!="vocals" and name!=chosen{
+     var i:u64=0
+     loop{if i==array.len(output){break}
+      array.set(output,i,array.get(output,i)+array.get(value.values,source*2*value.frames+i))
+      i+=1}}
+    source+=1}}
+  result.ok(output)}}
+}
+fn blended(primary:ref<option<Prediction>>,raw:ref<array<Prediction>>,c:ref<config.Recipe>,name:str,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var values:array<f32>=try primary_wave(primary,raw,name,c.complement,input)
+ match adjustment(c,name){none=>{},some(index)=>{
+  let rule:ref<config.Adjustment>=array.borrow(c.adjustments,index)
+  let secondary:array<f32>=try select(raw,rule.model,name,c.complement,input)
+  var inputs:array<array<f32>>=[values,secondary]
+  var mixed:tools.Output=try tools.process(inputs,"mix",rule.primary_weight,cancel,progress)
+  values=struct.replace(mixed,[],field=values)}}
+ result.ok(values)
+}
+pub fn vocal_input(raw:ref<array<Prediction>>,c:ref<config.Recipe>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ if vocal_model(c)==0{return result.err("No vocal splitter is selected")}
+ var primary:option<Prediction>=if c.preprocess>0{option.some(try compose(raw))}else{option.none()}
+ let vocals:array<f32>=try chain_master(primary,raw,c,"vocals",input,cancel,progress)
+ let instrumental:array<f32>=if rebalance(c)>0.0{try chain_master(primary,raw,c,"instrumental",input,cancel,progress)}else{[]}
+ var settings:vocal.Settings=vocal_settings(c)
+ vocal.prepare(array.view(vocals),array.view(instrumental),settings,cancel,progress)
+}
+fn chain_master(primary:ref<option<Prediction>>,raw:ref<array<Prediction>>,c:ref<config.Recipe>,name:str,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var values:array<f32>=try blended(primary,raw,c,name,input,cancel,progress)
+ if save_primary(name,c){let _=try ensemble.normalize(values,c.normalize)}
+ result.ok(values)
+}
+pub fn finish(raw:ref<array<Prediction>>,plan:ref<Plan>,c:ref<config.Recipe>,input:view<f32>,cancel:str,progress:str)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try validate(c)
+ var work:array<Stage>=stages(plan,c)
+ if array.len(raw)!=array.len(work){return result.err("Secondary prediction count differs from its plan")}
+ var primary:option<Prediction>=if c.preprocess>0{option.some(try compose(raw))}else{option.none()}
+ var output:array<Stem>=[]
+ var i:u64=0
+ loop{if i==array.len(plan.outputs){break}
+  if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+  let name:str=array.get(plan.outputs,i)
+  if save_primary(name,c){
+   var values:array<f32>=try blended(primary,raw,c,name,input,cancel,progress)
+   let _=try ensemble.normalize(values,c.normalize)
+   let frames:u64=array.len(values)/2
+   array.push(output,Stem{target:string.copy(name),values:values,frames:frames})}
+  control.report(progress,i+1,array.len(plan.outputs))
+  i+=1}
+ if extra_instrumental(plan,c){
+  var values:array<f32>=try instrumental_remainder(primary,raw,plan,c,input)
+  let _=try ensemble.normalize(values,c.normalize)
+  let frames:u64=array.len(values)/2
+  array.push(output,Stem{target:"other_instruments",values:values,frames:frames})}
+ if vocal_model(c)>0{
+  if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+  let vocals:array<f32>=try chain_master(primary,raw,c,"vocals",input,cancel,progress)
+  let instrumental:array<f32>=if c.vocal_mixes{try chain_master(primary,raw,c,"instrumental",input,cancel,progress)}else{[]}
+  let split:u64=try prediction(raw,vocal_model(c),"vocals")
+  let predicted:ref<Prediction>=array.borrow(raw,split)
+  var settings:vocal.Settings=vocal_settings(c)
+  var extra:array<vocal.Stem>=try vocal.finish(struct.borrow(predicted,field=targets),array.view(predicted.values),predicted.frames,array.view(vocals),array.view(instrumental),settings,cancel,progress)
+  i=0
+  loop{if i==array.len(extra){break}
+   let item:ref<vocal.Stem>=array.borrow(extra,i)
+   let name:string=string.copy(item.target)
+   let frames:u64=item.frames
+   var values:array<f32>=struct.replace(item,[],field=values)
+   array.push(output,Stem{target:name,values:values,frames:frames})
+   i+=1}}
+ let saved:array<Prediction>=if c.keep_members{ref.swap(raw,[])}else{[]}
+ result.ok(Output{stems:output,saved:saved,inputs:[]})
+}
+pub fn separate_cpu(bank:ref<cache.Cache>,bindings:ref<array<Binding>>,plan:ref<Plan>,c:ref<config.Recipe>,input:view<f32>,cancel:str,progress:str)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try cache.require_cpu_policy(bank)
+ var check:u64=0
+ loop{if check==array.len(bindings){break}
+  let member:u64=array.borrow(bindings,check).member
+  if member>=array.len(bank.entries){return result.err("A secondary model binding is out of range")}
+  let kind:str=array.borrow(bank.entries,member).model.profile.kind
+  if kind!="spectral" and kind!="exchange"{return result.err("A selected processing model currently requires GPU execution")}
+  check+=1}
+ var raw:array<Prediction>=[]
+ var captured:array<StageInput>=[]
+ var work:array<Stage>=stages(plan,c)
+ var i:u64=0
+ loop{if i==array.len(work){break}
+  if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+  let stage:ref<Stage>=array.borrow(work,i)
+  let model_index:u64=stage.model
+  let member:u64=try binding(bindings,model_index)
+  if member>=array.len(bank.entries){return result.err("A secondary model binding is out of range")}
+  let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,member),field=model)
+  let targets:array<string>=try roles.targets(struct.borrow(model,field=profile),array.borrow(c.models,model_index),stage.source)
+  control.status(progress,progress_message(c,i+1,array.len(work)))
+  var captured_input:array<f32>=[]
+  let values:array<f32>=if str.view(stage.source)=="instrumental"{
+   let filtered:array<f32>=try instrumental_input(raw,c,input)
+   let predicted:array<f32>=try engine.separate_cpu(model,array.view(filtered),cancel,progress)
+   if c.keep_members and (c.complement=="spectral" or c.preprocess_complement=="spectral"){captured_input=filtered}
+   predicted
+  }else{if str.view(stage.source)=="vocals"{
+   let filtered:array<f32>=try vocal_input(raw,c,input,cancel,progress)
+   let predicted:array<f32>=try engine.separate_cpu(model,array.view(filtered),cancel,progress)
+   if c.keep_members and (c.complement=="spectral" or c.preprocess_complement=="spectral"){captured_input=filtered}
+   predicted
+  }else{try engine.separate_cpu(model,input,cancel,progress)}}
+  let _=try push_stage(raw,model_index,targets,values,stage.source)
+  if array.len(captured)>0{let _=try cache_extent(raw,captured)}
+  if array.len(captured_input)>0{let _=try capture_input(raw,captured,model_index,stage.source,captured_input)}
+  i+=1}
+ var output:Output=try finish(raw,plan,c,input,cancel,progress)
+ output.inputs=captured
+ result.ok(output)
+}
+
+// Explicit retained CPU backend route; legacy CPU API stays dependency-free.
+pub fn separate_cpu_prepared(bank:ref<cache.Cache>,bindings:ref<array<Binding>>,plan:ref<Plan>,c:ref<config.Recipe>,input:view<f32>,cancel:str,progress:str)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ separate_cpu_prepared_with_high_band(bank,bindings,plan,c,input,cancel,progress,mask_request.HighBand.Profile)
+}
+pub fn separate_cpu_prepared_with_high_band(bank:ref<cache.Cache>,bindings:ref<array<Binding>>,plan:ref<Plan>,c:ref<config.Recipe>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var policy:mask_request.Policy=mask_request.defaults()
+ policy.high_band=high_band
+ separate_cpu_prepared_with_policy(bank,bindings,plan,c,input,cancel,progress,policy)
+}
+pub fn separate_cpu_prepared_with_policy(bank:ref<cache.Cache>,bindings:ref<array<Binding>>,plan:ref<Plan>,c:ref<config.Recipe>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try mask_request.validate_policy(policy)
+ let _=try cache.require_cpu_policy(bank)
+ var check:u64=0
+ loop{if check==array.len(bindings){break}
+  let member:u64=array.borrow(bindings,check).member
+  if member>=array.len(bank.entries){return result.err("A secondary model binding is out of range")}
+  let kind:str=array.borrow(bank.entries,member).model.profile.kind
+  if kind!="spectral" and kind!="exchange" and kind!="mask"{return result.err("A selected processing model currently requires GPU execution")}
+  check+=1}
+ var raw:array<Prediction>=[]
+ var captured:array<StageInput>=[]
+ var work:array<Stage>=stages(plan,c)
+ var i:u64=0
+ loop{if i==array.len(work){break}
+  if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+  let stage:ref<Stage>=array.borrow(work,i)
+  let model_index:u64=stage.model
+  let member:u64=try binding(bindings,model_index)
+  if member>=array.len(bank.entries){return result.err("A secondary model binding is out of range")}
+  let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,member),field=model)
+  let targets:array<string>=try roles.targets(struct.borrow(model,field=profile),array.borrow(c.models,model_index),stage.source)
+  control.status(progress,progress_message(c,i+1,array.len(work)))
+  var selected_policy:mask_request.Policy=mask_request.with_foreground(policy,roles.foreground(array.borrow(c.models,model_index),stage.source))
+  var captured_input:array<f32>=[]
+  let values:array<f32>=if str.view(stage.source)=="instrumental"{
+   let filtered:array<f32>=try instrumental_input(raw,c,input)
+   let predicted:array<f32>=try cache.separate_cpu_with_policy(bank,member,array.view(filtered),cancel,progress,selected_policy)
+   if c.keep_members and (c.complement=="spectral" or c.preprocess_complement=="spectral"){captured_input=filtered}
+   predicted
+  }else{if str.view(stage.source)=="vocals"{
+   let filtered:array<f32>=try vocal_input(raw,c,input,cancel,progress)
+   let predicted:array<f32>=try cache.separate_cpu_with_policy(bank,member,array.view(filtered),cancel,progress,selected_policy)
+   if c.keep_members and (c.complement=="spectral" or c.preprocess_complement=="spectral"){captured_input=filtered}
+   predicted
+  }else{try cache.separate_cpu_with_policy(bank,member,input,cancel,progress,selected_policy)}}
+  let _=try push_stage(raw,model_index,targets,values,stage.source)
+  if array.len(captured)>0{let _=try cache_extent(raw,captured)}
+  if array.len(captured_input)>0{let _=try capture_input(raw,captured,model_index,stage.source,captured_input)}
+  i+=1}
+ var output:Output=try finish(raw,plan,c,input,cancel,progress)
+ output.inputs=captured
+ result.ok(output)
+}
+
+// Source eligibility is request metadata; retained profile identities remain unchanged.
+pub fn vocal_model(c:ref<config.Recipe>)->u64 effects {} {
+ if array.len(c.models)>0 and array.borrow(c.models,0).role>0{0}else{c.vocal_split}
+}
+pub fn rebalance(c:ref<config.Recipe>)->f64 effects {} {
+ let index:u64=vocal_model(c)
+ if index>0 and index<array.len(c.models){
+  let selected:ref<config.Model>=array.borrow(c.models,index)
+  if selected.role>0{return if selected.role==2{selected.rebalance}else{0.0}}}
+ c.vocal_rebalance
+}

@@ -1,0 +1,50 @@
+module stemair.hybrid.host_recording
+import "../waveform/host_resampled_audio.ai" as overlap_audio
+import "../audio_normalization.ai" as normalization
+import "../numeric.ai" as num
+import "../chunks.ai" as chunks
+import "../control.ai" as control
+import "../ops.ai" as ops
+
+type Overlap=struct{split:bool,shift_offsets:array<u64>,overlap:f64,transition_power:f64}
+// Shifts wrap the whole normalized recording before triangle-weighted chunks.
+// The caller supplies its exact valid-length rule and original model forward.
+pub fn separate<N,P,C>(
+ n:ref<N>,prepared_bank:ref<P>,library:ref<CAbiLibrary>,c:ref<C>,size:u64,input:view<f32>,cancel:str,progress:str,predictor:fn(ref<N>,ref<P>,ref<CAbiLibrary>,ref<ops.Tensor>,str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta},length_for:fn(ref<N>,u64)->result<u64,string> effects {alloc})->result<array<f32>,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var prepared:normalization.Prepared=try normalization.prepare(input)
+ let length:u64=prepared.frames
+ let mean:f32=prepared.mean
+ let scale:f32=prepared.scale
+ if scale==0.0{return result.ok(num.zeros(8*length))}
+ let normalized:array<f32>=struct.replace(prepared,[],field=samples)
+ var overlap:Overlap=Overlap{split:c.split,shift_offsets:[],overlap:c.overlap,transition_power:c.transition_power}
+ if array.len(c.shift_offsets)==0{
+  let raw:array<f32>=try overlap_audio.separate(n,prepared_bank,library,overlap,size,array.view(normalized),cancel,progress,predictor,length_for)
+  return normalization.restore(array.view(raw),length,mean,scale)}
+ let half:u64=22050
+ let padded:array<f32>=try chunks.context_finite(array.view(normalized),2,0,length,length+2*half)
+ var averaged:array<f32>=num.zeros(8*length)
+ var shift:u64=0
+ loop{if shift==array.len(c.shift_offsets){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let offset:u64=array.get(c.shift_offsets,shift)
+  let count:u64=length+half-offset
+  let shifted:array<f32>=try chunks.context_finite(array.view(padded),2,offset,count,count)
+  let raw:array<f32>=try overlap_audio.separate(n,prepared_bank,library,overlap,size,array.view(shifted),cancel,progress,predictor,length_for)
+  var channel:u64=0
+  loop{if channel==8{break}
+   var time:u64=0
+   loop{if time==length{break}
+    let at:u64=channel*length+time
+    array.set(averaged,at,array.get(averaged,at)+array.get(raw,channel*count+half-offset+time))
+    time+=1}
+   channel+=1}
+  shift+=1}
+ let divisor:f32=cast.float(array.len(c.shift_offsets))
+ var i:u64=0
+ loop{if i==array.len(averaged){break}
+  array.set(averaged,i,array.get(averaged,i)/divisor)
+  i+=1}
+ normalization.restore(array.view(averaged),length,mean,scale)
+}

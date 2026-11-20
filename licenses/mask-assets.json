@@ -1,0 +1,9 @@
+{
+  "model": "mask-v1",
+  "filename": "mask-v1.pth",
+  "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/1_HP-UVR.pth",
+  "bytes": 126792647,
+  "sha256": "d9c654305888fe09668078ade76962b32d3782848f158192da7403a650e935a6",
+  "reference_metadata_tail_md5": "b5f988cd3e891dca7253bf5f0f3427c7",
+  "credit": "Original vocal-remover architecture by tsurumeso; model distributed by Ultimate Vocal Remover, Anjok07 and aufr33"
+}

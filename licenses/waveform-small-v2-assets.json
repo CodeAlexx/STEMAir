@@ -1,0 +1,10 @@
+{
+  "model": "waveform-small-v2",
+  "filename": "waveform-small-v2.th",
+  "url": "https://dl.fbaipublicfiles.com/demucs/v3.0/demucs_unittest-09ebc15f.th",
+  "bytes": 4194049,
+  "sha256": "09ebc15ff947a7a8ed10ed6d8a1210f8c33189ea3bb3d0202310cb8d12968157",
+  "credit": "Demucs by Alexandre Defossez and Facebook AI Research",
+  "license": "MIT; waveform-MIT.txt",
+  "note": "Original public unit-test checkpoint; constructor compatibility fixture, not a trained quality model."
+}

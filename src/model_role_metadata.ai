@@ -1,0 +1,34 @@
+module stemair.model_role_metadata
+import "../toolkit/secondary_config.ai" as config
+import std.codec as codec
+import std.json as json
+
+type Definition=struct{model:u64,definition:string,role:u32,rebalance:f64} derive codec(strict)
+type Definitions=struct{items:array<Definition>} derive codec(strict)
+// This appends one typed metadata member through JSON token spans. It never
+// replaces input paths, profile identities, existing field values or audio names.
+pub fn decorate(raw:str,recipe:ref<config.Recipe>)->result<string,string> effects {alloc} {
+ var accepted:Definitions=Definitions{items:[]}
+ var i:u64=0
+ loop{if i==array.len(recipe.models){break}
+  let model:ref<config.Model>=array.borrow(recipe.models,i)
+  if str.len(model.definition)>0 or model.role!=0 or model.rebalance!=0.0{
+   array.push(accepted.items,Definition{model:i,definition:string.copy(model.definition),role:model.role,rebalance:model.rebalance})}
+  i+=1}
+ if array.len(accepted.items)==0{return result.ok(string.copy(raw))}
+ let encoded:string=try Definitions_encode(accepted) map_err codec.describe
+ var document:json.Document=try json.parse(raw) map_err json.message
+ var keys:array<string>=[]
+ var values:array<string>=[]
+ var cursor:u64=json.first_member(document,0)
+ loop{let member:json.Member=match json.member(document,0,cursor){some(v)=>v,none=>{break}}
+  let key:string=match json.as_string(document,member.name){some(v)=>v,none=>{return result.err("Invalid secondary metadata key")}}
+  if key=="model_definitions"{return result.err("Secondary metadata already contains model definitions")}
+  let token:json.Token=match json.token(document,member.value){some(v)=>v,none=>{return result.err("Invalid secondary metadata value")}}
+  array.push(keys,key)
+  array.push(values,string.copy(str.slice(document.source,token.start,token.end)))
+  cursor=member.next}
+ array.push(keys,"model_definitions")
+ array.push(values,encoded)
+ result.ok(try json.encode_object(keys,values) map_err json.message)
+}

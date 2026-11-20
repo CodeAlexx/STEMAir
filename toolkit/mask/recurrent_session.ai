@@ -1,0 +1,41 @@
+module stemair.mask.recurrent_session
+import "config.ai" as config
+import "recurrent_network.ai" as network
+import "bands.ai" as bands
+import "../complex_spectral.ai" as spectral
+import "recurrent_device.ai" as device
+import "device_session.ai" as waveform
+import "../artifact_cleanup.ai" as cleanup
+import "recurrent_host.ai" as host
+import "../ops.ai" as ops
+import std.tensor as tensor
+pub type Session=struct{config:config.Config,network:network.Network,plans:array<spectral.Plan>,requests:u64=0,cpu:array<host.Backend>,cpu_preparations:u64=0}
+pub fn prepare_cpu(s:ref<Session>)->result<unit,string> effects {alloc,fs.read} {
+ if array.len(s.cpu)==0{array.push(s.cpu,try host.prepare(struct.borrow(s,field=network)))
+  s.cpu_preparations+=1}
+ if array.len(s.cpu)!=1{return result.err("Recurrent CPU session must own one retained weight bank")}
+ result.ok(())
+}
+pub fn open(path:str,settings:config.Config own)->result<Session,string> effects {alloc,fs.read} {
+ var c:config.Config=settings
+ let _=try config.validate(c)
+ if str.view(c.architecture)!="recurrent"{return result.err("Expected recurrent cascaded profile")}
+ let n:network.Network=try network.open(path,c.channels,c.recurrent_width,c.bins)
+ let plans:array<spectral.Plan>=try bands.plans(c)
+ result.ok(Session{config:c,network:n,plans:plans,cpu:[]})
+}
+fn predict_recurrent(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ device.predict(context,stream,parameters,n,input,cancel)
+}
+pub fn separate(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ waveform.separate_predicted(context,stream,parameters,n,plans,c,input,cancel,progress,predict_recurrent)
+}
+pub fn separate_with_cleanup(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ waveform.separate_predicted_with_cleanup(context,stream,parameters,n,plans,c,input,cancel,progress,predict_recurrent,settings)
+}
+pub fn separate_wide_with_cleanup(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ waveform.separate_predicted_wide_with_cleanup(context,stream,parameters,n,plans,c,input,cancel,progress,predict_recurrent,settings)
+}
+pub fn separate_wide_with_cleanup_and_band_input(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,plans:ref<array<spectral.Plan>>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,settings:ref<cleanup.Settings>,lower:view<f32>)->result<array<f64>,string> effects {alloc,gpu,fs.meta,fs.write,ffi} {
+ waveform.separate_predicted_wide_with_cleanup_and_band_input(context,stream,parameters,n,plans,c,input,cancel,progress,predict_recurrent,settings,lower)
+}

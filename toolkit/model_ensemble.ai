@@ -1,0 +1,333 @@
+module stemair.model_ensemble
+import "mask/request.ai" as mask_request
+import "engine.ai" as engine
+import "model_cache.ai" as cache
+import "model_ensemble_config.ai" as config
+import "ensemble.ai" as ensemble
+import "numeric.ai" as num
+import "control.ai" as control
+import "spectral_residual.ai" as residual
+import "wave_boundary.ai" as boundary
+import "audio_result.ai" as samples
+import std.audio as audio
+import std.codec as codec
+import std.float as fp
+import std.text as text
+
+pub type MemberOutput=struct{targets:array<string>,values:array<f32>,frames:u64,target_frames:array<u64>}
+pub type Stem=struct{estimates:array<array<f32>>}
+pub type Accumulator=struct{stems:array<Stem>,member_frames:array<u64>,saved:array<MemberOutput>,member_subtype:audio.WavSubtype}
+pub type Output=struct{targets:array<string>,values:array<f32>,frames:u64,member_frames:array<u64>,saved:array<MemberOutput>,target_frames:array<u64>}
+pub fn names(input:ref<array<string>>)->array<string> effects {alloc} {
+ var output:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(input){break}
+  array.push(output,string.copy(array.get(input,i)))
+  i+=1}
+ output
+}
+pub fn find(targets:ref<array<string>>,name:str)->option<u64> effects {} {
+ var i:u64=0
+ loop{if i==array.len(targets){break}
+  let candidate:str=array.get(targets,i)
+  if candidate==name{return option.some(i)}
+  i+=1}
+ option.none()
+}
+pub fn validate(c:ref<config.Options>)->result<unit,string> effects {alloc} {
+ if not ensemble.valid_method(c.method) or not ensemble.valid_domain(c.domain) or array.len(c.outputs)>16 or
+  (str.view(c.complement)!="sum" and str.view(c.complement)!="residual" and str.view(c.complement)!="spectral"){
+  return result.err("Invalid model ensemble reduction settings")}
+ var i:u64=0
+ loop{if i==array.len(c.outputs){break}
+  let target:ref<config.Target>=array.borrow(c.outputs,i)
+  if str.len(target.target)==0 or str.len(target.target)>64 or str.len(target.exclude)>64 or
+   (str.len(target.method)>0 and not ensemble.valid_method(target.method)){return result.err("Invalid model ensemble stem")}
+  var j:u64=0
+  loop{if j==i{break}
+   let previous:ref<config.Target>=array.borrow(c.outputs,j)
+   if str.view(previous.target)==str.view(target.target){return result.err("Duplicate model ensemble stem")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+fn implicit_instrumental(targets:ref<array<string>>)->bool effects {} {
+ option.is_some(find(targets,"vocals")) and option.is_some(find(targets,"bass")) and
+ option.is_some(find(targets,"drums")) and option.is_some(find(targets,"other"))
+}
+pub fn provides(targets:ref<array<string>>,target:ref<config.Target>)->bool effects {} {
+ if str.len(target.exclude)>0{return array.len(targets)>1 and option.is_some(find(targets,target.exclude))}
+ if option.is_some(find(targets,target.target)){return true}
+ str.view(target.target)=="instrumental" and implicit_instrumental(targets)
+}
+pub fn materialize(profiles:ref<array<engine.Profile>>,c:ref<config.Options>)->result<config.Options,string> effects {alloc} {
+ let _=try validate(c)
+ if array.len(profiles)<2{return result.err("Select at least two models for an ensemble")}
+ var i:u64=0
+ loop{if i==array.len(profiles){break}
+  if array.borrow(profiles,i).sample_rate!=44100{return result.err("Model ensemble members must use 44100 Hz")}
+  i+=1}
+ var outputs:array<config.Target>=[]
+ if array.len(c.outputs)==0{
+  let first:array<string>=names(struct.borrow(array.borrow(profiles,0),field=targets))
+  i=0
+  loop{if i==array.len(first){break}
+   let name:str=array.get(first,i)
+   var common:bool=true
+   var member:u64=1
+   loop{if member==array.len(profiles){break}
+    if not option.is_some(find(struct.borrow(array.borrow(profiles,member),field=targets),name)){common=false}
+    member+=1}
+   if common{array.push(outputs,config.Target{target:string.copy(name),method:string.copy(c.method),exclude:""})}
+   i+=1}
+  // Mixed two/four-source ensembles expose the vocal complement when at least
+  // one member provides it natively. All-four-source plans keep four outputs.
+  var direct_instrumental:bool=false
+  var already:bool=false
+  i=0
+  loop{if i==array.len(profiles){break}
+   if option.is_some(find(struct.borrow(array.borrow(profiles,i),field=targets),"instrumental")){direct_instrumental=true}
+   i+=1}
+  i=0
+  loop{if i==array.len(outputs){break}
+   if str.view(array.borrow(outputs,i).target)=="instrumental"{already=true}
+   i+=1}
+  if direct_instrumental and not already{
+   let requested:config.Target=config.Target{target:"instrumental",method:string.copy(c.method),exclude:""}
+   var common:bool=true
+   i=0
+   loop{if i==array.len(profiles){break}
+    if not provides(struct.borrow(array.borrow(profiles,i),field=targets),requested){common=false}
+    i+=1}
+   if common{array.push(outputs,requested)}}
+ }else{
+  i=0
+  loop{if i==array.len(c.outputs){break}
+   let requested:ref<config.Target>=array.borrow(c.outputs,i)
+   var member:u64=0
+   loop{if member==array.len(profiles){break}
+    if not provides(struct.borrow(array.borrow(profiles,member),field=targets),requested){
+     return result.err(text.concat("A selected model does not provide stem: ",requested.target))}
+    member+=1}
+   array.push(outputs,config.Target{target:string.copy(requested.target),method:if str.len(requested.method)==0{string.copy(c.method)}else{string.copy(requested.method)},exclude:string.copy(requested.exclude)})
+   i+=1}}
+ if array.len(outputs)==0{return result.err("Selected models have no matching output stems")}
+ result.ok(config.Options{outputs:outputs,method:string.copy(c.method),domain:string.copy(c.domain),normalize:c.normalize,keep_members:c.keep_members,complement:string.copy(c.complement)})
+}
+pub fn begin(c:ref<config.Options>)->result<Accumulator,string> effects {alloc} {
+ begin_as(c,audio.WavSubtype.Float32)
+}
+pub fn begin_as(c:ref<config.Options>,kind:audio.WavSubtype)->result<Accumulator,string> effects {alloc} {
+ let _=try validate(c)
+ if array.len(c.outputs)==0{return result.err("Model ensemble stems have not been resolved")}
+ var stems:array<Stem>=[]
+ var i:u64=0
+ loop{if i==array.len(c.outputs){break}
+  array.push(stems,Stem{estimates:[]})
+  i+=1}
+ result.ok(Accumulator{stems:stems,member_frames:[],saved:[],member_subtype:kind})
+}
+fn reload_member(values:array<f32> own,kind:audio.WavSubtype)->result<array<f32>,string> effects {alloc} {
+ // Validated F32 samples survive FLOAT/DOUBLE storage and F32 reload unchanged.
+ if kind==audio.WavSubtype.Float32 or kind==audio.WavSubtype.Float64{return result.ok(values)}
+ let source:samples.Samples=samples.from_single(values)
+ // Cover the existing 536870912-sample extent, including conversion workspace.
+ boundary.serialized_f32(source,44100,2,kind,boundary.Limits{max_working_bytes:12884901952+64})
+}
+pub fn source_wave(targets:ref<array<string>>,values:ref<array<f32>>,frames:u64,target:ref<config.Target>,complement:str,input:view<f32>)->result<array<f32>,string> effects {alloc, env, ffi, fs.read} {
+ var direct:option<u64>=option.none()
+ if str.len(target.exclude)==0 and not (complement=="spectral" and str.view(target.target)=="instrumental" and option.is_some(find(targets,"vocals"))){direct=find(targets,target.target)}
+ match direct{some(source)=>{
+  var output:array<f32>=[]
+  array.reserve(output,2*frames)
+  var i:u64=0
+  loop{if i==2*frames{break}
+   array.push(output,array.get(values,source*2*frames+i))
+   i+=1}
+  return result.ok(output)},none=>{}}
+ if not provides(targets,target){return result.err("A model ensemble stem is missing")}
+ let excluded:string=if str.len(target.exclude)>0{string.copy(target.exclude)}else{"vocals"}
+ let index:u64=match find(targets,excluded){some(v)=>v,none=>{return result.err("A complement source is missing")}}
+ if complement=="spectral"{
+  let selected:array<f32>=num.copy(view.slice(array.view(values),index*2*frames,(index+1)*2*frames))
+  var reconstructed:residual.Output=try residual.waveform(input,array.view(selected))
+  return result.ok(struct.replace(reconstructed,[],field=values))}
+ var output:array<f32>=num.zeros(2*frames)
+ if complement=="residual"{
+  let input_frames:u64=view.len(input)/2
+  if view.len(input)%2!=0 or input_frames<frames{return result.err("Mixture is shorter than its complement source")}
+  var channel:u64=0
+  loop{if channel==2{break}
+   var t:u64=0
+   loop{if t==frames{break}
+    array.set(output,channel*frames+t,view.get(input,channel*input_frames+t)-array.get(values,index*2*frames+channel*frames+t))
+    t+=1}
+   channel+=1}
+ }else{
+  var source:u64=0
+  loop{if source==array.len(targets){break}
+   if source!=index{
+    var i:u64=0
+    loop{if i==2*frames{break}
+     array.set(output,i,array.get(output,i)+array.get(values,source*2*frames+i))
+     i+=1}}
+   source+=1}}
+ result.ok(output)
+}
+pub fn push(acc:ref<Accumulator>,c:ref<config.Options>,targets:ref<array<string>>,values:array<f32> own,input:view<f32>,cancel:str)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read} {
+ if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+ var held:array<f32>=values
+ let count:u64=array.len(targets)
+ if count==0 or array.len(held)==0 or array.len(held)%(2*count)!=0 or not num.finite(array.view(held)){
+  return result.err("Invalid model ensemble member output")}
+ let frames:u64=array.len(held)/(2*count)
+ var saved:array<f32>=[]
+ var saved_targets:array<string>=[]
+ var saved_frames:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(c.outputs){break}
+  let requested:ref<config.Target>=array.borrow(c.outputs,i)
+  var selected:array<f32>=try source_wave(targets,held,frames,requested,c.complement,input)
+  let _=try ensemble.normalize(selected,c.normalize)
+  if c.keep_members{
+   array.push(saved_targets,string.copy(requested.target))
+   array.push(saved_frames,array.len(selected)/2)
+   var j:u64=0
+   loop{if j==array.len(selected){break}
+    array.push(saved,array.get(selected,j))
+    j+=1}}
+  let reloaded:array<f32>=try reload_member(selected,acc.member_subtype)
+  array.push(struct.borrow(array.borrow(acc.stems,i),field=estimates),reloaded)
+  i+=1}
+ array.push(acc.member_frames,frames)
+ if c.keep_members{array.push(acc.saved,MemberOutput{targets:saved_targets,values:saved,frames:frames,target_frames:saved_frames})}
+ result.ok(())
+}
+// Processed members supply one finished stereo array per resolved output.
+pub fn push_processed(acc:ref<Accumulator>,c:ref<config.Options>,waves:array<array<f32>> own,cancel:str)->result<unit,string> effects {alloc,fs.meta} {
+ var selected:array<array<f32>>=waves
+ if array.len(selected)!=array.len(c.outputs) or array.len(selected)!=array.len(acc.stems) or array.len(selected)==0{return result.err("Processed ensemble stem count differs")}
+ if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+ var extent:u64=0
+ var check:u64=0
+ loop{if check==array.len(selected){break}
+  let values:ref<array<f32>>=array.borrow(selected,check)
+  let count:u64=array.len(values)
+  if count==0 or count%2!=0 or count>536870912-extent or not num.finite(array.view(values)){return result.err("Invalid processed ensemble stem extent")}
+  extent+=count
+  check+=1}
+ var saved:array<f32>=[]
+ var names:array<string>=[]
+ var frames:array<u64>=[]
+ var total:u64=0
+ var index:u64=0
+ loop{if index==array.len(selected){break}
+  let values:ref<array<f32>>=array.borrow(selected,index)
+  let count:u64=array.len(values)
+  if count==0 or count%2!=0 or count>536870912-total{return result.err("Invalid processed ensemble stem extent")}
+  total+=count
+  let _=try ensemble.normalize(values,c.normalize)
+  array.push(frames,count/2)
+  array.push(names,string.copy(array.borrow(c.outputs,index).target))
+  if c.keep_members{
+   var at:u64=0
+   loop{if at==count{break}
+    array.push(saved,array.get(values,at))
+    at+=1}}
+  let reloaded:array<f32>=try reload_member(ref.swap(values,[]),acc.member_subtype)
+  array.push(struct.borrow(array.borrow(acc.stems,index),field=estimates),reloaded)
+  index+=1}
+ let first:u64=array.get(frames,0)
+ array.push(acc.member_frames,first)
+ if c.keep_members{array.push(acc.saved,MemberOutput{targets:names,values:saved,frames:first,target_frames:frames})}
+ result.ok(())
+}
+fn finish_impl(acc:ref<Accumulator>,c:ref<config.Options>,cancel:str,progress:str,independent:bool)->result<Output,string> effects {alloc,fs.meta,fs.write} {
+ if array.len(acc.member_frames)<2{return result.err("A model ensemble needs at least two completed members")}
+ var targets:array<string>=[]
+ var output:array<f32>=[]
+ var frames:u64=0
+ var target_frames:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(c.outputs){break}
+  let target:ref<config.Target>=array.borrow(c.outputs,i)
+  var combined:ensemble.Output=try ensemble.combine(struct.borrow(array.borrow(acc.stems,i),field=estimates),target.method,c.domain,c.normalize,cancel,progress)
+  if i==0{frames=combined.frames}else{if not independent and frames!=combined.frames{return result.err("Model ensemble stem lengths disagree")}}
+  array.push(target_frames,combined.frames)
+  array.push(targets,string.copy(target.target))
+  var j:u64=0
+  loop{if j==array.len(combined.values){break}
+   array.push(output,array.get(combined.values,j))
+   j+=1}
+  i+=1}
+ var extents:array<u64>=[]
+ i=0
+ loop{if i==array.len(acc.member_frames){break}
+  array.push(extents,array.get(acc.member_frames,i))
+  i+=1}
+ let saved:array<MemberOutput>=struct.replace(acc,[],field=saved)
+ result.ok(Output{targets:targets,values:output,frames:frames,member_frames:extents,saved:saved,target_frames:target_frames})
+}
+pub fn finish(acc:ref<Accumulator>,c:ref<config.Options>,cancel:str,progress:str)->result<Output,string> effects {alloc,fs.meta,fs.write} {
+ finish_impl(acc,c,cancel,progress,c.complement=="spectral")
+}
+pub fn finish_processed(acc:ref<Accumulator>,c:ref<config.Options>,cancel:str,progress:str)->result<Output,string> effects {alloc,fs.meta,fs.write} {
+ finish_impl(acc,c,cancel,progress,true)
+}
+pub fn validate_members(bank:ref<cache.Cache>,members:view<u64>)->result<unit,string> effects {alloc} {
+ if view.len(members)<2{return result.err("Select at least two models for an ensemble")}
+ var i:u64=0
+ loop{if i==view.len(members){break}
+  if view.get(members,i)>=array.len(bank.entries){return result.err("A model ensemble member is not loaded")}
+  var j:u64=0
+  loop{if j==i{break}
+   if view.get(members,i)==view.get(members,j){return result.err("Model ensemble members must be distinct")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn separate_cpu(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ separate_cpu_as(bank,members,c,input,cancel,progress,audio.WavSubtype.Float32)
+}
+pub fn separate_cpu_as(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,kind:audio.WavSubtype)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try cache.require_cpu_policy(bank)
+ let _=try validate_members(bank,members)
+ var acc:Accumulator=try begin_as(c,kind)
+ var i:u64=0
+ loop{if i==view.len(members){break}
+  if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+  let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,view.get(members,i)),field=model)
+  let targets:array<string>=names(struct.borrow(struct.borrow(model,field=profile),field=targets))
+  let output:array<f32>=try engine.separate_cpu(model,input,cancel,progress)
+  let _=try push(acc,c,targets,output,input,cancel)
+  i+=1}
+ finish(acc,c,cancel,progress)
+}
+
+// Explicit retained CPU backend route; legacy CPU API stays dependency-free.
+pub fn separate_cpu_prepared(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ separate_cpu_prepared_with_high_band(bank,members,c,input,cancel,progress,mask_request.HighBand.Profile)
+}
+pub fn separate_cpu_prepared_with_high_band(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ separate_cpu_prepared_with_high_band_as(bank,members,c,input,cancel,progress,high_band,audio.WavSubtype.Float32)
+}
+pub fn separate_cpu_prepared_with_high_band_as(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,high_band:mask_request.HighBand,kind:audio.WavSubtype)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var policy:mask_request.Policy=mask_request.defaults()
+ policy.high_band=high_band
+ separate_cpu_prepared_with_policy_as(bank,members,c,input,cancel,progress,policy,kind)
+}
+pub fn separate_cpu_prepared_with_policy_as(bank:ref<cache.Cache>,members:view<u64>,c:ref<config.Options>,input:view<f32>,cancel:str,progress:str,policy:ref<mask_request.Policy>,kind:audio.WavSubtype)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ let _=try mask_request.validate_policy(policy)
+ let _=try cache.require_cpu_policy(bank)
+ let _=try validate_members(bank,members)
+ var acc:Accumulator=try begin_as(c,kind)
+ var i:u64=0
+ loop{if i==view.len(members){break}
+  if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+  let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,view.get(members,i)),field=model)
+  let targets:array<string>=names(struct.borrow(struct.borrow(model,field=profile),field=targets))
+  let output:array<f32>=try cache.separate_cpu_with_policy(bank,view.get(members,i),input,cancel,progress,policy)
+  let _=try push(acc,c,targets,output,input,cancel)
+  i+=1}
+ finish(acc,c,cancel,progress)
+}

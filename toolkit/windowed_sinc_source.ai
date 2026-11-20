@@ -1,0 +1,45 @@
+// Optional CPU tensor recipe for the original twofold interpolation filters.
+// Existing windowed_sinc.plan and CPU resampling defaults remain unchanged.
+module stemair.windowed_sinc_source
+import "windowed_sinc.ai" as sinc
+import std.mkl_vml as vml
+import std.torch_cpu_f32 as torch
+import std.float as fp
+pub fn plan(runtime:ref<vml.Vml>,step:u64,phases:u64)->result<sinc.Plan,string> effects {alloc,ffi}{
+ if not ((step==1 and phases==2) or (step==2 and phases==1)){return result.err("Source interpolation recipe requires the qualified twofold ratio")}
+ let cutoff:f64=0.945
+ let width:u64=cast.sat(fp.ceil(24.0*cast.float(step)/cutoff))
+ let size:u64=2*width+step
+ var coefficients:array<f32>=[]
+ var phase:u64=0
+ loop{if phase==phases{break}
+  let phase64:f64=cast.float(phase)
+  let phases64:f64=cast.float(phases)
+  let step64:f64=cast.float(step)
+  let offset:f32=cast.float(-phase64/phases64)
+  let reciprocal:f32=cast.float(1.0/step64)
+  let frequency:f32=cast.float(cutoff)
+  var raw:array<f32>=[]
+  var i:u64=0
+  loop{if i==size{break}
+   let index:i64=cast.sat(i)-cast.sat(width)
+   let index32:f32=cast.float(index)
+   var t:f32=(offset+index32*reciprocal)*frequency
+   if t< -24.0{t= -24.0}
+   if t>24.0{t=24.0}
+   t*=3.14159265358979323846
+   let argument:f32=(t/24.0)/2.0
+   let cosine:f32=try vml.cos(runtime,argument)
+   let sine:f32=try vml.sin(runtime,t)
+   let window:f32=cosine*cosine
+   let cardinal:f32=if t==0.0{1.0}else{sine/t}
+   array.push(raw,cardinal*window)
+   i+=1}
+  let total:f32=torch.sum(raw)
+  i=0
+  loop{if i==size{break}
+   array.push(coefficients,array.get(raw,i)/total)
+   i+=1}
+  phase+=1}
+ result.ok(sinc.Plan{step:step,phases:phases,width:width,kernel:coefficients})
+}

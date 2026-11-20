@@ -1,0 +1,197 @@
+module stemair.typed_vocal_chain
+import "audio_result.ai" as audio
+import "typed_audio_math.ai" as math
+import "control.ai" as control
+import std.float as fp
+
+pub type Settings=struct{rebalance:f64=0.0,mixes:bool=false,mix_only:bool=false,vocal_only:bool=false,normalize:bool=false}
+pub type Limits=struct{max_working_bytes:u64}
+pub type Stem=struct{target:string,samples:audio.Samples,frames:u64}
+pub fn validate(c:ref<Settings>)->result<unit,string> effects {alloc} {
+ if not fp.is_finite(c.rebalance) or c.rebalance<0.0 or c.rebalance>1.0{return result.err("Vocal rebalance must be between 0 and 1")}
+ if c.mix_only and (not c.mixes or c.vocal_only){return result.err("Instrumental-only vocal splitting requires mixed outputs and excludes vocal-only output")}
+ result.ok(())
+}
+fn add_bytes(a:u64,b:u64)->result<u64,string> effects {alloc} {
+ if a>18446744073709551615-b{return result.err("Typed vocal byte extent overflows")}
+ result.ok(a+b)
+}
+fn multiply(a:u64,b:u64)->result<u64,string> effects {alloc} {
+ if b!=0 and a>18446744073709551615/b{return result.err("Typed vocal byte extent overflows")}
+ result.ok(a*b)
+}
+fn check(s:ref<audio.Samples>)->result<u64,string> effects {alloc} {
+ let _=try audio.validate(s)
+ let n:u64=audio.count(s)
+ if n%2!=0{return result.err("Typed vocal waveforms require complete planar stereo")}
+ result.ok(n/2)
+}
+fn size(s:ref<audio.Samples>)->result<u64,string> effects {alloc} {
+ let _=try check(s)
+ multiply(audio.count(s),if s.precision==audio.Precision.Float32{4}else{8})
+}
+fn budget(base:u64,largest:u64,copies:u64,limits:Limits)->result<unit,string> effects {alloc} {
+ let required:u64=try add_bytes(base,try multiply(try multiply(largest,8),copies))
+ if required>limits.max_working_bytes{return result.err("Typed vocal working budget exceeded")}
+ result.ok(())
+}
+fn value(s:ref<audio.Samples>,i:u64)->f64 effects {} {
+ if s.precision==audio.Precision.Float32{cast.float(array.get(s.single,i))}else{array.get(s.wide,i)}
+}
+fn copy(s:ref<audio.Samples>)->audio.Samples effects {alloc} {
+ var out:audio.Samples=if s.precision==audio.Precision.Float32{audio.from_single([])}else{audio.from_wide([])}
+ let n:u64=audio.count(s)
+ if s.precision==audio.Precision.Float32{array.reserve(out.single,n)}else{array.reserve(out.wide,n)}
+ var i:u64=0
+ loop{if i==n{break}
+  if s.precision==audio.Precision.Float32{array.push(out.single,array.get(s.single,i))}else{array.push(out.wide,array.get(s.wide,i))}
+  i+=1}
+ out
+}
+fn scaled(s:ref<audio.Samples>,factor:f64)->audio.Samples effects {alloc} {
+ // Current validated rebalance supplies 1-rate in [0,1], and instrumental
+ // inversion supplies -1: both weak scalars remain F32 for F32 arrays.
+ var out:audio.Samples=copy(s)
+ var i:u64=0
+ loop{if i==audio.count(s){break}
+  if s.precision==audio.Precision.Float32{
+   let scalar:f32=cast.float(factor)
+   array.set(out.single,i,array.get(s.single,i)*scalar)
+  }else{array.set(out.wide,i,array.get(s.wide,i)*factor)}
+  i+=1}
+ out
+}
+fn derived(backing:ref<audio.Samples>,vocals:ref<audio.Samples>)->audio.Samples effects {alloc} {
+ let frames:u64=audio.count(backing)/2
+ let master:u64=audio.count(vocals)/2
+ let wide:bool=backing.precision==audio.Precision.Float64 or vocals.precision==audio.Precision.Float64
+ var out:audio.Samples=if wide{audio.from_wide([])}else{audio.from_single([])}
+ if wide{array.reserve(out.wide,2*frames)}else{array.reserve(out.single,2*frames)}
+ var ch:u64=0
+ loop{if ch==2{break}
+  var i:u64=0
+  loop{if i==frames{break}
+   let b:f64=value(backing,ch*frames+i)
+   let v:f64=if i<master{value(vocals,ch*master+i)}else{0.0}
+   if wide{array.push(out.wide,b-v)}else{
+    let bf:f32=cast.float(b)
+    let vf:f32=cast.float(v)
+    array.push(out.single,bf-vf)}
+   i+=1}
+  ch+=1}
+ out
+}
+fn mix(instrumental:ref<audio.Samples>,vocals:ref<audio.Samples>,invert:bool,limits:Limits)->result<audio.Samples,string> effects {alloc} {
+ var inputs:array<audio.Samples>=[]
+ array.push(inputs,copy(instrumental))
+ var estimate:audio.Samples=copy(vocals)
+ if invert{var i:u64=0
+  loop{if i==audio.count(estimate){break}
+   if estimate.precision==audio.Precision.Float32{array.set(estimate.single,i,-array.get(estimate.single,i))}else{array.set(estimate.wide,i,-array.get(estimate.wide,i))}
+   i+=1}}
+ array.push(inputs,estimate)
+ math.combine(inputs,2,math.Limits{max_working_bytes:limits.max_working_bytes})
+}
+fn target(predictions:ref<array<Stem>>,name:str)->result<u64,string> effects {alloc} {
+ var i:u64=0
+ loop{if i==array.len(predictions){return result.err("A typed vocal splitter must provide lead and backing stems")}
+  if str.view(array.borrow(predictions,i).target)==name{return result.ok(i)}
+  i+=1}
+ result.err("A typed vocal splitter must provide lead and backing stems")
+}
+fn append(out:ref<array<Stem>>,name:str,samples:ref<audio.Samples>)->unit effects {alloc} {
+ array.push(out,Stem{target:string.copy(name),samples:copy(samples),frames:audio.count(samples)/2})
+ ()
+}
+pub fn prepare(vocals:ref<audio.Samples>,instrumental:ref<option<audio.Samples>>,c:ref<Settings>,limits:Limits,cancel:str,progress:str)->result<audio.Samples,string> effects {alloc,fs.meta,fs.write} {
+ let _=try validate(c)
+ if control.cancelled(cancel){return result.err("Vocal splitting cancelled")}
+ let vb:u64=try size(vocals)
+ var base:u64=vb
+ var largest:u64=audio.count(vocals)
+ match instrumental{none=>{},some(s)=>{
+  base=try add_bytes(base,try size(s))
+  if audio.count(s)>largest{largest=audio.count(s)}}}
+ let _=try budget(base,largest,4,limits)
+ if c.rebalance==0.0{return result.ok(copy(vocals))}
+ match instrumental{none=>result.err("Vocal rebalance requires a master instrumental"),some(inst)=>{
+  control.status(progress,"Preparing vocal split")
+  let factor:f64=1.0-c.rebalance
+  var inputs:array<audio.Samples>=[]
+  array.push(inputs,scaled(inst,factor))
+  array.push(inputs,copy(vocals))
+  math.combine(inputs,2,math.Limits{max_working_bytes:limits.max_working_bytes})}}
+}
+pub fn finish(predictions:ref<array<Stem>>,vocals:ref<audio.Samples>,instrumental:ref<option<audio.Samples>>,c:ref<Settings>,limits:Limits,cancel:str,progress:str)->result<array<Stem>,string> effects {alloc,fs.meta,fs.write} {
+ var captured:array<Stem>=[]
+ finish_impl(predictions,vocals,instrumental,c,limits,cancel,progress,captured,false)
+}
+pub fn finish_captured(predictions:ref<array<Stem>>,vocals:ref<audio.Samples>,instrumental:ref<option<audio.Samples>>,c:ref<Settings>,limits:Limits,cancel:str,progress:str,captured:ref<array<Stem>>)->result<array<Stem>,string> effects {alloc,fs.meta,fs.write}{
+ finish_impl(predictions,vocals,instrumental,c,limits,cancel,progress,captured,true)
+}
+fn finish_impl(predictions:ref<array<Stem>>,vocals:ref<audio.Samples>,instrumental:ref<option<audio.Samples>>,c:ref<Settings>,limits:Limits,cancel:str,progress:str,captured:ref<array<Stem>>,capture:bool)->result<array<Stem>,string> effects {alloc,fs.meta,fs.write} {
+ let _=try validate(c)
+ if control.cancelled(cancel){return result.err("Vocal splitting cancelled")}
+ let _=try check(vocals)
+ if array.len(predictions)!=2{return result.err("A typed vocal splitter must provide lead and backing stems")}
+ let backing_index:u64=try target(predictions,"backing")
+ let _=try target(predictions,"lead")
+ var base:u64=try size(vocals)
+ var largest:u64=audio.count(vocals)
+ match instrumental{none=>{},some(s)=>{
+  base=try add_bytes(base,try size(s))
+  if audio.count(s)>largest{largest=audio.count(s)}}}
+ var i:u64=0
+ loop{if i==array.len(predictions){break}
+  let p:ref<Stem>=array.borrow(predictions,i)
+  let count:u64=try check(struct.borrow(p,field=samples))
+  if count!=p.frames{return result.err("Typed vocal prediction frame metadata differs")}
+  base=try add_bytes(base,try size(struct.borrow(p,field=samples)))
+  if audio.count(struct.borrow(p,field=samples))>largest{largest=audio.count(struct.borrow(p,field=samples))}
+  i+=1}
+ let _=try budget(base,largest,12,limits)
+ var out:array<Stem>=[]
+ if c.rebalance>0.0{
+  let p:ref<Stem>=array.borrow(predictions,backing_index)
+  var backing:audio.Samples=copy(struct.borrow(p,field=samples))
+  // Literal source write_audio: derive BEFORE either vocal save mutates data.
+  var lead:audio.Samples=derived(backing,vocals)
+  if not c.mix_only{
+   if capture{append(captured,"backing",backing)}
+   let _=try math.normalize(backing,c.normalize)
+   append(out,"backing",backing)
+   if capture{append(captured,"lead",lead)}
+   let _=try math.normalize(lead,c.normalize)
+   append(out,"lead",lead)}
+  if c.mixes and not c.vocal_only{match instrumental{none=>{},some(inst)=>{
+   if control.cancelled(cancel){return result.err("Vocal splitting cancelled")}
+   var backing_mix:audio.Samples=try mix(inst,backing,false,limits)
+   if capture{append(captured,"instrumental_with_backing",backing_mix)}
+   let _=try math.normalize(backing_mix,c.normalize)
+   append(out,"instrumental_with_backing",backing_mix)
+   var lead_mix:audio.Samples=try mix(inst,lead,true,limits)
+   if capture{append(captured,"instrumental_with_lead",lead_mix)}
+   let _=try math.normalize(lead_mix,c.normalize)
+   append(out,"instrumental_with_lead",lead_mix)}}}
+ }else{
+  // Supplied prediction order is the actual caller's write_audio order.
+  i=0
+  loop{if i==array.len(predictions){break}
+   if control.cancelled(cancel){return result.err("Vocal splitting cancelled")}
+   let p:ref<Stem>=array.borrow(predictions,i)
+   let name:str=str.view(p.target)
+   var saved:audio.Samples=copy(struct.borrow(p,field=samples))
+   if not c.mix_only{
+    if capture{append(captured,name,saved)}
+    let _=try math.normalize(saved,c.normalize)
+    append(out,name,saved)}
+   if c.mixes and not c.vocal_only{match instrumental{none=>{},some(inst)=>{
+    var mixed:audio.Samples=try mix(inst,saved,false,limits)
+    if capture{append(captured,if name=="backing"{"instrumental_with_backing"}else{"instrumental_with_lead"},mixed)}
+    let _=try math.normalize(mixed,c.normalize)
+    append(out,if name=="backing"{"instrumental_with_backing"}else{"instrumental_with_lead"},mixed)}}}
+   control.report(progress,i+1,array.len(predictions))
+   i+=1}
+ }
+ result.ok(out)
+}

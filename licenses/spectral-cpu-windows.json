@@ -1,0 +1,15 @@
+{
+  "adapter": "air-cpu-primitives.dll",
+  "adapter_sha256": "61de09862d8056683c94e25f9042dc29f68a6f189791ffa1413b2a956c87c26a",
+  "runtime": "dnnl.dll",
+  "runtime_sha256": "65efe26c822efbabc3c00803925545fd06668e3e8c2d959a4599035980f0c99c",
+  "matrix_adapter": "air-mkl-vml.dll",
+  "matrix_adapter_sha256": "5140ba3ed61ebf3df73068c1275f1f0af4132054cdf75aec82badc8c850615dd",
+  "mkl": "mkl_rt.2.dll",
+  "mkl_sha256": "95844d971f88ad0acaf07bcb13762e53a5b9bc5c1b1fab65c3a7639c2103cb7d",
+  "mkl_version": "2025.3",
+  "affine_separate": true,
+  "owned_bytes": 1610612736,
+  "scratch_bytes": 142606336,
+  "staging_bytes": 536870912
+}

@@ -1,0 +1,94 @@
+module stemair.typed_spectral_residual
+import "audio_result.ai" as samples
+import "complex_spectral_source.ai" as spectral
+import "spectral_residual.ai" as legacy
+import "ops.ai" as ops
+import std.float as fp
+
+pub type Limits=struct{max_working_bytes:u64}
+pub type Output=struct{samples:samples.Samples,frames:u64}
+fn validate(source:ref<samples.Samples>)->result<u64,string> effects {alloc} {
+ let _=try samples.validate(source)
+ let count:u64=samples.count(source)
+ if count%2!=0{return result.err("Spectral subtraction requires complete planar stereo frames")}
+ var i:u64=0
+ loop{if i==count{break}
+  let value:f64=if source.precision==samples.Precision.Float32{cast.float(array.get(source.single,i))}else{array.get(source.wide,i)}
+  if not fp.is_finite(value){return result.err("Spectral subtraction requires finite input")}
+  i+=1}
+ result.ok(count/2)
+}
+fn transform(plan:ref<spectral.Plan>,source:ref<samples.Samples>)->result<spectral.WideSpectrum,string> effects {alloc} {
+ if source.precision==samples.Precision.Float64{return spectral.analyze_f64(plan,array.view(source.wide))}
+ let single:ops.Tensor=try spectral.analyze(plan,array.view(source.single))
+ var real:array<f64>=[]
+ var imaginary:array<f64>=[]
+ var channel:u64=0
+ loop{if channel==2{break}
+  var i:u64=0
+  loop{if i==single.h*single.w{break}
+   array.push(real,cast.float(array.get(single.data,2*channel*single.h*single.w+i)))
+   array.push(imaginary,cast.float(array.get(single.data,(2*channel+1)*single.h*single.w+i)))
+   i+=1}
+  channel+=1}
+ result.ok(spectral.WideSpectrum{real:real,imaginary:imaginary,bins:single.h,frames:single.w})
+}
+fn magnitude(real:f64,imaginary:f64,wide:bool)->f64 effects {} {
+ if wide{fp.hypot(real,imaginary)}else{cast.float(spectral.magnitude(cast.float(real),cast.float(imaginary)))}
+}
+pub fn waveform(mixture:ref<samples.Samples>,stem:ref<samples.Samples>,limits:Limits)->result<Output,string> effects {alloc, env, ffi, fs.read} {
+ let mixture_frames:u64=try validate(mixture)
+ let stem_frames:u64=try validate(stem)
+ let budget:u64=limits.max_working_bytes
+ if budget<1048576{return result.err("Spectral subtraction working budget exceeded")}
+ let capacity:u64=(budget-1048576)/128
+ if mixture_frames>capacity or stem_frames>capacity-mixture_frames{return result.err("Spectral subtraction working budget exceeded")}
+ let wide:bool=mixture.precision==samples.Precision.Float64 or stem.precision==samples.Precision.Float64
+ if mixture_frames<1024 or stem_frames<1024{
+  return result.ok(Output{samples:if wide{samples.from_wide([])}else{samples.from_single([])},frames:0})}
+ if not wide{
+  var output:legacy.Output=try legacy.waveform(array.view(mixture.single),array.view(stem.single))
+  return result.ok(Output{samples:samples.from_single(struct.replace(output,[],field=values)),frames:output.frames})}
+ var plan:spectral.Plan=try spectral.plan(2048,1024)
+ let original:spectral.WideSpectrum=try transform(plan,mixture)
+ let estimated:spectral.WideSpectrum=try transform(plan,stem)
+ let frames:u64=if original.frames<estimated.frames{original.frames}else{estimated.frames}
+ var real:array<f64>=[]
+ var imaginary:array<f64>=[]
+ var channel:u64=0
+ loop{if channel==2{break}
+  var bin:u64=0
+  loop{if bin==original.bins{break}
+   var time:u64=0
+   loop{if time==frames{break}
+    let mi:u64=(channel*original.bins+bin)*original.frames+time
+    let si:u64=(channel*estimated.bins+bin)*estimated.frames+time
+    let mr:f64=array.get(original.real,mi)
+    let mj:f64=array.get(original.imaginary,mi)
+    let sr:f64=array.get(estimated.real,si)
+    let sj:f64=array.get(estimated.imaginary,si)
+    let mm:f64=magnitude(mr,mj,mixture.precision==samples.Precision.Float64)
+    let sm:f64=magnitude(sr,sj,stem.precision==samples.Precision.Float64)
+    let largest:f64=if mm>=sm{mm}else{sm}
+    var cosine:f64=0.0
+    var sine:f64=0.0
+    if mixture.precision==samples.Precision.Float32{
+     let angle:f32=fp.atan2(cast.float(mj),cast.float(mr))
+     cosine=cast.float(fp.cos(angle))
+     sine=cast.float(fp.sin(angle))
+    }else{
+     let angle:f64=fp.atan2(mj,mr)
+     cosine=fp.cos(angle)
+     sine=fp.sin(angle)}
+    array.push(real,sr-largest*cosine)
+    array.push(imaginary,sj-largest*sine)
+    time+=1}
+   bin+=1}
+  channel+=1}
+ var output:array<f64>=try spectral.synthesize(plan,array.view(real),array.view(imaginary),frames)
+ var i:u64=0
+ loop{if i==array.len(output){break}
+  array.set(output,i,-array.get(output,i))
+  i+=1}
+ result.ok(Output{samples:samples.from_wide(output),frames:(frames-1)*1024})
+}

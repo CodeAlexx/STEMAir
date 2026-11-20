@@ -1,0 +1,78 @@
+module stemair.paired_inputs
+
+// Ordered path identity is independent of display labels and platform widgets.
+pub type Pair=struct{first:string,second:string} derive codec(strict)
+pub type Pairing=struct{items:array<Pair>,unmatched_first:u64,unmatched_second:u64} derive codec(strict)
+fn contains(items:ref<array<string>>,path:str)->bool effects {} {
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  if array.get(items,i)==path{return true}
+  i+=1}
+ false
+}
+pub fn add(items:ref<array<string>>,incoming:ref<array<string>>,maximum:u64)->result<unit,string> effects {alloc} {
+ var next:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  array.push(next,string.copy(array.get(items,i)))
+  i+=1}
+ i=0
+ loop{if i==array.len(incoming){break}
+  let value:str=array.get(incoming,i)
+  if str.len(value)==0{return result.err("Choose a nonempty recording path")}
+  if not contains(next,value){
+   if array.len(next)>=maximum{return result.err("The recording list exceeds its selected entry limit")}
+   array.push(next,string.copy(value))}
+  i+=1}
+ if array.len(next)>maximum{return result.err("The recording list exceeds its selected entry limit")}
+ let _=ref.swap(items,next)
+ result.ok(())
+}
+pub fn duplicate(items:ref<array<string>>,index:u64,maximum:u64)->result<unit,string> effects {alloc} {
+ if index>=array.len(items){return result.err("Select a current recording row")}
+ if array.len(items)>=maximum{return result.err("The recording list exceeds its selected entry limit")}
+ let value:string=string.copy(array.get(items,index))
+ array.push(items,value)
+ result.ok(())
+}
+pub fn remove(items:ref<array<string>>,index:u64)->result<unit,string> effects {alloc} {
+ if index>=array.len(items){return result.err("Select a current recording row")}
+ var next:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  if i!=index{array.push(next,string.copy(array.get(items,i)))}
+  i+=1}
+ let _=ref.swap(items,next)
+ result.ok(())
+}
+pub fn move(items:ref<array<string>>,index:u64,up:bool)->result<u64,string> effects {alloc} {
+ if index>=array.len(items){return result.err("Select a current recording row")}
+ if (up and index==0) or (not up and index+1==array.len(items)){return result.ok(index)}
+ let destination:u64=if up{index-1}else{index+1}
+ let first:string=string.copy(array.get(items,index))
+ let second:string=string.copy(array.get(items,destination))
+ array.set(items,index,second)
+ array.set(items,destination,first)
+ result.ok(destination)
+}
+pub fn transfer(first:ref<array<string>>,second:ref<array<string>>,index:u64,maximum:u64)->result<bool,string> effects {alloc} {
+ if index>=array.len(first){return result.err("Select a current recording row")}
+ let value:string=string.copy(array.get(first,index))
+ if contains(second,value){return result.ok(false)}
+ if array.len(second)>=maximum{return result.err("The recording list exceeds its selected entry limit")}
+ let _=try remove(first,index)
+ array.push(second,value)
+ result.ok(true)
+}
+// Source positional pairing stops at the shorter list. Report unused rows
+// explicitly so callers can display them before accepting the resulting pairs.
+pub fn pair(first:ref<array<string>>,second:ref<array<string>>)->result<Pairing,string> effects {alloc} {
+ let count:u64=if array.len(first)<array.len(second){array.len(first)}else{array.len(second)}
+ var items:array<Pair>=[]
+ var i:u64=0
+ loop{if i==count{break}
+  if str.len(array.get(first,i))==0 or str.len(array.get(second,i))==0{return result.err("A recording pair contains an empty path")}
+  array.push(items,Pair{first:string.copy(array.get(first,i)),second:string.copy(array.get(second,i))})
+  i+=1}
+ result.ok(Pairing{items:items,unmatched_first:array.len(first)-count,unmatched_second:array.len(second)-count})
+}

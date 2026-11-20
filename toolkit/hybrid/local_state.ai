@@ -1,0 +1,194 @@
+module stemair.hybrid.local_state
+import "../device_ops.ai" as ops
+import "../weights.ai" as weights
+import "../numeric.ai" as num
+import "../control.ai" as control
+import std.tensor as tensor
+import std.compute as compute
+import std.text as text
+import std.float as fp
+import std.softmax_spatial as spatial
+
+pub type Block=struct{content:ops.Convolution,query:ops.Convolution,key:ops.Convolution,
+ decay:ops.Convolution,projection:ops.Convolution,channels:u64,heads:u64,decays:u64}
+pub type Observer<O>=struct{callback:option<fn(ref<O>,str,view<u64>,view<f32>)->result<unit,string> effects {alloc}>}
+fn observe_host<O>(observer:ref<Observer<O>>,state:ref<O>,name:str,shape:view<u64>,values:view<f32>)->result<unit,string> effects {alloc} {
+ match observer.callback{none=>result.ok(()),some(invoke)=>invoke(state,name,shape,values)}
+}
+fn observe_tensor<O>(stream:ref<GpuStream>,observer:ref<Observer<O>>,state:ref<O>,name:str,value:ref<tensor.Tensor>)->result<unit,string> effects {alloc,gpu} {
+ match observer.callback{none=>result.ok(()),some(invoke)=>{
+  let values:array<f32>=try tensor.to_f32(stream,value) map_err ops.error
+  invoke(state,name,array.view(value.dimensions),array.view(values))}}
+}
+pub fn bind(w:ref<weights.Model>,base:str,channels:u64,heads:u64,decays:u64)->result<Block,string> effects {alloc} {
+ if channels==0 or heads==0 or channels%heads!=0 or decays==0 or decays>64{return result.err("Invalid local-state features")}
+ result.ok(Block{content:try ops.bind_conv(w,text.concat(base,".content"),channels,channels,1,1,true,false),
+  query:try ops.bind_conv(w,text.concat(base,".query"),channels,channels,1,1,true,false),
+  key:try ops.bind_conv(w,text.concat(base,".key"),channels,channels,1,1,true,false),
+  decay:try ops.bind_conv(w,text.concat(base,".query_decay"),channels,heads*decays,1,1,true,false),
+  projection:try ops.bind_conv(w,text.concat(base,".proj"),channels,channels,1,1,true,false),
+  channels:channels,heads:heads,decays:decays})
+}
+pub fn forward_observed_with_execution<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ block:Block,x:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,observer:ref<Observer<O>>,observations:ref<O>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if tensor.rank(x)!=4 or array.get(x.dimensions,1)!=block.channels or array.get(x.dimensions,2)!=1{
+  return result.err("Invalid local-state input tensor")}
+ let batches:u64=array.get(x.dimensions,0)
+ let time:u64=array.get(x.dimensions,3)
+ let heads:u64=batches*block.heads
+ let features:u64=block.channels/block.heads
+ if batches==0 or time==0 or time>state.local_state_steps or heads*time*time>state.local_state_scores{return result.err("Local-state workspace limit exceeded")}
+ let policy:ops.ConvolutionPolicy=state.convolution
+ let ordered:bool=state.attention_recipe==ops.AttentionRecipe.SpatialF32
+ if ordered{
+  match state.attention_normalizer{none=>{return result.err("Spatial attention state was not prepared")},some(_)=>{}}
+  let shape:array<u64>=[heads,time,time]
+  let _=try spatial.plan(array.view(shape),1)
+ }
+ let recording:bool=option.is_some(observer.callback)
+ let _=try observe_tensor(stream,observer,observations,"input",x)
+ var query:tensor.Tensor=try ops.convolution_with_policy(context,stream,parameters,x,block.query,policy)
+ let _=try observe_tensor(stream,observer,observations,"query",query)
+ var key:tensor.Tensor=try ops.convolution_with_policy(context,stream,parameters,x,block.key,policy)
+ let _=try observe_tensor(stream,observer,observations,"key",key)
+ let feature_shape:array<u64>=[heads,features,time]
+ let score_shape:array<u64>=[heads,time,time]
+ var queries:tensor.Tensor=try tensor.reshape(query,array.view(feature_shape)) map_err ops.error
+ var keys:tensor.Tensor=try tensor.reshape(key,array.view(feature_shape)) map_err ops.error
+ var dots:tensor.Tensor=try ops.empty(context,array.view(score_shape))
+ let _=try compute.matmul_batched(stream,keys,queries,dots,true,false) map_err ops.error
+ let _=try observe_tensor(stream,observer,observations,"raw-dots",dots)
+ var decay:tensor.Tensor=try ops.convolution_with_policy(context,stream,parameters,x,block.decay,policy)
+ let _=try observe_tensor(stream,observer,observations,"decay-raw",decay)
+ var decay_values:array<f32>=[]
+ if ordered{
+  var activated:tensor.Tensor=try ops.empty(context,array.view(decay.dimensions))
+  let _=try compute.sigmoid(stream,decay,activated) map_err ops.error
+  decay_values=try tensor.to_f32(stream,activated) map_err ops.error
+ }else{decay_values=try tensor.to_f32(stream,decay) map_err ops.error}
+ var index:u64=0
+ loop{if index==array.len(decay_values){break}
+  let v:f32=array.get(decay_values,index)
+  array.set(decay_values,index,if ordered{v/2.0}else{(1.0/(1.0+fp.exp(-v)))/2.0})
+  index+=1}
+ let decay_shape:array<u64>=[heads,block.decays,time]
+ let _=try observe_host(observer,observations,"decay-half",array.view(decay_shape),array.view(decay_values))
+ var dot_values:array<f32>=[]
+ if ordered{
+  let feature_number:f64=cast.float(features)
+  let denominator:f64=fp.sqrt(feature_number)
+  let reciprocal:f64=1.0/denominator
+  let alpha:f32=cast.float(reciprocal)
+  var constants:array<f32>=[]
+  index=0
+  loop{if index==heads*time*time{break}
+   array.push(constants,alpha)
+   index+=1}
+  var scales:tensor.Tensor=try tensor.from_f32(context,stream,array.view(constants),array.view(score_shape),tensor.DType.F32) map_err ops.error
+  var scaled:tensor.Tensor=try ops.empty(context,array.view(score_shape))
+  let _=try compute.mul(stream,dots,scales,scaled) map_err ops.error
+  dot_values=try tensor.to_f32(stream,scaled) map_err ops.error
+ }else{dot_values=try tensor.to_f32(stream,dots) map_err ops.error}
+ var adjusted:array<f32>=num.zeros(heads*time*time)
+ var kernel_values:array<f32>=if recording{num.zeros(block.decays*time*time)}else{[]}
+ var scaled_values:array<f32>=if recording{num.zeros(heads*time*time)}else{[]}
+ var penalty_values:array<f32>=if recording{num.zeros(heads*time*time)}else{[]}
+ var unmasked_values:array<f32>=if recording{num.zeros(heads*time*time)}else{[]}
+ let feature_count:f32=cast.float(features)
+ let decay_count:f32=cast.float(block.decays)
+ let divisor:f32=fp.sqrt(feature_count)
+ let decay_divisor:f32=fp.sqrt(decay_count)
+ var head:u64=0
+ loop{if head==heads{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var query_time:u64=0
+  loop{if query_time==time{break}
+   var key_time:u64=0
+   loop{if key_time==time{break}
+    let distance:u64=if key_time>query_time{key_time-query_time}else{query_time-key_time}
+    var penalty:f32=0.0
+    var d:u64=0
+    loop{if d==block.decays{break}
+     let decay_number:f32=cast.float(d+1)
+     let separation:f32=cast.float(distance)
+     let kernel:f32=(-decay_number*separation)/decay_divisor
+     if recording and head==0{array.set(kernel_values,(d*time+key_time)*time+query_time,kernel)}
+     penalty+=kernel*array.get(decay_values,(head*block.decays+d)*time+query_time)
+     d+=1}
+    let raw:f32=array.get(dot_values,(head*time+key_time)*time+query_time)
+    let scaled:f32=if ordered{raw}else{raw/divisor}
+    let value:f32=scaled+penalty
+    if recording{
+     let offset:u64=(head*time+query_time)*time+key_time
+     array.set(scaled_values,offset,scaled)
+     array.set(penalty_values,offset,penalty)
+     array.set(unmasked_values,offset,value)}
+    array.set(adjusted,(head*time+query_time)*time+key_time,if key_time==query_time{-100.0}else{value})
+    key_time+=1}
+   query_time+=1}
+  head+=1}
+ let kernel_shape:array<u64>=[block.decays,time,time]
+ let _=try observe_host(observer,observations,"decay-kernel",array.view(kernel_shape),array.view(kernel_values))
+ let _=try observe_host(observer,observations,"scaled-dots",array.view(score_shape),array.view(scaled_values))
+ let _=try observe_host(observer,observations,"penalty",array.view(score_shape),array.view(penalty_values))
+ let _=try observe_host(observer,observations,"adjusted-scores",array.view(score_shape),array.view(unmasked_values))
+ let _=try observe_host(observer,observations,"scores",array.view(score_shape),array.view(adjusted))
+ var probabilities:tensor.Tensor=try ops.empty(context,array.view(score_shape))
+ if ordered{
+  var original_order:array<f32>=num.zeros(heads*time*time)
+  head=0
+  loop{if head==heads{break}
+   var key_time:u64=0
+   loop{if key_time==time{break}
+    var query_time:u64=0
+    loop{if query_time==time{break}
+     array.set(original_order,(head*time+key_time)*time+query_time,array.get(adjusted,(head*time+query_time)*time+key_time))
+     query_time+=1}
+    key_time+=1}
+   head+=1}
+  var scores:tensor.Tensor=try tensor.from_f32(context,stream,array.view(original_order),array.view(score_shape),tensor.DType.F32) map_err ops.error
+  var original_probabilities:tensor.Tensor=try ops.empty(context,array.view(score_shape))
+  match state.attention_normalizer{none=>{return result.err("Spatial attention state was not prepared")},some(engine)=>{
+   let _=try spatial.forward_into(engine,context,stream,scores,original_probabilities,1) map_err ops.error}}
+  probabilities=try ops.transpose(context,stream,original_probabilities,[0,2,1])
+ }else{
+  var scores:tensor.Tensor=try tensor.from_f32(context,stream,array.view(adjusted),array.view(score_shape),tensor.DType.F32) map_err ops.error
+  let _=try compute.softmax(stream,scores,probabilities) map_err ops.error
+ }
+ let _=try observe_tensor(stream,observer,observations,"probabilities",probabilities)
+ var content:tensor.Tensor=try ops.convolution_with_policy(context,stream,parameters,x,block.content,policy)
+ let _=try observe_tensor(stream,observer,observations,"content",content)
+ var content_heads:tensor.Tensor=try tensor.reshape(content,array.view(feature_shape)) map_err ops.error
+ var attended:tensor.Tensor=try ops.empty(context,array.view(feature_shape))
+ let _=try compute.matmul_batched(stream,content_heads,probabilities,attended,false,true) map_err ops.error
+ let _=try observe_tensor(stream,observer,observations,"attended",attended)
+ let output_shape:array<u64>=[batches,block.channels,1,time]
+ var joined:tensor.Tensor=try tensor.reshape(attended,array.view(output_shape)) map_err ops.error
+ var projected:tensor.Tensor=try ops.convolution_with_policy(context,stream,parameters,joined,block.projection,policy)
+ let _=try observe_tensor(stream,observer,observations,"projected",projected)
+ var output:tensor.Tensor=try ops.add(context,stream,x,projected)
+ let _=try observe_tensor(stream,observer,observations,"output",output)
+ if ordered{state.attention_calls+=1}
+ result.ok(output)
+}
+pub fn forward_observed_with_convolution_policy<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ block:Block,x:ref<tensor.Tensor>,cancel:str,policy:ops.ConvolutionPolicy,observer:ref<Observer<O>>,observations:ref<O>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var state:ops.ExecutionState=ops.current_execution(policy)
+ forward_observed_with_execution(context,stream,parameters,block,x,cancel,state,observer,observations)
+}
+pub fn forward_with_execution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ block:Block,x:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ var observations:unit=()
+ forward_observed_with_execution(context,stream,parameters,block,x,cancel,state,observer,observations)
+}
+pub fn forward_with_convolution_policy(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ block:Block,x:ref<tensor.Tensor>,cancel:str,policy:ops.ConvolutionPolicy)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ var observations:unit=()
+ forward_observed_with_convolution_policy(context,stream,parameters,block,x,cancel,policy,observer,observations)
+}
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ block:Block,x:ref<tensor.Tensor>,cancel:str)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ forward_with_convolution_policy(context,stream,parameters,block,x,cancel,ops.ConvolutionPolicy{})
+}

@@ -1,0 +1,135 @@
+module stemair.exchange.checkpoint
+import "model.ai" as model
+import "../weights.ai" as weights
+import std.pytorch_checkpoint as checkpoint
+import std.codec as codec
+import std.table as table
+import std.text as text
+import std.float as fp
+
+pub type Settings=struct{target_name:string,lr:f64,optimizer:string,dim_c:u64,dim_f:u64,dim_t:u64,n_fft:u64,hop_length:u64,
+ num_blocks:u64,l:u64,g:u64,k:u64,bn:option<u64>,bias:bool,overlap:f64} derive codec(strict)
+pub type Loaded=struct{settings:Settings,graph:model.Model}
+type Builder=struct{parameters:weights.Model,nodes:array<model.Node>,used:table.Table<bool>,next:u64=0}
+fn key(prefix:str,suffix:str)->string effects {alloc}{text.concat(prefix,suffix)}
+fn indexed(prefix:str,index:u64)->string effects {alloc}{text.concat(prefix,string.from_int(index))}
+fn parameter(b:ref<Builder>,name:str,shape:array<u64> own)->result<string,string> effects {alloc}{
+ let _=try weights.index(struct.borrow(b,field=parameters),name,array.view(shape))
+ let _=table.put(struct.borrow(b,field=used),name,true)
+ result.ok(string.copy(name))
+}
+fn attribute(name:str,values:array<u64> own)->model.Attribute effects {alloc}{
+ model.Attribute{name:string.copy(name),integer:0,scalar:0.0,integers:values,kind:7}
+}
+fn emit(b:ref<Builder>,operation:str,inputs:array<string> own,attributes:array<model.Attribute> own)->string effects {alloc}{
+ let output:string=indexed("__activation_",b.next)
+ b.next+=1
+ array.push(b.nodes,model.Node{operation:string.copy(operation),inputs:inputs,outputs:[string.copy(output)],attributes:attributes})
+ output
+}
+fn activation(b:ref<Builder>,input:str)->string effects {alloc}{emit(b,"Relu",[string.copy(input)],[])}
+fn norm(b:ref<Builder>,input:str,prefix:str,channels:u64,grouped:bool)->result<string,string> effects {alloc}{
+ var inputs:array<string>=[string.copy(input),try parameter(b,key(prefix,".weight"),[channels]),try parameter(b,key(prefix,".bias"),[channels])]
+ var attrs:array<model.Attribute>=[]
+ if grouped{array.push(attrs,model.Attribute{name:"group",integer:2,scalar:0.0,integers:[],kind:2})}
+ else{
+  array.push(inputs,try parameter(b,key(prefix,".running_mean"),[channels]))
+  array.push(inputs,try parameter(b,key(prefix,".running_var"),[channels]))}
+ result.ok(emit(b,if grouped{"GroupNormalization"}else{"RunningNormalization"},inputs,attrs))
+}
+fn convolution(b:ref<Builder>,input:str,prefix:str,ci:u64,co:u64,k:u64,stride:u64,pad:u64,up:bool)->result<string,string> effects {alloc}{
+ let shape:array<u64>=if up{[ci,co,k,k]}else{[co,ci,k,k]}
+ let w:string=try parameter(b,key(prefix,".weight"),shape)
+ let bias:string=try parameter(b,key(prefix,".bias"),[co])
+ result.ok(emit(b,if up{"ConvTranspose"}else{"Conv"},[string.copy(input),w,bias],
+  [attribute("kernel_shape",[k,k]),attribute("strides",[stride,stride]),attribute("pads",[pad,pad,pad,pad])]))
+}
+fn conv_block(b:ref<Builder>,input:str,prefix:str,ci:u64,co:u64,k:u64,stride:u64,pad:u64,up:bool,grouped:bool)->result<string,string> effects {alloc}{
+ let x:string=try convolution(b,input,key(prefix,".0"),ci,co,k,stride,pad,up)
+ let y:string=try norm(b,x,key(prefix,".1"),co,grouped)
+ result.ok(activation(b,y))
+}
+fn dense(b:ref<Builder>,input:str,prefix:str,fi:u64,fo:u64,bias:bool)->result<string,string> effects {alloc}{
+ var inputs:array<string>=[string.copy(input),try parameter(b,key(prefix,".weight"),[fo,fi])]
+ if bias{array.push(inputs,try parameter(b,key(prefix,".bias"),[fo]))}
+ result.ok(emit(b,"Dense",inputs,[]))
+}
+fn block(b:ref<Builder>,input:str,prefix:str,c:u64,f:u64,s:ref<Settings>,grouped:bool)->result<string,string> effects {alloc}{
+ var x:string=string.copy(input)
+ var i:u64=0
+ loop{if i==s.l{break}
+  x=try conv_block(b,x,indexed(key(prefix,".tfc.H."),i),c,c,s.k,1,s.k/2,false,grouped)
+  i+=1}
+ match s.bn{none=>result.ok(x),some(divisor)=>{
+  let width:u64=if divisor==0{f}else{f/divisor}
+  if width==0{return result.err("Frequency projection bottleneck is empty")}
+  let a:string=try dense(b,x,key(prefix,".tdf.0"),f,width,s.bias)
+  let n:string=try norm(b,a,key(prefix,".tdf.1"),c,grouped)
+  var projected:string=activation(b,n)
+  if divisor!=0{
+   let a2:string=try dense(b,projected,key(prefix,".tdf.3"),width,f,s.bias)
+   let n2:string=try norm(b,a2,key(prefix,".tdf.4"),c,grouped)
+   projected=activation(b,n2)}
+  result.ok(emit(b,"Add",[x,projected],[]))}}
+}
+pub fn validate(s:ref<Settings>)->result<unit,string> effects {alloc}{
+ if s.dim_c!=4 or s.dim_f==0 or s.dim_f>s.n_fft/2+1 or s.dim_t==0 or s.n_fft<32 or s.n_fft>32768 or
+    s.n_fft%2!=0 or s.hop_length==0 or s.hop_length>s.n_fft/2 or s.num_blocks>31 or
+    s.l==0 or s.l>16 or s.g==0 or s.g>512 or s.k==0 or s.k>15 or s.k%2==0 or
+    not fp.is_finite(s.lr) or not fp.is_finite(s.overlap) or str.len(s.target_name)==0{
+  return result.err("Invalid checkpoint spectral constructor geometry")}
+ if s.optimizer!="rmsprop" and s.optimizer!="adamw"{return result.err("Unknown checkpoint normalization family")}
+ if s.optimizer=="adamw" and s.g%2!=0{return result.err("Two normalization groups require even channel growth")}
+ var scale:u64=1
+ var i:u64=0
+ loop{if i==s.num_blocks/2{break}
+  scale*=2
+  i+=1}
+ if s.dim_f%scale!=0 or s.dim_t%scale!=0{return result.err("Checkpoint skip geometry is not divisible by its downsampling depth")}
+ result.ok(())
+}
+pub fn from_weights(original:weights.Model own)->result<Loaded,string> effects {alloc}{
+ var p:weights.Model=original
+ var s:Settings=match Settings_decode(p.metadata){ok(v)=>v,err(e)=>{return result.err(codec.describe(e))}}
+ let _=try validate(s)
+ let grouped:bool=s.optimizer=="adamw"
+ var b:Builder=Builder{parameters:p,nodes:[],used:table.new()}
+ let _=try parameter(b,"window",[s.n_fft])
+ let _=try parameter(b,"freq_pad",[1,s.dim_c,s.n_fft/2+1-s.dim_f,s.dim_t])
+ var x:string=try conv_block(b,"__input","first_conv",s.dim_c,s.g,1,1,0,false,grouped)
+ x=emit(b,"Transpose",[x],[attribute("perm",[0,1,3,2])])
+ var f:u64=s.dim_f
+ var c:u64=s.g
+ var skips:array<string>=[]
+ var i:u64=0
+ loop{if i==s.num_blocks/2{break}
+  x=try block(b,x,indexed("encoding_blocks.",i),c,f,s,grouped)
+  array.push(skips,string.copy(x))
+  x=try conv_block(b,x,indexed("ds.",i),c,c+s.g,2,2,0,false,grouped)
+  f/=2
+  c+=s.g
+  i+=1}
+ x=try block(b,x,"bottleneck_block",c,f,s,grouped)
+ i=0
+ loop{if i==s.num_blocks/2{break}
+  x=try conv_block(b,x,indexed("us.",i),c,c-s.g,2,2,0,true,grouped)
+  x=emit(b,"Mul",[x,string.copy(array.get(skips,array.len(skips)-i-1))],[])
+  c-=s.g
+  f*=2
+  x=try block(b,x,indexed("decoding_blocks.",i),c,f,s,grouped)
+  i+=1}
+ x=emit(b,"Transpose",[x],[attribute("perm",[0,1,3,2])])
+ x=try convolution(b,x,"final_conv.0",c,s.dim_c,1,1,0,false)
+ if array.len(b.used.keys)!=array.len(b.parameters.parameters.keys){return result.err("Checkpoint contains parameters outside its declared constructor")}
+ let graph:model.Model=model.Model{weights:struct.replace(b,weights.Model{parameters:table.new(),bytes_read:0,loads:0},field=parameters),
+  nodes:struct.replace(b,[],field=nodes),input:"__input",output:x,shape:[1,s.dim_c,s.dim_f,s.dim_t],opset:0,checkpoint_arithmetic:true}
+ result.ok(Loaded{settings:s,graph:graph})
+}
+pub fn open(path:str)->result<Loaded,string> effects {alloc,fs.read}{
+ var policy:checkpoint.Limits=checkpoint.defaults()
+ policy.root=checkpoint.Root.StateDict
+ policy.legacy_little_endian=true
+ policy.primitive_metadata=true
+ let original:weights.Model=try weights.open_root_settings(path,"hyper_parameters",policy)
+ from_weights(original)
+}

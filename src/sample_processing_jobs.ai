@@ -1,0 +1,163 @@
+module stemair.sample_processing_jobs
+import "job.ai" as job
+import "output_naming.ai" as naming
+import "checked_input.ai" as checked
+import "processing_sample.ai" as prepare
+import "recording_sample_application.ai" as sample
+import "../toolkit/model_cache.ai" as cache
+import std.codec as codec
+import std.text as text
+
+pub type Payload=enum{Single(job.Work),Secondary(job.SecondaryWork),ModelEnsemble(job.ModelEnsembleWork),Pitch(job.PitchWork),Time(job.TimeWork)}
+
+fn input(payload:ref<Payload>)->string effects {alloc} {
+ match payload{Single(w)=>string.copy(w.input),Secondary(w)=>string.copy(w.input),ModelEnsemble(w)=>string.copy(w.input),Pitch(w)=>string.copy(w.input),Time(w)=>string.copy(w.input)}
+}
+fn progress(payload:ref<Payload>)->string effects {alloc} {
+ match payload{Single(w)=>string.copy(w.progress),Secondary(w)=>string.copy(w.progress),ModelEnsemble(w)=>string.copy(w.progress),Pitch(w)=>string.copy(w.progress),Time(w)=>string.copy(w.progress)}
+}
+fn refuse(payload:Payload own,message:str)->job.Completed effects {alloc} {
+ let retained:option<cache.Cache>=match payload{
+  Single(v)=>{var w:job.Work=v
+   struct.replace(w,option.none(),field=retained)},
+  Secondary(v)=>{var w:job.SecondaryWork=v
+   struct.replace(w,option.none(),field=retained)},
+  ModelEnsemble(v)=>{var w:job.ModelEnsembleWork=v
+   struct.replace(w,option.none(),field=retained)},
+  Pitch(v)=>{var w:job.PitchWork=v
+   struct.replace(w,option.none(),field=retained)},
+  Time(v)=>{var w:job.TimeWork=v
+   struct.replace(w,option.none(),field=retained)}}
+ job.Completed{retained:retained,ok:false,message:string.copy(message),queue_report:option.none()}
+}
+fn refuse_single(work:job.Work own,policy:option<checked.Options> own,problem:str)->job.Completed effects {alloc} {
+ refuse(Payload.Single(work),problem)
+}
+fn execute_single(work:job.Work own,policy:option<checked.Options> own,context:ref<option<naming.Context>>)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ match context{none=>match policy{none=>job.run(work),some(options)=>job.run_checked(work,options)},some(selected)=>{
+  match naming.copy(selected){ok(value)=>job.run_named(work,value,policy),err(problem)=>refuse_single(work,policy,problem)}}}
+}
+fn refuse_secondary(work:job.SecondaryWork own,policy:option<checked.Options> own,problem:str)->job.Completed effects {alloc} {
+ refuse(Payload.Secondary(work),problem)
+}
+fn copy_chain(context:ref<naming.Chain>)->result<naming.Chain,string> effects {alloc} {
+ let encoded:string=try naming.Chain_encode(context) map_err codec.describe
+ result.ok(try naming.Chain_decode(encoded) map_err codec.describe)
+}
+fn execute_secondary(work:job.SecondaryWork own,policy:option<checked.Options> own,context:ref<option<naming.Chain>>)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ match context{none=>match policy{none=>job.run_secondary(work),some(options)=>job.run_secondary_checked(work,options)},some(selected)=>{
+  match copy_chain(selected){ok(value)=>job.run_secondary_named(work,value,policy),err(problem)=>refuse_secondary(work,policy,problem)}}}
+}
+fn refuse_ensemble(work:job.ModelEnsembleWork own,policy:option<checked.Options> own,problem:str)->job.Completed effects {alloc} {
+ refuse(Payload.ModelEnsemble(work),problem)
+}
+fn copy_ensemble(context:ref<naming.Ensemble>)->result<naming.Ensemble,string> effects {alloc} {
+ let encoded:string=try naming.Ensemble_encode(context) map_err codec.describe
+ result.ok(try naming.Ensemble_decode(encoded) map_err codec.describe)
+}
+fn execute_ensemble(work:job.ModelEnsembleWork own,policy:option<checked.Options> own,context:ref<option<naming.Ensemble>>)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ match context{none=>match policy{none=>job.run_model_ensemble(work),some(options)=>job.run_model_ensemble_checked(work,options)},some(selected)=>{
+  match copy_ensemble(selected){ok(value)=>job.run_model_ensemble_named(work,value,policy),err(problem)=>refuse_ensemble(work,policy,problem)}}}
+}
+fn execute(payload:Payload own,file:str,options:checked.Options own,context:ref<option<naming.Context>>,chain_context:ref<option<naming.Chain>>,ensemble_context:ref<option<naming.Ensemble>>)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ match payload{
+  Single(v)=>{var w:job.Work=v
+   w.input=string.copy(file)
+   execute_single(w,option.some(options),context)},
+  Secondary(v)=>{var w:job.SecondaryWork=v
+   w.input=string.copy(file)
+   execute_secondary(w,option.some(options),chain_context)},
+  ModelEnsemble(v)=>{var w:job.ModelEnsembleWork=v
+   w.input=string.copy(file)
+   execute_ensemble(w,option.some(options),ensemble_context)},
+  Pitch(v)=>{var w:job.PitchWork=v
+   w.input=string.copy(file)
+   job.run_pitch_checked(w,options)},
+  Time(v)=>{var w:job.TimeWork=v
+   w.input=string.copy(file)
+   job.run_time_checked(w,options)}}
+}
+
+// The omitted mode follows the existing checked/legacy paths unchanged.
+pub fn dispatch_snapshot(payload:Payload own,policy:option<checked.Options> own,preparation:option<sample.Options> own,snapshot:str)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ if str.len(snapshot)==0{return dispatch_selected(payload,policy,preparation,option.none())}
+ match naming.decode_selection(snapshot){ok(selected)=>dispatch_selected(payload,policy,preparation,option.some(selected)),err(problem)=>refuse(payload,problem)}
+}
+pub fn dispatch(payload:Payload own,policy:option<checked.Options> own,preparation:option<sample.Options> own)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ dispatch_selected(payload,policy,preparation,option.none())
+}
+pub fn dispatch_named_single(work:job.Work own,policy:option<checked.Options> own,preparation:option<sample.Options> own,context:naming.Context own)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ dispatch_selected(Payload.Single(work),policy,preparation,option.some(naming.Selection.Single(context)))
+}
+pub fn dispatch_named_secondary(work:job.SecondaryWork own,policy:option<checked.Options> own,preparation:option<sample.Options> own,context:naming.Chain own)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ dispatch_selected(Payload.Secondary(work),policy,preparation,option.some(naming.Selection.Secondary(context)))
+}
+pub fn dispatch_named_ensemble(work:job.ModelEnsembleWork own,policy:option<checked.Options> own,preparation:option<sample.Options> own,context:naming.Ensemble own)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ dispatch_selected(Payload.ModelEnsemble(work),policy,preparation,option.some(naming.Selection.ModelEnsemble(context)))
+}
+fn kind(payload:ref<Payload>)->u32 effects {} {
+ match payload{Single(_)=>0,Secondary(_)=>1,ModelEnsemble(_)=>2,Pitch(_)=>3,Time(_)=>4}
+}
+fn refuse_selected(payload:Payload own,policy:option<checked.Options> own,preparation:option<sample.Options> own,problem:str)->job.Completed effects {alloc} {
+ refuse(payload,problem)
+}
+pub fn dispatch_selected(payload:Payload own,policy:option<checked.Options> own,preparation:option<sample.Options> own,selected:option<naming.Selection> own)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var pending:Payload=payload
+ var context:option<naming.Context>=option.none()
+ var chain_context:option<naming.Chain>=option.none()
+ var ensemble_context:option<naming.Ensemble>=option.none()
+ let workflow:u32=kind(pending)
+ var compatible:bool=true
+ match selected{none=>{},some(choice)=>match choice{
+  Single(value)=>{compatible=workflow==0
+   context=option.some(value)},Secondary(value)=>{compatible=workflow==1
+   chain_context=option.some(value)},ModelEnsemble(value)=>{compatible=workflow==2
+   ensemble_context=option.some(value)}}}
+ if not compatible{return refuse_selected(pending,policy,preparation,"Naming settings do not match the processing workflow")}
+ dispatch_impl(pending,policy,preparation,context,chain_context,ensemble_context)
+}
+fn dispatch_impl(payload:Payload own,policy:option<checked.Options> own,preparation:option<sample.Options> own,context:ref<option<naming.Context>>,chain_context:ref<option<naming.Chain>>,ensemble_context:ref<option<naming.Ensemble>>)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ match preparation{some(selected)=>match policy{
+  none=>refuse(payload,"Audio input policy is unavailable"),some(options)=>{
+   let scratch:string=text.concat(options.scratch_directory,"-sample")
+   run_impl(payload,options,selected,scratch,context,chain_context,ensemble_context)}},
+  none=>match policy{some(options)=>{
+   var pending:Payload=payload
+   let file:string=input(pending)
+   execute(pending,file,options,context,chain_context,ensemble_context)},none=>match payload{
+    Single(w)=>execute_single(w,option.none(),context),Secondary(w)=>execute_secondary(w,option.none(),chain_context),ModelEnsemble(w)=>execute_ensemble(w,option.none(),ensemble_context),Pitch(w)=>job.run_pitch(w),Time(w)=>job.run_time(w)}}}
+}
+
+// Preparation precedes all models in the payload; those existing jobs keep their
+// retained bank and share one prepared input throughout the recording.
+pub fn run(payload:Payload own,options:checked.Options own,preparation:sample.Options own,scratch:str)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var context:option<naming.Context>=option.none()
+ var chain_context:option<naming.Chain>=option.none()
+ var ensemble_context:option<naming.Ensemble>=option.none()
+ run_impl(payload,options,preparation,scratch,context,chain_context,ensemble_context)
+}
+fn run_impl(payload:Payload own,options:checked.Options own,preparation:sample.Options own,scratch:str,context:ref<option<naming.Context>>,chain_context:ref<option<naming.Chain>>,ensemble_context:ref<option<naming.Ensemble>>)->job.Completed
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var pending:Payload=payload
+ let original:string=input(pending)
+ let status:string=progress(pending)
+ var lease:prepare.Lease=match prepare.open(original,scratch,preparation,status){
+  ok(value)=>value,err(message)=>{return refuse(pending,message)}}
+ var completed:job.Completed=if prepare.ready(lease){execute(pending,lease.path,options,context,chain_context,ensemble_context)}else{refuse(pending,prepare.problem(lease))}
+ match prepare.close(lease){ok(_)=>{},err(message)=>{
+  completed.ok=false
+  completed.message=text.concat(completed.message,text.concat(" ",message))}}
+ completed
+}

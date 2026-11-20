@@ -1,0 +1,600 @@
+module stemair.secondary_application
+import "learned_cleanup_output.ai" as learned_output
+import "wav_export.ai" as wav
+import "model_defaults.ai" as definitions
+import "model_role_metadata.ai" as role_metadata
+import "container_export.ai" as container
+import "output_naming.ai" as naming
+import "secondary_naming.ai" as named_chain
+import "application.ai" as app
+import "checked_input.ai" as checked_input
+import "model_input.ai" as model_input
+import "../toolkit/recording_sources.ai" as recording_sources
+import "cpu_model_runtime.ai" as cpu_runtime
+import "../toolkit/secondary.ai" as secondary
+import "../toolkit/typed_secondary.ai" as typed_secondary
+import "../toolkit/typed_secondary_cache.ai" as typed_cache
+import "../toolkit/typed_source_wave.ai" as typed_source
+import "../toolkit/audio_result.ai" as samples
+import "../toolkit/secondary_config.ai" as config
+import "../toolkit/model_cache.ai" as cache
+import "../toolkit/engine.ai" as engine
+import "../toolkit/control.ai" as control
+import std.audio as audio
+import std.codec as codec
+import std.files as files
+import std.path as path
+import std.text as text
+
+pub type Prepared=struct{bindings:array<secondary.Binding>,plan:secondary.Plan,input:array<f32>,input_path:string,directory:string}
+pub type NamedPrepared=struct{prepared:Prepared,format:container.Plan,profiles:array<engine.Profile>}
+pub fn validate(c:ref<config.Recipe>)->result<unit,string> effects {alloc,fs.read} {
+ let _=try secondary.validate(c)
+ var identities:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(c.models){break}
+  let selected:ref<config.Model>=array.borrow(c.models,i)
+  if str.len(selected.config)==0{return result.err("A secondary model configuration path is empty")}
+  let identity:string=try cache.checkpoint_id(selected.checkpoint)
+  var j:u64=0
+  loop{if j==i{break}
+   if str.view(identity)==array.get(identities,j){return result.err("List each secondary checkpoint once and reuse its model index")}
+   j+=1}
+  array.push(identities,identity)
+  i+=1}
+ result.ok(())
+}
+pub fn read(file:str)->result<config.Recipe,string> effects {alloc,fs.read} {
+ let raw:string=match files.read_text(file){ok(v)=>v,err(_)=>{return result.err("Cannot read secondary model recipe")}}
+ var c:config.Recipe=try config.Recipe_decode(raw) map_err codec.describe
+ let _=try validate(c)
+ result.ok(c)
+}
+type Pending=struct{profiles:array<engine.Profile>,plan:secondary.Plan,input:array<f32>}
+fn read_profiles(c:ref<config.Recipe>,cancel:str)->result<array<engine.Profile>,string> effects {alloc,fs.read,fs.meta} {
+ read_profiles_impl(c,cancel,false)
+}
+fn read_profiles_impl(c:ref<config.Recipe>,cancel:str,typed:bool)->result<array<engine.Profile>,string> effects {alloc,fs.read,fs.meta} {
+ let _=try validate(c)
+ if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+ var profiles:array<engine.Profile>=[]
+ var i:u64=0
+ loop{if i==array.len(c.models){break}
+  let member:ref<config.Model>=array.borrow(c.models,i)
+  let profile:engine.Profile=if typed{try engine.read_typed(member.config)}else{try engine.read(member.config)}
+  if str.len(member.definition)>0{
+   let selected:definitions.LoadedRecord=try definitions.inspect_published(member.definition)
+   if str.view(selected.record.configuration)!=str.view(profile.identity){return result.err("Accepted model definition differs from its configuration")}
+   if member.role!=0 and (member.role!=selected.record.role or member.rebalance!=selected.record.rebalance){return result.err("Accepted vocal role differs from its immutable definition")}
+   member.role=selected.record.role
+   member.rebalance=selected.record.rebalance}
+  array.push(profiles,profile)
+  i+=1}
+ result.ok(profiles)
+}
+fn pending_impl(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str,encoding:option<audio.WavSubtype>,selected:option<container.Plan> own,input_options:ref<option<checked_input.Options>>)->result<Pending,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ let profiles:array<engine.Profile>=try read_profiles(c,cancel)
+ pending_profiles(profiles,c,input,directory,encoding,selected,input_options)
+}
+fn pending_profiles(loaded:array<engine.Profile> own,c:ref<config.Recipe>,input:str,directory:str,encoding:option<audio.WavSubtype>,selected:option<container.Plan> own,input_options:ref<option<checked_input.Options>>)->result<Pending,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var inputs:recording_sources.Set=recording_sources.empty()
+ pending_profiles_inputs(loaded,c,input,directory,encoding,selected,input_options,inputs,false)
+}
+fn pending_profiles_inputs(loaded:array<engine.Profile> own,c:ref<config.Recipe>,input:str,directory:str,encoding:option<audio.WavSubtype>,selected:option<container.Plan> own,input_options:ref<option<checked_input.Options>>,inputs:ref<recording_sources.Set>,source_readers:bool)->result<Pending,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var profiles:array<engine.Profile>=loaded
+ var plan:secondary.Plan=try secondary.materialize(profiles,c)
+ match selected{none=>{match encoding{some(kind)=>{let _=try app.preflight_as(directory,secondary.output_count(plan,c),kind)
+  let _=try wav.preflight_file(path.join(directory,"secondary.json"))},none=>{let _=try app.preflight(directory,secondary.output_count(plan,c))}}},some(format)=>{
+  var journal:container.Journal=container.empty_journal()
+  let _=try app.preflight_to(directory,secondary.output_count(plan,c),format,journal)
+  let _=try container.preflight_metadata_tracked(path.join(directory,"secondary.json"),journal)}}
+ let exists:bool=match files.exists(path.join(directory,"secondary.json")){ok(v)=>v,err(_)=>{return result.err("Cannot inspect secondary manifest")}}
+ if exists{return result.err("A secondary processing manifest already exists")}
+ if c.keep_members{
+  let exists:bool=match files.exists(path.join(directory,"members")){ok(v)=>v,err(_)=>{return result.err("Cannot inspect secondary member directory")}}
+  if exists{return result.err("The secondary member directory already exists")}}
+ var decoded:audio.AudioBuffer=try match input_options{
+  none=>app.read_recording(input,44100,directory),some(options)=>if source_readers{model_input.prepare_into(input,44100,profiles,options,inputs)}else{model_input.profiles(input,44100,profiles,options)}
+ } map_err app.recording_error
+ let samples:array<f32>=try app.planar(decoded,44100) map_err app.recording_error
+ result.ok(Pending{profiles:profiles,plan:plan,input:samples})
+}
+fn prepare_impl(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str,encoding:option<audio.WavSubtype>,selected:option<container.Plan> own,input_options:ref<option<checked_input.Options>>)->result<Prepared,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ let pending:Pending=try pending_impl(bank,c,input,directory,cancel,progress,encoding,selected,input_options)
+ acquire_pending(bank,c,input,directory,cancel,pending)
+}
+fn acquire_pending(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,loaded:Pending own)->result<Prepared,string> effects {alloc,fs.read,fs.meta} {
+ var pending:Pending=loaded
+ var profiles:array<engine.Profile>=struct.replace(pending,[],field=profiles)
+ var plan:secondary.Plan=struct.replace(pending,secondary.Plan{required:[],outputs:[]},field=plan)
+ let samples:array<f32>=struct.replace(pending,[],field=input)
+ var i:u64=0
+ var bindings:array<secondary.Binding>=[]
+ i=0
+ loop{if i==array.len(plan.required){break}
+  if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+  let index:u64=array.get(plan.required,i)
+  let profile:engine.Profile=try engine.decode(array.borrow(profiles,index).identity)
+  let member:u64=try cache.acquire(bank,array.borrow(c.models,index).checkpoint,profile)
+  array.push(bindings,secondary.Binding{model:index,member:member})
+  i+=1}
+ result.ok(Prepared{bindings:bindings,plan:plan,input:samples,input_path:string.copy(input),directory:string.copy(directory)})
+}
+pub fn prepare_cpu_with_input_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,root:str)->result<Prepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let pending:Pending=try pending_impl(bank,c,input,directory,cancel,progress,option.none(),option.some(try container.copy_plan(format)),input_options)
+ acquire_pending_cpu(bank,c,input,directory,cancel,pending,root)
+}
+fn acquire_pending_cpu(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,loaded:Pending own,root:str)->result<Prepared,string> effects {alloc,env,fs.read,fs.meta,ffi} {
+ var pending:Pending=loaded
+ var at:u64=0
+ loop{if at==array.len(pending.plan.required){break}
+  let index:u64=array.get(pending.plan.required,at)
+  let _=try cpu_runtime.preflight(bank,root,array.borrow(pending.profiles,index))
+  at+=1}
+ var profiles:array<engine.Profile>=struct.replace(pending,[],field=profiles)
+ var plan:secondary.Plan=struct.replace(pending,secondary.Plan{required:[],outputs:[]},field=plan)
+ let samples:array<f32>=struct.replace(pending,[],field=input)
+ var i:u64=0
+ var backend:option<cache.CpuBackend>=option.none()
+ var bindings:array<secondary.Binding>=[]
+ i=0
+ loop{if i==array.len(plan.required){break}
+  if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+  let index:u64=array.get(plan.required,i)
+  let profile:engine.Profile=try engine.decode(array.borrow(profiles,index).identity)
+  let member:u64=try cache.acquire_cpu(bank,array.borrow(c.models,index).checkpoint,profile,backend)
+  array.push(bindings,secondary.Binding{model:index,member:member})
+  i+=1}
+ result.ok(Prepared{bindings:bindings,plan:plan,input:samples,input_path:string.copy(input),directory:string.copy(directory)})
+}
+pub fn prepare_named_with_input_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,context:ref<naming.Chain>,use_gpu:bool,root:str)->result<NamedPrepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var profiles:array<engine.Profile>=try read_profiles(c,cancel)
+ var selected:naming.Selected=try named_chain.select(input,directory,context,profiles,c,format)
+ var snapshot:array<engine.Profile>=[]
+ var index:u64=0
+ loop{if index==array.len(profiles){break}
+  array.push(snapshot,try engine.decode(array.borrow(profiles,index).identity))
+  index+=1}
+ let _=try container.require_directory(directory)
+ if context.main.model_folder{match files.mkdirs(selected.directory){ok(_)=>{},err(_)=>{return result.err("Cannot create the selected processing output folder")}}}
+ var pending:Pending=try pending_profiles(profiles,c,input,selected.directory,option.none(),option.some(try container.copy_plan(struct.borrow(selected,field=plan))),input_options)
+ let prepared:Prepared=if use_gpu{try acquire_pending(bank,c,input,selected.directory,cancel,pending)}else{
+  try acquire_pending_cpu(bank,c,input,selected.directory,cancel,pending,root)}
+ let export_plan:container.Plan=struct.replace(selected,container.wav_plan(format.working_wav),field=plan)
+ result.ok(NamedPrepared{prepared:prepared,format:export_plan,profiles:snapshot})
+}
+pub fn prepare(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str)->result<Prepared,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var input_options:option<checked_input.Options>=option.none()
+ prepare_impl(bank,c,input,directory,cancel,progress,option.none(),option.none(),input_options)
+}
+pub fn prepare_as(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str,kind:audio.WavSubtype)->result<Prepared,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var input_options:option<checked_input.Options>=option.none()
+ prepare_impl(bank,c,input,directory,cancel,progress,option.some(kind),option.none(),input_options)
+}
+
+pub fn export(bank:ref<cache.Cache>,c:ref<config.Recipe>,prepared:ref<Prepared>,output:ref<secondary.Output>,use_gpu:bool,cancel:str)->result<unit,string> effects {alloc,fs.write,fs.meta} {
+ if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+ let backend:str=if use_gpu{"native-air-gpu-f32"}else{"native-air-cpu-f32"}
+ var models:array<config.ModelRecord>=[]
+ var i:u64=0
+ loop{if i==array.len(prepared.bindings){break}
+  let binding:ref<secondary.Binding>=array.borrow(prepared.bindings,i)
+  let loaded:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,binding.member),field=model)
+  let selected:ref<config.Model>=array.borrow(c.models,binding.model)
+  array.push(models,config.ModelRecord{model:binding.model,config:string.copy(selected.config),checkpoint:string.copy(selected.checkpoint),
+   profile:string.copy(loaded.profile.identity),engine:string.copy(loaded.profile.kind),checkpoint_loads:engine.loads(loaded),bytes_read:engine.bytes_read(loaded),inference_requests:loaded.requests})
+  i+=1}
+ if c.keep_members{
+  var stages:array<secondary.Stage>=secondary.stages(struct.borrow(prepared,field=plan),c)
+  if array.len(output.saved)!=array.len(stages){return result.err("Secondary saved member count differs")}
+  i=0
+  loop{if i==array.len(output.saved){break}
+   let saved:ref<secondary.Prediction>=array.borrow(output.saved,i)
+   let suffix:string=if str.view(saved.stage)=="recording"{""}else{text.concat("-",saved.stage)}
+   let directory:string=path.join(path.join(prepared.directory,"members"),text.concat("model-",text.concat(string.from_int(saved.model),suffix)))
+   match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create secondary member directory")}}
+   let _=try app.export_with_loads(directory,44100,struct.borrow(saved,field=targets),array.view(saved.values),saved.frames,backend,1)
+   i+=1}
+  i=0
+  loop{if i==array.len(output.inputs){break}
+   let captured:ref<secondary.StageInput>=array.borrow(output.inputs,i)
+   let directory:string=path.join(path.join(prepared.directory,"members"),text.concat("model-",text.concat(string.from_int(captured.model),text.concat("-",captured.source))))
+   let _=try app.write_planar(path.join(directory,"input.wav"),44100,array.view(captured.values))
+   i+=1}}
+ var records:array<config.StemRecord>=[]
+ i=0
+ loop{if i==array.len(output.stems){break}
+  // Once export starts, finish this recording so a late cancellation leaves
+  // complete outputs. The queue observes cancellation before its next item.
+  let stem:ref<secondary.Stem>=array.borrow(output.stems,i)
+  let file:string=app.output_name(prepared.directory,i)
+  let _=try app.write_planar(file,44100,array.view(stem.values))
+  array.push(records,config.StemRecord{target:string.copy(stem.target),frames:stem.frames,file:path.basename(file)})
+  i+=1}
+ var adjustments:array<config.Adjustment>=[]
+ i=0
+ loop{if i==array.len(c.adjustments){break}
+  let adjustment:ref<config.Adjustment>=array.borrow(c.adjustments,i)
+  array.push(adjustments,config.Adjustment{target:string.copy(adjustment.target),model:adjustment.model,primary_weight:adjustment.primary_weight})
+  i+=1}
+ var manifest:config.Manifest=config.Manifest{input:string.copy(prepared.input_path),sample_rate:44100,stems:records,models:models,
+  adjustments:adjustments,normalize:c.normalize,complement:string.copy(c.complement),backend:string.copy(backend),preprocess:c.preprocess,
+  preprocess_complement:string.copy(c.preprocess_complement),save_instrumental_mix:c.save_instrumental_mix,vocal_split:secondary.vocal_model(c),
+  vocal_rebalance:secondary.rebalance(c),vocal_mixes:c.vocal_mixes,vocal_mix_only:c.vocal_mix_only,vocal_save_only:c.vocal_save_only}
+ let plain:string=try config.Manifest_encode(manifest) map_err codec.describe
+ let encoded:string=try role_metadata.decorate(plain,c)
+ match files.write_new_text(path.join(prepared.directory,"secondary.json"),encoded){ok(_)=>result.ok(()),err(_)=>result.err("Cannot create secondary manifest; source WAVs remain available")}
+}
+pub fn run_cpu(c:ref<config.Recipe>,input:str,directory:str)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var bank:cache.Cache=cache.empty()
+ var prepared:Prepared=try prepare(bank,c,input,directory,"","")
+ var output:secondary.Output=try secondary.separate_cpu(bank,struct.borrow(prepared,field=bindings),struct.borrow(prepared,field=plan),c,array.view(prepared.input),"","")
+ export(bank,c,prepared,output,false,"")
+}
+
+pub fn export_as(bank:ref<cache.Cache>,c:ref<config.Recipe>,prepared:ref<Prepared>,output:ref<secondary.Output>,use_gpu:bool,cancel:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let _=try app.preflight_as(prepared.directory,array.len(output.stems),kind)
+ let _=try wav.preflight_file(path.join(prepared.directory,"secondary.json"))
+ let _=try preflight_outputs_as(c,output,prepared.directory,kind)
+ if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+ let backend:str=if use_gpu{"native-air-gpu-f32"}else{"native-air-cpu-f32"}
+ var models:array<config.ModelRecord>=[]
+ var i:u64=0
+ loop{if i==array.len(prepared.bindings){break}
+  let binding:ref<secondary.Binding>=array.borrow(prepared.bindings,i)
+  let loaded:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,binding.member),field=model)
+  let selected:ref<config.Model>=array.borrow(c.models,binding.model)
+  array.push(models,config.ModelRecord{model:binding.model,config:string.copy(selected.config),checkpoint:string.copy(selected.checkpoint),
+   profile:string.copy(loaded.profile.identity),engine:string.copy(loaded.profile.kind),checkpoint_loads:engine.loads(loaded),bytes_read:engine.bytes_read(loaded),inference_requests:loaded.requests})
+  i+=1}
+ if c.keep_members{
+  var stages:array<secondary.Stage>=secondary.stages(struct.borrow(prepared,field=plan),c)
+  if array.len(output.saved)!=array.len(stages){return result.err("Secondary saved member count differs")}
+  i=0
+  loop{if i==array.len(output.saved){break}
+   let saved:ref<secondary.Prediction>=array.borrow(output.saved,i)
+   let suffix:string=if str.view(saved.stage)=="recording"{""}else{text.concat("-",saved.stage)}
+   let directory:string=path.join(path.join(prepared.directory,"members"),text.concat("model-",text.concat(string.from_int(saved.model),suffix)))
+   match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create secondary member directory")}}
+   let _=try app.export_with_loads_as(directory,44100,struct.borrow(saved,field=targets),array.view(saved.values),saved.frames,backend,1,kind)
+   i+=1}
+  i=0
+  loop{if i==array.len(output.inputs){break}
+   let captured:ref<secondary.StageInput>=array.borrow(output.inputs,i)
+   let directory:string=path.join(path.join(prepared.directory,"members"),text.concat("model-",text.concat(string.from_int(captured.model),text.concat("-",captured.source))))
+   let _=try app.write_planar_as(path.join(directory,"input.wav"),44100,array.view(captured.values),kind)
+   i+=1}}
+ var records:array<config.StemRecord>=[]
+ i=0
+ loop{if i==array.len(output.stems){break}
+  // Once export starts, finish this recording so a late cancellation leaves
+  // complete outputs. The queue observes cancellation before its next item.
+  let stem:ref<secondary.Stem>=array.borrow(output.stems,i)
+  let file:string=app.output_name(prepared.directory,i)
+  let _=try app.write_planar_as(file,44100,array.view(stem.values),kind)
+  array.push(records,config.StemRecord{target:string.copy(stem.target),frames:stem.frames,file:path.basename(file)})
+  i+=1}
+ var adjustments:array<config.Adjustment>=[]
+ i=0
+ loop{if i==array.len(c.adjustments){break}
+  let adjustment:ref<config.Adjustment>=array.borrow(c.adjustments,i)
+  array.push(adjustments,config.Adjustment{target:string.copy(adjustment.target),model:adjustment.model,primary_weight:adjustment.primary_weight})
+  i+=1}
+ var manifest:config.Manifest=config.Manifest{input:string.copy(prepared.input_path),sample_rate:44100,stems:records,models:models,
+  adjustments:adjustments,normalize:c.normalize,complement:string.copy(c.complement),backend:string.copy(backend),preprocess:c.preprocess,
+  preprocess_complement:string.copy(c.preprocess_complement),save_instrumental_mix:c.save_instrumental_mix,vocal_split:secondary.vocal_model(c),
+  vocal_rebalance:secondary.rebalance(c),vocal_mixes:c.vocal_mixes,vocal_mix_only:c.vocal_mix_only,vocal_save_only:c.vocal_save_only}
+ let plain:string=try config.Manifest_encode(manifest) map_err codec.describe
+ let encoded:string=try role_metadata.decorate(plain,c)
+ wav.write_metadata(path.join(prepared.directory,"secondary.json"),encoded,kind)
+}
+
+pub fn run_cpu_as(c:ref<config.Recipe>,input:str,directory:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var bank:cache.Cache=cache.empty()
+ var prepared:Prepared=try prepare_as(bank,c,input,directory,"","",kind)
+ var output:secondary.Output=try secondary.separate_cpu(bank,struct.borrow(prepared,field=bindings),struct.borrow(prepared,field=plan),c,array.view(prepared.input),"","")
+ export_as(bank,c,prepared,output,false,"",kind)
+}
+
+// Filesystem-only planned-path scan, also used by processed ensemble exports.
+pub fn preflight_outputs_as(c:ref<config.Recipe>,output:ref<secondary.Output>,directory:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.meta} {
+ let _=try app.preflight_source_files(directory,array.len(output.stems))
+ let _=try wav.preflight_file(path.join(directory,"secondary.json"))
+ if c.keep_members{
+  var at:u64=0
+  loop{if at==array.len(output.saved){break}
+   let saved:ref<secondary.Prediction>=array.borrow(output.saved,at)
+   let suffix:string=if str.view(saved.stage)=="recording"{""}else{text.concat("-",saved.stage)}
+   let folder:string=path.join(path.join(directory,"members"),text.concat("model-",text.concat(string.from_int(saved.model),suffix)))
+   let _=try app.preflight_source_files(folder,array.len(saved.targets))
+   at+=1}
+  at=0
+  loop{if at==array.len(output.inputs){break}
+   let captured:ref<secondary.StageInput>=array.borrow(output.inputs,at)
+   let folder:string=path.join(path.join(directory,"members"),text.concat("model-",text.concat(string.from_int(captured.model),text.concat("-",captured.source))))
+   let _=try wav.preflight_file(path.join(folder,"input.wav"))
+   at+=1}}
+ result.ok(())
+}
+
+fn export_to_impl(bank:ref<cache.Cache>,c:ref<config.Recipe>,prepared:ref<Prepared>,output:ref<secondary.Output>,use_gpu:bool,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let start:u64=array.len(log.artifacts)
+ let export_cancel:string=if container.extension(plan)=="wav"{""}else{string.copy(cancel)}
+ let _=try app.preflight_to(prepared.directory,array.len(output.stems),plan,log)
+ let _=try container.preflight_metadata_tracked(path.join(prepared.directory,"secondary.json"),log)
+ let _=try preflight_outputs_to(c,output,prepared.directory,plan,log)
+ if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+ let backend:str=if use_gpu{"native-air-gpu-f32"}else{"native-air-cpu-f32"}
+ var models:array<config.ModelRecord>=[]
+ var i:u64=0
+ loop{if i==array.len(prepared.bindings){break}
+  let binding:ref<secondary.Binding>=array.borrow(prepared.bindings,i)
+  let loaded:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,binding.member),field=model)
+  let selected:ref<config.Model>=array.borrow(c.models,binding.model)
+  array.push(models,config.ModelRecord{model:binding.model,config:string.copy(selected.config),checkpoint:string.copy(selected.checkpoint),
+   profile:string.copy(loaded.profile.identity),engine:string.copy(loaded.profile.kind),checkpoint_loads:engine.loads(loaded),bytes_read:engine.bytes_read(loaded),inference_requests:loaded.requests})
+  i+=1}
+ if c.keep_members{
+  var stages:array<secondary.Stage>=secondary.stages(struct.borrow(prepared,field=plan),c)
+  if array.len(output.saved)!=array.len(stages){return result.err("Secondary saved member count differs")}
+  i=0
+  loop{if i==array.len(output.saved){break}
+   let saved:ref<secondary.Prediction>=array.borrow(output.saved,i)
+   let suffix:string=if str.view(saved.stage)=="recording"{""}else{text.concat("-",saved.stage)}
+   let key:string=text.concat("members/model-",text.concat(string.from_int(saved.model),suffix))
+   let directory:string=path.join(prepared.directory,key)
+   var member_plan:container.Plan=try container.scoped(plan,key)
+   match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create secondary member directory")}}
+   let _=try app.export_with_loads_to(directory,44100,struct.borrow(saved,field=targets),array.view(saved.values),saved.frames,backend,1,export_cancel,progress,member_plan,log)
+   i+=1}
+  i=0
+  loop{if i==array.len(output.inputs){break}
+   let captured:ref<secondary.StageInput>=array.borrow(output.inputs,i)
+   let directory:string=path.join(path.join(prepared.directory,"members"),text.concat("model-",text.concat(string.from_int(captured.model),text.concat("-",captured.source))))
+   let _=try app.write_planar_to(container.target(directory,"input",plan),44100,array.view(captured.values),export_cancel,progress,plan,log)
+   i+=1}}
+ var records:array<config.StemRecord>=[]
+ i=0
+ loop{if i==array.len(output.stems){break}
+  // Once export starts, finish this recording so a late cancellation leaves
+  // complete outputs. The queue observes cancellation before its next item.
+  let stem:ref<secondary.Stem>=array.borrow(output.stems,i)
+  let file:string=app.output_name_to(prepared.directory,i,plan)
+  let _=try app.write_planar_to(file,44100,array.view(stem.values),export_cancel,progress,plan,log)
+  array.push(records,config.StemRecord{target:string.copy(stem.target),frames:stem.frames,file:path.basename(file)})
+  i+=1}
+ var adjustments:array<config.Adjustment>=[]
+ i=0
+ loop{if i==array.len(c.adjustments){break}
+  let adjustment:ref<config.Adjustment>=array.borrow(c.adjustments,i)
+  array.push(adjustments,config.Adjustment{target:string.copy(adjustment.target),model:adjustment.model,primary_weight:adjustment.primary_weight})
+  i+=1}
+ var manifest:config.Manifest=config.Manifest{input:string.copy(prepared.input_path),sample_rate:44100,stems:records,models:models,
+  adjustments:adjustments,normalize:c.normalize,complement:string.copy(c.complement),backend:string.copy(backend),preprocess:c.preprocess,
+  preprocess_complement:string.copy(c.preprocess_complement),save_instrumental_mix:c.save_instrumental_mix,vocal_split:secondary.vocal_model(c),
+  vocal_rebalance:secondary.rebalance(c),vocal_mixes:c.vocal_mixes,vocal_mix_only:c.vocal_mix_only,vocal_save_only:c.vocal_save_only}
+ let plain:string=try config.Manifest_encode(manifest) map_err codec.describe
+ let encoded:string=try role_metadata.decorate(plain,c)
+ container.write_metadata(path.join(prepared.directory,"secondary.json"),encoded,plan,log,start)
+}
+pub fn export_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,prepared:ref<Prepared>,output:ref<secondary.Output>,use_gpu:bool,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=export_to_impl(bank,c,prepared,output,use_gpu,cancel,progress,plan,log)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+
+pub fn preflight_outputs_to(c:ref<config.Recipe>,output:ref<secondary.Output>,directory:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.meta} {
+ let _=try app.preflight_source_files_to(directory,array.len(output.stems),plan,log)
+ let _=try container.preflight_metadata_tracked(path.join(directory,"secondary.json"),log)
+ if c.keep_members{
+  var at:u64=0
+  loop{if at==array.len(output.saved){break}
+   let saved:ref<secondary.Prediction>=array.borrow(output.saved,at)
+   let suffix:string=if str.view(saved.stage)=="recording"{""}else{text.concat("-",saved.stage)}
+   let key:string=text.concat("members/model-",text.concat(string.from_int(saved.model),suffix))
+   let folder:string=path.join(directory,key)
+   var member_plan:container.Plan=try container.scoped(plan,key)
+   let _=try app.preflight_source_files_to(folder,array.len(saved.targets),member_plan,log)
+   at+=1}
+  at=0
+  loop{if at==array.len(output.inputs){break}
+   let captured:ref<secondary.StageInput>=array.borrow(output.inputs,at)
+   let folder:string=path.join(path.join(directory,"members"),text.concat("model-",text.concat(string.from_int(captured.model),text.concat("-",captured.source))))
+   let _=try container.preflight_tracked(container.target(folder,"input",plan),plan,log)
+   at+=1}}
+ result.ok(())
+}
+
+pub fn prepare_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>)->result<Prepared,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ let _=try container.verify(plan)
+ var input_options:option<checked_input.Options>=option.none()
+ prepare_impl(bank,c,input,directory,cancel,progress,option.none(),option.some(try container.copy_plan(plan)),input_options)
+}
+
+fn run_cpu_to_impl(c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var bank:cache.Cache=cache.empty()
+ var prepared:Prepared=try prepare_to(bank,c,input,directory,cancel,progress,plan)
+ var output:secondary.Output=try secondary.separate_cpu(bank,struct.borrow(prepared,field=bindings),struct.borrow(prepared,field=plan),c,array.view(prepared.input),cancel,progress)
+ export_to(bank,c,prepared,output,false,cancel,progress,plan,log)
+}
+pub fn run_cpu_to(c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=run_cpu_to_impl(c,input,directory,cancel,progress,plan,log)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+
+pub fn prepare_with_input_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,input_options:ref<option<checked_input.Options>>)->result<Prepared,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ let _=try container.verify(plan)
+ prepare_impl(bank,c,input,directory,cancel,progress,option.none(),option.some(try container.copy_plan(plan)),input_options)
+}
+
+fn acquire_pending_typed(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,loaded:Pending own,use_gpu:bool,root:str)->result<Prepared,string> effects {alloc,env,fs.read,fs.meta,ffi} {
+ var pending:Pending=loaded
+ var i:u64=0
+ if not use_gpu{loop{if i==array.len(pending.plan.required){break}
+  let index:u64=array.get(pending.plan.required,i)
+  let _=try cpu_runtime.preflight(bank,root,array.borrow(pending.profiles,index))
+  i+=1}}
+ var profiles:array<engine.Profile>=struct.replace(pending,[],field=profiles)
+ var plan:secondary.Plan=struct.replace(pending,secondary.Plan{required:[],outputs:[]},field=plan)
+ let input_samples:array<f32>=struct.replace(pending,[],field=input)
+ var backend:option<cache.CpuBackend>=option.none()
+ var bindings:array<secondary.Binding>=[]
+ i=0
+ loop{if i==array.len(plan.required){break}
+  if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+  let index:u64=array.get(plan.required,i)
+  let profile:engine.Profile=try engine.decode_typed(array.borrow(profiles,index).identity)
+  let member:u64=if use_gpu{try cache.acquire_typed(bank,array.borrow(c.models,index).checkpoint,profile)}else{
+   try cache.acquire_cpu_typed(bank,array.borrow(c.models,index).checkpoint,profile,backend)}
+  array.push(bindings,secondary.Binding{model:index,member:member})
+  i+=1}
+ result.ok(Prepared{bindings:bindings,plan:plan,input:input_samples,input_path:string.copy(input),directory:string.copy(directory)})
+}
+pub fn prepare_typed_with_input_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,use_gpu:bool,root:str)->result<Prepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let _=try container.verify(format)
+ let profiles:array<engine.Profile>=try read_profiles_impl(c,cancel,true)
+ var pending:Pending=try pending_profiles(profiles,c,input,directory,option.none(),option.some(try container.copy_plan(format)),input_options)
+ let _=try preflight_learned(bank,c,struct.borrow(pending,field=plan),directory,format)
+ acquire_pending_typed(bank,c,input,directory,cancel,pending,use_gpu,root)
+}
+pub fn prepare_typed_with_sources_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,use_gpu:bool,root:str,inputs:ref<recording_sources.Set>)->result<Prepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let _=try container.verify(format)
+ let profiles:array<engine.Profile>=try read_profiles_impl(c,cancel,true)
+ var pending:Pending=try pending_profiles_inputs(profiles,c,input,directory,option.none(),option.some(try container.copy_plan(format)),input_options,inputs,true)
+ let _=try preflight_learned(bank,c,struct.borrow(pending,field=plan),directory,format)
+ acquire_pending_typed(bank,c,input,directory,cancel,pending,use_gpu,root)
+}
+fn preflight_learned(bank:ref<cache.Cache>,c:ref<config.Recipe>,pending:ref<secondary.Plan>,directory:str,format:ref<container.Plan>)->result<unit,string> effects {alloc,fs.meta}{
+ var selected=cache.learned_settings(bank)
+ if not selected.room{return result.ok(())}
+ var targets:array<string>=secondary.output_targets(pending,c)
+ var expanded:container.Plan=try learned_output.planned(format,targets,selected,false,secondary.vocal_model(c)>0)
+ var journal:container.Journal=container.empty_journal()
+ app.preflight_source_files_to(directory,array.len(expanded.source_names),expanded,journal)
+}
+pub fn prepare_typed_named_with_input_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,context:ref<naming.Chain>,use_gpu:bool,root:str)->result<NamedPrepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var profiles:array<engine.Profile>=try read_profiles_impl(c,cancel,true)
+ var selected:naming.Selected=try named_chain.select_typed(input,directory,context,profiles,c,format)
+ var snapshot:array<engine.Profile>=[]
+ var index:u64=0
+ loop{if index==array.len(profiles){break}
+  array.push(snapshot,try engine.decode_typed(array.borrow(profiles,index).identity))
+  index+=1}
+ let _=try container.require_directory(directory)
+ if context.main.model_folder{match files.mkdirs(selected.directory){ok(_)=>{},err(_)=>{return result.err("Cannot create the selected processing output folder")}}}
+ var pending:Pending=try pending_profiles(profiles,c,input,selected.directory,option.none(),option.some(try container.copy_plan(struct.borrow(selected,field=plan))),input_options)
+ let _=try preflight_learned(bank,c,struct.borrow(pending,field=plan),selected.directory,struct.borrow(selected,field=plan))
+ let prepared:Prepared=try acquire_pending_typed(bank,c,input,selected.directory,cancel,pending,use_gpu,root)
+ let export_plan:container.Plan=struct.replace(selected,container.wav_plan(format.working_wav),field=plan)
+ result.ok(NamedPrepared{prepared:prepared,format:export_plan,profiles:snapshot})
+}
+pub fn prepare_typed_named_with_sources_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,context:ref<naming.Chain>,use_gpu:bool,root:str,inputs:ref<recording_sources.Set>)->result<NamedPrepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var profiles:array<engine.Profile>=try read_profiles_impl(c,cancel,true)
+ var selected:naming.Selected=try named_chain.select_typed(input,directory,context,profiles,c,format)
+ var snapshot:array<engine.Profile>=[]
+ var index:u64=0
+ loop{if index==array.len(profiles){break}
+  array.push(snapshot,try engine.decode_typed(array.borrow(profiles,index).identity))
+  index+=1}
+ let _=try container.require_directory(directory)
+ if context.main.model_folder{match files.mkdirs(selected.directory){ok(_)=>{},err(_)=>{return result.err("Cannot create the selected processing output folder")}}}
+ var pending:Pending=try pending_profiles_inputs(profiles,c,input,selected.directory,option.none(),option.some(try container.copy_plan(struct.borrow(selected,field=plan))),input_options,inputs,true)
+ let _=try preflight_learned(bank,c,struct.borrow(pending,field=plan),selected.directory,struct.borrow(selected,field=plan))
+ let prepared:Prepared=try acquire_pending_typed(bank,c,input,selected.directory,cancel,pending,use_gpu,root)
+ let export_plan:container.Plan=struct.replace(selected,container.wav_plan(format.working_wav),field=plan)
+ result.ok(NamedPrepared{prepared:prepared,format:export_plan,profiles:snapshot})
+}
+pub fn preflight_typed_outputs_to(c:ref<config.Recipe>,output:ref<typed_secondary.Output>,directory:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.meta} {
+ let _=try typed_source.validate(struct.borrow(output,field=stems))
+ let _=try app.preflight_source_files_to(directory,array.len(output.stems),plan,log)
+ let _=try container.preflight_metadata_tracked(path.join(directory,"secondary.json"),log)
+ if c.keep_members{
+  var at:u64=0
+  loop{if at==array.len(output.saved){break}
+   let saved:ref<typed_cache.Prediction>=array.borrow(output.saved,at)
+   let suffix:string=if str.view(saved.stage)=="recording"{""}else{text.concat("-",saved.stage)}
+   let key:string=text.concat("members/model-",text.concat(string.from_int(saved.model),suffix))
+   var member_plan:container.Plan=try container.scoped(plan,key)
+   let _=try app.preflight_source_files_to(path.join(directory,key),array.len(saved.sources),member_plan,log)
+   at+=1}
+  at=0
+  loop{if at==array.len(output.inputs){break}
+   let captured:ref<typed_cache.StageInput>=array.borrow(output.inputs,at)
+   let folder:string=path.join(path.join(directory,"members"),text.concat("model-",text.concat(string.from_int(captured.model),text.concat("-",captured.source))))
+   let _=try container.preflight_tracked(container.target(folder,"input",plan),plan,log)
+   at+=1}}
+ result.ok(())
+}
+fn write_typed_to(file:str,values:ref<samples.Samples>,plan:ref<container.Plan>,log:ref<container.Journal>,cancel:str,progress:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let _=try samples.validate(values)
+ if values.precision==samples.Precision.Float32{return app.write_planar_to(file,44100,array.view(values.single),cancel,progress,plan,log)}
+ container.write_planar_f64(file,44100,array.view(values.wide),plan,log,cancel,progress)
+}
+fn export_typed_to_impl(bank:ref<cache.Cache>,c:ref<config.Recipe>,prepared:ref<Prepared>,output:ref<typed_secondary.Output>,use_gpu:bool,cancel:str,progress:str,format:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ var plan:container.Plan=try learned_output.rendered(format,struct.borrow(output,field=stems))
+ let start:u64=array.len(log.artifacts)
+ let export_cancel:string=if container.extension(plan)=="wav"{""}else{string.copy(cancel)}
+ let _=try app.preflight_to(prepared.directory,array.len(output.stems),plan,log)
+ let _=try preflight_typed_outputs_to(c,output,prepared.directory,plan,log)
+ if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+ let backend:str=if use_gpu{"native-air-gpu-typed"}else{"native-air-cpu-typed"}
+ var models:array<config.ModelRecord>=[]
+ var i:u64=0
+ loop{if i==array.len(prepared.bindings){break}
+  let binding:ref<secondary.Binding>=array.borrow(prepared.bindings,i)
+  let loaded:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,binding.member),field=model)
+  let selected:ref<config.Model>=array.borrow(c.models,binding.model)
+  array.push(models,config.ModelRecord{model:binding.model,config:string.copy(selected.config),checkpoint:string.copy(selected.checkpoint),profile:string.copy(loaded.profile.identity),engine:string.copy(loaded.profile.kind),checkpoint_loads:engine.loads(loaded),bytes_read:engine.bytes_read(loaded),inference_requests:loaded.requests})
+  i+=1}
+ if c.keep_members{
+  var stages:array<secondary.Stage>=secondary.stages(struct.borrow(prepared,field=plan),c)
+  if array.len(output.saved)!=array.len(stages){return result.err("Secondary saved member count differs")}
+  i=0
+  loop{if i==array.len(output.saved){break}
+   let saved:ref<typed_cache.Prediction>=array.borrow(output.saved,i)
+   let suffix:string=if str.view(saved.stage)=="recording"{""}else{text.concat("-",saved.stage)}
+   let key:string=text.concat("members/model-",text.concat(string.from_int(saved.model),suffix))
+   let directory:string=path.join(prepared.directory,key)
+   var member_plan:container.Plan=try container.scoped(plan,key)
+   match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create secondary member directory")}}
+   let binding:u64=try secondary.binding(struct.borrow(prepared,field=bindings),saved.model)
+   let loads:u64=engine.loads(struct.borrow(array.borrow(bank.entries,binding),field=model))
+   let _=try app.export_waves_to(directory,44100,struct.borrow(saved,field=sources),backend,loads,export_cancel,progress,member_plan,log)
+   i+=1}
+  i=0
+  loop{if i==array.len(output.inputs){break}
+   let captured:ref<typed_cache.StageInput>=array.borrow(output.inputs,i)
+   let directory:string=path.join(path.join(prepared.directory,"members"),text.concat("model-",text.concat(string.from_int(captured.model),text.concat("-",captured.source))))
+   let _=try write_typed_to(container.target(directory,"input",plan),struct.borrow(captured,field=samples),plan,log,export_cancel,progress)
+   i+=1}}
+ var records:array<config.StemRecord>=[]
+ i=0
+ loop{if i==array.len(output.stems){break}
+  let stem:ref<typed_source.Wave>=array.borrow(output.stems,i)
+  let file:string=app.output_name_to(prepared.directory,i,plan)
+  let _=try write_typed_to(file,struct.borrow(stem,field=samples),plan,log,export_cancel,progress)
+  array.push(records,config.StemRecord{target:string.copy(stem.target),frames:stem.frames,file:path.basename(file)})
+  i+=1}
+ var adjustments:array<config.Adjustment>=[]
+ i=0
+ loop{if i==array.len(c.adjustments){break}
+  let adjustment:ref<config.Adjustment>=array.borrow(c.adjustments,i)
+  array.push(adjustments,config.Adjustment{target:string.copy(adjustment.target),model:adjustment.model,primary_weight:adjustment.primary_weight})
+  i+=1}
+ var manifest:config.Manifest=config.Manifest{input:string.copy(prepared.input_path),sample_rate:44100,stems:records,models:models,adjustments:adjustments,normalize:c.normalize,complement:string.copy(c.complement),backend:string.copy(backend),preprocess:c.preprocess,preprocess_complement:string.copy(c.preprocess_complement),save_instrumental_mix:c.save_instrumental_mix,vocal_split:secondary.vocal_model(c),vocal_rebalance:secondary.rebalance(c),vocal_mixes:c.vocal_mixes,vocal_mix_only:c.vocal_mix_only,vocal_save_only:c.vocal_save_only}
+ let plain:string=try config.Manifest_encode(manifest) map_err codec.describe
+ let encoded:string=try role_metadata.decorate(plain,c)
+ container.write_metadata(path.join(prepared.directory,"secondary.json"),encoded,plan,log,start)
+}
+pub fn export_typed_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,prepared:ref<Prepared>,output:ref<typed_secondary.Output>,use_gpu:bool,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=export_typed_to_impl(bank,c,prepared,output,use_gpu,cancel,progress,plan,log)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}

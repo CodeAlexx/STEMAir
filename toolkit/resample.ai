@@ -1,0 +1,146 @@
+module stemair.resample
+import "numeric.ai" as num
+import std.float as fp
+
+pub type Plan=struct{up:u64,down:u64,half:u64,filter:array<f32>}
+pub type WidePlan=struct{up:u64,down:u64,half:u64,filter:array<f64>}
+fn gcd(a:u64,b:u64)->u64 effects {} {
+ var x:u64=a
+ var y:u64=b
+ loop{if y==0{break}
+  let next:u64=x%y
+  x=y
+  y=next}
+ x
+}
+fn i0(x:f64)->f64 effects {} {
+ let square:f64=x*x/4.0
+ var sum:f64=1.0
+ var term:f64=1.0
+ var k:u64=1
+ loop{if k>64{break}
+  term*=square/(cast.float(k)*cast.float(k))
+  sum+=term
+  if term<sum*0.00000000000000001{break}
+  k+=1}
+ sum
+}
+// Zero-phase rational polyphase FIR: cutoff 1/max(up,down), half-length
+// 10*max(up,down), Kaiser beta 5, unit DC gain, then F32 filter storage.
+pub fn plan(input_rate:u32,output_rate:u32)->result<Plan,string> effects {alloc} {
+ if input_rate<1000 or input_rate>192000 or output_rate<1000 or output_rate>192000{return result.err("Unsupported audio sample rate")}
+ let divisor:u64=gcd(cast.wrap(input_rate),cast.wrap(output_rate))
+ let up:u64=cast.wrap(output_rate)/divisor
+ let down:u64=cast.wrap(input_rate)/divisor
+ let maximum:u64=if up>down{up}else{down}
+ if maximum>2048{return result.err("Rational resampling ratio exceeds its filter bound")}
+ if up==1 and down==1{return result.ok(Plan{up:1,down:1,half:0,filter:[1.0]})}
+ let half:u64=10*maximum
+ let cutoff:f64=1.0/cast.float(maximum)
+ let denominator:f64=i0(5.0)
+ var values:array<f64>=[]
+ var sum:f64=0.0
+ var i:u64=0
+ loop{if i>=2*half+1{break}
+  let m:f64=cast.float(i)-cast.float(half)
+  let ratio:f64=m/cast.float(half)
+  let sinc:f64=if m==0.0{1.0}else{fp.sin(3.14159265358979323846*cutoff*m)/(3.14159265358979323846*cutoff*m)}
+  let value:f64=cutoff*sinc*i0(5.0*fp.sqrt(1.0-ratio*ratio))/denominator
+  sum+=value
+  array.push(values,value)
+  i+=1}
+ var filter:array<f32>=[]
+ i=0
+ loop{if i>=array.len(values){break}
+  let coefficient:f32=cast.float(array.get(values,i)/sum)
+  array.push(filter,coefficient*cast.float(up))
+  i+=1}
+ result.ok(Plan{up:up,down:down,half:half,filter:filter})
+}
+pub fn apply(p:ref<Plan>,input:view<f32>,channels:u64)->result<array<f32>,string> effects {alloc} {
+ if channels==0 or channels>8 or view.len(input)==0 or view.len(input)%channels!=0 or
+  view.len(input)>317520000 or not num.finite(input){return result.err("Expected bounded finite planar audio")}
+ if p.up==0 or p.down==0 or array.len(p.filter)!=2*p.half+1{return result.err("Invalid resampling plan")}
+ let samples:u64=view.len(input)/channels
+ let count:u64=(samples*p.up+p.down-1)/p.down
+ if count>317520000/channels{return result.err("Resampled audio exceeds its memory bound")}
+ if p.up==1 and p.down==1{return result.ok(num.copy(input))}
+ var out:array<f32>=[]
+ array.reserve(out,channels*count)
+ var channel:u64=0
+ loop{if channel>=channels{break}
+  var i:u64=0
+  loop{if i>=count{break}
+   let center:u64=p.half+i*p.down
+   let first:u64=if center>=2*p.half{(center-2*p.half+p.up-1)/p.up}else{0}
+   let last:u64=if center/p.up<samples{center/p.up}else{samples-1}
+   var sum:f32=0.0
+   var k:u64=first
+   loop{if k>last{break}
+    let coefficient:u64=center-k*p.up
+    sum+=view.get(input,channel*samples+k)*array.get(p.filter,coefficient)
+    k+=1}
+   array.push(out,sum)
+   i+=1}
+  channel+=1}
+ result.ok(out)
+}
+// Additive F64 carrier for source polyphase callers. Existing F32 filter
+// storage and accumulation are unchanged.
+pub fn plan_wide(input_rate:u32,output_rate:u32)->result<WidePlan,string> effects {alloc}{
+ if input_rate<1000 or input_rate>192000 or output_rate<1000 or output_rate>192000{return result.err("Unsupported audio sample rate")}
+ let divisor:u64=gcd(cast.wrap(input_rate),cast.wrap(output_rate))
+ let up:u64=cast.wrap(output_rate)/divisor
+ let down:u64=cast.wrap(input_rate)/divisor
+ let maximum:u64=if up>down{up}else{down}
+ if maximum>2048{return result.err("Rational resampling ratio exceeds its filter bound")}
+ if up==1 and down==1{return result.ok(WidePlan{up:1,down:1,half:0,filter:[1.0]})}
+ let half:u64=10*maximum
+ let cutoff:f64=1.0/cast.float(maximum)
+ let denominator:f64=i0(5.0)
+ var values:array<f64>=[]
+ var sum:f64=0.0
+ var i:u64=0
+ loop{if i>=2*half+1{break}
+  let m:f64=cast.float(i)-cast.float(half)
+  let ratio:f64=m/cast.float(half)
+  let sinc:f64=if m==0.0{1.0}else{fp.sin(3.14159265358979323846*cutoff*m)/(3.14159265358979323846*cutoff*m)}
+  let value:f64=cutoff*sinc*i0(5.0*fp.sqrt(1.0-ratio*ratio))/denominator
+  sum+=value
+  array.push(values,value)
+  i+=1}
+ i=0
+ loop{if i==array.len(values){break}
+  array.set(values,i,(array.get(values,i)/sum)*cast.float(up))
+  i+=1}
+ result.ok(WidePlan{up:up,down:down,half:half,filter:values})
+}
+pub fn apply_wide(p:ref<WidePlan>,input:view<f64>,channels:u64)->result<array<f64>,string> effects {alloc}{
+ if channels==0 or channels>8 or view.len(input)==0 or view.len(input)%channels!=0 or view.len(input)>317520000{return result.err("Expected bounded finite planar audio")}
+ if p.up==0 or p.down==0 or array.len(p.filter)!=2*p.half+1{return result.err("Invalid resampling plan")}
+ var i:u64=0
+ loop{if i==view.len(input){break}
+  if not fp.is_finite(view.get(input,i)){return result.err("Expected finite planar audio")}
+  i+=1}
+ let samples:u64=view.len(input)/channels
+ let count:u64=(samples*p.up+p.down-1)/p.down
+ if count>317520000/channels{return result.err("Resampled audio exceeds its memory bound")}
+ var out:array<f64>=[]
+ array.reserve(out,channels*count)
+ var channel:u64=0
+ loop{if channel==channels{break}
+  i=0
+  loop{if i==count{break}
+   let center:u64=p.half+i*p.down
+   let first:u64=if center>=2*p.half{(center-2*p.half+p.up-1)/p.up}else{0}
+   let last:u64=if center/p.up<samples{center/p.up}else{samples-1}
+   var sum:f64=0.0
+   var k:u64=first
+   loop{if k>last{break}
+    sum+=view.get(input,channel*samples+k)*array.get(p.filter,center-k*p.up)
+    k+=1}
+   array.push(out,sum)
+   i+=1}
+  channel+=1}
+ result.ok(out)
+}

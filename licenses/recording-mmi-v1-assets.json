@@ -1,0 +1,17 @@
+{
+  "model": "recording-mmi-v1",
+  "filename": "recording-mmi-v1.yaml",
+  "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/hdemucs_mmi.yaml",
+  "bytes": 33,
+  "sha256": "be8b1c6ef2ca406c620917f3d94c15a0d240718604ce89bfa6765bcc52631f05",
+  "configuration": "configs/recording-mmi-v1.json",
+  "credit": "Original Demucs models by Meta Platforms and collaborators, MIT license; attention-MIT.txt, hybrid-MIT.txt and waveform-MIT.txt. Original identifiers preserve checkpoint compatibility.",
+  "dependencies": [
+    {
+      "filename": "hybrid-mmi-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/75fc33f5-1941ce65.th",
+      "bytes": 167407275,
+      "sha256": "1941ce654b11df4132b9f4eae408556b4c83fad6fe26b4bc0dbcb36b975befb3"
+    }
+  ]
+}

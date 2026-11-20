@@ -1,0 +1,184 @@
+module stemair.hybrid.recurrent
+import "../recurrent.ai" as recurrent
+import "../recurrent_device.ai" as recurrent_device
+import "../device_ops.ai" as ops
+import "../ops.ai" as host
+import "../weights.ai" as weights
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "../recurrent_vendor.ai" as vendor
+import std.tensor as tensor
+import std.compute as compute
+import std.text as text
+
+pub type Block=struct{first:recurrent.Bidirectional,second:recurrent.Bidirectional,weight:u64,bias:u64,features:u64}
+pub type Observer<O>=struct{callback:option<fn(ref<O>,str,view<u64>,view<f32>)->result<unit,string> effects {alloc}>}
+fn observe<O>(observer:ref<Observer<O>>,observations:ref<O>,name:str,shape:view<u64>,values:view<f32>)->result<unit,string> effects {alloc} {
+ match observer.callback{none=>result.ok(()),some(invoke)=>invoke(observations,name,shape,values)}
+}
+pub fn bind(w:ref<weights.Model>,base:str,features:u64)->result<Block,string> effects {alloc} {
+ let shape:array<u64>=[features,features*2]
+ let bias_shape:array<u64>=[features]
+ result.ok(Block{first:try recurrent.bind_layer(w,text.concat(base,".lstm"),features,features,0),
+  second:try recurrent.bind_layer(w,text.concat(base,".lstm"),features*2,features,1),
+  weight:try weights.index(w,text.concat(base,".linear.weight"),array.view(shape)),
+  bias:try weights.index(w,text.concat(base,".linear.bias"),array.view(bias_shape)),features:features})
+}
+pub fn forward_observed<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ w:ref<weights.Model>,block:Block,x:ref<tensor.Tensor>,cancel:str,observer:ref<Observer<O>>,observations:ref<O>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if tensor.rank(x)!=4 or array.get(x.dimensions,1)!=block.features or array.get(x.dimensions,2)!=1{
+  return result.err("Invalid windowed recurrent tensor")}
+ let batches:u64=array.get(x.dimensions,0)
+ let channels:u64=block.features
+ let length:u64=array.get(x.dimensions,3)
+ if batches==0 or length==0 or length>65536{return result.err("Invalid windowed recurrent extent")}
+ let framed:bool=length>200
+ let steps:u64=if framed{200}else{length}
+ let frames:u64=if framed{(length+99)/100}else{1}
+ if batches*frames*steps>65536{return result.err("Windowed recurrent workspace limit exceeded")}
+ let original:array<f32>=try tensor.to_f32(stream,x) map_err ops.error
+ var packed:array<f32>=[]
+ array.reserve(packed,batches*frames*steps*channels)
+ var batch:u64=0
+ loop{if batch==batches{break}
+  var frame:u64=0
+  loop{if frame==frames{break}
+   if control.cancelled(cancel){return result.err("Separation cancelled")}
+   var time:u64=0
+   loop{if time==steps{break}
+    let position:u64=if framed{frame*100+time}else{time}
+    var channel:u64=0
+    loop{if channel==channels{break}
+     array.push(packed,if position<length{array.get(original,(batch*channels+channel)*length+position)}else{0.0})
+     channel+=1}
+    time+=1}
+   frame+=1}
+  batch+=1}
+ var rows:host.Tensor=host.tensor(batches*frames,steps,channels,packed)
+ var nested:recurrent_device.Observer<O>=recurrent_device.Observer<O>{callback:observer.callback}
+ rows=try recurrent_device.forward_batched_observed(context,stream,parameters,w,block.first,rows,cancel,"layer-0",nested,observations)
+ rows=try recurrent_device.forward_batched_observed(context,stream,parameters,w,block.second,rows,cancel,"layer-1",nested,observations)
+ let recurrent_shape:array<u64>=[batches*frames,steps,channels*2]
+ let _=try observe(observer,observations,"lstm-output",array.view(recurrent_shape),array.view(rows.data))
+ let input_shape:array<u64>=[batches*frames*steps,channels*2]
+ let output_shape:array<u64>=[batches*frames*steps,channels]
+ var input:tensor.Tensor=try tensor.from_f32(context,stream,array.view(rows.data),array.view(input_shape),tensor.DType.F32) map_err ops.error
+ var output:tensor.Tensor=try ops.empty(context,array.view(output_shape))
+ var weight:tensor.Tensor=try tensor.view(array.borrow(parameters,block.weight)) map_err ops.error
+ var bias:tensor.Tensor=try tensor.view(array.borrow(parameters,block.bias)) map_err ops.error
+ let _=try compute.linear_bias(stream,input,weight,bias,output) map_err ops.error
+ let projected:array<f32>=try tensor.to_f32(stream,output) map_err ops.error
+ let projected_shape:array<u64>=[batches*frames,steps,channels]
+ let _=try observe(observer,observations,"linear-output",array.view(projected_shape),array.view(projected))
+ var result:array<f32>=num.zeros(batches*channels*length)
+ batch=0
+ loop{if batch==batches{break}
+  var time:u64=0
+  loop{if time==length{break}
+   let frame:u64=if framed and time>=150{1+(time-150)/100}else{0}
+   let position:u64=if framed and time>=150{50+(time-150)%100}else{time}
+   var channel:u64=0
+   loop{if channel==channels{break}
+    let index:u64=(batch*channels+channel)*length+time
+    let prediction:f32=array.get(projected,((batch*frames+frame)*steps+position)*channels+channel)
+    array.set(result,index,prediction+array.get(original,index))
+    channel+=1}
+   time+=1}
+  batch+=1}
+ let _=try observe(observer,observations,"output",array.view(x.dimensions),array.view(result))
+ result.ok(try tensor.from_f32(context,stream,array.view(result),array.view(x.dimensions),tensor.DType.F32) map_err ops.error)
+}
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ w:ref<weights.Model>,block:Block,x:ref<tensor.Tensor>,cancel:str)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ var observations:unit=()
+ forward_observed(context,stream,parameters,w,block,x,cancel,observer,observations)
+}
+
+// Explicit retained recipe, preserving original sequence-major layout through
+// the shared projection. The old wrappers above remain the manual recipe.
+fn forward_retained_observed<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ bank:ref<vendor.State>,projection:ops.ProjectionPolicy,block:Block,x:ref<tensor.Tensor>,cancel:str,prefix:str,observer:ref<Observer<O>>,observations:ref<O>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if tensor.rank(x)!=4 or array.get(x.dimensions,1)!=block.features or array.get(x.dimensions,2)!=1{return result.err("Invalid retained recurrent input")}
+ let batches:u64=array.get(x.dimensions,0)
+ let channels:u64=block.features
+ let length:u64=array.get(x.dimensions,3)
+ if batches==0 or length==0 or length>65536{return result.err("Invalid retained recurrent extent")}
+ let framed:bool=length>200
+ let steps:u64=if framed{200}else{length}
+ let frames:u64=if framed{(length+99)/100}else{1}
+ if batches>65536/frames or batches*frames>65536/steps{return result.err("Retained recurrent frame workspace limit exceeded")}
+ let instances:u64=batches*frames
+ let original:array<f32>=try tensor.to_f32(stream,x) map_err ops.error
+ var packed:array<f32>=[]
+ array.reserve(packed,steps*instances*channels)
+ var time:u64=0
+ loop{if time==steps{break}
+  var batch:u64=0
+  loop{if batch==batches{break}
+   var frame:u64=0
+   loop{if frame==frames{break}
+    if control.cancelled(cancel){return result.err("Separation cancelled")}
+    let position:u64=if framed{frame*100+time}else{time}
+    var channel:u64=0
+    loop{if channel==channels{break}
+     array.push(packed,if position<length{array.get(original,(batch*channels+channel)*length+position)}else{0.0})
+     channel+=1}
+    frame+=1}
+   batch+=1}
+  time+=1}
+ let input_shape:array<u64>=[steps,instances,channels]
+ var input:tensor.Tensor=try tensor.from_f32(context,stream,array.view(packed),array.view(input_shape),tensor.DType.F32) map_err ops.error
+ var sequence:tensor.Tensor=try vendor.forward(bank,context,stream,block.first.forward.input,input)
+ match observer.callback{some(invoke)=>{
+  let raw:array<f32>=try tensor.to_f32(stream,sequence) map_err ops.error
+  let _=try invoke(observations,text.concat(prefix,"-lstm-output"),array.view(sequence.dimensions),array.view(raw))
+ },none=>{}}
+ let flat_shape:array<u64>=[steps*instances,channels*2]
+ let output_shape:array<u64>=[steps*instances,channels]
+ var rows:tensor.Tensor=try tensor.reshape(sequence,array.view(flat_shape)) map_err ops.error
+ var output:tensor.Tensor=try ops.empty(context,array.view(output_shape))
+ var weight:tensor.Tensor=try tensor.view(array.borrow(parameters,block.weight)) map_err ops.error
+ var bias:tensor.Tensor=try tensor.view(array.borrow(parameters,block.bias)) map_err ops.error
+ if projection.recipe==ops.ProjectionRecipe.EagerF32{
+  let _=try compute.linear_bias_eager_f32(stream,rows,weight,bias,output,projection.workspace_bytes) map_err ops.error
+ }else{
+  let _=try compute.linear_bias(stream,rows,weight,bias,output) map_err ops.error
+ }
+ let projected:array<f32>=try tensor.to_f32(stream,output) map_err ops.error
+ match observer.callback{some(invoke)=>{
+  let projected_shape:array<u64>=[steps,instances,channels]
+  let _=try invoke(observations,text.concat(prefix,"-linear-output"),array.view(projected_shape),array.view(projected))
+ },none=>{}}
+ var result:array<f32>=num.zeros(batches*channels*length)
+ var batch:u64=0
+ loop{if batch==batches{break}
+  time=0
+  loop{if time==length{break}
+   let frame:u64=if framed and time>=150{1+(time-150)/100}else{0}
+   let position:u64=if framed and time>=150{50+(time-150)%100}else{time}
+   var channel:u64=0
+   loop{if channel==channels{break}
+    let index:u64=(batch*channels+channel)*length+time
+    let prediction:f32=array.get(projected,(position*instances+batch*frames+frame)*channels+channel)
+    array.set(result,index,prediction+array.get(original,index))
+    channel+=1}
+   time+=1}
+  batch+=1}
+ result.ok(try tensor.from_f32(context,stream,array.view(result),array.view(x.dimensions),tensor.DType.F32) map_err ops.error)
+}
+pub fn forward_with_execution(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ w:ref<weights.Model>,block:Block,x:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ var observations:unit=()
+ forward_observed_with_execution(context,stream,parameters,w,block,x,cancel,state,"",observer,observations)
+}
+pub fn forward_observed_with_execution<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ w:ref<weights.Model>,block:Block,x:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,prefix:str,observer:ref<Observer<O>>,observations:ref<O>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ let projection:ops.ProjectionPolicy=state.projection
+ match state.recurrence{
+  none=>{if projection.recipe!=ops.ProjectionRecipe.Current{return result.err("Explicit projection requires retained recurrent state")}
+   forward(context,stream,parameters,w,block,x,cancel)},
+  some(bank)=>forward_retained_observed(context,stream,parameters,bank,projection,block,x,cancel,prefix,observer,observations),
+ }
+}

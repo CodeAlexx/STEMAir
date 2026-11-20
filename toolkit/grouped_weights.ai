@@ -1,0 +1,248 @@
+module stemair.grouped_weights
+import "weights.ai" as weights
+import std.pytorch_checkpoint as ck
+import std.table as table
+import std.text as text
+import std.float as fp
+import std.system as system
+pub type Spec=struct{name:string,shape:array<u64>,elements:u64}
+fn error(s:str)->string effects {alloc}{text.concat("Grouped checkpoint: ",s)}
+fn node(source:ref<ck.InertCheckpoint>,id:u64)->result<ck.InertNode,string> effects {alloc}{
+ if id>=array.len(source.nodes){return result.err(error("node index exceeds arena"))}
+ let n:ref<ck.InertNode>=array.borrow(source.nodes,id)
+ var items:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(n.items){break}
+  array.push(items,array.get(n.items,i))
+  i+=1}
+ result.ok(ck.InertNode{kind:n.kind,number:n.number,word:string.copy(n.word),items:items,tensor:n.tensor})
+}
+fn sequence(source:ref<ck.InertCheckpoint>,id:u64)->result<u64,string> effects {alloc}{
+ let n:ck.InertNode=try node(source,id)
+ if n.kind!=ck.InertKind.Sequence{return result.err(error("sequence required"))}
+ result.ok(array.len(n.items))
+}
+fn number(source:ref<ck.InertCheckpoint>,id:u64)->result<u64,string> effects {alloc}{
+ let n:ck.InertNode=try node(source,id)
+ if n.kind!=ck.InertKind.Integer{return result.err(error("integer required"))}
+ result.ok(n.number)
+}
+fn boolean(source:ref<ck.InertCheckpoint>,id:u64)->result<bool,string> effects {alloc}{
+ let n:ck.InertNode=try node(source,id)
+ if n.kind!=ck.InertKind.Boolean{return result.err(error("boolean required"))}
+ result.ok(n.number==1)
+}
+fn scalar(source:ref<ck.InertCheckpoint>,id:u64)->result<f64,string> effects {alloc}{
+ let n:ck.InertNode=try node(source,id)
+ if n.kind!=ck.InertKind.FloatBits{return result.err(error("floating scale required"))}
+ let value:f64=cast.bits(n.number)
+ if not fp.is_finite(value){return result.err(error("non-finite scale"))}
+ result.ok(value)
+}
+fn field(source:ref<ck.InertCheckpoint>,id:u64,name:str)->result<u64,string> effects {alloc}{ck.inert_field(source,id,name)}
+fn word64(raw:view<byte>,offset:u64)->u64 effects {}{
+ var value:u64=0
+ var b:u64=0
+ loop{if b==8{break}
+  let byte:u8=cast.bits(view.get(raw,offset+b))
+  let wide:u64=cast.wrap(byte)
+  value|=wide << cast.wrap(8*b)
+  b+=1}
+ value
+}
+// Generic lane mapping from the reference bit-plane format, no external code.
+pub fn unpack(source:ref<ck.InertCheckpoint>,id:u64,count:u64)->result<array<u16>,string> effects {alloc}{
+ let slot:u64=try ck.inert_tensor(source,id)
+ let t:ref<ck.Tensor>=array.borrow(source.tensors,slot)
+ if t.dtype!="I64" or array.len(t.shape)!=3 or array.get(t.shape,2)!=32 or
+  array.get(t.shape,1)>14 or count>134217728{
+  return result.err(error("invalid packed plane layout"))}
+ let lines:u64=array.get(t.shape,0)
+ let bits:u64=array.get(t.shape,1)
+ // A uniform zero code vector is represented by a zero-width bit plane. It
+ // has no payload; the ordinary contiguous-stride predicate need not hold for
+ // this empty tensor. Nonempty planes retain the strict layout requirement.
+ if bits!=0 and not t.contiguous{return result.err(error("invalid packed plane layout"))}
+ if lines>65536 or count>lines*2048 or (lines!=0 and count<=(lines-1)*2048){
+  return result.err(error("packed plane length differs"))}
+ let bytes:u64=lines*bits*32*8
+ let total:u64=view.len(bytes.view(source.archive))
+ if t.byte_offset>total or bytes>total-t.byte_offset or t.byte_length!=bytes or
+  t.logical_elements!=lines*bits*32{return result.err(error("packed plane byte extent differs"))}
+ var out:array<u16>=[]
+ array.reserve(out,count)
+ var i:u64=0
+ loop{if i==count{break}
+  array.push(out,0)
+  i+=1}
+ var line:u64=0
+ loop{if line==lines{break}
+  var bit:u64=0
+  loop{if bit==bits{break}
+   var column:u64=0
+   loop{if column==32{break}
+    let word:u64=word64(bytes.view(source.archive),t.byte_offset+((line*bits+bit)*32+column)*8)
+    var lane:u64=0
+    loop{if lane==64{break}
+     let at:u64=line*2048+lane*32+column
+     if at<count{
+      let value:u16=cast.wrap(((word >> cast.wrap(lane)) & 1) << cast.wrap(bit))
+      array.set(out,at,array.get(out,at)|value)}
+     lane+=1}
+    column+=1}
+   bit+=1}
+  line+=1}
+ result.ok(out)
+}
+fn ordinary<S>(source:ref<ck.InertCheckpoint>,id:u64,spec:ref<S>)->result<array<f32>,string> effects {alloc}{
+ let slot:u64=try ck.inert_tensor(source,id)
+ let t:ref<ck.Tensor>=array.borrow(source.tensors,slot)
+ if t.dtype!="F32" or not t.contiguous or t.logical_elements!=spec.elements or array.len(t.shape)!=array.len(spec.shape){
+  return result.err(error("ordinary parameter layout differs"))}
+ var i:u64=0
+ loop{if i==array.len(t.shape){break}
+  if array.get(t.shape,i)!=array.get(spec.shape,i){return result.err(error("ordinary parameter shape differs"))}
+  i+=1}
+ var out:array<f32>=[]
+ array.reserve(out,spec.elements)
+ i=0
+ loop{if i==spec.elements{break}
+  var bits:u32=0
+  var b:u64=0
+  loop{if b==4{break}
+   let value:u8=cast.bits(view.get(bytes.view(source.archive),t.byte_offset+4*i+b))
+   let wide:u32=cast.wrap(value)
+   bits|=wide << cast.wrap(8*b)
+   b+=1}
+  let value:f32=cast.bits(bits)
+  if not fp.is_finite(value){return result.err(error("non-finite ordinary parameter"))}
+  array.push(out,value)
+  i+=1}
+ result.ok(out)
+}
+fn quantized<S>(source:ref<ck.InertCheckpoint>,id:u64,spec:ref<S>)->result<array<f32>,string> effects {alloc}{
+ if (try sequence(source,id))!=3 or spec.elements%8!=0{return result.err(error("quantized record geometry differs"))}
+ let planes:u64=try ck.inert_child(source,id,0)
+ let scales:u64=try ck.inert_child(source,id,1)
+ if (try sequence(source,planes))!=14 or (try sequence(source,scales))!=2{return result.err(error("quantized fields differ"))}
+ let minimum:f64=try scalar(source,try ck.inert_child(source,scales,0))
+ let maximum:f64=try scalar(source,try ck.inert_child(source,scales,1))
+ if maximum<=minimum{return result.err(error("quantized range is not increasing"))}
+ let groups:u64=spec.elements/8
+ let codes:array<u16>=try unpack(source,try ck.inert_child(source,id,2),groups)
+ var counts:array<u64>=[]
+ var i:u64=0
+ loop{if i==14{break}
+  array.push(counts,0)
+  i+=1}
+ i=0
+ loop{if i==groups{break}
+  let width:u64=cast.wrap(array.get(codes,i))+2
+  if width>14{return result.err(error("unsupported width code"))}
+  array.set(counts,width-1,array.get(counts,width-1)+8)
+  i+=1}
+ var output:array<f32>=[]
+ array.reserve(output,spec.elements)
+ i=0
+ loop{if i==spec.elements{break}
+  array.push(output,0.0)
+  i+=1}
+ let delta:f32=cast.float(maximum-minimum)
+ let mn:f32=cast.float(minimum)
+ var width:u64=1
+ loop{if width==15{break}
+  let plane:u64=try ck.inert_child(source,planes,width-1)
+  let count:u64=array.get(counts,width-1)
+  if count==0{
+   if (try node(source,plane)).kind!=ck.InertKind.None{return result.err(error("unused packed width is not empty"))}
+  }else{
+   let plane_slot:u64=try ck.inert_tensor(source,plane)
+   let plane_tensor:ref<ck.Tensor>=array.borrow(source.tensors,plane_slot)
+   if array.len(plane_tensor.shape)!=3 or array.get(plane_tensor.shape,1)!=width{
+    return result.err(error("packed level width differs"))}
+   let levels:array<u16>=try unpack(source,plane,count)
+   let steps:u64=1 << cast.wrap(width)
+   let divisor:f32=cast.float(steps-1)
+   let unit:f32=1.0/divisor
+   var position:u64=0
+   var group:u64=0
+   loop{if group==groups{break}
+    let code:u64=cast.wrap(array.get(codes,group))
+    if code+2==width{
+     var lane:u64=0
+     loop{if lane==8{break}
+      let level:f32=cast.float(array.get(levels,position))
+      let normalized:f32=level*unit
+      let scaled:f32=normalized*delta
+      let value:f32=scaled+mn
+      if not fp.is_finite(value){return result.err(error("non-finite restored parameter"))}
+      array.set(output,group*8+lane,value)
+      position+=1
+      lane+=1}}
+    group+=1}
+   if position!=count{return result.err(error("packed scatter count differs"))}}
+  width+=1}
+ result.ok(output)
+}
+pub fn restore<S>(source:ref<ck.InertCheckpoint>,specs:ref<array<S>>)->result<weights.Model,string> effects {alloc}{
+ if array.len(specs)==0 or array.len(specs)>8192{return result.err(error("parameter roster extent differs"))}
+ var expected_quantized:u64=0
+ var total_elements:u64=0
+ var check:u64=0
+ loop{if check==array.len(specs){break}
+  let spec:ref<S>=array.borrow(specs,check)
+  if str.len(spec.name)==0 or spec.elements==0 or spec.elements>268435456 or array.len(spec.shape)==0 or array.len(spec.shape)>8{return result.err(error("parameter roster geometry differs"))}
+  var extent:u64=1
+  var dimension:u64=0
+  loop{if dimension==array.len(spec.shape){break}
+   let size:u64=array.get(spec.shape,dimension)
+   if size==0 or size>268435456/extent{return result.err(error("parameter roster extent overflows"))}
+   extent*=size
+   dimension+=1}
+  if spec.elements>536870912-total_elements{return result.err(error("restored parameter extent exceeds two-GiB limit"))}
+  total_elements+=spec.elements
+  if extent!=spec.elements{return result.err(error("parameter roster size differs"))}
+  if spec.elements>52428{expected_quantized+=1}
+  check+=1}
+ let memory:system.Memory=match system.memory(){ok(v)=>v,err(_)=>{return result.err(error("cannot query restoration RAM"))}}
+ if total_elements*4+268435456>memory.available_bytes{return result.err(error("not enough RAM for restored retained parameters"))}
+ let state:u64=try field(source,source.root,"state")
+ if not (try boolean(source,try field(source,state,"__quantized"))){return result.err(error("quantized marker required"))}
+ let meta:u64=try field(source,state,"meta")
+ if not (try boolean(source,try field(source,meta,"packed"))){return result.err(error("packed state required"))}
+ let klass:ck.InertNode=try node(source,try field(source,meta,"klass"))
+ if klass.kind!=ck.InertKind.Global or klass.word!="diffq.diffq\nDiffQuantizer"{return result.err(error("quantizer class differs"))}
+ let init:u64=try field(source,meta,"init_kwargs")
+ var init_record:ck.InertNode=try node(source,init)
+ if (try number(source,try field(source,init,"group_size")))!=8 or
+  (try scalar(source,try field(source,init,"min_size")))!=0.2 or array.len(init_record.items)!=4{
+  return result.err(error("quantizer settings differ"))}
+ let quant:u64=try field(source,state,"quantized")
+ let others:u64=try field(source,state,"others")
+ if (try sequence(source,quant))!=expected_quantized or (try sequence(source,others))!=array.len(specs)-expected_quantized or
+  (try sequence(source,try field(source,state,"float16")))!=0{return result.err(error("parameter record counts differ"))}
+
+ var parameters:table.Table<weights.Parameter>=table.new()
+ var q:u64=0
+ var other:u64=0
+ var i:u64=0
+ loop{if i==array.len(specs){break}
+  let s:ref<S>=array.borrow(specs,i)
+  var values:array<f32>=[]
+  if s.elements>52428{
+   values=try quantized(source,try ck.inert_child(source,quant,q),s)
+   q+=1
+  }else{
+   values=try ordinary(source,try ck.inert_child(source,others,other),s)
+   other+=1}
+  var shape:array<u64>=[]
+  var j:u64=0
+  loop{if j==array.len(s.shape){break}
+   array.push(shape,array.get(s.shape,j))
+   j+=1}
+  if option.is_some(table.index_of(parameters,s.name)){return result.err(error("duplicate parameter name in roster"))}
+  let _=table.put(parameters,s.name,weights.Parameter{shape:shape,values:values})
+  i+=1}
+ if q!=expected_quantized or other!=array.len(specs)-expected_quantized{return result.err(error("ordered parameter roster differs"))}
+ result.ok(weights.Model{parameters:parameters,bytes_read:source.archive_bytes,loads:1,metadata:string.copy(source.arguments_json)})
+}

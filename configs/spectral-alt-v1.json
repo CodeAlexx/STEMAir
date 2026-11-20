@@ -1,0 +1,1 @@
+{"engine":"spectral","sample_rate":44100,"n_fft":12288,"hop":2048,"frequency_bins":4096,"bands":4,"channels":128,"growth":64,"scales":5,"blocks":2,"bottleneck":4,"targets":["vocals","instrumental"],"frames":256,"overlap":8}

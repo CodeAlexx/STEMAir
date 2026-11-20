@@ -1,0 +1,68 @@
+module stemair.recording_bag_request
+import "recording_bag_state.ai" as state
+import "recording_context.ai" as context
+import "recording_inference.ai" as inference
+import "recording_shifts.ai" as shifts
+import "audio_normalization.ai" as normalization
+import "numeric.ai" as num
+pub type Limits=struct{max_waveform_bytes:u64,max_frontends:u64,transform_bytes:u64}
+pub type Invocation=struct{options:inference.Options,schedule:shifts.Schedule,fixed:bool}
+pub type MemberOutput=struct{values:array<f32>,observation:inference.Observation}
+pub type Output=struct{values:array<f32>,observations:array<inference.Observation>}
+pub fn preflight(s:ref<state.State>,input:view<f32>,controls:ref<context.Context>,limits:ref<Limits>)->result<unit,string> effects {alloc}{
+ let _=try context.validate(controls)
+ let sources:u64=array.len(s.targets)
+ if sources<2 or sources>8 or array.len(s.members)==0 or view.len(input)<4 or view.len(input)%2!=0 or limits.max_frontends==0 or limits.transform_bytes==0{return result.err("Invalid recording bundle request or allocation policy")}
+ // Conservative waveform ownership: borrowed input, normalization, one member
+ // copy, shifted/padded recording, averaged/raw member and weighted accumulator.
+ // Model weights/NN work and the independently bounded FFT policy are separate.
+ let fixed:u64=529200+176400*sources
+ let per_frame:u64=40+24*sources
+ if limits.max_waveform_bytes<fixed or view.len(input)/2>(limits.max_waveform_bytes-fixed)/per_frame{return result.err("Recording bundle waveforms exceed the explicit caller byte allowance")}
+ var i:u64=0
+ loop{if i==array.len(s.members){break}
+  let member:ref<state.Member>=array.borrow(s.members,i)
+  if member.slot>=array.len(s.slots) or array.len(member.weights)!=sources{return result.err("Recording bundle member binding is invalid")}
+  i+=1}
+ result.ok(())
+}
+pub fn copy(source:ref<normalization.Prepared>)->normalization.Prepared effects {alloc}{
+ normalization.Prepared{samples:num.copy(array.view(source.samples)),frames:source.frames,mean:0.0,scale:1.0}
+}
+pub fn configure<C>(c:ref<C>,controls:ref<context.Context>)->unit effects {}{
+ if controls.enabled{c.split=controls.options.split
+  c.overlap=controls.options.overlap}
+ ()
+}
+pub fn segment(member:ref<state.Member>,controls:ref<context.Context>,default_value:u64)->result<u64,string> effects {alloc}{
+ let selected:u64=if controls.enabled and controls.options.segment_seconds!=0{controls.options.segment_seconds*44100}else{if member.segment_samples!=0{member.segment_samples}else{default_value}}
+ if selected==0{return result.err("Recording bundle member has an empty segment")}
+ result.ok(selected)
+}
+pub fn begin<C>(c:ref<C>,controls:ref<context.Context>,frames:u64,segment:u64)->result<Invocation,string> effects {alloc}{
+ var options:inference.Options=if controls.enabled{controls.options}else{inference.Options{shifts:array.len(c.shift_offsets),split:c.split,overlap:c.overlap}}
+ if controls.enabled{
+  let schedule:shifts.Schedule=try inference.begin(array.borrow(controls.streams,0),options,shifts.Family.Outer,frames,segment,controls.limits)
+  return result.ok(Invocation{options:options,schedule:schedule,fixed:false})}
+ let profile:shifts.Request=shifts.Request{family:shifts.Family.Outer,count:array.len(c.shift_offsets),seed:0,frames:frames,split:c.split,segment:segment,overlap:c.overlap}
+ let bounds:shifts.Limits=shifts.Limits{max_forwards:18446744073709551615,max_groups:1,max_group_offsets:array.len(c.shift_offsets),max_random_calls:array.len(c.shift_offsets)}
+ let schedule:shifts.Schedule=try shifts.begin(profile,bounds)
+ result.ok(Invocation{options:options,schedule:schedule,fixed:true})
+}
+pub fn group<C>(invocation:ref<Invocation>,c:ref<C>)->result<shifts.Group,string> effects {alloc}{
+ if not invocation.fixed{return shifts.next_group(struct.borrow(invocation,field=schedule))}
+ var offsets:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(c.shift_offsets){break}
+  array.push(offsets,array.get(c.shift_offsets,i))
+  i+=1}
+ invocation.schedule.groups=1
+ result.ok(shifts.Group{offsets:offsets,divisor:if array.len(c.shift_offsets)==0{1}else{array.len(c.shift_offsets)},shifted:array.len(c.shift_offsets)!=0})
+}
+pub fn finish(invocation:ref<Invocation>,controls:ref<context.Context>)->inference.Observation effects {alloc}{
+ if not invocation.fixed{
+  var observation:inference.Observation=inference.finish(array.borrow(controls.streams,0),struct.borrow(invocation,field=schedule),struct.borrow(invocation,field=options))
+  observation.segment_seconds_ignored=false
+  return observation}
+ inference.Observation{seed:0,shifts:invocation.schedule.request.count,groups:invocation.schedule.groups,reserved_forwards:invocation.schedule.forwards,segment_frames:invocation.schedule.plan.segment,segment_seconds_ignored:false}
+}

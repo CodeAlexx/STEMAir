@@ -1,0 +1,44 @@
+module stemair.temporal.session
+import "network.ai" as network
+import "device.ai" as device
+import "host_session.ai" as host
+import "../waveform/config.ai" as config
+import "../waveform/audio.ai" as audio
+import "../ops.ai" as ops
+import "../recording_shifts.ai" as shifts
+import "../recording_moments.ai" as source_moments
+import "../audio_normalization.ai" as normalization
+import std.tensor as tensor
+
+pub type Session=struct{network:network.Network,cpu:array<host.Prepared>,cpu_preparations:u64=0}
+pub fn prepare_cpu(s:ref<Session>)->result<unit,string> effects {alloc} {
+ if array.len(s.cpu)==0{array.push(s.cpu,try host.prepare(struct.borrow(s,field=network)))
+  s.cpu_preparations+=1}
+ if array.len(s.cpu)!=1{return result.err("CPU temporal session must own one retained weight bank")}
+ result.ok(())
+}
+pub fn open(path:str,settings:ref<config.Config>)->result<Session,string> effects {alloc,fs.read} {
+ let _=try config.validate(settings)
+ if str.view(settings.engine)!="temporal"{return result.err("Temporal profile engine differs")}
+ let n:network.Network=try network.open(path,settings.generation)
+ result.ok(Session{network:n,cpu:[]})
+}
+fn temporal_predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ device.forward(context,stream,parameters,n,input,cancel)
+}
+fn temporal_length(n:ref<network.Network>,length:u64)->result<u64,string> effects {alloc} {
+ network.valid_length(n,length)
+}
+pub fn separate(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if n.options.generation!=c.generation{return result.err("Temporal generation differs from retained network")}
+ let prepared:normalization.Prepared=try source_moments.prepare(input,2)
+ audio.separate_prepared(context,stream,parameters,n,c,prepared,cancel,progress,temporal_predict,temporal_length)
+}
+
+pub fn separate_scheduled(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,c:ref<config.Config>,schedule:ref<shifts.Schedule>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if n.options.generation!=c.generation{return result.err("Temporal generation differs from retained network")}
+ let prepared:normalization.Prepared=try source_moments.prepare(input,2)
+ audio.separate_scheduled_prepared(context,stream,parameters,n,c,schedule,prepared,cancel,progress,temporal_predict,temporal_length)
+}

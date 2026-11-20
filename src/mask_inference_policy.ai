@@ -1,0 +1,71 @@
+module stemair.mask_inference_policy
+import "artifact_cleanup_policy.ai" as cleanup_policy
+import "../toolkit/mask/request.ai" as request
+import std.codec as codec
+import std.text as text
+
+// This snapshot belongs to one accepted request, never to checkpoint identity.
+pub type Controls=struct{tta:i64=-1,window:u64=0,aggression:f64=-1.0} derive codec(strict)
+pub fn validate(value:ref<Controls>)->result<unit,string> effects {alloc} {
+ var policy:request.Policy=request.defaults()
+ policy.tta=cast.sat(value.tta)
+ policy.window=value.window
+ policy.aggression=value.aggression
+ request.validate_policy(policy)
+}
+pub fn decode(raw:str)->result<Controls,string> effects {alloc} {
+ if str.len(raw)==0{return result.ok(Controls{})}
+ if str.len(raw)>512{return result.err("Accepted mask controls exceed their bound")}
+ var value:Controls=try Controls_decode(raw) map_err codec.describe
+ let _=try validate(value)
+ result.ok(value)
+}
+pub fn encode(value:ref<Controls>)->result<string,string> effects {alloc} {
+ let _=try validate(value)
+ result.ok(try Controls_encode(value) map_err codec.describe)
+}
+fn integer(value:str)->result<u64,string> effects {alloc} {
+ if str.len(value)==0 or str.len(value)>4{return result.err("Enter a whole number or Default")}
+ var i:u64=0
+ loop{if i==str.len(value){break}
+  let digit:u8=cast.bits(view.get(str.bytes(value),i))
+  if digit<48 or digit>57{return result.err("Enter a whole number or Default")}
+  i+=1}
+ match text.parse_u64(value){some(v)=>result.ok(v),none=>result.err("Enter a bounded whole number")}
+}
+pub fn current(tta:f64,window:str,aggression:str)->result<string,string> effects {alloc} {
+ if tta!=0.0 and tta!=1.0 and tta!=2.0{return result.err("Choose model default, TTA off or TTA on")}
+ var value:Controls=Controls{tta:if tta==0.0{-1}else{if tta==1.0{0}else{1}}}
+ if window!="Default"{value.window=try integer(window)
+  if value.window==0{return result.err("Use Default to inherit the model window")}}
+ if aggression!="Default"{
+  let amount:u64=try integer(aggression)
+  if amount>50{return result.err("Mask aggression must be a whole number from 0 to 50")}
+  value.aggression=cast.float(amount)/100.0}
+ encode(value)
+}
+pub fn cli(tta:str,window:u64,aggression:i64)->result<string,string> effects {alloc} {
+ if tta!="default" and tta!="off" and tta!="on"{return result.err("Mask TTA must be default, off or on")}
+ if aggression< -1 or aggression>50{return result.err("Mask aggression must be -1 for model default or 0 to 50")}
+ var value:Controls=Controls{tta:if tta=="default"{-1}else{if tta=="off"{0}else{1}},window:window,
+  aggression:if aggression== -1{-1.0}else{cast.float(aggression)/100.0}}
+ encode(value)
+}
+pub fn resolve(choice:u32,enabled:bool,threshold:f64,raw:str)->result<request.Policy,string> effects {alloc} {
+ let selected:Controls=try decode(raw)
+ var policy:request.Policy=try cleanup_policy.request(choice,enabled,threshold)
+ policy.tta=cast.sat(selected.tta)
+ policy.window=selected.window
+ policy.aggression=selected.aggression
+ result.ok(policy)
+}
+pub fn edit_window(candidate:str,previous:str)->result<string,string> effects {alloc} {
+ if result.is_ok(current(0.0,candidate,"Default")){return result.ok(string.copy(candidate))}
+ let _=try current(0.0,previous,"Default")
+ result.ok(string.copy(previous))
+}
+pub fn edit_aggression(candidate:str,previous:str)->result<string,string> effects {alloc} {
+ if result.is_ok(current(0.0,"Default",candidate)){return result.ok(string.copy(candidate))}
+ let _=try current(0.0,"Default",previous)
+ result.ok(string.copy(previous))
+}

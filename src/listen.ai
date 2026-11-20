@@ -1,0 +1,228 @@
+module stemair.listen
+import "../../AIR/toolkits/desktop/ui.ai" as desk
+import std.codec as codec
+import std.desktop_launch as launch
+import std.files as files
+import std.path as path
+import std.text as text
+import std.float as fp
+import std.json as json
+
+pub type State=struct{selection:string,file:string,root:string,files:array<string>,
+ loaded:bool=false,playing:bool=false,ended:bool=false,position:f64=0.0,duration:f64=0.0,
+ volume:f64=0.75,muted:bool=false,last_text:string=""}
+type Catalog=struct{files:array<string>,entries:u64=0,directories:u64=0}
+pub fn empty()->State effects {alloc} {State{selection:"",file:"",root:"",files:[]}}
+pub fn supported(file:str)->bool effects {alloc} {
+ let suffix:string=text.lower_ascii(path.extension(file))
+ suffix==".wav" or suffix==".flac" or suffix==".mp3" or suffix==".ogg" or suffix==".opus" or
+ suffix==".m4a" or suffix==".aac" or suffix==".wma" or suffix==".aif" or suffix==".aiff" or
+ suffix==".mp4" or suffix==".webm" or suffix==".mkv"
+}
+fn absolute(file:str)->result<string,string> effects {alloc,fs.read} {
+ if path.is_absolute(file){return result.ok(path.normalize(file))}
+ let root:string=match files.cwd(){ok(v)=>v,err(_)=>{return result.err("Cannot resolve the selected audio path")}}
+ result.ok(path.normalize(path.join(root,file)))
+}
+pub fn audio_path(file:str)->result<string,string> effects {alloc,fs.read,fs.meta} {
+ if str.len(file)==0{return result.err("Choose a recording or result to play")}
+ if not supported(file){return result.err("Choose a supported audio or media file")}
+ let resolved:string=try absolute(file)
+ if not match files.is_file(resolved){ok(v)=>v,err(_)=>false}{return result.err("The selected audio file is unavailable")}
+ result.ok(resolved)
+}
+pub fn directory_path(directory:str)->result<string,string> effects {alloc,fs.read,fs.meta} {
+ if str.len(directory)==0{return result.err("Choose an output or results folder")}
+ let resolved:string=try absolute(directory)
+ if not match files.is_dir(resolved){ok(v)=>v,err(_)=>false}{return result.err("The selected folder is unavailable")}
+ result.ok(resolved)
+}
+fn collect(directory:str,depth:u64,c:ref<Catalog>)->result<unit,string> effects {alloc,fs.meta} {
+ c.directories+=1
+ if c.directories>256{return result.err("Too many result folders; choose a more specific folder")}
+ let names:array<string>=match files.list_dir(directory){ok(v)=>v,err(_)=>{return result.err("Cannot read the results folder")}}
+ var i:u64=0
+ loop{if i==array.len(names){break}
+  c.entries+=1
+  if c.entries>10000{return result.err("Too many result entries; choose a more specific folder")}
+  let file:string=path.join(directory,array.get(names,i))
+  let info:fs.meta=match files.symlink_metadata(file){ok(v)=>v,err(_)=>{return result.err("A result changed while the folder was being read; refresh again")}}
+  if not info.is_symlink{
+   if info.is_dir{
+    if depth>=5{return result.err("Result folders are nested too deeply; choose a more specific folder")}
+    let _=try collect(file,depth+1,c)}
+   if info.is_file and supported(file){
+    if array.len(c.files)==4096{return result.err("Too many audio results; choose a more specific folder")}
+    array.push(c.files,file)}}
+  i+=1}
+ result.ok(())
+}
+pub fn catalog(directory:str)->result<array<string>,string> effects {alloc,fs.read,fs.meta} {
+ let root:string=try directory_path(directory)
+ var found:Catalog=Catalog{files:[]}
+ let _=try collect(root,0,found)
+ result.ok(struct.replace(found,[],field=files))
+}
+pub fn open_folder(directory:str)->result<unit,string> effects {alloc,env,fs.read,fs.meta,process,time} {
+ let folder:string=try directory_path(directory)
+ launch.open(folder)
+}
+pub fn open_external(file:str)->result<unit,string> effects {alloc,env,fs.read,fs.meta,process,time} {
+ let selected:string=try audio_path(file)
+ launch.open(selected)
+}
+pub fn reveal(file:str)->result<unit,string> effects {alloc,env,fs.read,fs.meta,process,time} {
+ let selected:string=try audio_path(file)
+ launch.open(path.dirname(selected))
+}
+fn stamp(seconds:f64)->string effects {alloc} {
+ let whole:u64=cast.sat(fp.floor(seconds))
+ let part:u64=whole%60
+ text.concat(string.from_int(whole/60),text.concat(":",text.concat(if part<10{"0"}else{""},string.from_int(part))))
+}
+fn display(app:ref<desk.Session>,c:ref<State>)->unit effects {alloc,net,time} {
+ let phase:str=if c.ended{"Finished"}else{if c.playing{"Playing"}else{if c.loaded{"Paused"}else{"No audio loaded"}}}
+ let label:string=text.concat(phase,text.concat(" — ",text.concat(stamp(c.position),text.concat(" / ",text.concat(stamp(c.duration),if c.muted{" (muted)"}else{""})))))
+ if label!=c.last_text{let _=desk.set_text(app,"audio_status",label)
+  c.last_text=label}
+ let _=desk.set_number(app,"audio_seek","value",if c.duration>0.0{100.0*c.position/c.duration}else{0.0})
+ let _=desk.set_bool(app,"audio_seek","sensitive",c.loaded and c.duration>0.0)
+ ()
+}
+pub fn clear_results(app:ref<desk.Session>,c:ref<State>,directory:str)->result<unit,string> effects {alloc,net,time} {
+ var out:codec.Writer=desk.command("items","audio_results")
+ codec.key(out,"items")
+ codec.begin_array(out)
+ codec.end_array(out)
+ let _=try desk.submit(app,out)
+ c.files=[]
+ c.root=string.copy(directory)
+ let _=try desk.set_text(app,"audio_folder",directory)
+ desk.set_text(app,"audio_results_status","Refresh to list results for this session.")
+}
+pub fn refresh(app:ref<desk.Session>,c:ref<State>,directory:str)->result<unit,string> effects {alloc,fs.read,fs.meta,net,time,io.write} {
+ let root:string=try directory_path(directory)
+ let found:array<string>=try catalog(root)
+ var out:codec.Writer=desk.command("items","audio_results")
+ codec.key(out,"items")
+ codec.begin_array(out)
+ var i:u64=0
+ loop{if i==array.len(found){break}
+  let file:str=array.get(found,i)
+  let label:string=match path.relative_absolute(file,root){ok(v)=>match v{some(name)=>name,none=>path.basename(file)},err(_)=>path.basename(file)}
+  codec.begin_object(out)
+  codec.field_text(out,"key",file)
+  codec.field_text(out,"label",label)
+  codec.field_text(out,"icon","audio-x-generic-symbolic")
+  codec.end_object(out)
+  i+=1}
+ codec.end_array(out)
+ let _=try desk.submit(app,out)
+ c.root=root
+ c.files=found
+ let _=desk.set_text(app,"audio_folder",c.root)
+ let _=desk.set_text(app,"audio_results_status",text.concat(string.from_int(array.len(c.files))," audio results. Select a file to preview; activate it to play."))
+ io.write(text.concat("Audio results: ",text.concat(string.from_int(array.len(c.files)),text.concat(" files in ",text.concat(c.root,"\n")))))
+ result.ok(())
+}
+pub fn load(app:ref<desk.Session>,c:ref<State>,file:str,playing:bool)->result<unit,string> effects {alloc,fs.read,fs.meta,net,time} {
+ let selected:string=try audio_path(file)
+ var out:codec.Writer=desk.command("video","audio_player")
+ codec.field_text(out,"path",selected)
+ codec.field_bool(out,"playing",playing)
+ codec.field_bool(out,"muted",c.muted)
+ codec.field_f64(out,"volume",c.volume)
+ let _=try desk.submit(app,out)
+ c.selection=string.copy(selected)
+ c.file=selected
+ c.loaded=true
+ c.playing=false
+ c.ended=false
+ c.position=0.0
+ c.duration=0.0
+ let _=desk.set_text(app,"audio_file",c.selection)
+ let _=desk.set_text(app,"audio_status","Loading audio…")
+ c.last_text=""
+ result.ok(())
+}
+pub fn play(app:ref<desk.Session>,c:ref<State>)->result<unit,string> effects {alloc,fs.read,fs.meta,net,time} {
+ let selected:string=try audio_path(c.selection)
+ if c.loaded and selected==c.file{
+  if c.ended{let _=try desk.seek(app,"audio_player",0.0)}
+  return desk.pause(app,"audio_player",true)}
+ load(app,c,selected,true)
+}
+pub fn stop(app:ref<desk.Session>,c:ref<State>)->result<unit,string> effects {alloc,net,time,io.write} {
+ let _=try desk.clear_video(app,"audio_player")
+ c.loaded=false
+ c.playing=false
+ c.ended=false
+ c.position=0.0
+ c.duration=0.0
+ display(app,c)
+ io.write("Audio: stopped\n")
+ result.ok(())
+}
+pub fn report(app:ref<desk.Session>,message:str)->unit effects {alloc,net,time,io.write} {
+ let label:string=text.concat("Audio playback: ",message)
+ let _=desk.set_text(app,"audio_status",label)
+ io.write(text.concat(label,"\n"))
+ ()
+}
+pub fn selected(c:ref<State>,key:str)->bool effects {} {
+ var i:u64=0
+ loop{if i==array.len(c.files){break}
+  if array.get(c.files,i)==key{return true}
+  i+=1}
+ false
+}
+pub fn change(app:ref<desk.Session>,c:ref<State>,event:ref<json.Document>)->result<bool,string> effects {alloc,net,time} {
+ let id:string=desk.field(event,"id")
+ if id=="audio_file"{c.selection=desk.field(event,"value")
+  return result.ok(true)}
+ if id=="audio_muted"{c.muted=desk.boolean(event,"value")
+  let _=try desk.muted(app,"audio_player",c.muted)
+  return result.ok(true)}
+ if id=="audio_volume"{
+  let value:f64=desk.number(event,"value")
+  if not fp.is_finite(value) or value<0.0 or value>100.0{return result.err("Audio volume must be between 0 and 100 percent")}
+  c.volume=value/100.0
+  let _=try desk.volume(app,"audio_player",value/100.0)
+  return result.ok(true)}
+ if id=="audio_seek"{
+  let value:f64=desk.number(event,"value")
+  if not fp.is_finite(value) or value<0.0 or value>100.0{return result.err("Audio position must be between 0 and 100 percent")}
+  if c.loaded and c.duration>0.0{let _=try desk.seek(app,"audio_player",c.duration*value/100.0)}
+  return result.ok(true)}
+ result.ok(false)
+}
+pub fn observe(app:ref<desk.Session>,c:ref<State>,event:ref<json.Document>)->unit effects {alloc,net,time,io.write} {
+ if desk.field(event,"event")=="error"{
+  let message:string=text.concat("Audio playback: ",desk.field(event,"message"))
+  let _=desk.set_text(app,"audio_status",message)
+  io.write(text.concat(message,"\n"))
+  c.loaded=false
+  c.playing=false
+  let _=desk.clear_video(app,"audio_player")
+  return}
+ if not c.loaded{return}
+ let position:f64=desk.number(event,"position")
+ let duration:f64=desk.number(event,"duration")
+ if not fp.is_finite(position) or not fp.is_finite(duration) or position<0.0 or duration<0.0{return}
+ let playing:bool=desk.boolean(event,"playing")
+ let ended:bool=desk.boolean(event,"ended")
+ let muted:bool=desk.boolean(event,"muted")
+ let volume:f64=desk.number(event,"volume")
+ let changed:bool=c.playing!=playing or c.ended!=ended or (c.duration==0.0 and duration>0.0) or fp.abs(c.position-position)>0.5
+ c.position=if position>duration and duration>0.0{duration}else{position}
+ c.duration=duration
+ c.ended=ended
+ c.playing=playing and not ended
+ c.muted=muted
+ if fp.is_finite(volume) and volume>=0.0 and volume<=1.0{c.volume=volume}
+ let _=desk.set_bool(app,"audio_muted","active",c.muted)
+ let _=desk.set_number(app,"audio_volume","value",c.volume*100.0)
+ display(app,c)
+ if changed{io.write(text.concat("Audio: ",text.concat(c.last_text,"\n")))}
+ ()
+}

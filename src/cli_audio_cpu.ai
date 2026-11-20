@@ -1,0 +1,209 @@
+module stemair.cli_audio_cpu
+import "application.ai" as app
+import "learned_cleanup_single.ai" as learned_single
+import "learned_cleanup_output.ai" as learned_output
+import "../toolkit/numeric.ai" as numeric
+import "cli_audio_policy.ai" as policy
+import "cpu_model_runtime.ai" as cpu_runtime
+import "checked_input.ai" as checked
+import "model_input.ai" as model_input
+import "../toolkit/recording_sources.ai" as recording_sources
+import "container_export.ai" as container
+import "secondary_application.ai" as secondary_app
+import "model_ensemble_application.ai" as model_app
+import "ensemble_processing_application.ai" as processing_app
+import "../toolkit/engine.ai" as engine
+import "../toolkit/model_cache.ai" as cache
+import "../toolkit/secondary.ai" as secondary
+import "../toolkit/secondary_config.ai" as secondary_config
+import "../toolkit/model_ensemble.ai" as models
+import "../toolkit/model_ensemble_config.ai" as model_config
+import "../toolkit/ensemble_processing.ai" as processing
+import "../toolkit/control.ai" as control
+import "../toolkit/audio_result.ai" as audio_result
+import "../toolkit/mask/request.ai" as mask_request
+import "../toolkit/recording_context.ai" as recording_context
+import "../toolkit/cpu_inference.ai" as cpu_inference
+import "recording_inference_policy.ai" as recording_policy
+import "../toolkit/typed_secondary_cpu.ai" as typed_secondary_cpu
+import "../toolkit/typed_secondary.ai" as typed_secondary
+import "../toolkit/typed_model_ensemble.ai" as typed_models
+import "../toolkit/typed_ensemble_processing.ai" as typed_processing
+import "../toolkit/typed_ensemble_processing_cpu.ai" as typed_processing_cpu
+import "../toolkit/typed_source_wave.ai" as typed_source
+import "secondary_resource_policy.ai" as resources
+import std.audio as audio
+import std.text as text
+
+// CPU orchestration deliberately does not import device workers or job.ai.
+type Single=struct{settings:engine.Profile,values:array<f32>,lower:array<f32>}
+fn prepare_single(configuration:str,input:str,directory:str,cancel:str,plan:ref<container.Plan>,log:ref<container.Journal>,options:ref<checked.Options>)->result<Single,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var settings:engine.Profile=try engine.read_typed(configuration)
+ let _=try app.preflight_to(directory,array.len(settings.targets),plan,log)
+ var inputs:recording_sources.Set=recording_sources.empty()
+ var accepted:array<engine.Profile>=[try engine.decode_typed(settings.identity)]
+ let source:audio.AudioBuffer=try model_input.prepare_into(try policy.absolute(input),settings.sample_rate,accepted,options,inputs) map_err app.recording_error
+ let frames:u64=audio.num_frames(source)
+ if frames>9223372036854775807{return result.err("Stereo output extent overflows")}
+ let _=try container.preflight_extent(frames*2,settings.sample_rate,2,plan)
+ let values:array<f32>=try app.planar(source,settings.sample_rate) map_err app.recording_error
+ let lower:array<f32>=try recording_sources.lower(inputs,settings.identity,typed_source.Limits{max_working_bytes:resources.limits().max_working_bytes})
+ result.ok(Single{settings:settings,values:values,lower:lower})
+}
+fn export_single(bank:ref<cache.Cache>,settings:ref<engine.Profile>,output:ref<audio_result.Samples>,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let samples:u64=audio_result.count(output)/(2*array.len(settings.targets))
+ app.export_typed_to(directory,settings.sample_rate,struct.borrow(settings,field=targets),output,samples,
+  if output.precision==audio_result.Precision.Float64{"native-air-cpu-f64"}else{"native-air-cpu-f32"},cache.loads(bank),cancel,progress,plan,log)
+}
+pub fn single(bank:ref<cache.Cache>,configuration:str,checkpoint:str,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:ref<checked.Options>)->result<unit,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ let _=try cache.require_cpu_policy(bank)
+ var prepared:Single=try prepare_single(configuration,input,directory,cancel,plan,log,options)
+ let copy:engine.Profile=try engine.decode_typed(prepared.settings.identity)
+ let index:u64=try cache.acquire_typed(bank,checkpoint,copy)
+ let model:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,index),field=model)
+ var output:audio_result.Samples=try engine.separate_cpu_typed(model,array.view(prepared.values),cancel,progress)
+ export_single(bank,struct.borrow(prepared,field=settings),output,directory,cancel,progress,plan,log)
+}
+pub fn single_prepared(bank:ref<cache.Cache>,configuration:str,checkpoint:str,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:ref<checked.Options>,root:str)->result<unit,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var request:mask_request.Policy=mask_request.defaults()
+ single_prepared_with_policy(bank,configuration,checkpoint,input,directory,cancel,progress,plan,log,options,root,request)
+}
+pub fn single_prepared_with_policy(bank:ref<cache.Cache>,configuration:str,checkpoint:str,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:ref<checked.Options>,root:str,request:ref<mask_request.Policy>)->result<unit,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let _=try mask_request.validate_policy(request)
+ var prepared:Single=try prepare_single(configuration,input,directory,cancel,plan,log,options)
+ var selected:option<cache.CpuBackend>=if cpu_runtime.needs_selection(bank,struct.borrow(prepared,field=settings)){try cpu_runtime.selected(root,struct.borrow(prepared,field=settings))}else{option.none()}
+ let copy:engine.Profile=try engine.decode_typed(prepared.settings.identity)
+ let index:u64=try cache.acquire_cpu_typed(bank,checkpoint,copy,selected)
+ let _=try cache.prepare_learned_cpu(bank)
+ var output:audio_result.Samples=try cache.separate_cpu_typed_with_policy_and_band_input(bank,index,array.view(prepared.values),cancel,progress,request,array.view(prepared.lower))
+ export_single(bank,struct.borrow(prepared,field=settings),output,directory,cancel,progress,plan,log)
+}
+pub fn secondary_job(bank:ref<cache.Cache>,settings:ref<secondary_config.Recipe>,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:checked.Options own)->result<unit,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ let _=try cache.require_cpu_policy(bank)
+ var selected:option<checked.Options>=option.some(options)
+ var prepared:secondary_app.Prepared=try secondary_app.prepare_with_input_to(bank,settings,try policy.absolute(input),directory,cancel,progress,plan,selected)
+ var output:secondary.Output=try secondary.separate_cpu(bank,struct.borrow(prepared,field=bindings),struct.borrow(prepared,field=plan),settings,array.view(prepared.input),cancel,progress)
+ secondary_app.export_to(bank,settings,prepared,output,false,cancel,progress,plan,log)
+}
+pub fn ensemble_job(bank:ref<cache.Cache>,settings:ref<model_config.Recipe>,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:checked.Options own)->result<unit,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ let _=try cache.require_cpu_policy(bank)
+ var selected:option<checked.Options>=option.some(options)
+ if processing_app.enabled(settings){
+  var prepared:processing_app.Prepared=try processing_app.prepare_with_input_to(bank,settings,try policy.absolute(input),directory,false,cancel,progress,plan,selected)
+  var output:processing.Output=try processing.separate_cpu_as(bank,struct.borrow(prepared,field=members),struct.borrow(prepared,field=options),array.view(prepared.input),cancel,progress,plan.working_wav)
+  return processing_app.export_to(bank,prepared,output,false,cancel,progress,plan,log)}
+ var prepared:model_app.Prepared=try model_app.prepare_with_input_to(bank,settings,try policy.absolute(input),directory,cancel,progress,plan,selected)
+ var output:models.Output=try models.separate_cpu_as(bank,array.view(prepared.members),struct.borrow(prepared,field=options),array.view(prepared.input),cancel,progress,plan.working_wav)
+ model_app.export_to(bank,settings,prepared,output,false,cancel,progress,plan,log)
+}
+
+pub fn secondary_prepared(bank:ref<cache.Cache>,settings:ref<secondary_config.Recipe>,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:checked.Options own,root:str)->result<unit,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var request:mask_request.Policy=mask_request.defaults()
+ secondary_prepared_with_policy(bank,settings,input,directory,cancel,progress,plan,log,options,root,request)
+}
+pub fn secondary_prepared_with_policy(bank:ref<cache.Cache>,settings:ref<secondary_config.Recipe>,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:checked.Options own,root:str,request:ref<mask_request.Policy>)->result<unit,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let _=try mask_request.validate_policy(request)
+ var selected:option<checked.Options>=option.some(options)
+ var prepared:secondary_app.Prepared=try secondary_app.prepare_cpu_with_input_to(bank,settings,try policy.absolute(input),directory,cancel,progress,plan,selected,root)
+ var output:secondary.Output=try secondary.separate_cpu_prepared_with_policy(bank,struct.borrow(prepared,field=bindings),struct.borrow(prepared,field=plan),settings,array.view(prepared.input),cancel,progress,request)
+ secondary_app.export_to(bank,settings,prepared,output,false,cancel,progress,plan,log)
+}
+pub fn ensemble_prepared(bank:ref<cache.Cache>,settings:ref<model_config.Recipe>,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:checked.Options own,root:str)->result<unit,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var request:mask_request.Policy=mask_request.defaults()
+ ensemble_prepared_with_policy(bank,settings,input,directory,cancel,progress,plan,log,options,root,request)
+}
+pub fn ensemble_prepared_with_policy(bank:ref<cache.Cache>,settings:ref<model_config.Recipe>,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:checked.Options own,root:str,request:ref<mask_request.Policy>)->result<unit,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let _=try mask_request.validate_policy(request)
+ var selected:option<checked.Options>=option.some(options)
+ if processing_app.enabled(settings){
+  var prepared:processing_app.Prepared=try processing_app.prepare_cpu_with_input_to(bank,settings,try policy.absolute(input),directory,cancel,progress,plan,selected,root)
+  var output:processing.Output=try processing.separate_cpu_prepared_with_policy_as(bank,struct.borrow(prepared,field=members),struct.borrow(prepared,field=options),array.view(prepared.input),cancel,progress,request,plan.working_wav)
+  return processing_app.export_to(bank,prepared,output,false,cancel,progress,plan,log)}
+ var prepared:model_app.Prepared=try model_app.prepare_cpu_with_input_to(bank,settings,try policy.absolute(input),directory,cancel,progress,plan,selected,root)
+ var output:models.Output=try models.separate_cpu_prepared_with_policy_as(bank,array.view(prepared.members),struct.borrow(prepared,field=options),array.view(prepared.input),cancel,progress,request,plan.working_wav)
+ model_app.export_to(bank,settings,prepared,output,false,cancel,progress,plan,log)
+}
+
+pub fn single_prepared_controlled(bank:ref<cache.Cache>,configuration:str,checkpoint:str,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:ref<checked.Options>,root:str,request:ref<mask_request.Policy>,recording:ref<recording_context.Context>)->result<unit,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, random, time} {
+ let _=try mask_request.validate_policy(request)
+ let _=try recording_context.validate(recording)
+ var prepared:Single=try prepare_single(configuration,input,directory,cancel,plan,log,options)
+ var learned=cache.learned_settings(bank)
+ let _=try recording_policy.ensure_source_defaults(recording,struct.borrow(prepared,field=settings),options.limits.max_decoded_bytes)
+ var learned_plan:container.Plan=try learned_output.planned(plan,struct.borrow(prepared.settings,field=targets),learned,false,false)
+ let _=try app.preflight_to(directory,array.len(learned_plan.source_names),learned_plan,log)
+ var selected:option<cache.CpuBackend>=if cpu_runtime.needs_selection(bank,struct.borrow(prepared,field=settings)){try cpu_runtime.selected(root,struct.borrow(prepared,field=settings))}else{option.none()}
+ let copy:engine.Profile=try engine.decode_typed(prepared.settings.identity)
+ let index:u64=try cache.acquire_cpu_typed(bank,checkpoint,copy,selected)
+ let _=try cache.prepare_learned_cpu(bank)
+ var output:audio_result.Samples=try cpu_inference.separate_with_policy_and_band_input(bank,index,array.view(prepared.values),cancel,progress,request,recording,array.view(prepared.lower))
+ if learned.noise or learned.room{
+  var master:audio_result.Samples=audio_result.from_single(numeric.copy(array.view(prepared.values)))
+  var waves:array<typed_source.Wave>=try learned_single.finish_cpu(bank,prepared.settings.kind,struct.borrow(prepared.settings,field=targets),master,output,cancel,typed_source.Limits{max_working_bytes:8589934592},array.view(recording.frequency_reference))
+  return app.export_waves_to(directory,prepared.settings.sample_rate,waves,"native-air-cpu-typed",cache.loads(bank)+cache.learned_loads(bank),cancel,progress,learned_plan,log)}
+ export_single(bank,struct.borrow(prepared,field=settings),output,directory,cancel,progress,plan,log)
+}
+pub fn secondary_prepared_controlled(bank:ref<cache.Cache>,settings:ref<secondary_config.Recipe>,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:checked.Options own,root:str,request:ref<mask_request.Policy>,recording:ref<recording_context.Context>)->result<unit,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, random, time} {
+ let _=try recording_context.validate(recording)
+ let configurations:array<string>=recording_policy.configurations<secondary_config.Model>(struct.borrow(settings,field=models))
+ let _=try recording_policy.ensure_sources(recording,configurations,options.limits.max_decoded_bytes)
+ var selected:option<checked.Options>=option.some(options)
+ var inputs:recording_sources.Set=recording_sources.empty()
+ var prepared:secondary_app.Prepared=try secondary_app.prepare_typed_with_sources_to(bank,settings,input,directory,cancel,plan,selected,false,root,inputs)
+ let _=try cache.prepare_learned_cpu(bank)
+ let master:audio_result.Samples=audio_result.from_single(struct.replace(prepared,[],field=input))
+ var output:typed_secondary.Output=try typed_secondary_cpu.separate_with_policy_controlled_inputs(bank,struct.borrow(prepared,field=bindings),struct.borrow(prepared,field=plan),settings,master,resources.limits(),plan.working_wav,request,cancel,progress,recording,inputs)
+ secondary_app.export_typed_to(bank,settings,prepared,output,false,cancel,progress,plan,log)
+}
+pub fn ensemble_prepared_controlled(bank:ref<cache.Cache>,settings:ref<model_config.Recipe>,input:str,directory:str,cancel:str,progress:str,
+ plan:ref<container.Plan>,log:ref<container.Journal>,options:checked.Options own,root:str,request:ref<mask_request.Policy>,recording:ref<recording_context.Context>)->result<unit,string>
+ effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, random, time} {
+ let _=try recording_context.validate(recording)
+ var configurations:array<string>=recording_policy.configurations<model_config.Model>(struct.borrow(settings,field=models))
+ var member:u64=0
+ loop{if member==array.len(settings.models){break}
+  let _=try recording_policy.include_processing(configurations,array.borrow(settings.models,member).processing)
+  member+=1}
+ let _=try recording_policy.ensure_sources(recording,configurations,options.limits.max_decoded_bytes)
+ var selected:option<checked.Options>=option.some(options)
+ var inputs:recording_sources.Set=recording_sources.empty()
+ let budget:typed_secondary_cpu.Limits=resources.limits()
+ if processing_app.enabled(settings){
+  var prepared:processing_app.Prepared=try processing_app.prepare_typed_with_sources_to(bank,settings,input,directory,cancel,plan,selected,false,root,inputs)
+ let _=try cache.prepare_learned_cpu(bank)
+  let master:audio_result.Samples=audio_result.from_single(struct.replace(prepared,[],field=input))
+  let limits:typed_processing.Limits=typed_processing.Limits{max_retained_bytes:budget.max_retained_bytes,max_working_bytes:budget.max_working_bytes,allow_provisional_spectral:budget.allow_provisional_spectral}
+  var output:typed_processing.Output=try typed_processing_cpu.separate_with_policy_as_controlled_inputs(bank,struct.borrow(prepared,field=members),struct.borrow(prepared,field=options),master,cancel,progress,request,plan.working_wav,limits,recording,inputs)
+  return processing_app.export_typed_to(bank,prepared,output,false,cancel,progress,plan,log)}
+ var prepared:model_app.Prepared=try model_app.prepare_typed_with_sources_to(bank,settings,input,directory,cancel,progress,plan,selected,false,root,inputs)
+ let _=try cache.prepare_learned_cpu(bank)
+ let limits:typed_source.Limits=typed_source.Limits{max_working_bytes:budget.max_working_bytes,allow_provisional_spectral:budget.allow_provisional_spectral}
+ var output:typed_models.Output=try typed_models.separate_cpu_with_policy_as_controlled_inputs(bank,array.view(prepared.members),struct.borrow(prepared,field=options),array.view(prepared.input),cancel,progress,request,plan.working_wav,limits,recording,inputs)
+ model_app.export_typed_to(bank,settings,prepared,output,false,cancel,progress,plan,log)
+}

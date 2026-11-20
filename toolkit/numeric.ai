@@ -1,0 +1,58 @@
+module stemair.numeric
+import std.float as fp
+
+pub fn zeros(count:u64)->array<f32> effects {alloc} {
+ var out:array<f32>=[]
+ array.reserve(out,count)
+ var i:u64=0
+ loop{if i>=count{break}
+  array.push(out,0.0)
+  i+=1}
+ out
+}
+pub fn finite(values:view<f32>)->bool effects {} {
+ var i:u64=0
+ loop{if i>=view.len(values){break}
+  if not fp.is_finite(view.get(values,i)){return false}
+  i+=1}
+ true
+}
+pub fn normalize_peak(values:ref<array<f32>>,enabled:bool)->result<unit,string> effects {alloc} {
+ if not finite(array.view(values)){return result.err("Non-finite audio samples")}
+ if not enabled{return result.ok(())}
+ var peak:f32=0.0
+ var i:u64=0
+ loop{if i==array.len(values){break}
+  let value:f32=fp.abs(array.get(values,i))
+  if value>peak{peak=value}
+  i+=1}
+ if peak>1.0{
+  i=0
+  loop{if i==array.len(values){break}
+   array.set(values,i,array.get(values,i)/peak)
+   i+=1}}
+ result.ok(())
+}
+pub fn copy(values:view<f32>)->array<f32> effects {alloc} {
+ var out:array<f32>=[]
+ array.reserve(out,view.len(values))
+ var i:u64=0
+ loop{if i>=view.len(values){break}
+  array.push(out,view.get(values,i))
+  i+=1}
+ out
+}
+pub fn fit_stereo(input:view<f32>,frames:u64)->result<array<f32>,string> effects {alloc} {
+ if view.len(input)==0 or view.len(input)%2!=0 or frames==0 or frames>268435456 or not finite(input){return result.err("Invalid stereo source extent")}
+ let size:u64=view.len(input)/2
+ var output:array<f32>=[]
+ array.reserve(output,2*frames)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var time:u64=0
+  loop{if time==frames{break}
+   array.push(output,if time<size{view.get(input,channel*size+time)}else{0.0})
+   time+=1}
+  channel+=1}
+ result.ok(output)
+}

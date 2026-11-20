@@ -1,0 +1,308 @@
+// Explicit bounded recording recipe. Existing short interfaces are separate.
+module stemair.recording_alignment
+import "coarse_alignment.ai" as coarse
+import "recording_resources.ai" as resources
+import "alignment_options.ai" as options
+import "initial_polarity.ai" as initial
+import "leading_silence.ai" as silence
+import "recording_preparation.ai" as preparation
+import "local_residual.ai" as local
+import "local_phase_search.ai" as phase_search
+import "numeric.ai" as num
+import "control.ai" as control
+import std.cpu_dot as dot
+import std.cpu_fft as fft
+import std.libm as libm
+import std.cabi as native
+import std.float as fp
+import std.pairwise_mean as mean
+import std.text as text
+
+pub type Limits=resources.Limits
+
+pub type Prepared=struct{first:array<f32>,raw_second:array<f64>,frames:u64,channels:u64,
+ decision:initial.Decision,reference_silence:silence.End,target_silence:silence.End,
+ silence_delta:i64,adjusted_second_frames:u64,raw_second_promoted:bool,intro_index:u64,lags:array<coarse.Lag>}
+
+pub type PreparedInputs=struct{first:array<f32>,second:array<f32>,frames:u64,other_frames:u64,channels:u64,first_input_channels:u64,second_input_channels:u64,
+ decision:initial.Decision,reference_silence:silence.End,target_silence:silence.End,silence_delta:i64,adjusted_second_frames:u64}
+fn copy_end(value:ref<silence.End>)->silence.End effects {alloc} {
+ silence.End{frame:value.frame,channel:value.channel,energies:num.copy(array.view(value.energies))}
+}
+pub fn prepare_inputs(engine:ref<dot.Engine>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,limits:Limits,cancel:str,progress:str)
+ ->result<PreparedInputs,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let recipe:preparation.Recipe=preparation.Recipe{polarity:preparation.Polarity.Automatic,match_silence:true}
+ var selected:preparation.Inputs=try preparation.prepare(engine,first,first_channels,second,second_channels,recipe,limits,cancel,progress)
+ let shape:preparation.Geometry=selected.geometry
+ let observed:ref<preparation.Observation>=struct.borrow(selected,field=observation)
+ let decision:initial.Decision=match observed.automatic{some(value)=>value,none=>{return result.err("Default preparation has no automatic observation")}}
+ let reference:silence.End=match struct.borrow(observed,field=reference_silence){some(value)=>copy_end(value),none=>{return result.err("Default preparation has no reference silence observation")}}
+ let target:silence.End=match struct.borrow(observed,field=target_silence){some(value)=>copy_end(value),none=>{return result.err("Default preparation has no target silence observation")}}
+ let a:array<f32>=struct.replace(selected,[],field=first)
+ let b:array<f32>=struct.replace(selected,[],field=second)
+ result.ok(PreparedInputs{first:a,second:b,frames:shape.frames,other_frames:shape.other_frames,channels:shape.channels,first_input_channels:shape.first_input_channels,second_input_channels:shape.second_input_channels,
+  decision:decision,reference_silence:reference,target_silence:target,silence_delta:shape.silence_delta,adjusted_second_frames:shape.adjusted_second_frames})
+}
+fn input_geometry(inputs:ref<PreparedInputs>)->preparation.Geometry effects {} {
+ preparation.Geometry{frames:inputs.frames,other_frames:inputs.other_frames,channels:inputs.channels,first_input_channels:inputs.first_input_channels,second_input_channels:inputs.second_input_channels,silence_delta:inputs.silence_delta,adjusted_second_frames:inputs.adjusted_second_frames}
+}
+pub fn prepare_intro(engine:ref<dot.Engine>,inputs:ref<PreparedInputs>,divisor:u64,limits:Limits,cancel:str,progress:str)->result<Prepared,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let shape:preparation.Geometry=input_geometry(inputs)
+ var estimate:preparation.Estimate=try preparation.estimate_views(engine,array.view(inputs.first),array.view(inputs.second),shape,divisor,limits,cancel,progress)
+ materialize_at(inputs,array.view(estimate.lags),estimate.index,limits,cancel)
+}
+pub type IntroEstimate=struct{divisor:u64,index:u64,lags:array<coarse.Lag>,unmatched_frames:u64,promoted:bool}
+fn materialize_at(inputs:ref<PreparedInputs>,lags:view<coarse.Lag>,index:u64,limits:Limits,cancel:str)->result<Prepared,string> effects {alloc,fs.meta} {
+ let frames:u64=inputs.frames
+ let other:u64=inputs.other_frames
+ let channels:u64=inputs.channels
+ if channels!=1 and channels!=2{return result.err("Prepared input channels differ")}
+ if view.len(lags)!=channels or array.len(inputs.first)!=(try resources.multiply(frames,channels)) or array.len(inputs.second)!=(try resources.multiply(other,channels)){return result.err("Prepared intro extents differ")}
+ let _=try resources.plan(frames,inputs.first_input_channels,other,inputs.second_input_channels,limits,true)
+ let shape:preparation.Geometry=input_geometry(inputs)
+ var matched:preparation.Matched=try preparation.match_views(array.view(inputs.first),array.view(inputs.second),shape,lags,index,limits,cancel)
+ let first:array<f32>=struct.replace(matched,[],field=first)
+ let second:array<f64>=struct.replace(matched,[],field=raw_second)
+ let copied_lags:array<coarse.Lag>=struct.replace(matched,[],field=lags)
+ result.ok(Prepared{first:first,raw_second:second,frames:frames,channels:channels,decision:inputs.decision,
+  reference_silence:copy_end(inputs.reference_silence),target_silence:copy_end(inputs.target_silence),silence_delta:inputs.silence_delta,adjusted_second_frames:inputs.adjusted_second_frames,
+  raw_second_promoted:matched.raw_second_promoted,intro_index:index,lags:copied_lags})
+}
+pub fn estimate_intro(engine:ref<dot.Engine>,inputs:ref<PreparedInputs>,divisor:u64,limits:Limits,cancel:str,progress:str)->result<IntroEstimate,string> effects {alloc,ffi,fs.meta,fs.write} {
+ // Raw views are discarded after recording a small estimate; audio remains resident.
+ var prepared:Prepared=try prepare_intro(engine,inputs,divisor,limits,cancel,progress)
+ let lag:i64=array.get(prepared.lags,0).samples
+ let count:u64=inputs.adjusted_second_frames
+ let unmatched:u64=if lag>=0{try resources.checked_add(count,cast.wrap(lag))}else{count-cast.wrap(-lag)}
+ let empty:array<coarse.Lag>=[]
+ let lags:array<coarse.Lag>=struct.replace(prepared,empty,field=lags)
+ result.ok(IntroEstimate{divisor:divisor,index:prepared.intro_index,lags:lags,unmatched_frames:unmatched,promoted:prepared.raw_second_promoted})
+}
+pub fn materialize_intro(inputs:ref<PreparedInputs>,estimate:ref<IntroEstimate>,limits:Limits,cancel:str)->result<Prepared,string> effects {alloc,fs.meta} {
+ materialize_at(inputs,array.view(estimate.lags),estimate.index,limits,cancel)
+}
+
+pub fn prepare_factory_limited(engine:ref<dot.Engine>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,limits:Limits,cancel:str,progress:str)->result<Prepared,string> effects {alloc,ffi,fs.meta,fs.write} {
+ var inputs:PreparedInputs=try prepare_inputs(engine,first,first_channels,second,second_channels,limits,cancel,progress)
+ prepare_intro(engine,inputs,10,limits,cancel,progress)
+}
+
+pub fn factory_gains(math:ref<CAbiLibrary>)->result<array<f64>,string> effects {alloc,ffi} {
+ var gains:array<f64>=[]
+ array.push(gains,try libm.pow(math,10.0,-6.0/20.0) map_err native.error_message)
+ var i:u64=0
+ loop{if i==12{break}
+  let exponent:f64=cast.float(i)/20.0
+  array.push(gains,try libm.pow(math,10.0,exponent) map_err native.error_message)
+  i+=1}
+ result.ok(gains)
+}
+
+pub type GainStep=struct{start:u64,channel:u64,selected:u64,costs:array<f64>,peaks:array<u64>,delays:array<i64>,
+ candidate_residual_sha256:array<string>,selected_sha256:string,sub_sha256:string,divider_sha256:string}
+pub type FactoryOutput=struct{preparation:Prepared,residual:array<f32>,aligned:array<f32>,
+ normalization:local.Normalized,steps:array<GainStep>}
+
+// Scalar-key dictionary semantics: equal keys replace values but keep their
+// insertion position; min scans the unique keys in their original order.
+fn select_ordered_costs(costs:view<f64>)->result<u64,string> effects {alloc} {
+ var keys:array<f64>=[]
+ var values:array<u64>=[]
+ var i:u64=0
+ loop{if i==view.len(costs){break}
+  let cost:f64=view.get(costs,i)
+  var key:u64=0
+  loop{if key==array.len(keys) or cost==array.get(keys,key){break}
+   key+=1}
+  if key==array.len(keys){array.push(keys,cost)
+   array.push(values,i)}else{array.set(values,key,i)}
+  i+=1}
+ var best:u64=0
+ i=1
+ loop{if i==array.len(keys){break}
+  if array.get(keys,i)<array.get(keys,best){best=i}
+  i+=1}
+ result.ok(array.get(values,best))
+}
+pub fn select_costs(costs:view<f64>)->result<u64,string> effects {alloc} {
+ if view.len(costs)==0 or view.len(costs)>12{return result.err("Factory gain selection requires one to12 costs")}
+ select_ordered_costs(costs)
+}
+pub fn select_choice_costs(costs:view<f64>)->result<u64,string> effects {alloc} {
+ if view.len(costs)==0 or view.len(costs)>82{return result.err("Alignment choices require one to82 candidate costs")}
+ select_ordered_costs(costs)
+}
+fn digest64(values:view<f64>)->result<string,string> effects {alloc} {
+ let packed:dot.BufferF64=try dot.pack_f64(values)
+ result.ok(bytes.hex(hash.sha256(bytes.view(packed.data))))
+}
+fn affected_digest(values:view<f32>,channels:u64,start:u64,ch:u64,size:u64)->result<string,string> effects {alloc} {
+ var samples:array<f32>=[]
+ array.reserve(samples,size)
+ var i:u64=0
+ loop{if i==size{break}
+  array.push(samples,view.get(values,(start+i)*channels+ch))
+  i+=1}
+ let packed:dot.Buffer=try dot.pack(array.view(samples))
+ result.ok(bytes.hex(hash.sha256(bytes.view(packed.data))))
+}
+pub type LocalPass=struct{normalization:local.Normalized,steps:array<GainStep>}
+fn select_window(fft_engine:ref<fft.Engine>,math:ref<CAbiLibrary>,a:view<f32>,b:view<f64>,weights:view<f64>,gains:view<f64>,choice:local.WindowChoice,phase:local.PhaseChoice,hann:local.Recipe,cancel:str,capture:bool)->result<phase_search.Selection,string> effects {alloc,ffi,fs.meta} {
+ let phase_count:u64=local.phase_count(phase)
+ if phase_count>2{return phase_search.select(fft_engine,math,a,b,weights,gains,choice,phase,hann,cancel,capture)}
+ let size:u64=local.window_frames(choice)
+ let candidate_count:u64=(view.len(gains)-1)*phase_count
+ var candidates:array<local.WindowResult>=[]
+ var costs:array<f64>=[]
+ var peaks:array<u64>=[]
+ var delays:array<i64>=[]
+ var hashes:array<string>=[]
+ var i:u64=0
+ loop{if i==candidate_count{break}
+  if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+  let value:local.WindowResult=try local.window_residual_with_phase_and_gains(fft_engine,a,b,weights,1,0,0,choice,phase_count==2 and i%2==1,view.get(gains,0),view.get(gains,i/phase_count+1))
+  var absolute:array<f64>=[]
+  var j:u64=0
+  loop{if j==size{break}
+   array.push(absolute,fp.abs(array.get(value.residual,j)))
+   j+=1}
+  array.push(costs,mean.mean_f64(array.view(absolute)))
+  array.push(peaks,value.step.peak_index)
+  array.push(delays,value.step.delay)
+  if capture{array.push(hashes,try digest64(array.view(value.residual)))}
+  array.push(candidates,value)
+  i+=1}
+ let selected:u64=try select_ordered_costs(array.view(costs))
+ let chosen_ref:ref<local.WindowResult>=array.borrow(candidates,selected)
+ let old_step:local.Step=chosen_ref.step
+ let chosen_residual:array<f64>=struct.replace(chosen_ref,[],field=residual)
+ result.ok(phase_search.Selection{value:local.WindowResult{residual:chosen_residual,step:old_step},selected:selected,costs:costs,peaks:peaks,delays:delays,hashes:hashes})
+}
+fn process_local_views(fft_engine:ref<fft.Engine>,math:ref<CAbiLibrary>,first:view<f32>,raw_second:view<f64>,frames:u64,channels:u64,hann:local.Recipe,choice:local.WindowChoice,gain_choice:options.GainChoice,phase:local.PhaseChoice,max_working_bytes:u64,cancel:str,progress:str,capture:bool)->result<LocalPass,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if (channels!=1 and channels!=2){return result.err("Local prepared channels differ")}
+ let samples:u64=try resources.multiply(frames,channels)
+ if view.len(first)!=samples or view.len(raw_second)!=samples{return result.err("Local prepared extents differ")}
+ let candidate_count_plan:u64=options.gain_steps(gain_choice)*local.phase_count(phase)
+ let per_channel:u64=if frames>local.window_frames(choice){1+(frames-local.window_frames(choice)-1)/local.hop_frames(choice)}else{0}
+ let step_count:u64=try resources.multiply(per_channel,channels)
+ let reservation:u64=try resources.checked_add(if capture{2048}else{512},try resources.multiply(candidate_count_plan,if capture{256}else{48}))
+ let retained:u64=try resources.checked_add(try resources.multiply(samples,20),try resources.multiply(try resources.capacity(samples),9))
+ let workspace:u64=if local.phase_count(phase)>2{try resources.local_phase_workspace(local.window_frames(choice),candidate_count_plan)}else{try resources.local_workspace(local.window_frames(choice),candidate_count_plan)}
+ let required:u64=try resources.checked_add(try resources.checked_add(retained,workspace),try resources.multiply(step_count,reservation))
+ if required>max_working_bytes{return result.err("Local prepared pass exceeds the caller working-memory limit")}
+ let gains:array<f64>=if gain_choice==options.GainChoice.Medium{try factory_gains(math)}else{try options.gains(math,gain_choice)}
+ let size:u64=local.window_frames(choice)
+ let hop:u64=local.hop_frames(choice)
+ let weights:array<f64>=try local.hann_for_window(math,hann,choice)
+ var sub:array<f32>=num.zeros(frames*channels)
+ var divider:array<f32>=num.zeros(frames*channels)
+ var steps:array<GainStep>=[]
+ var ch:u64=0
+ loop{if ch==channels{break}
+  if frames>size{
+   var start:u64=0
+   loop{if start>=frames-size{break}
+    if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+    control.status(progress,text.concat("Local window ",string.from_int(array.len(steps))))
+    var a:array<f32>=[]
+    var b:array<f64>=[]
+    array.reserve(a,size)
+    array.reserve(b,size)
+    var i:u64=0
+    loop{if i==size{break}
+     let at:u64=(start+i)*channels+ch
+     array.push(a,view.get(first,at))
+     array.push(b,view.get(raw_second,at))
+     i+=1}
+    var selection:phase_search.Selection=try select_window(fft_engine,math,array.view(a),array.view(b),array.view(weights),array.view(gains),choice,phase,hann,cancel,capture)
+    let chosen_ref:ref<local.WindowResult>=struct.borrow(selection,field=value)
+    let old_step:local.Step=chosen_ref.step
+    let empty_residual:array<f64>=[]
+    let chosen_residual:array<f64>=struct.replace(chosen_ref,empty_residual,field=residual)
+    var chosen:local.WindowResult=local.WindowResult{residual:chosen_residual,
+     step:local.Step{start:start,channel:ch,peak_index:old_step.peak_index,delay:old_step.delay}}
+    let _=try local.accumulate_for_window(sub,divider,chosen,array.view(weights),channels,choice)
+    let selected_hash:string=if capture{try digest64(array.view(chosen.residual))}else{string.copy("")}
+    let sub_hash:string=if capture{try affected_digest(array.view(sub),channels,start,ch,size)}else{string.copy("")}
+    let divider_hash:string=if capture{try affected_digest(array.view(divider),channels,start,ch,size)}else{string.copy("")}
+    let costs:array<f64>=struct.replace(selection,[],field=costs)
+    let peaks:array<u64>=struct.replace(selection,[],field=peaks)
+    let delays:array<i64>=struct.replace(selection,[],field=delays)
+    let hashes:array<string>=struct.replace(selection,[],field=hashes)
+    array.push(steps,GainStep{start:start,channel:ch,selected:selection.selected,costs:costs,peaks:peaks,delays:delays,
+     candidate_residual_sha256:hashes,selected_sha256:selected_hash,sub_sha256:sub_hash,divider_sha256:divider_hash})
+    start+=hop}}
+  ch+=1}
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ let normalized:local.Normalized=try local.normalize(array.view(sub),array.view(divider))
+ result.ok(LocalPass{normalization:normalized,steps:steps})
+
+}
+pub fn process_prepared_choices(fft_engine:ref<fft.Engine>,math:ref<CAbiLibrary>,prepared:ref<Prepared>,hann:local.Recipe,choice:local.WindowChoice,gain_choice:options.GainChoice,phase:local.PhaseChoice,max_working_bytes:u64,cancel:str,progress:str,capture:bool)->result<LocalPass,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let frames:u64=prepared.frames
+ let channels:u64=prepared.channels
+ process_local_views(fft_engine,math,array.view(prepared.first),array.view(prepared.raw_second),frames,channels,hann,choice,gain_choice,phase,max_working_bytes,cancel,progress,capture)
+}
+pub fn process_matched_choices(fft_engine:ref<fft.Engine>,math:ref<CAbiLibrary>,prepared:ref<preparation.Matched>,hann:local.Recipe,choice:local.WindowChoice,gain_choice:options.GainChoice,phase:local.PhaseChoice,max_working_bytes:u64,cancel:str,progress:str,capture:bool)->result<LocalPass,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let frames:u64=prepared.frames
+ let channels:u64=prepared.channels
+ process_local_views(fft_engine,math,array.view(prepared.first),array.view(prepared.raw_second),frames,channels,hann,choice,gain_choice,phase,max_working_bytes,cancel,progress,capture)
+}
+
+fn process_recipe(dot_engine:ref<dot.Engine>,fft_engine:ref<fft.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,
+ hann:local.Recipe,limits:Limits,cancel:str,progress:str,capture:bool,choice:local.WindowChoice,gain_choice:options.GainChoice,phase:local.PhaseChoice,prechecked:bool)->result<FactoryOutput,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if not prechecked{let _=try resources.plan(view.len(first)/(if first_channels==0{1}else{first_channels}),first_channels,view.len(second)/(if second_channels==0{1}else{second_channels}),second_channels,limits,capture)}
+ var prepared:Prepared=try prepare_factory_limited(dot_engine,first,first_channels,second,second_channels,resources.Limits{max_decoded_bytes:limits.max_decoded_bytes,max_working_bytes:18446744073709551615},cancel,progress)
+ var pass:LocalPass=try process_prepared_choices(fft_engine,math,prepared,hann,choice,gain_choice,phase,18446744073709551615,cancel,progress,capture)
+ let empty_normalization:local.Normalized=local.Normalized{division:[],mask:b"",selected:[]}
+ let normalized:local.Normalized=struct.replace(pass,empty_normalization,field=normalization)
+ let empty_steps:array<GainStep>=[]
+ let steps:array<GainStep>=struct.replace(pass,empty_steps,field=steps)
+ let frames:u64=prepared.frames
+ let channels:u64=prepared.channels
+ var residual:array<f32>=[]
+ var aligned:array<f32>=[]
+ array.reserve(residual,frames*channels)
+ array.reserve(aligned,frames*channels)
+ var i:u64=0
+ loop{if i==frames*channels{break}
+  if i%4096==0 and control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+  let value:f32=array.get(normalized.selected,i)
+  let clipped:f32=if value< -1.0{-1.0}else{if value>1.0{1.0}else{value}}
+  array.push(residual,clipped)
+  array.push(aligned,array.get(prepared.first,i)-clipped)
+  i+=1}
+ result.ok(FactoryOutput{preparation:prepared,residual:residual,aligned:aligned,normalization:normalized,steps:steps})
+}
+fn process_mode(dot_engine:ref<dot.Engine>,fft_engine:ref<fft.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,
+ hann:local.Recipe,limits:Limits,cancel:str,progress:str,capture:bool)->result<FactoryOutput,string> effects {alloc,ffi,fs.meta,fs.write} {
+ process_recipe(dot_engine,fft_engine,math,first,first_channels,second,second_channels,hann,limits,cancel,progress,capture,local.WindowChoice.QuarterSecond,options.GainChoice.Medium,local.PhaseChoice.Unchanged,false)
+}
+pub fn process_factory(dot_engine:ref<dot.Engine>,fft_engine:ref<fft.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,
+ hann:local.Recipe,cancel:str,progress:str)->result<FactoryOutput,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if first_channels==0 or second_channels==0 or view.len(first)/first_channels>1323001 or view.len(second)/second_channels>1323020{return result.err("Recording alignment exceeds its qualified recording bound")}
+ process_mode(dot_engine,fft_engine,math,first,first_channels,second,second_channels,hann,resources.Limits{max_decoded_bytes:22000000,max_working_bytes:1073741824},cancel,progress,false)
+}
+pub fn process_factory_captured(dot_engine:ref<dot.Engine>,fft_engine:ref<fft.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,
+ hann:local.Recipe,cancel:str,progress:str)->result<FactoryOutput,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if first_channels==0 or second_channels==0 or view.len(first)/first_channels>1323001 or view.len(second)/second_channels>1323020{return result.err("Recording alignment exceeds its qualified recording bound")}
+ process_mode(dot_engine,fft_engine,math,first,first_channels,second,second_channels,hann,resources.Limits{max_decoded_bytes:22000000,max_working_bytes:1073741824},cancel,progress,true)
+}
+
+pub fn prepare_factory(engine:ref<dot.Engine>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,cancel:str,progress:str)->result<Prepared,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if first_channels==0 or second_channels==0 or view.len(first)/first_channels>1323001 or view.len(second)/second_channels>1323020{return result.err("Recording alignment exceeds its qualified recording bound")}
+ prepare_factory_limited(engine,first,first_channels,second,second_channels,resources.Limits{max_decoded_bytes:22000000,max_working_bytes:1073741824},cancel,progress)
+}
+pub fn process_factory_limited(dot_engine:ref<dot.Engine>,fft_engine:ref<fft.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,hann:local.Recipe,limits:Limits,cancel:str,progress:str)->result<FactoryOutput,string> effects {alloc,ffi,fs.meta,fs.write} {
+ process_mode(dot_engine,fft_engine,math,first,first_channels,second,second_channels,hann,limits,cancel,progress,false)
+}
+pub fn process_factory_captured_limited(dot_engine:ref<dot.Engine>,fft_engine:ref<fft.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,hann:local.Recipe,limits:Limits,cancel:str,progress:str)->result<FactoryOutput,string> effects {alloc,ffi,fs.meta,fs.write} {
+ process_mode(dot_engine,fft_engine,math,first,first_channels,second,second_channels,hann,limits,cancel,progress,true)
+}
+
+pub fn process_choices(dot_engine:ref<dot.Engine>,fft_engine:ref<fft.Engine>,math:ref<CAbiLibrary>,first:view<f32>,first_channels:u64,second:view<f32>,second_channels:u64,
+ hann:local.Recipe,choice:local.WindowChoice,gain:options.GainChoice,phase:local.PhaseChoice,limits:Limits,cancel:str,progress:str,capture:bool)->result<FactoryOutput,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let candidates:u64=options.gain_steps(gain)*local.phase_count(phase)
+ let _=try resources.plan_search_choices(view.len(first)/(if first_channels==0{1}else{first_channels}),first_channels,view.len(second)/(if second_channels==0{1}else{second_channels}),second_channels,limits,capture,local.window_frames(choice),local.hop_frames(choice),candidates,local.phase_count(phase)>2)
+ process_recipe(dot_engine,fft_engine,math,first,first_channels,second,second_channels,hann,limits,cancel,progress,capture,choice,gain,phase,true)
+}

@@ -1,0 +1,98 @@
+module stemair.sinc_resample
+import "sinc_coefficients.ai" as coefficients
+import "numeric.ai" as num
+import std.float as fp
+
+pub type Plan=struct{ratio:f64,increment:u64,scale:f64,coefficients:array<f32>}
+fn round_even(x:f64)->u64 effects {} {
+ let base:u64=cast.sat(x)
+ let fraction:f64=x-cast.float(base)
+ if fraction>0.5 or (fraction==0.5 and base%2!=0){base+1}else{base}
+}
+pub fn plan(input_rate:u32,output_rate:u32)->result<Plan,string> effects {alloc} {
+ if input_rate<1000 or input_rate>192000 or output_rate<1000 or output_rate>192000{return result.err("Unsupported audio sample rate")}
+ plan_fractional(cast.float(input_rate),cast.float(output_rate))
+}
+// Pitch resampling uses a fractional target rate before fixing the exported
+// sample-rate tag. Keep that rate in F64 instead of rounding it to an integer.
+pub fn plan_fractional(input_rate:f64,output_rate:f64)->result<Plan,string> effects {alloc} {
+ if not fp.is_finite(input_rate) or not fp.is_finite(output_rate) or input_rate<1000.0 or input_rate>192000.0 or output_rate<1000.0 or output_rate>192000.0{
+  return result.err("Unsupported audio sample rate")}
+ let ratio:f64=output_rate/input_rate
+ let scale:f64=if ratio<1.0{ratio}else{1.0}
+ let increment:u64=round_even(128.0*scale*4096.0)
+ var values:array<f32>=[]
+ let source:view<f32>=coefficients.values()
+ var i:u64=0
+ loop{if i>=view.len(source){break}
+  array.push(values,view.get(source,i))
+  i+=1}
+ result.ok(Plan{ratio:ratio,increment:increment,scale:scale,coefficients:values})
+}
+fn coefficient(p:ref<Plan>,index:u64)->f64 effects {} {
+ let at:u64=index/4096
+ let fraction:f64=cast.float(index%4096)/4096.0
+ let first:f32=array.get(p.coefficients,at)
+ let delta:f32=array.get(p.coefficients,at+1)-first
+ cast.float(first)+fraction*cast.float(delta)
+}
+// Whole-buffer constant-ratio sinc with the original 12-bit coefficient phase,
+// far-to-near left/right F64 sums and final F32 output. The source wrapper
+// generates floor(N*ratio) samples; its audio layer pads to ceil(N*ratio).
+pub fn apply(p:ref<Plan>,input:view<f32>,channels:u64)->result<array<f32>,string> effects {alloc} {
+ if channels==0 or channels>8 or view.len(input)==0 or view.len(input)%channels!=0 or
+  view.len(input)>317520000 or not num.finite(input){return result.err("Expected bounded finite planar audio")}
+ if array.len(p.coefficients)!=2464 or p.increment==0 or not fp.is_finite(p.ratio) or p.ratio<0.00390625 or p.ratio>256.0{
+  return result.err("Invalid sinc resampling plan")}
+ if p.ratio==1.0{return result.ok(num.copy(input))}
+ let samples:u64=view.len(input)/channels
+ let extent:f64=cast.float(samples)*p.ratio
+ let generated:u64=cast.sat(extent)
+ let count:u64=cast.sat(fp.ceil(extent))
+ if count==0 or count>317520000/channels{return result.err("Resampled audio exceeds its memory bound")}
+ var output:array<f32>=[]
+ array.reserve(output,channels*count)
+ let maximum:u64=2462*4096
+ var channel:u64=0
+ loop{if channel>=channels{break}
+  var position:u64=0
+  var phase:f64=0.0
+  var i:u64=0
+  loop{if i>=generated{break}
+   let start:u64=round_even(phase*128.0*p.scale*4096.0)
+   let left_count:u64=(maximum-start)/p.increment
+   var j:u64=left_count
+   var left:f64=0.0
+   loop{
+    let filter_index:u64=start+j*p.increment
+    if position>=j and position-j<samples{
+     left+=coefficient(p,filter_index)*cast.float(view.get(input,channel*samples+position-j))}
+    if j==0{break}
+    j-=1}
+   // Rounding the fractional phase can land exactly on the next sample.
+   // The left filter then includes index zero at position+1; the right
+   // filter excludes that same zero index. Preserve that boundary term.
+   if start==p.increment and position+1<samples{
+    left+=coefficient(p,0)*cast.float(view.get(input,channel*samples+position+1))}
+   let right_start:u64=p.increment-start
+   let right_count:u64=(maximum-right_start)/p.increment
+   j=right_count
+   var right:f64=0.0
+   loop{
+    let filter_index:u64=right_start+j*p.increment
+    if filter_index>0 and position+1+j<samples{
+     right+=coefficient(p,filter_index)*cast.float(view.get(input,channel*samples+position+1+j))}
+    if j==0{break}
+    j-=1}
+   array.push(output,cast.float(p.scale*(left+right)))
+   let advanced:f64=phase+1.0/p.ratio
+   let whole:u64=cast.sat(advanced)
+   position+=whole
+   phase=advanced-cast.float(whole)
+   i+=1}
+  loop{if i>=count{break}
+   array.push(output,0.0)
+   i+=1}
+  channel+=1}
+ result.ok(output)
+}

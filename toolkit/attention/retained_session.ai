@@ -1,0 +1,61 @@
+module stemair.attention.retained_session
+import "network.ai" as network
+import "host_session.ai" as cpu_host
+import "device.ai" as device
+import "position.ai" as position
+import "config.ai" as config
+import "../hybrid/frontend.ai" as frontend
+import "../hybrid/device.ai" as layers
+import "../device_ops.ai" as ops
+import "../recording_audio.ai" as recording
+import "../recording_moments.ai" as moments
+import "../audio_normalization.ai" as normalization
+import "../ops.ai" as host
+import std.tensor as tensor
+import std.layer_norm_vectorized as row_norm
+import std.sinusoidal_positions as positions
+import std.mkl_vml as window_math
+
+pub type Work=struct{execution:ops.ExecutionState,frontend:layers.Frontend,length:u64,cpu_threads:u64=2}
+pub type State=struct{network:network.Network,gpu:array<Work>,cpu:array<cpu_host.Prepared>,cpu_preparations:u64=0,requests:u64=0,active_training_length:u64=0}
+pub fn prepare_work(context:ref<GpuContext>,stream:ref<GpuStream>,model:ref<network.Network>,runtime:str,length:u64)->result<Work,string> effects {alloc,ffi,gpu}{
+ if length==0 or length>134217728{return result.err("Invalid complete recording extent")}
+ let policy:ops.ConvolutionPolicy=ops.ConvolutionPolicy{workspace_bytes:2147483648,deterministic:false,allow_tf32:true}
+ var execution:ops.ExecutionState=try ops.prepare_execution(context,policy,ops.ActivationRecipe.OrderedF32,ops.NormalizationRecipe.OrderedF32)
+ execution.projection=ops.ProjectionPolicy{recipe:ops.ProjectionRecipe.EagerF32,workspace_bytes:1048576}
+ execution.transformer_recipe=ops.TransformerRecipe.EfficientF32
+ execution.row_normalizer=option.some(try row_norm.create(context) map_err ops.error)
+ execution.position_engine=option.some(try positions.create(context) map_err ops.error)
+ var library:window_math.Vml=try window_math.open(runtime)
+ execution.frequency_positions=try position.spectral_with_math(library,model.spectral.base.n/512,(model.training_length+model.spectral.base.hop-1)/model.spectral.base.hop,model.transformer.width,10000.0)
+ var transformed:frontend.State=try frontend.create_sources(context,stream,runtime,model.spectral.base.n,model.spectral.base.hop,model.training_length,model.spectral.old,model.source_count)
+ result.ok(Work{execution:execution,frontend:layers.Frontend{retained:option.some(transformed)},length:length})
+}
+pub fn predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<State>,input:ref<tensor.Tensor>,cancel:str)->result<host.Tensor,string> effects {alloc,gpu,fs.meta}{
+ if array.len(s.gpu)!=1{return result.err("Attention GPU work was not prepared")}
+ device.forward_with_frontend(context,stream,parameters,struct.borrow(s,field=network),input,cancel,
+  struct.borrow(array.borrow(s.gpu,0),field=execution),struct.borrow(array.borrow(s.gpu,0),field=frontend))
+}
+pub fn valid_length(s:ref<State>,length:u64)->result<u64,string> effects {alloc}{
+ if length==0 or length>s.network.training_length{return result.err("Attention chunk exceeds its training extent")}
+ result.ok(s.network.training_length)
+}
+pub fn separate(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<State>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write}{
+ let _=try config.validate(c)
+ if array.len(s.gpu)!=1{return result.err("Attention GPU work was not prepared")}
+ if view.len(input)!=2*array.borrow(s.gpu,0).length{return result.err("Retained recording extent differs")}
+ var prepared:normalization.Prepared=try moments.prepare(input,array.borrow(s.gpu,0).cpu_threads)
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{s.network.training_length}
+ let output:array<f32>=try recording.separate_prepared_sources(context,stream,parameters,s,c,size,s.network.source_count,prepared,cancel,progress,predict,valid_length)
+ s.requests+=1
+ result.ok(output)
+}
+pub fn separate_once(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<State>,runtime:str,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,ffi,gpu,fs.meta,fs.write}{
+ if array.len(s.gpu)!=0{return result.err("Previous attention GPU work was not released")}
+ if view.len(input)%2!=0{return result.err("Expected complete stereo recording")}
+ let work:Work=try prepare_work(context,stream,struct.borrow(s,field=network),runtime,view.len(input)/2)
+ array.push(s.gpu,work)
+ let output:result<array<f32>,string>=separate(context,stream,parameters,s,c,input,cancel,progress)
+ s.gpu=[]
+ output
+}

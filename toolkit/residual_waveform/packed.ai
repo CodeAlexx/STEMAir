@@ -1,0 +1,182 @@
+module stemair.residual_waveform.packed
+import "../weights.ai" as weights
+import std.pytorch_checkpoint as ck
+import std.table as table
+import std.text as text
+import std.float as fp
+import "../grouped_weights.ai" as grouped
+pub type Spec=struct{name:string,shape:array<u64>,elements:u64}
+fn error(s:str)->string effects {alloc}{text.concat("Packed residual checkpoint: ",s)}
+fn add_spec(specs:ref<array<Spec>>,name:str,shape:array<u64> own)->unit effects {alloc}{
+ var n:u64=1
+ var i:u64=0
+ loop{if i==array.len(shape){break}
+  n*=array.get(shape,i)
+  i+=1}
+ array.push(specs,Spec{name:string.copy(name),shape:shape,elements:n})
+}
+fn pair(specs:ref<array<Spec>>,name:str,shape:array<u64> own,bias:u64)->unit effects {alloc}{
+ add_spec(specs,text.concat(name,".weight"),shape)
+ add_spec(specs,text.concat(name,".bias"),[bias])
+}
+fn key(base:str,index:u64)->string effects {alloc}{text.concat(text.concat(base,"."),string.from_int(index))}
+fn recurrent(specs:ref<array<Spec>>,base:str,h:u64)->unit effects {alloc}{
+ var layer:u64=0
+ loop{if layer==2{break}
+  var direction:u64=0
+  loop{if direction==2{break}
+   let tail:string=text.concat(text.concat("_l",string.from_int(layer)),if direction==0{""}else{"_reverse"})
+   add_spec(specs,text.concat(text.concat(base,".lstm.weight_ih"),tail),[4*h,if layer==0{h}else{2*h}])
+   add_spec(specs,text.concat(text.concat(base,".lstm.weight_hh"),tail),[4*h,h])
+   add_spec(specs,text.concat(text.concat(base,".lstm.bias_ih"),tail),[4*h])
+   add_spec(specs,text.concat(text.concat(base,".lstm.bias_hh"),tail),[4*h])
+   direction+=1}
+  layer+=1}
+ pair(specs,text.concat(base,".linear"),[h,2*h],h)
+}
+// Literal constructor registration order; not a guessed state-dict/shape zip.
+pub fn specifications()->array<Spec> effects {alloc}{
+ var out:array<Spec>=[]
+ var level:u64=0
+ var input:u64=2
+ var c:u64=64
+ loop{if level==6{break}
+  let base:string=key("encoder",level)
+  pair(out,text.concat(base,".0"),[c,input,8],c)
+  if level>=4{pair(out,text.concat(base,".1"),[c],c)}
+  var depth:u64=0
+  loop{if depth==2{break}
+   let p:string=key(text.concat(base,".3.layers"),depth)
+   let h:u64=c/4
+   pair(out,text.concat(p,".0"),[h,c,3],h)
+   pair(out,text.concat(p,".1"),[h],h)
+   var cursor:u64=3
+   if level>=4{
+    recurrent(out,key(p,cursor),h)
+    cursor+=1
+    let a:string=key(p,cursor)
+    pair(out,text.concat(a,".content"),[h,h,1],h)
+    pair(out,text.concat(a,".query"),[h,h,1],h)
+    pair(out,text.concat(a,".key"),[h,h,1],h)
+    pair(out,text.concat(a,".query_decay"),[16,h,1],16)
+    pair(out,text.concat(a,".proj"),[h,h,1],h)
+    cursor+=1}
+   pair(out,key(p,cursor),[2*c,h,1],2*c)
+   pair(out,key(p,cursor+1),[2*c],2*c)
+   add_spec(out,text.concat(key(p,cursor+3),".scale"),[c])
+   depth+=1}
+  input=c
+  c*=2
+  level+=1}
+ var index:u64=0
+ loop{if index==6{break}
+  level=5-index
+  c=64*(1 << cast.wrap(level))
+  let output:u64=if level==0{8}else{c/2}
+  let base:string=key("decoder",index)
+  pair(out,text.concat(base,".0"),[c,output,8],output)
+  if level>=4{pair(out,text.concat(base,".1"),[output],output)}
+  index+=1}
+ out
+}
+fn node(source:ref<ck.InertCheckpoint>,id:u64)->result<ck.InertNode,string> effects {alloc}{
+ if id>=array.len(source.nodes){return result.err(error("node index exceeds arena"))}
+ let n:ref<ck.InertNode>=array.borrow(source.nodes,id)
+ var items:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(n.items){break}
+  array.push(items,array.get(n.items,i))
+  i+=1}
+ result.ok(ck.InertNode{kind:n.kind,number:n.number,word:string.copy(n.word),items:items,tensor:n.tensor})
+}
+fn sequence(source:ref<ck.InertCheckpoint>,id:u64)->result<u64,string> effects {alloc}{
+ let n:ck.InertNode=try node(source,id)
+ if n.kind!=ck.InertKind.Sequence{return result.err(error("sequence required"))}
+ result.ok(array.len(n.items))
+}
+fn number(source:ref<ck.InertCheckpoint>,id:u64)->result<u64,string> effects {alloc}{
+ let n:ck.InertNode=try node(source,id)
+ if n.kind!=ck.InertKind.Integer{return result.err(error("integer required"))}
+ result.ok(n.number)
+}
+fn boolean(source:ref<ck.InertCheckpoint>,id:u64)->result<bool,string> effects {alloc}{
+ let n:ck.InertNode=try node(source,id)
+ if n.kind!=ck.InertKind.Boolean{return result.err(error("boolean required"))}
+ result.ok(n.number==1)
+}
+fn scalar(source:ref<ck.InertCheckpoint>,id:u64)->result<f64,string> effects {alloc}{
+ let n:ck.InertNode=try node(source,id)
+ if n.kind!=ck.InertKind.FloatBits{return result.err(error("floating scale required"))}
+ let value:f64=cast.bits(n.number)
+ if not fp.is_finite(value){return result.err(error("non-finite scale"))}
+ result.ok(value)
+}
+fn field(source:ref<ck.InertCheckpoint>,id:u64,name:str)->result<u64,string> effects {alloc}{ck.inert_field(source,id,name)}
+fn require_integer(source:ref<ck.InertCheckpoint>,kwargs:u64,name:str,expected:u64)->result<unit,string> effects {alloc}{
+ if (try number(source,try field(source,kwargs,name)))!=expected{return result.err(error(text.concat("constructor differs: ",name)))}
+ result.ok(())
+}
+fn require_boolean(source:ref<ck.InertCheckpoint>,kwargs:u64,name:str,expected:bool)->result<unit,string> effects {alloc}{
+ if (try boolean(source,try field(source,kwargs,name)))!=expected{return result.err(error(text.concat("constructor differs: ",name)))}
+ result.ok(())
+}
+fn validate_constructor(source:ref<ck.InertCheckpoint>)->result<unit,string> effects {alloc}{
+ let klass:ck.InertNode=try node(source,try field(source,source.root,"klass"))
+ if klass.kind!=ck.InertKind.Global or klass.word!="demucs.demucs\nDemucs"{return result.err(error("model class differs"))}
+ if (try sequence(source,try field(source,source.root,"args")))!=0{return result.err(error("positional constructor arguments unsupported"))}
+ let kwargs:u64=try field(source,source.root,"kwargs")
+ try require_integer(source,kwargs,"audio_channels",2)
+ try require_integer(source,kwargs,"samplerate",44100)
+ try require_integer(source,kwargs,"channels",64)
+ try require_integer(source,kwargs,"depth",6)
+ try require_integer(source,kwargs,"lstm_layers",0)
+ try require_integer(source,kwargs,"kernel_size",8)
+ try require_integer(source,kwargs,"stride",4)
+ try require_integer(source,kwargs,"context",1)
+ try require_integer(source,kwargs,"norm_starts",4)
+ try require_integer(source,kwargs,"norm_groups",4)
+ try require_integer(source,kwargs,"dconv_depth",2)
+ try require_integer(source,kwargs,"dconv_mode",1)
+ try require_integer(source,kwargs,"dconv_comp",4)
+ try require_integer(source,kwargs,"dconv_attn",4)
+ try require_integer(source,kwargs,"dconv_lstm",4)
+ try require_boolean(source,kwargs,"rewrite",false)
+ try require_boolean(source,kwargs,"gelu",true)
+ try require_boolean(source,kwargs,"glu",true)
+ try require_boolean(source,kwargs,"normalize",true)
+ try require_boolean(source,kwargs,"resample",true)
+ let growth:ck.InertNode=try node(source,try field(source,kwargs,"growth"))
+ if not ((growth.kind==ck.InertKind.Integer and growth.number==2) or
+  (growth.kind==ck.InertKind.FloatBits and growth.number==4611686018427387904)){
+  return result.err(error("constructor growth differs"))}
+ let sources:u64=try field(source,kwargs,"sources")
+ if (try sequence(source,sources))!=4{return result.err(error("source count differs"))}
+ let labels:array<string>=["drums","bass","other","vocals"]
+ var i:u64=0
+ loop{if i==4{break}
+  let actual:ck.InertNode=try node(source,try ck.inert_child(source,sources,i))
+  let expected:str=array.get(labels,i)
+  if actual.kind!=ck.InertKind.Text or str.view(actual.word)!=expected{return result.err(error("source order differs"))}
+  i+=1}
+ result.ok(())
+}
+fn legacy_error(value:string own)->string effects {alloc}{
+ let prefix:str="Grouped checkpoint: "
+ if str.starts_with(value,prefix){return error(str.slice(value,str.len(prefix),str.len(value)))}
+ value
+}
+pub fn unpack(source:ref<ck.InertCheckpoint>,id:u64,count:u64)->result<array<u16>,string> effects {alloc}{
+ result.ok(try grouped.unpack(source,id,count) map_err legacy_error)
+}
+pub fn open(path:str)->result<weights.Model,string> effects {alloc,fs.read}{
+ var policy:ck.Limits=ck.defaults()
+ policy.archive_bytes=134217728
+ policy.root=ck.Root.ModelState
+ policy.symbolic_classes=true
+ policy.opaque_metadata=true
+ policy.legacy_little_endian=true
+ var source:ck.InertCheckpoint=try ck.open_inert(path,policy)
+ try validate_constructor(source)
+ var specs:array<Spec>=specifications()
+ result.ok(try grouped.restore(source,specs) map_err legacy_error)
+}

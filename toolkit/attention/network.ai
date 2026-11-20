@@ -1,0 +1,57 @@
+module stemair.attention.network
+import "metadata.ai" as metadata
+import "stack.ai" as stack
+import "../weights.ai" as weights
+import "../device_ops.ai" as ops
+import "../hybrid/network.ai" as layers
+import "../hybrid/residual.ai" as residual
+import "../hybrid/spectral.ai" as spectral
+import std.pytorch_checkpoint as checkpoint
+import std.text as text
+
+pub type Network=struct{weights:weights.Model,training_length:u64,source_count:u64=4,projected:bool=true,
+ encoder:array<layers.Encoder>,decoder:array<layers.Decoder>,
+ tencoder:array<layers.Encoder>,tdecoder:array<layers.Decoder>,
+ residuals:array<residual.Block>,embedding:u64,spectral:spectral.Plan,
+ up:option<ops.Convolution>,down:option<ops.Convolution>,time_up:option<ops.Convolution>,time_down:option<ops.Convolution>,
+ transformer:stack.Network}
+fn key(base:str,index:u64)->string effects {alloc} {text.concat(base,string.from_int(index))}
+pub fn open(path:str)->result<Network,string> effects {alloc,fs.read} {
+ var policy:checkpoint.Limits=checkpoint.defaults()
+ policy.root=checkpoint.Root.ModelState
+ policy.symbolic_classes=true
+ policy.opaque_metadata=true
+ policy.rational_metadata=true
+ policy.legacy_little_endian=true
+ var w:weights.Model=try weights.open_promoted(path,policy)
+ let description:metadata.Description=try metadata.inspect(w.metadata)
+ var encoder:array<layers.Encoder>=[]
+ var decoder:array<layers.Decoder>=[]
+ var tencoder:array<layers.Encoder>=[]
+ var tdecoder:array<layers.Decoder>=[]
+ var bank:array<residual.Block>=[]
+ var input:u64=4
+ var input_time:u64=2
+ var channels:u64=48
+ var i:u64=0
+ loop{if i==4{break}
+  array.push(encoder,try layers.bind_encoder(w,bank,key("encoder.",i),input,channels,8,4,2,true,false,false,8,false,false))
+  array.push(tencoder,try layers.bind_encoder(w,bank,key("tencoder.",i),input_time,channels,8,4,2,false,false,false,8,false,false))
+  array.push(decoder,try layers.bind_decoder(w,bank,key("decoder.",3-i),channels,if i==0{4*description.sources}else{input},8,4,2,true,i,8))
+  array.push(tdecoder,try layers.bind_decoder(w,bank,key("tdecoder.",3-i),channels,if i==0{2*description.sources}else{input_time},8,4,2,false,i,8))
+  input=channels
+  input_time=channels
+  channels*=2
+  i+=1}
+ let shape:array<u64>=[512,48]
+ let embedding:u64=try weights.index(w,"freq_emb.embedding.weight",array.view(shape))
+ let up:option<ops.Convolution>=if description.projected{option.some(try ops.bind_conv(w,"channel_upsampler",384,512,1,1,true,false))}else{option.none()}
+ let down:option<ops.Convolution>=if description.projected{option.some(try ops.bind_conv(w,"channel_downsampler",512,384,1,1,true,false))}else{option.none()}
+ let time_up:option<ops.Convolution>=if description.projected{option.some(try ops.bind_conv(w,"channel_upsampler_t",384,512,1,1,true,false))}else{option.none()}
+ let time_down:option<ops.Convolution>=if description.projected{option.some(try ops.bind_conv(w,"channel_downsampler_t",512,384,1,1,true,false))}else{option.none()}
+ var transformer:stack.Network=try stack.bind_width(w,description.width)
+ if array.len(w.parameters.values)!=if description.projected{533}else{525}{return result.err("Attention parameter inventory differs")}
+ result.ok(Network{weights:w,training_length:description.training_length,source_count:description.sources,projected:description.projected,encoder:encoder,decoder:decoder,
+  tencoder:tencoder,tdecoder:tdecoder,residuals:bank,embedding:embedding,spectral:try spectral.plan(4096,false),
+  up:up,down:down,time_up:time_up,time_down:time_down,transformer:transformer})
+}

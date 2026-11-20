@@ -1,0 +1,41 @@
+module stemair.residual_waveform.config
+import std.codec as codec
+import std.files as files
+import std.float as fp
+
+pub type Config=struct{engine:string="residual-waveform",generation:u64=1,sample_rate:u32=44100,packed:bool=false,
+ split:bool=true,shift_offsets:array<u64>,targets:array<string>,segment_samples:u64=0,
+ overlap:f64=0.25,transition_power:f64=1.0} derive codec(strict)
+pub fn validate(c:ref<Config>)->result<unit,string> effects {alloc} {
+ if str.view(c.engine)!="residual-waveform" or c.generation!=1 or c.sample_rate!=44100 or array.len(c.targets)!=4 or
+  array.len(c.shift_offsets)>32 or not fp.is_finite(c.overlap) or c.overlap<0.0 or c.overlap>=1.0 or
+  not fp.is_finite(c.transition_power) or c.transition_power<1.0 or
+  (c.segment_samples!=0 and (c.segment_samples<4410 or c.segment_samples>16711680)){
+  return result.err("Invalid residual waveform profile")}
+ var i:u64=0
+ loop{if i==array.len(c.shift_offsets){break}
+  if array.get(c.shift_offsets,i)>22050{return result.err("Residual waveform shift exceeds half-second range")}
+  i+=1}
+ i=0
+ loop{if i==4{break}
+  let name:str=array.get(c.targets,i)
+  if str.len(name)==0 or str.len(name)>64{return result.err("Invalid residual waveform source name")}
+  var b:u64=0
+  loop{if b==str.len(name){break}
+   let value:u8=cast.bits(view.get(str.bytes(name),b))
+   if not ((value>=97 and value<=122) or (value>=48 and value<=57) or value==45 or value==95){return result.err("Invalid residual waveform source name")}
+   b+=1}
+  var j:u64=0
+  loop{if j==i{break}
+   let other:str=array.get(c.targets,j)
+   if name==other{return result.err("Duplicate residual waveform source name")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn read(path:str)->result<Config,string> effects {alloc,fs.read} {
+ let raw:string=match files.read_text(path){ok(v)=>v,err(_)=>{return result.err("Cannot read residual waveform profile")}}
+ var c:Config=try Config_decode(raw) map_err codec.describe
+ let _=try validate(c)
+ result.ok(c)
+}

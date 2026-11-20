@@ -1,0 +1,226 @@
+// Fixed source window arithmetic extracted without changing the qualified order.
+module stemair.local_residual
+import std.cpu_fft as cpu
+import std.fft as fft
+import std.libm as libm
+import std.vector_math as vector
+import std.cabi as native
+import std.float as fp
+import "numeric.ai" as num
+import "control.ai" as control
+import std.text as text
+import "phase_tracks.ai" as phase
+
+pub type Recipe=enum{WindowsScalar,LinuxVectorRoundoff}
+pub type WindowChoice=enum{SixteenthSecond,EighthSecond,QuarterSecond,HalfSecond,ThreeQuarterSecond,OneSecond,TwoSeconds}
+pub type PhaseChoice=phase.Choice
+pub fn phase_count(choice:PhaseChoice)->u64 effects {} {phase.count(choice)}
+pub fn window_frames(choice:WindowChoice)->u64 effects {} {
+ match choice{SixteenthSecond=>2756,EighthSecond=>5512,QuarterSecond=>11025,HalfSecond=>22050,ThreeQuarterSecond=>33075,OneSecond=>44100,TwoSeconds=>88200}
+}
+pub fn hop_frames(choice:WindowChoice)->u64 effects {} {
+ match choice{SixteenthSecond=>1378,EighthSecond=>2756,QuarterSecond=>5512,HalfSecond=>11025,ThreeQuarterSecond=>16537,OneSecond=>22050,TwoSeconds=>44100}
+}
+pub fn fft_length(choice:WindowChoice)->u64 effects {} {
+ match choice{SixteenthSecond=>5625,EighthSecond=>11250,QuarterSecond=>22500,HalfSecond=>45000,ThreeQuarterSecond=>67500,OneSecond=>90000,TwoSeconds=>177147}
+}
+pub type Step=struct{start:u64,channel:u64,peak_index:u64,delay:i64} derive codec(strict)
+pub type WindowResult=struct{residual:array<f64>,step:Step}
+pub type Normalized=struct{division:array<f32>,mask:bytes,selected:array<f32>}
+pub type Output=struct{residual:array<f32>,steps:array<Step>}
+pub fn hann_for_window(library:ref<CAbiLibrary>,recipe:Recipe,choice:WindowChoice)->result<array<f64>,string> effects {alloc,ffi} {
+ let size:u64=window_frames(choice)
+ let last:i64=cast.sat(size)-1
+ let denominator:f64=cast.float(last)
+ var values:array<f64>=[]
+ var i:u64=0
+ loop{if i==size{break}
+  let index:i64=cast.sat(i)
+  let n:i64=-last+2*index
+  let angle:f64=(3.141592653589793*cast.float(n))/denominator
+  let cosine:f64=if recipe==Recipe.WindowsScalar{try libm.cos(library,angle) map_err native.error_message}else{try vector.cos_pi_roundoff_f64(angle)}
+  array.push(values,0.5+0.5*cosine)
+  i+=1}
+ result.ok(values)
+}
+pub fn hann(library:ref<CAbiLibrary>,recipe:Recipe)->result<array<f64>,string> effects {alloc,ffi} {
+ hann_for_window(library,recipe,WindowChoice.SixteenthSecond)
+}
+fn window_variant(engine:ref<cpu.Engine>,first:view<f32>,second:view<f64>,weights:view<f64>,channels:u64,start:u64,ch:u64,opposite:bool,choice:WindowChoice,base_gain:f64,offset_gain:f64)->result<WindowResult,string> effects {alloc,ffi} {
+ let size:u64=window_frames(choice)
+ if (channels!=1 and channels!=2) or ch>=channels or view.len(weights)!=size or view.len(first)!=view.len(second) or view.len(first)%channels!=0{return result.err("Fixed local window shape is invalid")}
+ let frames:u64=view.len(first)/channels
+ if (size<=22050 and frames>31744) or start>frames or size>frames-start{return result.err("Fixed local window is outside its retained input")}
+ var a:array<f64>=[]
+ var b:array<f64>=[]
+ var i:u64=0
+ loop{if i==size{break}
+  let at:u64=(start+i)*channels+ch
+  let value:f64=cast.float(view.get(first,at))
+  array.push(a,value*view.get(weights,i))
+  let weighted:f64=view.get(second,at)*view.get(weights,i)
+  let first_gain:f64=weighted*base_gain
+  let phased:f64=if opposite{-first_gain}else{first_gain}
+  array.push(b,phased*offset_gain)
+  i+=1}
+ weighted_residual(engine,a,b,start,ch,choice)
+}
+// Inputs already contain the window, base gain, phase and offset gain.
+pub fn weighted_residual(engine:ref<cpu.Engine>,a:ref<array<f64>>,b:ref<array<f64>>,start:u64,ch:u64,choice:WindowChoice)->result<WindowResult,string> effects {alloc,ffi} {
+ let size:u64=window_frames(choice)
+ let padded:u64=fft_length(choice)
+ if array.len(a)!=size or array.len(b)!=size or ch>1{return result.err("Weighted local window shape is invalid")}
+ var padded_a:array<f64>=[]
+ var padded_b:array<f64>=[]
+ var i:u64=0
+ loop{if i==padded{break}
+  array.push(padded_a,if i<size{array.get(a,i)}else{0.0})
+  array.push(padded_b,if i<size{array.get(b,size-1-i)}else{0.0})
+  i+=1}
+ let fa:fft.Complex=if padded<=65536{try cpu.forward(engine,array.view(padded_a))}else{try cpu.forward_bounded(engine,array.view(padded_a),padded)}
+ let fb:fft.Complex=if padded<=65536{try cpu.forward(engine,array.view(padded_b))}else{try cpu.forward_bounded(engine,array.view(padded_b),padded)}
+ var rr:array<f64>=[]
+ var ii:array<f64>=[]
+ var ri:array<f64>=[]
+ var ir:array<f64>=[]
+ i=0
+ loop{if i==array.len(fa.re){break}
+  array.push(rr,array.get(fa.re,i)*array.get(fb.re,i))
+  array.push(ii,array.get(fa.im,i)*array.get(fb.im,i))
+  array.push(ri,array.get(fa.re,i)*array.get(fb.im,i))
+  array.push(ir,array.get(fa.im,i)*array.get(fb.re,i))
+  i+=1}
+ var real:array<f64>=[]
+ var imaginary:array<f64>=[]
+ i=0
+ loop{if i==array.len(rr){break}
+  array.push(real,array.get(rr,i)-array.get(ii,i))
+  array.push(imaginary,array.get(ri,i)+array.get(ir,i))
+  i+=1}
+ let product:fft.Complex=fft.Complex{re:real,im:imaginary}
+ let correlation:array<f64>=if padded<=65536{try cpu.inverse(engine,product,padded)}else{try cpu.inverse_bounded(engine,product,padded,padded)}
+ var peak:u64=0
+ var score:f64=-1.0
+ i=0
+ loop{if i==2*size-1{break}
+  let value:f64=fp.abs(array.get(correlation,i))
+  if value>score{score=value
+   peak=i}
+  i+=1}
+ let lag:i64=cast.sat(peak)-cast.sat(size-1)
+ var difference:array<f64>=[]
+ i=0
+ loop{if i==size{break}
+  var from:i64=cast.sat(i)-lag
+  if from<0{from+=cast.sat(size)}
+  if from>=cast.sat(size){from-=cast.sat(size)}
+  let index:u64=cast.sat(from)
+  array.push(difference,array.get(a,i)-array.get(b,index))
+  i+=1}
+ result.ok(WindowResult{residual:difference,step:Step{start:start,channel:ch,peak_index:peak,delay:lag}})
+}
+pub fn window_residual(engine:ref<cpu.Engine>,first:view<f32>,second:view<f64>,weights:view<f64>,channels:u64,start:u64,ch:u64)->result<WindowResult,string> effects {alloc,ffi} {
+ window_variant(engine,first,second,weights,channels,start,ch,false,WindowChoice.SixteenthSecond,1.0,1.0)
+}
+pub fn window_residual_opposite(engine:ref<cpu.Engine>,first:view<f32>,second:view<f64>,weights:view<f64>,channels:u64,start:u64,ch:u64)->result<WindowResult,string> effects {alloc,ffi} {
+ window_variant(engine,first,second,weights,channels,start,ch,true,WindowChoice.SixteenthSecond,1.0,1.0)
+}
+pub fn window_residual_for_window(engine:ref<cpu.Engine>,first:view<f32>,second:view<f64>,weights:view<f64>,channels:u64,start:u64,ch:u64,choice:WindowChoice)->result<WindowResult,string> effects {alloc,ffi} {
+ window_variant(engine,first,second,weights,channels,start,ch,false,choice,1.0,1.0)
+}
+pub fn window_residual_opposite_for_window(engine:ref<cpu.Engine>,first:view<f32>,second:view<f64>,weights:view<f64>,channels:u64,start:u64,ch:u64,choice:WindowChoice)->result<WindowResult,string> effects {alloc,ffi} {
+ window_variant(engine,first,second,weights,channels,start,ch,true,choice,1.0,1.0)
+}
+pub fn window_residual_with_gains(engine:ref<cpu.Engine>,first:view<f32>,second:view<f64>,weights:view<f64>,channels:u64,start:u64,ch:u64,choice:WindowChoice,base_gain:f64,offset_gain:f64)->result<WindowResult,string> effects {alloc,ffi} {
+ if not fp.is_finite(base_gain) or not fp.is_finite(offset_gain){return result.err("Local gain factors must be finite")}
+ window_variant(engine,first,second,weights,channels,start,ch,false,choice,base_gain,offset_gain)
+}
+pub fn window_residual_with_phase_and_gains(engine:ref<cpu.Engine>,first:view<f32>,second:view<f64>,weights:view<f64>,channels:u64,start:u64,ch:u64,choice:WindowChoice,opposite:bool,base_gain:f64,offset_gain:f64)->result<WindowResult,string> effects {alloc,ffi} {
+ if not fp.is_finite(base_gain) or not fp.is_finite(offset_gain){return result.err("Local gain factors must be finite")}
+ window_variant(engine,first,second,weights,channels,start,ch,opposite,choice,base_gain,offset_gain)
+}
+pub fn normalize(sub:view<f32>,divider:view<f32>)->result<Normalized,string> effects {alloc} {
+ if view.len(sub)!=view.len(divider){return result.err("Local numerator and divider extents differ")}
+ var divided:array<f32>=[]
+ var mask:array<byte>=[]
+ var selected:array<f32>=[]
+ let threshold:f32=0.000001
+ var i:u64=0
+ loop{if i==view.len(sub){break}
+  let numerator:f32=view.get(sub,i)
+  let denominator:f32=view.get(divider,i)
+  let quotient:f32=numerator/denominator
+  array.push(divided,quotient)
+  let enabled:bool=denominator>threshold
+  let flag:u8=if enabled{1}else{0}
+  array.push(mask,cast.bits(flag))
+  array.push(selected,if enabled{quotient}else{numerator})
+  i+=1}
+ result.ok(Normalized{division:divided,mask:bytes.from_array(mask),selected:selected})
+}
+fn accumulate_variant(sub:ref<array<f32>>,divider:ref<array<f32>>,window:ref<WindowResult>,weights:view<f64>,channels:u64,size:u64)->result<unit,string> effects {alloc} {
+ if (channels!=1 and channels!=2) or array.len(sub)!=array.len(divider) or array.len(sub)%channels!=0 or view.len(weights)!=size or array.len(window.residual)!=size or window.step.channel>=channels{return result.err("Local accumulation shape is invalid")}
+ let frames:u64=array.len(sub)/channels
+ if window.step.start>frames or size>frames-window.step.start{return result.err("Local accumulation window is outside its arrays")}
+ var i:u64=0
+ loop{if i==size{break}
+  let at:u64=(window.step.start+i)*channels+window.step.channel
+  let old:f64=cast.float(array.get(sub,at))
+  let sum:f64=old+array.get(window.residual,i)
+  let stored:f32=cast.float(sum)
+  array.set(sub,at,stored)
+  i+=1}
+ i=0
+ loop{if i==size{break}
+  let at:u64=(window.step.start+i)*channels+window.step.channel
+  let old:f64=cast.float(array.get(divider,at))
+  let sum:f64=old+view.get(weights,i)
+  let stored:f32=cast.float(sum)
+  array.set(divider,at,stored)
+  i+=1}
+ result.ok(())
+}
+pub fn accumulate(sub:ref<array<f32>>,divider:ref<array<f32>>,window:ref<WindowResult>,weights:view<f64>,channels:u64)->result<unit,string> effects {alloc} {
+ accumulate_variant(sub,divider,window,weights,channels,2756)
+}
+pub fn accumulate_for_window(sub:ref<array<f32>>,divider:ref<array<f32>>,window:ref<WindowResult>,weights:view<f64>,channels:u64,choice:WindowChoice)->result<unit,string> effects {alloc} {
+ accumulate_variant(sub,divider,window,weights,channels,window_frames(choice))
+}
+pub fn process_for_window(engine:ref<cpu.Engine>,math:ref<CAbiLibrary>,first:view<f32>,second:view<f64>,frames:u64,channels:u64,recipe:Recipe,cancel:str,progress:str,choice:WindowChoice)->result<Output,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Local alignment cancelled")}
+ if frames==0 or frames>31744 or (channels!=1 and channels!=2){return result.err("Fixed local alignment requires one to31744 mono or stereo frames")}
+ if view.len(first)!=frames*channels or view.len(second)!=frames*channels{return result.err("Fixed local alignment input extents differ")}
+ if not num.finite(first){return result.err("Local alignment requires finite samples")}
+ var at:u64=0
+ loop{if at==view.len(second){break}
+  if not fp.is_finite(view.get(second,at)){return result.err("Local alignment requires finite samples")}
+  at+=1}
+ let size:u64=window_frames(choice)
+ let hop:u64=hop_frames(choice)
+ let weights:array<f64>=try hann_for_window(math,recipe,choice)
+ var sub:array<f32>=num.zeros(frames*channels)
+ var divider:array<f32>=num.zeros(frames*channels)
+ var steps:array<Step>=[]
+ var ch:u64=0
+ loop{if ch==channels{break}
+  if frames>size{
+   var start:u64=0
+   loop{if start>=frames-size{break}
+    if control.cancelled(cancel){return result.err("Local alignment cancelled")}
+    control.status(progress,text.concat("Local window ",string.from_int(array.len(steps))))
+    let window:WindowResult=try window_residual_for_window(engine,first,second,array.view(weights),channels,start,ch,choice)
+    let _=try accumulate_for_window(sub,divider,window,array.view(weights),channels,choice)
+    array.push(steps,window.step)
+    start+=hop}}
+  ch+=1}
+ if control.cancelled(cancel){return result.err("Local alignment cancelled")}
+ var normalized:Normalized=try normalize(array.view(sub),array.view(divider))
+ // The one candidate is observationally identical to both original ensembles;
+ // this function does not implement their mean reductions or other candidates.
+ let empty:array<f32>=[]
+ let selected:array<f32>=struct.replace(normalized,empty,field=selected)
+ result.ok(Output{residual:selected,steps:steps})
+}
+pub fn process(engine:ref<cpu.Engine>,math:ref<CAbiLibrary>,first:view<f32>,second:view<f64>,frames:u64,channels:u64,recipe:Recipe,cancel:str,progress:str)->result<Output,string> effects {alloc,ffi,fs.meta,fs.write} {
+ process_for_window(engine,math,first,second,frames,channels,recipe,cancel,progress,WindowChoice.SixteenthSecond)
+}

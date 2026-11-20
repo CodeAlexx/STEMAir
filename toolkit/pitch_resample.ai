@@ -1,0 +1,28 @@
+module stemair.pitch_resample
+import "sinc_resample.ai" as resample
+import "ensemble.ai" as ensemble
+import "control.ai" as control
+import std.float as fp
+
+pub type Output=struct{values:array<f32>,frames:u64,ratio:f64}
+pub fn validate(semitones:f64)->result<unit,string> effects {alloc} {
+ if not fp.is_finite(semitones) or semitones< -10.0 or semitones>10.0{
+  return result.err("Pitch shift must be between -10 and 10 semitones")}
+ result.ok(())
+}
+// Positive pitch reduces duration; the output is still played at 44100 Hz.
+// This is the duration-changing route, without a phase-vocoder/time correction.
+pub fn process(input:view<f32>,semitones:f64,normalize:bool,cancel:str,progress:str)->result<Output,string> effects {alloc,fs.meta,fs.write} {
+ let _=try validate(semitones)
+ if control.cancelled(cancel){return result.err("Pitch resampling cancelled")}
+ let factor:f64=fp.pow(2.0,-semitones/12.0)
+ // Preserve the source's multiply-before-divide rate calculation.
+ let target_rate:f64=44100.0*factor
+ var plan:resample.Plan=try resample.plan_fractional(44100.0,target_rate)
+ var values:array<f32>=try resample.apply(plan,input,2)
+ if control.cancelled(cancel){return result.err("Pitch resampling cancelled")}
+ let _=try ensemble.normalize(values,normalize)
+ control.report(progress,1,1)
+ let frames:u64=array.len(values)/2
+ result.ok(Output{values:values,frames:frames,ratio:plan.ratio})
+}

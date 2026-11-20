@@ -1,0 +1,110 @@
+module stemair.attention.stack
+import "transformer.ai" as transformer
+import "position.ai" as position
+import "../weights.ai" as weights
+import "../device_ops.ai" as ops
+import "../control.ai" as control
+import "../numeric.ai" as num
+import std.tensor as tensor
+import std.sinusoidal_positions as device_positions
+import std.text as text
+
+pub type Observer<O>=struct{callback:option<fn(ref<O>,str,view<u64>,view<f32>)->result<unit,string> effects {alloc}>}
+fn observe<O>(stream:ref<GpuStream>,observer:ref<Observer<O>>,observations:ref<O>,name:str,value:ref<tensor.Tensor>)->result<unit,string> effects {alloc,gpu}{
+ match observer.callback{none=>result.ok(()),some(invoke)=>{
+  let values:array<f32>=try tensor.to_f32(stream,value) map_err ops.error
+  invoke(observations,name,array.view(value.dimensions),array.view(values))}}}
+pub type Network=struct{width:u64,norm:transformer.Norm,norm_time:transformer.Norm,
+ layers:array<transformer.Block>,time_layers:array<transformer.Block>}
+pub type Streams=struct{frequency:tensor.Tensor,time:tensor.Tensor}
+pub fn bind(w:ref<weights.Model>)->result<Network,string> effects {alloc} {
+ bind_width(w,512)
+}
+pub fn bind_width(w:ref<weights.Model>,width:u64)->result<Network,string> effects {alloc} {
+ if width!=384 and width!=512{return result.err("Unsupported attention width")}
+ var layers:array<transformer.Block>=[]
+ var time_layers:array<transformer.Block>=[]
+ var i:u64=0
+ loop{if i==5{break}
+  array.push(layers,try transformer.bind(w,text.concat("crosstransformer.layers.",string.from_int(i)),width,8,i%2==1))
+  array.push(time_layers,try transformer.bind(w,text.concat("crosstransformer.layers_t.",string.from_int(i)),width,8,i%2==1))
+  i+=1}
+ result.ok(Network{width:width,norm:try transformer.bind_norm(w,"crosstransformer.norm_in",width,false),
+  norm_time:try transformer.bind_norm(w,"crosstransformer.norm_in_t",width,false),layers:layers,time_layers:time_layers})
+}
+fn add_position(context:ref<GpuContext>,stream:ref<GpuStream>,x:ref<tensor.Tensor>,values:view<f32>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let batches:u64=array.get(x.dimensions,0)
+ var expanded:array<f32>=[]
+ array.reserve(expanded,batches*view.len(values))
+ var b:u64=0
+ loop{if b==batches{break}
+  var i:u64=0
+  loop{if i==view.len(values){break}
+   array.push(expanded,view.get(values,i))
+   i+=1}
+  b+=1}
+ var packed:tensor.Tensor=try tensor.from_f32(context,stream,array.view(expanded),array.view(x.dimensions),tensor.DType.F32) map_err ops.error
+ ops.add(context,stream,x,packed)
+}
+pub fn forward_observed<O>(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<Network>,frequency:ref<tensor.Tensor>,time:ref<tensor.Tensor>,cancel:str,state:ref<ops.ExecutionState>,observer:ref<Observer<O>>,observations:ref<O>)->result<Streams,string> effects {alloc,gpu,fs.meta} {
+ if tensor.rank(frequency)!=4 or tensor.rank(time)!=4 or frequency.dtype!=tensor.DType.F32 or time.dtype!=tensor.DType.F32 or
+  array.get(frequency.dimensions,0)!=array.get(time.dimensions,0) or array.get(frequency.dimensions,1)!=n.width or
+  array.get(time.dimensions,1)!=n.width or array.get(time.dimensions,2)!=1{
+  return result.err("Invalid two-stream attention geometry")}
+ let batch:u64=array.get(frequency.dimensions,0)
+ let freqs:u64=array.get(frequency.dimensions,2)
+ let frames:u64=array.get(frequency.dimensions,3)
+ let temporal:u64=array.get(time.dimensions,3)
+ if batch==0 or freqs==0 or frames==0 or temporal==0 or freqs*frames>8192 or temporal>8192{
+  return result.err("Two-stream attention workspace limit exceeded")}
+ var x:tensor.Tensor=try ops.transpose(context,stream,frequency,[0,3,2,1])
+ let frequency_shape:array<u64>=[batch,freqs*frames,n.width]
+ x=try tensor.reshape(x,array.view(frequency_shape)) map_err ops.error
+ var xt:tensor.Tensor=try ops.transpose(context,stream,time,[0,2,3,1])
+ let time_shape:array<u64>=[batch,temporal,n.width]
+ xt=try tensor.reshape(xt,array.view(time_shape)) map_err ops.error
+ x=try transformer.normalize_with_execution(context,stream,parameters,x,n.norm,state)
+ xt=try transformer.normalize_with_execution(context,stream,parameters,xt,n.norm_time,state)
+ let _=try observe(stream,observer,observations,"frequency-stack-norm",x)
+ let _=try observe(stream,observer,observations,"time-stack-norm",xt)
+ if array.len(state.frequency_positions)!=0 and array.len(state.frequency_positions)!=freqs*frames*n.width{return result.err("Prepared frequency position extent differs")}
+ let spectral_position:array<f32>=if array.len(state.frequency_positions)!=0{num.copy(array.view(state.frequency_positions))}else{try position.spectral(freqs,frames,n.width,10000.0)}
+ let time_position:array<f32>=match state.position_engine{none=>try position.temporal(temporal,n.width,0,10000.0),some(engine)=>{
+  var value:tensor.Tensor=try device_positions.forward(engine,context,stream,temporal,n.width,0,10000.0) map_err ops.error
+  try tensor.to_f32(stream,value) map_err ops.error}}
+ x=try add_position(context,stream,x,array.view(spectral_position))
+ xt=try add_position(context,stream,xt,array.view(time_position))
+ let _=try observe(stream,observer,observations,"frequency-stack-position",x)
+ let _=try observe(stream,observer,observations,"time-stack-position",xt)
+ var i:u64=0
+ loop{if i==array.len(n.layers){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var detailed:transformer.Observer<O>=transformer.Observer<O>{callback:observer.callback}
+  let frequency_prefix:string=if i<2{text.concat(text.concat("frequency-detail-",string.from_int(i)),"-")}else{string.copy("")}
+  let time_prefix:string=if i<2{text.concat(text.concat("time-detail-",string.from_int(i)),"-")}else{string.copy("")}
+  var previous:tensor.Tensor=try tensor.view(x) map_err ops.error
+  if i%2==0{
+   var previous_time:tensor.Tensor=try tensor.view(xt) map_err ops.error
+   x=try transformer.forward_observed(context,stream,parameters,array.get(n.layers,i),x,previous,cancel,state,detailed,observations,frequency_prefix)
+   xt=try transformer.forward_observed(context,stream,parameters,array.get(n.time_layers,i),xt,previous_time,cancel,state,detailed,observations,time_prefix)
+  }else{
+   x=try transformer.forward_observed(context,stream,parameters,array.get(n.layers,i),x,xt,cancel,state,detailed,observations,frequency_prefix)
+   xt=try transformer.forward_observed(context,stream,parameters,array.get(n.time_layers,i),xt,previous,cancel,state,detailed,observations,time_prefix)}
+  let _=try observe(stream,observer,observations,text.concat("frequency-transformer-",string.from_int(i)),x)
+  let _=try observe(stream,observer,observations,text.concat("time-transformer-",string.from_int(i)),xt)
+  i+=1}
+ let frequency_expanded:array<u64>=[batch,frames,freqs,n.width]
+ x=try tensor.reshape(x,array.view(frequency_expanded)) map_err ops.error
+ x=try ops.transpose(context,stream,x,[0,3,2,1])
+ let time_expanded:array<u64>=[batch,1,temporal,n.width]
+ xt=try tensor.reshape(xt,array.view(time_expanded)) map_err ops.error
+ xt=try ops.transpose(context,stream,xt,[0,3,1,2])
+ result.ok(Streams{frequency:x,time:xt})
+}
+
+pub fn forward(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<Network>,frequency:ref<tensor.Tensor>,time:ref<tensor.Tensor>,cancel:str)->result<Streams,string> effects {alloc,gpu,fs.meta} {
+ var state:ops.ExecutionState=ops.current_execution(ops.ConvolutionPolicy{})
+ var observations:unit=()
+ var observer:Observer<unit>=Observer<unit>{callback:option.none()}
+ forward_observed(context,stream,parameters,n,frequency,time,cancel,state,observer,observations)
+}

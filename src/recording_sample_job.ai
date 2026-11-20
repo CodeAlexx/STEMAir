@@ -1,0 +1,17 @@
+module stemair.recording_sample_job
+import "recording_sample_application.ai" as application
+import "../toolkit/model_cache.ai" as cache
+
+pub type Work=struct{retained:option<cache.Cache>,selection:array<application.Selection>,queue:bool,generation:u64,
+ options:application.Options,progress:string}
+pub type Outcome=struct{retained:option<cache.Cache>,envelope:application.Envelope}
+
+// Model ownership crosses this worker unchanged. Sample processing has no model
+// acquisition or inference path, including cancellation and partial failures.
+pub fn run(work:Work own)->Outcome effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var w:Work=work
+ let report:application.Report=application.run(struct.borrow(w,field=selection),struct.borrow(w,field=options),w.progress)
+ let envelope:application.Envelope=application.Envelope{queue:w.queue,generation:w.generation,
+  selection:struct.replace(w,[],field=selection),report:report}
+ Outcome{retained:struct.replace(w,option.none(),field=retained),envelope:envelope}
+}

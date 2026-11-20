@@ -1,0 +1,41 @@
+module stemair.attention.session
+import "network.ai" as network
+import "device.ai" as device
+import "host_session.ai" as host
+import "config.ai" as config
+import "retained_session.ai" as retained
+import "../recording_audio.ai" as recording_audio
+import "../ops.ai" as ops
+import std.tensor as tensor
+import std.cpu_neural_f32 as neural
+
+pub type Session=retained.State
+pub fn prepare_cpu(s:ref<Session>,platform:str)->result<unit,string> effects {alloc} {
+ if array.len(s.cpu)==0{
+  if platform!="windows" and platform!="linux"{return result.err("CPU attention host arithmetic has not been qualified")}
+  array.push(s.cpu,try host.prepare(struct.borrow(s,field=network),if platform=="windows"{neural.Affine.Separate}else{neural.Affine.Fused}))
+  s.cpu_preparations+=1}
+ if array.len(s.cpu)!=1{return result.err("CPU attention session must own one retained prepared bank")}
+ result.ok(())
+}
+pub fn open(path:str,c:ref<config.Config>)->result<Session,string> effects {alloc,fs.read} {
+ let _=try config.validate(c)
+ var n:network.Network=try network.open(path)
+ if array.len(c.targets)!=n.source_count{return result.err("Attention profile source count differs from checkpoint")}
+ if c.segment_samples!=0{n.training_length=c.segment_samples}
+ result.ok(retained.State{network:n,cpu:[],gpu:[]})
+}
+fn attention_predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ device.forward(context,stream,parameters,n,input,cancel)
+}
+fn attention_length(n:ref<network.Network>,length:u64)->result<u64,string> effects {alloc} {
+ if length==0 or length>n.training_length{return result.err("Attention chunk exceeds its training extent")}
+ result.ok(n.training_length)
+}
+pub fn separate(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ let _=try config.validate(c)
+ let size:u64=if c.segment_samples!=0{c.segment_samples}else{n.training_length}
+ recording_audio.separate(context,stream,parameters,n,c,size,input,cancel,progress,attention_predict,attention_length)
+}

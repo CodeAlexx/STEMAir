@@ -1,0 +1,48 @@
+module stemair.recording_state
+import "recording_context.ai" as context
+import std.codec as codec
+type Snapshot=struct{version:u64=1,seed:u64,requests:u64,words:array<u64>,left:i64,next:u64} derive codec(strict)
+// Application default acceptance needs the saved request's seed before creating
+// its owner. restore still validates every word/cursor before any inference.
+pub fn seed(raw:str)->result<u64,string> effects {alloc}{
+ if str.len(raw)==0 or str.len(raw)>65536{return result.err("Recording RNG state exceeds its transport bound")}
+ let saved:Snapshot=try Snapshot_decode(raw) map_err codec.describe
+ if saved.version!=1{return result.err("Unsupported recording RNG state version")}
+ result.ok(saved.seed)
+}
+// Thread/queue transport only: an accepted recording request owns this state.
+// Checkpoints, profile identity and retained model caches do not contain it.
+pub fn encode(c:ref<context.Context>)->result<string,string> effects {alloc} {
+ let _=try context.validate(c)
+ if not c.enabled{return result.ok("")}
+ let s=array.borrow(c.streams,0)
+ if s.generator.engine.has_normal or s.generator.engine.cached_normal!=0.0{return result.err("Recording RNG state contains an unsupported normal sample")}
+ var words:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(s.generator.engine.state){break}
+  array.push(words,cast.wrap(array.get(s.generator.engine.state,i)))
+  i+=1}
+ let saved:Snapshot=Snapshot{seed:s.seed,requests:s.requests,words:words,left:s.generator.engine.left,next:s.generator.engine.next}
+ result.ok(try Snapshot_encode(saved) map_err codec.describe)
+}
+pub fn restore(c:ref<context.Context>,raw:str)->result<unit,string> effects {alloc} {
+ let _=try context.validate(c)
+ if str.len(raw)==0{return result.ok(())}
+ if not c.enabled or str.len(raw)>65536{return result.err("Recording RNG transport state has no matching accepted request or exceeds its bound")}
+ let saved:Snapshot=try Snapshot_decode(raw) map_err codec.describe
+ let s=array.borrow(c.streams,0)
+ if saved.version!=1 or saved.seed!=s.seed or array.len(saved.words)!=624 or saved.left<1 or saved.left>624 or saved.next>624 or
+  not ((saved.next==0 and saved.left==1) or (saved.next>0 and saved.left==625-cast.sat(saved.next))){return result.err("Recording RNG transport state has invalid seed, extent or cursor")}
+ var i:u64=0
+ loop{if i==624{break}
+  if array.get(saved.words,i)>4294967295{return result.err("Recording RNG transport word exceeds unsigned32")}
+  i+=1}
+ i=0
+ loop{if i==624{break}
+  array.set(s.generator.engine.state,i,cast.wrap(array.get(saved.words,i)))
+  i+=1}
+ s.generator.engine.left=saved.left
+ s.generator.engine.next=saved.next
+ s.requests=saved.requests
+ result.ok(())
+}

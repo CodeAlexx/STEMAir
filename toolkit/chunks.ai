@@ -1,0 +1,97 @@
+module stemair.chunks
+import "numeric.ai" as num
+
+// Constant-overlap plan. All positions refer to channel-major padded audio.
+pub type Plan=struct{samples:u64,chunk:u64,hop:u64,overlap:u64,left:u64,right:u64,padded:u64,count:u64}
+pub fn plan(samples:u64,chunk:u64,overlap:u64)->result<Plan,string> effects {alloc} {
+ if samples==0 or samples>158760000 or chunk==0 or chunk>16777216 or overlap==0 or overlap>64 or overlap>chunk {
+  return result.err("Invalid chunk plan: positive bounded duration, chunk and overlap required")}
+ let hop:u64=chunk/overlap
+ // Exact constant overlap requires divisibility; unequal geometry is refused.
+ if chunk%overlap!=0{return result.err("Chunk size must be divisible by overlap")}
+ let left:u64=chunk-hop
+ // Python-style (samples-chunk) % hop, including short inputs.
+ let remainder:u64=(samples%hop+hop-chunk%hop)%hop
+ let padding:u64=hop-remainder
+ let right:u64=padding+left
+ let padded:u64=left+samples+right
+ result.ok(Plan{samples:samples,chunk:chunk,hop:hop,overlap:overlap,left:left,right:right,
+  padded:padded,count:(padded-chunk)/hop+1})
+}
+pub fn extract(p:ref<Plan>,input:view<f32>,channels:u64,index:u64)->result<array<f32>,string> effects {alloc} {
+ if not num.finite(input){return result.err("Non-finite chunk input")}
+ extract_finite(p,input,channels,index)
+}
+// The retained session validates the complete waveform once before its chunk
+// loop. Keep geometry checks here without rescanning a whole song per chunk.
+pub fn extract_finite(p:ref<Plan>,input:view<f32>,channels:u64,index:u64)->result<array<f32>,string> effects {alloc} {
+ if channels==0 or channels>32 or view.len(input)!=channels*p.samples or index>=p.count{
+  return result.err("Invalid chunk input geometry, index or samples")}
+ var out:array<f32>=[]
+ array.reserve(out,channels*p.chunk)
+ var c:u64=0
+ loop{if c>=channels{break}
+  var t:u64=0
+  loop{if t>=p.chunk{break}
+   let pos:u64=index*p.hop+t
+   array.push(out,if pos>=p.left and pos-p.left<p.samples{view.get(input,c*p.samples+pos-p.left)}else{0.0})
+   t+=1}
+  c+=1}
+ result.ok(out)
+}
+pub type Accumulator=struct{values:array<f32>,next:u64,streams:u64}
+pub fn accumulator(p:ref<Plan>,streams:u64)->result<Accumulator,string> effects {alloc} {
+ if streams==0 or streams>32 or p.padded*streams>317520000{return result.err("Chunk accumulator exceeds memory bound")}
+ result.ok(Accumulator{values:num.zeros(p.padded*streams),next:0,streams:streams})
+}
+pub fn add(p:ref<Plan>,a:ref<Accumulator>,output:view<f32>)->result<unit,string> effects {alloc} {
+ if a.next>=p.count or array.len(a.values)!=a.streams*p.padded or view.len(output)!=a.streams*p.chunk or not num.finite(output){
+  return result.err("Invalid chunk output geometry, order or non-finite output")}
+ var c:u64=0
+ loop{if c>=a.streams{break}
+  var t:u64=0
+  loop{if t>=p.chunk{break}
+   let dst:u64=c*p.padded+a.next*p.hop+t
+   array.set(a.values,dst,array.get(a.values,dst)+view.get(output,c*p.chunk+t))
+   t+=1}
+  c+=1}
+ a.next+=1
+ result.ok(())
+}
+pub fn finish(p:ref<Plan>,a:ref<Accumulator>)->result<array<f32>,string> effects {alloc} {
+ if a.next!=p.count{return result.err("Incomplete separation chunks")}
+ var out:array<f32>=[]
+ array.reserve(out,a.streams*p.samples)
+ var c:u64=0
+ loop{if c>=a.streams{break}
+  var t:u64=0
+  loop{if t>=p.samples{break}
+   array.push(out,array.get(a.values,c*p.padded+p.left+t)/cast.float(p.overlap))
+   t+=1}
+  c+=1}
+ result.ok(out)
+}
+// Center padding draws available neighboring samples from the retained whole
+// recording before adding zeros beyond its actual edges. Caller checks finite
+// samples once, rather than rescanning the whole recording for every chunk.
+pub fn context_finite(input:view<f32>,channels:u64,offset:u64,count:u64,target:u64)->result<array<f32>,string> effects {alloc} {
+ if channels==0 or channels>32 or view.len(input)%channels!=0 or target<count or
+  target>317520000/channels{return result.err("Invalid contextual chunk geometry")}
+ let total:u64=view.len(input)/channels
+ if count==0 or offset>=total or count>total-offset{return result.err("Contextual chunk lies outside recording")}
+ let delta:u64=(target-count)/2
+ let beginning:i64=cast.sat(offset)-cast.sat(delta)
+ let end:i64=cast.sat(total)
+ var output:array<f32>=[]
+ array.reserve(output,channels*target)
+ var channel:u64=0
+ loop{if channel==channels{break}
+  var time:u64=0
+  loop{if time==target{break}
+   let source:i64=beginning+cast.sat(time)
+   let at:u64=cast.sat(source)
+   array.push(output,if source>=0 and source<end{view.get(input,channel*total+at)}else{0.0})
+   time+=1}
+  channel+=1}
+ result.ok(output)
+}

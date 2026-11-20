@@ -1,0 +1,170 @@
+module stemair.coarse_alignment
+import "control.ai" as control
+import "numeric.ai" as num
+import std.float as fp
+import std.cpu_dot as dot
+
+pub type Lag=struct{samples:i64,probe_frames:u64,score:f64} derive codec(strict)
+pub type Output=struct{residual:array<f32>,aligned:array<f32>,frames:u64,channels:u64,lag:Lag}
+
+// Signed full correlation in the original increasing lag order, retaining its
+// first-index tie rule. The original converts probes to contiguous F32 and
+// uses its retained ILP64 dot backend except for the tiny central kernel.
+pub fn estimate(engine:ref<dot.Engine>,first:view<f32>,second:view<f32>,cancel:str,progress:str)->result<Lag,string>
+ effects {alloc,fs.meta,fs.write,ffi} {
+ let a:u64=view.len(first)
+ let b:u64=view.len(second)
+ let ai:i64=cast.sat(a)
+ let bi:i64=cast.sat(b)
+ if a==0 or b==0 or a>44100 or b>44100{return result.err("Alignment probe must contain between one and 44100 frames")}
+ if not num.finite(first) or not num.finite(second){return result.err("Alignment requires finite samples")}
+ var left:dot.Buffer=try dot.pack(first)
+ var right:dot.Buffer=try dot.pack(second)
+ var lag:i64=1-bi
+ let final:i64=ai-1
+ var best:i64=lag
+ var best_score:f32=0.0
+ var have:bool=false
+ loop{if lag>final{break}
+  let ordinal:u64=cast.wrap(lag+bi-1)
+  if ordinal%256==0 and control.cancelled(cancel){return result.err("Alignment cancelled")}
+  let start:u64=if lag>0{cast.wrap(lag)}else{0}
+  let stop:u64=if ai<bi+lag{a}else{cast.wrap(bi+lag)}
+  let signed_start:i64=cast.sat(start)
+  let offset:u64=cast.wrap(signed_start-lag)
+  let small:bool=(if a<b{a}else{b})<=11 and
+   ((a>=b and lag>=0 and lag<=ai-bi) or (a<b and lag>=ai-bi and lag<=0))
+  var sum:f32=0.0
+  if small{
+   var at:u64=0
+   loop{if at==stop-start{break}
+    let product:f32=view.get(first,start+at)*view.get(second,offset+at)
+    sum+=product
+    at+=1}
+  }else{sum=try dot.dot(engine,left,start,right,offset,stop-start)}
+  if not fp.is_finite(sum){return result.err("Alignment correlation overflow")}
+  if not have or sum>best_score{
+   best=lag
+   best_score=sum
+   have=true
+  }
+  if ordinal%4096==0{control.report(progress,ordinal+1,a+b-1)}
+  lag+=1}
+ result.ok(Lag{samples:best,probe_frames:if a<b{a}else{b},score:cast.float(best_score)})
+}
+
+pub fn process(engine:ref<dot.Engine>,first:view<f32>,second:view<f32>,first_channels:u64,second_channels:u64,invert:bool,cancel:str,progress:str)
+ ->result<Output,string> effects {alloc,fs.meta,fs.write,ffi} {
+ if (first_channels!=1 and first_channels!=2) or (second_channels!=1 and second_channels!=2) or
+  view.len(first)==0 or view.len(second)==0 or view.len(first)%first_channels!=0 or view.len(second)%second_channels!=0{
+  return result.err("Alignment requires nonempty planar mono or stereo inputs")}
+ let frames:u64=view.len(first)/first_channels
+ let other:u64=view.len(second)/second_channels
+ if frames>8388608 or other>8388608{return result.err("Alignment exceeds its retained recording bound")}
+ if not num.finite(first) or not num.finite(second){return result.err("Alignment requires finite samples")}
+ let seconds:u64=if frames<other{frames/44100}else{other/44100}
+ let index:u64=44100*(seconds/10)
+ let first_count:u64=if frames-index<44100{frames-index}else{44100}
+ let second_count:u64=if other-index<44100{other-index}else{44100}
+ var probe:array<f32>=[]
+ array.reserve(probe,second_count)
+ var i:u64=0
+ loop{if i==second_count{break}
+  let value:f32=view.get(second,index+i)
+  array.push(probe,if invert{-value}else{value})
+  i+=1}
+ let selected:Lag=try estimate(engine,view.slice(first,index,index+first_count),array.view(probe),cancel,progress)
+ let channels:u64=if first_channels==1 and second_channels==1{1}else{2}
+ var residual:array<f32>=[]
+ var aligned:array<f32>=[]
+ array.reserve(residual,channels*frames)
+ array.reserve(aligned,channels*frames)
+ var channel:u64=0
+ loop{if channel==channels{break}
+  i=0
+  loop{if i==frames{break}
+   if i%65536==0 and control.cancelled(cancel){return result.err("Alignment cancelled")}
+   let reference:f32=view.get(first,(if first_channels==1{0}else{channel*frames})+i)
+   let position:i64=cast.sat(i)-selected.samples
+   let outside:bool=position<0 or position>=cast.sat(other)
+   let raw:f32=if outside{0.0}else{
+    view.get(second,(if second_channels==1{0}else{channel*other})+cast.wrap(position))}
+   let shifted:f32=if outside{0.0}else{if invert{-raw}else{raw}}
+   // Positive coarse delay inserts default F64 zeros before the F32
+   // recording. Preserve the resulting wide subtract/clip/reconstruction.
+   if selected.samples>0{
+    let reference_wide:f64=cast.float(reference)
+    let shifted_wide:f64=cast.float(shifted)
+    let difference:f64=reference_wide-shifted_wide
+    let clipped:f64=if difference< -1.0{-1.0}else{if difference>1.0{1.0}else{difference}}
+    array.push(residual,cast.float(clipped))
+    array.push(aligned,cast.float(reference_wide-clipped))
+   }else{
+    let difference:f32=reference-shifted
+    let clipped:f32=if difference< -1.0{-1.0}else{if difference>1.0{1.0}else{difference}}
+    array.push(residual,clipped)
+    array.push(aligned,reference-clipped)}
+   i+=1}
+  channel+=1}
+ result.ok(Output{residual:residual,aligned:aligned,frames:frames,channels:channels,lag:selected})
+}
+
+// Additive wide-probe route for callers whose raw padding promoted an input.
+// The established F32 estimator and recording process above remain unchanged.
+pub fn full_f64(engine:ref<dot.Engine>,first:view<f64>,second:view<f64>,cancel:str,progress:str)
+ ->result<array<f64>,string> effects {alloc,fs.meta,fs.write,ffi} {
+ let a:u64=view.len(first)
+ let b:u64=view.len(second)
+ if a==0 or b==0 or a>44100 or b>44100{return result.err("Alignment F64 probe must contain between one and 44100 frames")}
+ var i:u64=0
+ loop{if i==a{break}
+  if not fp.is_finite(view.get(first,i)){return result.err("Alignment requires finite samples")}
+  i+=1}
+ i=0
+ loop{if i==b{break}
+  if not fp.is_finite(view.get(second,i)){return result.err("Alignment requires finite samples")}
+  i+=1}
+ var left:dot.BufferF64=try dot.pack_f64(first)
+ var right:dot.BufferF64=try dot.pack_f64(second)
+ let ai:i64=cast.sat(a)
+ let bi:i64=cast.sat(b)
+ var lag:i64=1-bi
+ let final:i64=ai-1
+ var values:array<f64>=[]
+ array.reserve(values,a+b-1)
+ loop{if lag>final{break}
+  let ordinal:u64=cast.wrap(lag+bi-1)
+  if ordinal%256==0 and control.cancelled(cancel){return result.err("Alignment cancelled")}
+  let start:u64=if lag>0{cast.wrap(lag)}else{0}
+  let stop:u64=if ai<bi+lag{a}else{cast.wrap(bi+lag)}
+  let signed_start:i64=cast.sat(start)
+  let offset:u64=cast.wrap(signed_start-lag)
+  let small:bool=(if a<b{a}else{b})<=11 and
+   ((a>=b and lag>=0 and lag<=ai-bi) or (a<b and lag>=ai-bi and lag<=0))
+  var sum:f64=0.0
+  if small{
+   var at:u64=0
+   loop{if at==stop-start{break}
+    let product:f64=view.get(first,start+at)*view.get(second,offset+at)
+    sum+=product
+    at+=1}
+  }else{
+   let value:f64=try dot.dot_f64(engine,left,start,right,offset,stop-start)
+   sum=0.0+value}
+  if not fp.is_finite(sum){return result.err("Alignment F64 correlation overflow")}
+  array.push(values,sum)
+  if ordinal%4096==0{control.report(progress,ordinal+1,a+b-1)}
+  lag+=1}
+ result.ok(values)
+}
+pub fn estimate_f64(engine:ref<dot.Engine>,first:view<f64>,second:view<f64>,cancel:str,progress:str)
+ ->result<Lag,string> effects {alloc,fs.meta,fs.write,ffi} {
+ let values:array<f64>=try full_f64(engine,first,second,cancel,progress)
+ var best:u64=0
+ var at:u64=1
+ loop{if at==array.len(values){break}
+  if array.get(values,at)>array.get(values,best){best=at}
+  at+=1}
+ result.ok(Lag{samples:cast.sat(best)-cast.sat(view.len(second)-1),
+  probe_frames:if view.len(first)<view.len(second){view.len(first)}else{view.len(second)},score:array.get(values,best)})
+}

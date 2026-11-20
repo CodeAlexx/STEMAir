@@ -1,0 +1,327 @@
+module stemair.container_export
+import "wav_export.ai" as wav
+import "../toolkit/export_audio.ai" as wave
+import "../toolkit/compressed_export.ai" as codec
+import "../toolkit/codec_process.ai" as child
+import "../toolkit/output_names.ai" as names
+import std.audio as audio
+import std.codec as serialization
+import std.files as files
+import std.json as json
+import std.path as path
+import std.text as text
+
+// All zero retains the original writer policy. Explicit limits apply only to codecs.
+pub type SourceScope=struct{key:string,names:array<string>}
+pub type Plan=struct{working_wav:audio.WavSubtype,compressed:option<codec.Settings>,
+ source_names:array<string>,source_scopes:array<SourceScope>,export_max_frames:u64=0,export_max_stage_bytes:u64=0,export_max_encoded_bytes:u64=0}
+pub type Artifact=struct{path:string,wav:option<wave.Report>,compressed:option<codec.Report>}
+pub type Journal=struct{artifacts:array<Artifact>,attempted:string,failure:string}
+pub fn empty_journal()->Journal effects {alloc} {Journal{artifacts:[],attempted:"",failure:""}}
+pub fn wav_plan(kind:audio.WavSubtype)->Plan effects {alloc} {Plan{working_wav:kind,compressed:option.none(),source_names:[],source_scopes:[]}}
+fn validate_names(selected:ref<array<string>>)->result<unit,string> effects {alloc} {
+ var index:u64=0
+ loop{if index==array.len(selected){break}
+  let value:str=array.get(selected,index)
+  if not names.component(value){return result.err("Source filenames must be nonempty filename components")}
+  let folded:string=text.lower_ascii(value)
+  var previous:u64=0
+  loop{if previous==index{break}
+   let other:string=text.lower_ascii(array.get(selected,previous))
+   if folded==str.view(other){return result.err("Source filenames must be distinct")}
+   previous+=1}
+  index+=1}
+ result.ok(())
+}
+pub fn validate(plan:ref<Plan>)->result<unit,string> effects {alloc} {
+ let _=try validate_names(struct.borrow(plan,field=source_names))
+ var index:u64=0
+ loop{if index==array.len(plan.source_scopes){break}
+  let branch:ref<SourceScope>=array.borrow(plan.source_scopes,index)
+  if str.len(branch.key)==0{return result.err("A source naming scope needs a key")}
+  let _=try validate_names(struct.borrow(branch,field=names))
+  let key:string=text.lower_ascii(branch.key)
+  var previous:u64=0
+  loop{if previous==index{break}
+   let other:string=text.lower_ascii(array.borrow(plan.source_scopes,previous).key)
+   if key==str.view(other){return result.err("Source naming scope keys must be distinct")}
+   previous+=1}
+  index+=1}
+ let selected:bool=plan.export_max_frames>0 or plan.export_max_stage_bytes>0 or plan.export_max_encoded_bytes>0
+ if selected and (plan.export_max_frames==0 or plan.export_max_stage_bytes==0 or plan.export_max_encoded_bytes<4){return result.err("Explicit compressed export requires positive frame/stage limits and at least four encoded bytes")}
+ if selected and match plan.compressed{none=>true,some(_)=>false}{return result.err("Compressed export limits require a compressed container")}
+ let expected:str=wav.name(plan.working_wav)
+ match plan.compressed{none=>{},some(settings)=>{
+  let _=try codec.validate(settings)
+  if settings.subtype!=expected{return result.err("Working WAV subtype differs from codec settings")}
+  if settings.normalize{return result.err("Application export requires normalize:false; processing already owns normalization")}}}
+ result.ok(())
+}
+pub fn compressed_plan(kind:audio.WavSubtype,settings:codec.Settings own)->result<Plan,string> effects {alloc} {
+ var plan:Plan=Plan{working_wav:kind,compressed:option.some(settings),source_names:[],source_scopes:[]}
+ let _=try validate(plan)
+ result.ok(plan)
+}
+pub fn copy_plan(plan:ref<Plan>)->result<Plan,string> effects {alloc} {
+ let _=try validate(plan)
+ var value:Plan=match plan.compressed{none=>wav_plan(plan.working_wav),some(settings)=>{
+  let raw:string=try codec.Settings_encode(settings) map_err serialization.describe
+  let copied:codec.Settings=try codec.Settings_decode(raw) map_err serialization.describe
+  try compressed_plan(plan.working_wav,copied)}}
+ value.export_max_frames=plan.export_max_frames
+ value.export_max_stage_bytes=plan.export_max_stage_bytes
+ value.export_max_encoded_bytes=plan.export_max_encoded_bytes
+ var index:u64=0
+ loop{if index==array.len(plan.source_names){break}
+  array.push(value.source_names,string.copy(array.get(plan.source_names,index)))
+  index+=1}
+ index=0
+ loop{if index==array.len(plan.source_scopes){break}
+  let branch:ref<SourceScope>=array.borrow(plan.source_scopes,index)
+  array.push(value.source_scopes,SourceScope{key:string.copy(branch.key),names:copy_names(struct.borrow(branch,field=names))})
+  index+=1}
+ result.ok(value)
+}
+fn copy_names(values:ref<array<string>>)->array<string> effects {alloc} {
+ var copied:array<string>=[]
+ var index:u64=0
+ loop{if index==array.len(values){break}
+  array.push(copied,string.copy(array.get(values,index)))
+  index+=1}
+ copied
+}
+pub fn with_scope_names(plan:ref<Plan>,key:str,filenames:ref<array<string>>)->result<Plan,string> effects {alloc} {
+ var value:Plan=try copy_plan(plan)
+ array.push(value.source_scopes,SourceScope{key:string.copy(key),names:copy_names(filenames)})
+ let _=try validate(value)
+ result.ok(value)
+}
+// Keys select caller-owned export branches; they never create filesystem paths.
+// A child without explicit names retains legacy names, never its parent's list.
+pub fn scoped(plan:ref<Plan>,key:str)->result<Plan,string> effects {alloc} {
+ if str.len(key)==0{return result.err("Choose a source naming scope")}
+ var value:Plan=try copy_plan(plan)
+ value.source_names=[]
+ value.source_scopes=[]
+ let prefix:string=text.concat(key,"/")
+ var index:u64=0
+ loop{if index==array.len(plan.source_scopes){break}
+  let branch:ref<SourceScope>=array.borrow(plan.source_scopes,index)
+  if str.view(branch.key)==key{value.source_names=copy_names(struct.borrow(branch,field=names))}
+  if str.starts_with(branch.key,prefix){array.push(value.source_scopes,SourceScope{
+   key:string.copy(str.slice(branch.key,str.len(prefix),str.len(branch.key))),names:copy_names(struct.borrow(branch,field=names))})}
+  index+=1}
+ result.ok(value)
+}
+pub fn with_source_names(plan:ref<Plan>,filenames:ref<array<string>>)->result<Plan,string> effects {alloc} {
+ var value:Plan=try copy_plan(plan)
+ value.source_names=[]
+ var index:u64=0
+ loop{if index==array.len(filenames){break}
+  array.push(value.source_names,string.copy(array.get(filenames,index)))
+  index+=1}
+ let _=try validate(value)
+ result.ok(value)
+}
+pub fn with_limits(plan:Plan own,limits:codec.Limits)->result<Plan,string> effects {alloc} {
+ var selected:Plan=plan
+ selected.export_max_frames=limits.max_frames
+ selected.export_max_stage_bytes=limits.max_stage_bytes
+ selected.export_max_encoded_bytes=limits.max_encoded_bytes
+ if limits.max_frames==0 or limits.max_stage_bytes==0 or limits.max_encoded_bytes<4{return result.err("Explicit compressed export requires positive frame/stage limits and at least four encoded bytes")}
+ let _=try validate(selected)
+ result.ok(selected)
+}
+pub fn preflight_extent(samples:u64,rate:u32,channels:u16,plan:ref<Plan>)->result<unit,string> effects {alloc} {
+ let _=try validate(plan)
+ if plan.export_max_frames==0{return result.ok(())}
+ let limits:codec.Limits=codec.Limits{max_frames:plan.export_max_frames,max_stage_bytes:plan.export_max_stage_bytes,max_encoded_bytes:plan.export_max_encoded_bytes}
+ match plan.compressed{none=>{},some(settings)=>{
+  let _=try codec.plan_extent(samples,rate,channels,settings,limits)}}
+ result.ok(())
+}
+pub fn extension(plan:ref<Plan>)->str effects {} {
+ match plan.compressed{none=>"wav",some(settings)=>if settings.format=="flac"{"flac"}else{"mp3"}}
+}
+pub fn filename(stem:str,plan:ref<Plan>)->string effects {alloc} {text.concat(stem,text.concat(".",extension(plan)))}
+pub fn target(directory:str,stem:str,plan:ref<Plan>)->string effects {alloc} {path.join(directory,filename(stem,plan))}
+fn io_error(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+pub fn verify(plan:ref<Plan>)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ let _=try validate(plan)
+ match plan.compressed{none=>{},some(settings)=>{
+  let encoder:child.Tool=child.Tool{path:string.copy(settings.encoder),sha256:string.copy(settings.encoder_sha256)}
+  let probe:child.Tool=child.Tool{path:string.copy(settings.probe),sha256:string.copy(settings.probe_sha256)}
+  let _=try child.verify(encoder)
+  let _=try child.verify(probe)}}
+ result.ok(())
+}
+pub fn preflight_file(file:str,plan:ref<Plan>)->result<unit,string> effects {alloc,fs.meta} {
+ let _=try validate(plan)
+ if not text.ends_with(file,text.concat(".",extension(plan))){return result.err("Output extension differs from the selected container")}
+ let _=try wav.preflight_file(file)
+ match plan.compressed{none=>{},some(_)=>{
+  match files.symlink_metadata(text.concat(file,".work")){ok(_)=>{return result.err("A foreign codec workspace already exists")},err(e)=>{if e.code!=1{return result.err("Cannot inspect codec workspace")}}}}}
+ result.ok(())
+}
+pub fn preflight_metadata(file:str)->result<unit,string> effects {alloc,fs.meta} {wav.preflight_file(file)}
+pub fn require_directory(directory:str)->result<unit,string> effects {alloc,fs.meta} {
+ if not match files.is_dir(directory){ok(v)=>v,err(_)=>false}{return result.err("Output directory must already exist")}
+ result.ok(())
+}
+pub fn record_failure(log:ref<Journal>,file:str,message:str)->unit effects {alloc} {
+ log.attempted=string.copy(file)
+ log.failure=string.copy(message)
+ ()
+}
+fn write_one(file:str,buffer:ref<audio.AudioBuffer>,plan:ref<Plan>,cancel:str,progress:str)->result<Artifact,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let _=try preflight_file(file,plan)
+ let limits:codec.Limits=codec.Limits{max_frames:plan.export_max_frames,max_stage_bytes:plan.export_max_stage_bytes,max_encoded_bytes:plan.export_max_encoded_bytes}
+ match plan.compressed{none=>{
+  let settings:wave.Settings=wave.Settings{subtype:string.copy(wav.name(plan.working_wav)),normalize:false}
+  let report:wave.Report=try wave.run(buffer,settings,file,cancel,progress)
+  result.ok(Artifact{path:string.copy(file),wav:option.some(report),compressed:option.none()})},some(settings)=>{
+  let absolute:string=if path.is_absolute(file){path.normalize(file)}else{path.join(try files.cwd() map_err io_error,file)}
+  let report:codec.Report=try if limits.max_frames==0{codec.run(buffer,settings,absolute,cancel,progress)}else{
+   codec.run_limited(buffer,settings,absolute,cancel,progress,limits)}
+  result.ok(Artifact{path:absolute,wav:option.none(),compressed:option.some(report)})}}
+}
+pub fn write_buffer(file:str,buffer:ref<audio.AudioBuffer>,plan:ref<Plan>,log:ref<Journal>,cancel:str,progress:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=string.copy(file)
+ log.failure=""
+ var artifact:Artifact=match write_one(file,buffer,plan,cancel,progress){ok(v)=>v,err(e)=>{record_failure(log,file,e)
+  return result.err(e)}}
+ record_artifact(file,artifact,log)
+}
+fn record_artifact(file:str,value:Artifact own,log:ref<Journal>)->result<unit,string> effects {alloc} {
+ var artifact:Artifact=value
+ let cleanup:string=match artifact.wav{none=>"",some(report)=>if report.staging_removed{""}else{text.concat("WAV published; export staging remains at ",report.staging_path)}}
+ array.push(log.artifacts,artifact)
+ if str.len(cleanup)>0{record_failure(log,file,cleanup)
+  return result.err(cleanup)}
+ result.ok(())
+}
+fn write_one_f64(file:str,samples:view<f64>,rate:u32,channels:u16,plan:ref<Plan>,cancel:str,progress:str)->result<Artifact,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let _=try preflight_file(file,plan)
+ let limits:codec.Limits=codec.Limits{max_frames:plan.export_max_frames,max_stage_bytes:plan.export_max_stage_bytes,max_encoded_bytes:plan.export_max_encoded_bytes}
+ match plan.compressed{none=>{
+  let settings:wave.Settings=wave.Settings{subtype:string.copy(wav.name(plan.working_wav)),normalize:false}
+  let report:wave.Report=try wave.run_f64(samples,rate,channels,settings,file,cancel,progress)
+  result.ok(Artifact{path:string.copy(file),wav:option.some(report),compressed:option.none()})},some(settings)=>{
+  let absolute:string=if path.is_absolute(file){path.normalize(file)}else{path.join(try files.cwd() map_err io_error,file)}
+  let report:codec.Report=try if limits.max_frames==0{codec.run_f64(samples,rate,channels,settings,absolute,cancel,progress)}else{
+   codec.run_f64_limited(samples,rate,channels,settings,absolute,cancel,progress,limits)}
+  result.ok(Artifact{path:absolute,wav:option.none(),compressed:option.some(report)})}}
+}
+pub fn write_buffer_f64(file:str,samples:view<f64>,rate:u32,channels:u16,plan:ref<Plan>,log:ref<Journal>,cancel:str,progress:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=string.copy(file)
+ log.failure=""
+ let artifact:Artifact=match write_one_f64(file,samples,rate,channels,plan,cancel,progress){ok(v)=>v,err(e)=>{record_failure(log,file,e)
+  return result.err(e)}}
+ record_artifact(file,artifact,log)
+}
+pub fn write_planar(file:str,rate:u32,values:view<f32>,plan:ref<Plan>,log:ref<Journal>,cancel:str,progress:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ match preflight_extent(view.len(values),rate,2,plan){ok(_)=>{},err(e)=>{record_failure(log,file,e)
+  return result.err(e)}}
+ let buffer:audio.AudioBuffer=match wav.buffer_planar(values,rate,view.len(values)/2,2){ok(v)=>v,err(e)=>{record_failure(log,file,e)
+  return result.err(e)}}
+ write_buffer(file,buffer,plan,log,cancel,progress)
+}
+pub fn write_planar_f64(file:str,rate:u32,values:view<f64>,plan:ref<Plan>,log:ref<Journal>,cancel:str,progress:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ match preflight_extent(view.len(values),rate,2,plan){ok(_)=>{},err(e)=>{record_failure(log,file,e)
+  return result.err(e)}}
+ var interleaved:array<f64>=[]
+ array.reserve(interleaved,view.len(values))
+ let frames:u64=view.len(values)/2
+ var index:u64=0
+ loop{if index==frames{break}
+  array.push(interleaved,view.get(values,index))
+  array.push(interleaved,view.get(values,frames+index))
+  index+=1}
+ write_buffer_f64(file,array.view(interleaved),rate,2,plan,log,cancel,progress)
+}
+fn write_json(file:str,raw:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let stage:string=text.concat(file,".export")
+ var sink:files.Sink=try files.sink_create(file,stage) map_err io_error
+ match files.sink_write(sink,str.bytes(raw)){ok(_)=>{},err(e)=>{let _=files.sink_discard(sink)
+  return result.err(text.concat(io_error(e),text.concat("; inspect export staging at ",stage)))}}
+ let outcome:files.Publication=match files.sink_publish_new(sink,false){ok(v)=>v,err(e)=>{return result.err(text.concat(io_error(e),text.concat("; inspect export staging at ",stage)))}}
+ if not outcome.temporary_removed{return result.err(text.concat("Metadata published; export staging remains at ",outcome.temporary))}
+ result.ok(())
+}
+pub fn metadata(raw:str,plan:ref<Plan>,log:ref<Journal>,start:u64)->result<string,string> effects {alloc} {
+ let _=try validate(plan)
+ match plan.compressed{none=>{return wav.metadata(raw,plan.working_wav)},some(_)=>{}}
+ if start>=array.len(log.artifacts){return result.err("Compressed metadata has no successful output reports in its scope")}
+ var document:json.Document=try json.parse(raw) map_err json.message
+ let root:json.Token=match json.token(document,0){some(v)=>v,none=>{return result.err("Missing output metadata")}}
+ if root.kind!=json.Kind.Object{return result.err("Output metadata must be an object")}
+ var keys:array<string>=[]
+ var values:array<string>=[]
+ var cursor:u64=json.first_member(document,0)
+ loop{let member:json.Member=match json.member(document,0,cursor){some(v)=>v,none=>{break}}
+  let key:string=match json.as_string(document,member.name){some(v)=>v,none=>{return result.err("Invalid output metadata key")}}
+  if key=="container" or key=="wav_subtype" or key=="working_wav_subtype" or key=="intermediate_wav_subtype" or key=="requested_mp3_bitrate" or key=="frame_count_basis" or key=="export_reports"{return result.err("Output metadata already has an encoding")}
+  let token:json.Token=match json.token(document,member.value){some(v)=>v,none=>{return result.err("Invalid output metadata value")}}
+  array.push(keys,key)
+  array.push(values,string.copy(str.slice(document.source,token.start,token.end)))
+  cursor=member.next}
+ var reports:array<string>=[]
+ var intermediate:string=""
+ var bitrate:string="null"
+ var at:u64=start
+ loop{if at==array.len(log.artifacts){break}
+  let artifact:ref<Artifact>=array.borrow(log.artifacts,at)
+  match artifact.compressed{none=>{return result.err("Mixed container reports in metadata scope")},some(report)=>{
+   if report.format!=extension(plan) or report.subtype!=wav.name(plan.working_wav){return result.err("Codec report differs from metadata plan")}
+   let kind:audio.WavSubtype=try wave.subtype(report.intermediate_subtype)
+   intermediate=string.copy(wav.label(kind))
+   if report.format=="mp3"{bitrate=json.quote(report.bitrate)}
+   array.push(reports,try codec.Report_encode(report) map_err serialization.describe)}}
+  at+=1}
+ array.push(keys,"container")
+ array.push(values,json.quote(extension(plan)))
+ array.push(keys,"working_wav_subtype")
+ array.push(values,json.quote(wav.label(plan.working_wav)))
+ array.push(keys,"intermediate_wav_subtype")
+ array.push(values,json.quote(intermediate))
+ array.push(keys,"requested_mp3_bitrate")
+ array.push(values,bitrate)
+ array.push(keys,"frame_count_basis")
+ array.push(values,json.quote("source-working-wav"))
+ array.push(keys,"export_reports")
+ array.push(values,try json.encode_array(reports) map_err json.message)
+ result.ok(try json.encode_object(keys,values) map_err json.message)
+}
+pub fn write_metadata(file:str,raw:str,plan:ref<Plan>,log:ref<Journal>,start:u64)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ log.attempted=string.copy(file)
+ log.failure=""
+ let result:result<unit,string>=match plan.compressed{none=>wav.write_metadata(file,raw,plan.working_wav),some(_)=>{
+  let encoded:result<string,string>=metadata(raw,plan,log,start)
+  match encoded{err(e)=>result.err(e),ok(value)=>write_json(file,value)}}}
+ match result{ok(_)=>result.ok(()),err(e)=>{record_failure(log,file,e)
+  result.err(e)}}
+}
+pub fn encode_journal(log:ref<Journal>)->result<string,string> effects {alloc} {
+ var rows:array<string>=[]
+ var at:u64=0
+ loop{if at==array.len(log.artifacts){break}
+  let artifact:ref<Artifact>=array.borrow(log.artifacts,at)
+  let wave_report:string=match artifact.wav{none=>"null",some(report)=>try wave.Report_encode(report) map_err serialization.describe}
+  let codec_report:string=match artifact.compressed{none=>"null",some(report)=>try codec.Report_encode(report) map_err serialization.describe}
+  let keys:array<string>=["path","wav","compressed"]
+  let values:array<string>=[json.quote(artifact.path),wave_report,codec_report]
+  array.push(rows,try json.encode_object(keys,values) map_err json.message)
+  at+=1}
+ let keys:array<string>=["artifacts","attempted","failure"]
+ let values:array<string>=[try json.encode_array(rows) map_err json.message,json.quote(log.attempted),json.quote(log.failure)]
+ result.ok(try json.encode_object(keys,values) map_err json.message)
+}
+
+pub fn preflight_tracked(file:str,plan:ref<Plan>,log:ref<Journal>)->result<unit,string> effects {alloc,fs.meta} {
+ match preflight_file(file,plan){ok(_)=>result.ok(()),err(e)=>{record_failure(log,file,e)
+  result.err(e)}}
+}
+pub fn preflight_metadata_tracked(file:str,log:ref<Journal>)->result<unit,string> effects {alloc,fs.meta} {
+ match preflight_metadata(file){ok(_)=>result.ok(()),err(e)=>{record_failure(log,file,e)
+  result.err(e)}}
+}

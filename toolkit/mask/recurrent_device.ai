@@ -1,0 +1,192 @@
+module stemair.mask.recurrent_device
+import "recurrent_network.ai" as network
+import "device.ai" as common
+import "network.ai" as layout
+import "../recurrent.ai" as recurrent
+import "../recurrent_vendor.ai" as vendor
+import "../weights.ai" as weights
+import "../ops.ai" as ops
+import "../spatial.ai" as spatial
+import "../control.ai" as control
+import std.resize_bilinear as resize
+import std.cuda_batch_norm_f32 as dense_norm
+import std.tensor as tensor
+import std.compute as compute
+import std.gpu as devicegpu
+
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+pub fn upload(context:ref<GpuContext>,stream:ref<GpuStream>,n:ref<network.Network>)->result<array<tensor.Tensor>,string> effects {alloc,gpu} {
+ var out:array<tensor.Tensor>=[]
+ var i:u64=0
+ loop{if i>=array.len(n.weights.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,i)
+  array.push(out,try tensor.from_f32(context,stream,array.view(p.values),array.view(p.shape),tensor.DType.F32) map_err error)
+  i+=1}
+ let _=try devicegpu.sync(context) map_err error
+ result.ok(out)
+}
+fn parameter(w:ref<weights.Model>,index:u64,feature:u64)->f32 effects {} {array.get(array.borrow(w.parameters.values,index).values,feature)}
+fn resize_selected(context:ref<GpuContext>,stream:ref<GpuStream>,input:ref<tensor.Tensor>,height:u64,width:u64,prepared:bool,interpolation:ref<resize.Engine>)->result<tensor.Tensor,string> effects {alloc,gpu}{
+ if prepared{return result.ok(try resize.apply(interpolation,context,stream,input,height,width) map_err error)}
+ common.resize(context,stream,input,height,width)
+}
+fn recurrent_feature(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,w:ref<weights.Model>,r:ref<network.Recurrent>,x:ref<tensor.Tensor>,cancel:str,policy:common.ConvolutionPolicy,retained:ref<vendor.State>,use_vendor:bool,normalizer:ref<dense_norm.Engine>,interpolation:ref<resize.Engine>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var reduced:tensor.Tensor=try common.convolve_with_policy(context,stream,parameters,x,r.convolution,policy)
+ let batch:u64=array.get(reduced.dimensions,0)
+ let steps:u64=array.get(reduced.dimensions,3)
+ let width:u64=2*r.layer.hidden_features
+ if use_vendor{
+  var permuted:tensor.Tensor=try tensor.permute(reduced,[3,0,2,1]) map_err error
+  var dense:tensor.Tensor=try tensor.contiguous(context,stream,permuted) map_err error
+  let shape:array<u64>=[steps,batch,r.features]
+  var tnc:tensor.Tensor=try tensor.reshape(dense,array.view(shape)) map_err error
+  var hidden:tensor.Tensor=try vendor.forward(retained,context,stream,r.layer.forward.input,tnc)
+  let matrix_shape:array<u64>=[steps*batch,width]
+  var matrix:tensor.Tensor=try tensor.reshape(hidden,array.view(matrix_shape)) map_err error
+  let output_shape:array<u64>=[steps*batch,r.features]
+  var projected:tensor.Tensor=try common.empty(context,array.view(output_shape))
+  var projection:tensor.Tensor=try tensor.view(array.borrow(parameters,r.projection)) map_err error
+  var bias:tensor.Tensor=try tensor.view(array.borrow(parameters,r.projection_bias)) map_err error
+  let _=try compute.linear_bias_eager_f32(stream,matrix,projection,bias,projected,1048576) map_err error
+  var gamma:tensor.Tensor=try tensor.view(array.borrow(parameters,r.normalization_gamma)) map_err error
+  var beta:tensor.Tensor=try tensor.view(array.borrow(parameters,r.normalization_beta)) map_err error
+  var mean:tensor.Tensor=try tensor.view(array.borrow(parameters,r.normalization_mean)) map_err error
+  var variance:tensor.Tensor=try tensor.view(array.borrow(parameters,r.normalization_variance)) map_err error
+  var normalized:tensor.Tensor=try dense_norm.evaluation(normalizer,context,stream,projected,
+   gamma,beta,mean,variance,0.00001)
+  var activated:tensor.Tensor=try common.empty(context,array.view(output_shape))
+  let _=try compute.relu(stream,normalized,activated) map_err error
+  let temporal_shape:array<u64>=[steps,batch,r.features,1]
+  var temporal:tensor.Tensor=try tensor.reshape(activated,array.view(temporal_shape)) map_err error
+  var channel_first:tensor.Tensor=try tensor.permute(temporal,[1,3,2,0]) map_err error
+  return result.ok(try tensor.contiguous(context,stream,channel_first) map_err error)
+ }
+ var members:array<ops.Tensor>=[]
+ var member:u64=0
+ loop{if member==array.get(reduced.dimensions,0){break}
+  var columns:ops.Tensor=try common.download_member(stream,reduced,member)
+  var rows:ops.Tensor=ops.transpose(columns)
+  var hidden:ops.Tensor=try recurrent.forward(w,r.layer,rows,cancel)
+  var projected:ops.Tensor=ops.linear(hidden,array.borrow(w.parameters.values,r.projection))
+  var i:u64=0
+  loop{if i>=array.len(projected.data){break}
+   let feature:u64=i%r.features
+   let biased:f32=array.get(projected.data,i)+parameter(w,r.projection_bias,feature)
+   let normalized:f32=biased*parameter(w,r.scale,feature)+parameter(w,r.bias,feature)
+   array.set(projected.data,i,if normalized>0.0{normalized}else{0.0})
+   i+=1}
+  array.push(members,ops.transpose(projected))
+  member+=1}
+ common.from_members(context,stream,members)
+}
+fn base(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,w:ref<weights.Model>,n:ref<network.Base>,input:tensor.Tensor own,cancel:str,policy:common.ConvolutionPolicy,retained:ref<vendor.State>,use_vendor:bool,normalizer:ref<dense_norm.Engine>,interpolation:ref<resize.Engine>)->result<tensor.Tensor,string> effects {alloc,gpu,fs.meta} {
+ var given:tensor.Tensor=input
+ var x:tensor.Tensor=try common.convolve_with_policy(context,stream,parameters,given,n.initial,policy)
+ var skips:array<tensor.Tensor>=[]
+ array.push(skips,try tensor.view(x) map_err error)
+ var i:u64=0
+ loop{if i>=4{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let pair:ref<layout.Pair>=array.borrow(n.encoder,i)
+  var first:tensor.Tensor=try common.convolve_with_policy(context,stream,parameters,x,pair.first,policy)
+  x=try common.convolve_with_policy(context,stream,parameters,first,pair.second,policy)
+  if i<3{array.push(skips,try tensor.view(x) map_err error)}
+  i+=1}
+ var averages:array<ops.Tensor>=[]
+ var member:u64=0
+ loop{if member==array.get(x.dimensions,0){break}
+  var original:ops.Tensor=try common.download_member(stream,x,member)
+  array.push(averages,spatial.mean_height(original))
+  member+=1}
+ var pooled:tensor.Tensor=try common.from_members(context,stream,averages)
+ var first:tensor.Tensor=try common.convolve_with_policy(context,stream,parameters,pooled,array.get(n.branches,0),policy)
+ var joined:tensor.Tensor=try resize_selected(context,stream,first,array.get(x.dimensions,2),array.get(x.dimensions,3),use_vendor,interpolation)
+ i=1
+ loop{if i>=5{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var part:tensor.Tensor=try common.convolve_with_policy(context,stream,parameters,x,array.get(n.branches,i),policy)
+  joined=try common.join(context,stream,joined,part)
+  i+=1}
+ x=try common.convolve_with_policy(context,stream,parameters,joined,n.bottleneck,policy)
+ i=0
+ loop{if i>=3{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var expanded:tensor.Tensor=try resize_selected(context,stream,x,2*array.get(x.dimensions,2),2*array.get(x.dimensions,3),use_vendor,interpolation)
+  var skip:tensor.Tensor=match array.pop(skips){some(v)=>v,none=>{return result.err("Missing recurrent cascade skip")},}
+  let width:u64=array.get(expanded.dimensions,3)
+  let old_width:u64=array.get(skip.dimensions,3)
+  if old_width<width{return result.err("Recurrent decoder exceeds skip extent")}
+  if old_width!=width{skip=try common.slice(context,stream,skip,3,(old_width-width)/2,width)}
+  var joined:tensor.Tensor=try common.join(context,stream,expanded,skip)
+  x=try common.convolve_with_policy(context,stream,parameters,joined,array.get(n.decoder,i),policy)
+  i+=1}
+ var feature:tensor.Tensor=try recurrent_feature(context,stream,parameters,w,struct.borrow(n,field=recurrent),x,cancel,policy,retained,use_vendor,normalizer,interpolation)
+ joined=try common.join(context,stream,x,feature)
+ var expanded:tensor.Tensor=try resize_selected(context,stream,joined,2*array.get(joined.dimensions,2),2*array.get(joined.dimensions,3),use_vendor,interpolation)
+ var first_skip:tensor.Tensor=match array.pop(skips){some(v)=>v,none=>{return result.err("Missing initial recurrent skip")},}
+ joined=try common.join(context,stream,expanded,first_skip)
+ common.convolve_with_policy(context,stream,parameters,joined,n.final,policy)
+}
+fn frequency_join(context:ref<GpuContext>,stream:ref<GpuStream>,a:ref<tensor.Tensor>,b:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ if array.get(a.dimensions,0)!=array.get(b.dimensions,0){return result.err("Recurrent frequency batches differ")}
+ var members:array<ops.Tensor>=[]
+ var i:u64=0
+ loop{if i==array.get(a.dimensions,0){break}
+  var first:ops.Tensor=try common.download_member(stream,a,i)
+  var second:ops.Tensor=try common.download_member(stream,b,i)
+  array.push(members,try spatial.concatenate_height(first,second))
+  i+=1}
+ common.from_members(context,stream,members)
+}
+fn predict_impl(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,policy:common.ConvolutionPolicy,retained:ref<vendor.State>,use_vendor:bool,normalizer:ref<dense_norm.Engine>,interpolation:ref<resize.Engine>)->result<array<ops.Tensor>,string> effects {alloc,gpu,fs.meta} {
+ let bins:u64=n.bins
+ if tensor.rank(input)!=4 or (array.get(input.dimensions,0)==0 or array.get(input.dimensions,0)>4) or array.get(input.dimensions,1)!=2 or
+  array.get(input.dimensions,2)!=bins+1 or array.get(input.dimensions,3)<=2*n.offset or array.get(input.dimensions,3)%32!=0{
+  return result.err("Invalid recurrent cascade input geometry")}
+ var x:tensor.Tensor=try common.slice(context,stream,input,2,0,bins)
+ var low:tensor.Tensor=try common.slice(context,stream,x,2,0,bins/2)
+ var high:tensor.Tensor=try common.slice(context,stream,x,2,bins/2,bins/2)
+ var first_low:tensor.Tensor=try base(context,stream,parameters,struct.borrow(n,field=weights),struct.borrow(n,field=low1),try tensor.view(low) map_err error,cancel,policy,retained,use_vendor,normalizer,interpolation)
+ first_low=try common.convolve_with_policy(context,stream,parameters,first_low,n.low1_tail,policy)
+ var first_high:tensor.Tensor=try base(context,stream,parameters,struct.borrow(n,field=weights),struct.borrow(n,field=high1),try tensor.view(high) map_err error,cancel,policy,retained,use_vendor,normalizer,interpolation)
+ var aux1:tensor.Tensor=try frequency_join(context,stream,first_low,first_high)
+ var low2:tensor.Tensor=try common.join(context,stream,low,first_low)
+ var high2:tensor.Tensor=try common.join(context,stream,high,first_high)
+ var second_low:tensor.Tensor=try base(context,stream,parameters,struct.borrow(n,field=weights),struct.borrow(n,field=low2),low2,cancel,policy,retained,use_vendor,normalizer,interpolation)
+ second_low=try common.convolve_with_policy(context,stream,parameters,second_low,n.low2_tail,policy)
+ var second_high:tensor.Tensor=try base(context,stream,parameters,struct.borrow(n,field=weights),struct.borrow(n,field=high2),high2,cancel,policy,retained,use_vendor,normalizer,interpolation)
+ var aux2:tensor.Tensor=try frequency_join(context,stream,second_low,second_high)
+ var joined:tensor.Tensor=try common.join(context,stream,x,aux1)
+ joined=try common.join(context,stream,joined,aux2)
+ var full:tensor.Tensor=try base(context,stream,parameters,struct.borrow(n,field=weights),struct.borrow(n,field=full),joined,cancel,policy,retained,use_vendor,normalizer,interpolation)
+ var projected:tensor.Tensor=try common.convolve_with_policy(context,stream,parameters,full,n.output,policy)
+ var activated:tensor.Tensor=try common.empty(context,array.view(projected.dimensions))
+ let _=try compute.sigmoid(stream,projected,activated) map_err error
+ var members:array<ops.Tensor>=[]
+ var i:u64=0
+ loop{if i==array.get(activated.dimensions,0){break}
+  var mask:ops.Tensor=try common.download_member(stream,activated,i)
+  var edge:ops.Tensor=try spatial.slice(mask,bins-1,1,0,mask.w)
+  var extended:ops.Tensor=try spatial.concatenate_height(mask,edge)
+  array.push(members,try spatial.slice(extended,0,bins+1,n.offset,extended.w-2*n.offset))
+  i+=1}
+ result.ok(members)
+}
+pub fn predict_batch_prepared(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,policy:common.ConvolutionPolicy,retained:ref<vendor.State>,normalizer:ref<dense_norm.Engine>,interpolation:ref<resize.Engine>)->result<array<ops.Tensor>,string> effects {alloc,gpu,fs.meta} {
+ predict_impl(context,stream,parameters,n,input,cancel,policy,retained,true,normalizer,interpolation)
+}
+pub fn predict_batch_with_policy(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str,policy:common.ConvolutionPolicy)->result<array<ops.Tensor>,string> effects {alloc,gpu,fs.meta} {
+ var interpolation:resize.Engine=resize.Engine{kernels:[],align_corners:true}
+ var normalizer:dense_norm.Engine=dense_norm.Engine{kernel:option.none()}
+ var retained:vendor.State=vendor.empty(0)
+ let use_vendor:bool=false
+ predict_impl(context,stream,parameters,n,input,cancel,policy,retained,use_vendor,normalizer,interpolation)
+}
+pub fn predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ if tensor.rank(input)!=4 or array.get(input.dimensions,0)!=1{return result.err("Legacy recurrent predictor requires one member")}
+ var interpolation:resize.Engine=resize.Engine{kernels:[],align_corners:true}
+ var normalizer:dense_norm.Engine=dense_norm.Engine{kernel:option.none()}
+ var retained:vendor.State=vendor.empty(0)
+ var members:array<ops.Tensor>=try predict_impl(context,stream,parameters,n,input,cancel,common.ConvolutionPolicy{},retained,false,normalizer,interpolation)
+ match array.pop(members){some(value)=>result.ok(value),none=>result.err("Recurrent predictor returned no member")}
+}

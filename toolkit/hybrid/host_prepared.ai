@@ -1,0 +1,188 @@
+module stemair.hybrid.host_prepared
+import "network.ai" as network
+import "host_ops.ai" as host
+import "../weights.ai" as weights
+import "../device_ops.ai" as forms
+import std.cpu_conv2d as convolution
+import std.cpu_transpose_conv2d as transpose
+import std.cpu_matmul as matrix
+import std.system as system
+import "host_transform.ai" as transform
+
+type Slot=enum{None,Forward(convolution.Prepared),Transpose(transpose.Prepared),Matrix(matrix.Matrix)}
+pub type Backend=struct{slots:array<Slot>,packs:u64,bytes:u64,max_convolution_elements:u64=100663296,
+ max_tensor_elements:u64=134217728,max_transpose_elements:u64=67108864,
+ max_transpose_matrix_elements:u64=134217728,max_matrix_input_bytes:u64=268435456,
+ max_matrix_output_elements:u64=67108864,max_local_steps:u64=8192,max_local_elements:u64=67108864,max_activation_bytes:u64=0,transforms:array<transform.Plan>}
+fn up(n:ref<network.Network>,id:u64)->bool effects {} {
+ var i:u64=0
+ loop{if i==array.len(n.decoder){break}
+  if array.get(n.decoder,i).conv.weight==id{return true}
+  var band:u64=0
+  loop{if band==array.len(array.borrow(n.decoder_bands,i).layers){break}
+   if array.get(array.borrow(n.decoder_bands,i).layers,band).conv.weight==id{return true}
+   band+=1}
+  i+=1}
+ i=0
+ loop{if i==array.len(n.tdecoder){break}
+  if array.get(n.tdecoder,i).conv.weight==id{return true}
+  i+=1}
+ false
+}
+fn projection(n:ref<network.Network>,id:u64)->bool effects {} {
+ var i:u64=0
+ loop{if i==array.len(n.residuals){break}
+  var j:u64=0
+  loop{if j==array.len(array.borrow(n.residuals,i).branches){break}
+   match array.get(array.borrow(n.residuals,i).branches,j).recurrence{some(r)=>{if r.weight==id{return true}},none=>{}}
+   j+=1}
+  i+=1}
+ false
+}
+pub fn prepare(n:ref<network.Network>)->result<Backend,string> effects {alloc,fs.read} {
+ var transposed:array<u64>=[]
+ var dense:array<u64>=[]
+ var i:u64=0
+ loop{if i==array.len(n.weights.parameters.values){break}
+  if up(n,i){array.push(transposed,i)}
+  if projection(n,i){array.push(dense,i)}
+  i+=1}
+ var out:Backend=try prepare_indexed(struct.borrow(n,field=weights),array.view(transposed),array.view(dense))
+ if array.len(n.constructor.kwargs.multi_freqs)!=0 and n.constructor.kwargs.segment==112{
+  // Logical capacities for the admitted public112-second band constructor.
+  // Allocation/RAM is checked again against the actual forward extent.
+  out.max_convolution_elements=268435456
+  out.max_tensor_elements=268435456
+  out.max_transpose_elements=268435456
+  out.max_transpose_matrix_elements=268435456
+  out.max_matrix_input_bytes=1073741824
+  out.max_local_elements=134217728
+  out.max_activation_bytes=8589934592}
+ result.ok(out)
+}
+fn contains(indices:view<u64>,index:u64)->bool effects {}{
+ var i:u64=0
+ loop{if i==view.len(indices){break}
+  if view.get(indices,i)==index{return true}
+  i+=1}
+ false
+}
+pub fn prepare_indexed(model:ref<weights.Model>,transposed_indices:view<u64>,dense_indices:view<u64>)->result<Backend,string> effects {alloc,fs.read}{
+ var bytes:u64=0
+ var i:u64=0
+ loop{if i==array.len(model.parameters.values){break}
+  let dense:bool=contains(dense_indices,i)
+  let p:ref<weights.Parameter>=array.borrow(model.parameters.values,i)
+  if array.len(p.shape)==3 or array.len(p.shape)==4 or dense{bytes+=array.len(p.values)*4}
+  i+=1}
+ let available:system.Memory=match system.memory(){ok(v)=>v,err(_)=>{return result.err("Cannot query retained hybrid memory availability")}}
+ if bytes>1073741824 or 1073741824+2*bytes>available.available_bytes{return result.err("Not enough RAM for retained hybrid products and bounded activations")}
+ var slots:array<Slot>=[]
+ var packs:u64=0
+ i=0
+ loop{if i==array.len(model.parameters.values){break}
+  let dense:bool=contains(dense_indices,i)
+  let transposed:bool=contains(transposed_indices,i)
+  let p:ref<weights.Parameter>=array.borrow(model.parameters.values,i)
+  var slot:Slot=Slot.None
+  if array.len(p.shape)==3 or array.len(p.shape)==4{
+   let shape:array<u64>=if array.len(p.shape)==3{[array.get(p.shape,0),array.get(p.shape,1),1,array.get(p.shape,2)]}else{[array.get(p.shape,0),array.get(p.shape,1),array.get(p.shape,2),array.get(p.shape,3)]}
+   if transposed{slot=Slot.Transpose(try transpose.prepare(array.view(p.values),array.view(shape),1,transpose.Limits{matrix:matrix.Limits{}}))}else{slot=Slot.Forward(try convolution.prepare(array.view(p.values),array.view(shape)))}
+   packs+=1
+  }else{if dense{slot=Slot.Matrix(try matrix.prepare(array.view(p.values),array.get(p.shape,0),array.get(p.shape,1),matrix.Limits{}))
+   packs+=1}}
+  array.push(slots,slot)
+  i+=1}
+ result.ok(Backend{slots:slots,packs:packs,bytes:bytes,transforms:[]})
+}
+pub fn convolve(n:ref<network.Network>,p:ref<Backend>,library:ref<CAbiLibrary>,input:ref<host.Tensor>,c:forms.Convolution)->result<host.Tensor,string> effects {alloc,ffi} {
+ convolve_weights(struct.borrow(n,field=weights),p,library,input,c)
+}
+pub fn convolve_weights(model:ref<weights.Model>,p:ref<Backend>,library:ref<CAbiLibrary>,input:ref<host.Tensor>,c:forms.Convolution)->result<host.Tensor,string> effects {alloc,ffi}{
+ let shape:array<u64>=host.shape(input)
+ let tensor_max:u64=if input.max_elements<p.max_tensor_elements{input.max_elements}else{p.max_tensor_elements}
+ let bias:ref<weights.Parameter>=array.borrow(model.parameters.values,c.bias)
+ let matrix_bytes:u64=p.max_matrix_input_bytes
+ let matrix_elements:u64=p.max_transpose_matrix_elements
+ let transpose_elements:u64=p.max_transpose_elements
+ if c.up{
+  let weight:ref<transpose.Prepared>=match array.borrow(p.slots,c.weight){Transpose(v)=>v,_=>{return result.err("CPU hybrid transpose was not prepared at startup")}}
+  // Actual44-second dense profile: final frequency column matrix124190720
+  // F32words; output62095360words. Input storage remains capped256MiB.
+  let limits:transpose.Limits=transpose.Limits{matrix:matrix.Limits{max_input_bytes:matrix_bytes,max_output_elements:matrix_elements},max_output_elements:transpose_elements}
+  let options:transpose.Options=transpose.Options{stride_height:c.stride_h,stride_width:c.stride_w,padding_height:c.pad_h,padding_width:c.pad_w,dilation_height:c.dilation_h,dilation_width:c.dilation_w}
+  let g:transpose.Geometry=try transpose.geometry_general(array.view(shape),weight,options,limits)
+  let _=try host.extent(g.batch,g.output_channels,g.output_height,g.output_width,tensor_max)
+  let values:array<f32>=try transpose.convolve_general(library,array.view(input.data),array.view(shape),weight,array.view(bias.values),options,limits)
+  return host.make_limited(g.batch,g.output_channels,g.output_height,g.output_width,values,tensor_max)}
+ let maximum:u64=p.max_convolution_elements
+ let weight:ref<convolution.Prepared>=match array.borrow(p.slots,c.weight){Forward(v)=>v,_=>{return result.err("CPU hybrid convolution was not prepared at startup")}}
+ // Actual first frequency rewrite and residual expansion93143040words.
+ let options:convolution.Options=convolution.Options{stride_height:c.stride_h,stride_width:c.stride_w,padding_height:c.pad_h,padding_width:c.pad_w,dilation_height:c.dilation_h,dilation_width:c.dilation_w,max_output_elements:maximum}
+ let g:convolution.Geometry=try convolution.geometry(array.view(shape),array.view(weight.shape),options)
+ let _=try host.extent(g.batch,g.output_channels,g.output_height,g.output_width,tensor_max)
+ let values:array<f32>=try convolution.convolve_blas(library,array.view(input.data),array.view(shape),weight,array.view(bias.values),options,8388608)
+ host.make_limited(g.batch,g.output_channels,g.output_height,g.output_width,values,tensor_max)
+}
+pub fn project(p:ref<Backend>,library:ref<CAbiLibrary>,id:u64,input:view<f32>,rows:u64,features:u64)->result<array<f32>,string> effects {alloc,ffi} {
+ let limits:matrix.Limits=matrix.Limits{max_input_bytes:p.max_matrix_input_bytes,max_output_elements:p.max_matrix_output_elements}
+ let weight:ref<matrix.Matrix>=match array.borrow(p.slots,id){Matrix(v)=>v,_=>{return result.err("CPU hybrid projection was not prepared at startup")}}
+ var activation:matrix.Matrix=try matrix.prepare(input,rows,features,limits)
+ matrix.multiply(library,activation,matrix.Operation.Identity,weight,matrix.Operation.Transpose,limits)
+}
+
+pub fn prepare_transform(bank:ref<Backend>,n:ref<network.Network>,runtime:str,length:u64)->result<unit,string> effects {alloc,ffi}{
+ if array.len(bank.transforms)!=0{return result.err("CPU hybrid transform was already prepared")}
+ let plan:transform.Plan=try transform.create(runtime,n.constructor.kwargs.nfft,length,n.constructor.kwargs.hybrid_old)
+ array.push(bank.transforms,plan)
+ result.ok(())
+}
+pub fn close_transform(bank:ref<Backend>)->result<unit,string> effects {alloc,ffi}{
+ match array.pop(bank.transforms){none=>result.ok(()),some(plan)=>transform.close(plan)}
+}
+pub fn prepare_magnitude(n:ref<network.Network>)->result<Backend,string> effects {alloc,fs.read}{
+ if n.constructor.kwargs.cac or n.constructor.kwargs.channels!=48 or n.constructor.kwargs.segment!=112 or array.len(n.constructor.kwargs.sources)!=4{return result.err("Original magnitude CPU requires its qualified48channel four-source constructor")}
+ var out:Backend=try prepare(n)
+ out.max_convolution_elements=268435456
+ out.max_tensor_elements=268435456
+ out.max_transpose_elements=268435456
+ out.max_transpose_matrix_elements=268435456
+ out.max_matrix_input_bytes=1073741824
+ out.max_local_elements=134217728
+ out.max_activation_bytes=8589934592
+ result.ok(out)
+}
+pub fn transform_index(bank:ref<Backend>,length:u64)->option<u64> effects {}{
+ var i:u64=0
+ loop{if i==array.len(bank.transforms){break}
+  if array.borrow(bank.transforms,i).length==length{return option.some(i)}
+  i+=1}
+ option.none()
+}
+pub fn close_transforms(bank:ref<Backend>)->result<unit,string> effects {alloc,ffi}{
+ var failure:string=""
+ loop{match array.pop(bank.transforms){none=>{break},some(plan)=>{match transform.close(plan){ok(_)=>{},err(e)=>{failure=e}}}}}
+ if str.len(failure)!=0{return result.err(failure)}
+ result.ok(())
+}
+pub fn prepare_transform_lengths(bank:ref<Backend>,n:ref<network.Network>,runtime:str,lengths:view<u64>,per_plan:u64,total:u64)->result<unit,string> effects {alloc,ffi}{
+ if array.len(bank.transforms)!=0 or view.len(lengths)==0 or view.len(lengths)>32 or per_plan>1073741824 or total>1073741824{return result.err("Invalid explicit retained CPU transform allowance")}
+ var sum:u64=0
+ var i:u64=0
+ loop{if i==view.len(lengths){break}
+  let bytes:u64=try transform.staging_bytes(n.constructor.kwargs.nfft,view.get(lengths,i))
+  if bytes>per_plan or bytes>total-sum{return result.err("Retained CPU transform staging exceeds explicit allowance")}
+  var j:u64=0
+  loop{if j==i{break}
+   if view.get(lengths,j)==view.get(lengths,i){return result.err("Repeated CPU transform extent")}
+   j+=1}
+  sum+=bytes
+  i+=1}
+ i=0
+ loop{if i==view.len(lengths){break}
+  match transform.create_with_limit(runtime,n.constructor.kwargs.nfft,view.get(lengths,i),n.constructor.kwargs.hybrid_old,per_plan){ok(plan)=>array.push(bank.transforms,plan),err(e)=>{
+    let _=close_transforms(bank)
+    return result.err(e)}}
+  i+=1}
+ result.ok(())
+}

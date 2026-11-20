@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "windows": {
+    "version": "9.0.2",
+    "encoder_sha256": "589e50b766d251afdf181dd664d40bd94407e200b019989fd7468c7d118a28d0",
+    "probe_sha256": "02264dfa4f56baaa31e443ece8aa16d397f6b008200e7fd184d22b9009e75fd3"
+  },
+  "linux": {
+    "version": "8.0.1-3ubuntu2",
+    "encoder_sha256": "bdf6aabffdba7411edff8d36c389d695257fcdf823d196020176e117612862f6",
+    "probe_sha256": "a6dac1e9e8631e04075d06854cc4069308aec279bb04683b4a0bca5e4f54b2fe"
+  }
+}

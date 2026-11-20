@@ -1,0 +1,9 @@
+{
+  "model": "residual-packed-v1",
+  "filename": "residual-packed-v1.th",
+  "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/6b9c2ca1-3fd82607.th",
+  "bytes": 59648321,
+  "sha256": "3fd82607b051e9f8ed0e86a30791023a3b589a427fb994c8bbfdff8c1903eeff",
+  "credit": "Demucs by Alexandre Defossez, Facebook AI Research and Meta Platforms",
+  "license": "MIT; waveform-MIT.txt and hybrid-MIT.txt"
+}

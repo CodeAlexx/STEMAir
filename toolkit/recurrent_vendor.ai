@@ -1,0 +1,79 @@
+// Retained bidirectional recurrent snapshots over the general shared LSTM API.
+module stemair.recurrent_vendor
+import "weights.ai" as weights
+import "recurrent.ai" as recurrent
+import std.cudnn_lstm as lstm
+import std.tensor as tensor
+import std.gpu as agpu
+pub type Entry=struct{key:u64,weights:lstm.Weights,plan:option<lstm.Plan>,algorithm:lstm.Algorithm}
+pub type State=struct{entries:array<Entry>,packs:u64,canonical_bytes:u64,packed_bytes:u64,workspace_limit:u64,sequence_prepares:u64,calls:u64}
+fn error(e:gpu.error)->string effects {alloc} {string.copy(e.message)}
+pub fn empty(workspace_limit:u64)->State effects {alloc} {
+ State{entries:[],packs:0,canonical_bytes:0,packed_bytes:0,workspace_limit:workspace_limit,sequence_prepares:0,calls:0}
+}
+fn find(state:ref<State>,key:u64)->option<u64> effects {} {
+ var i:u64=0
+ loop{if i==array.len(state.entries){break}
+  if array.borrow(state.entries,i).key==key{return option.some(i)}
+  i+=1}
+ option.none()
+}
+pub fn prepare(state:ref<State>,context:ref<GpuContext>,stream:ref<GpuStream>,model:ref<weights.Model>,layers:view<recurrent.Bidirectional>,packed_limit:u64)->result<unit,string> effects {alloc,gpu} {
+ if view.len(layers)==0 or view.len(layers)>8{return result.err("Invalid retained recurrent layer count")}
+ let first:recurrent.Bidirectional=view.get(layers,0)
+ if option.is_some(find(state,first.forward.input)){return result.err("Duplicate retained recurrent parameter identity")}
+ let config:lstm.Config=lstm.Config{input_features:first.input_features,hidden_features:first.hidden_features,layers:view.len(layers),directions:2,math:lstm.MathMode.Default}
+ var canonical:array<f32>=[]
+ var layer:u64=0
+ loop{if layer==view.len(layers){break}
+  let current:recurrent.Bidirectional=view.get(layers,layer)
+  if current.hidden_features!=first.hidden_features or current.input_features!=if layer==0{first.input_features}else{first.hidden_features*2}{return result.err("Retained recurrent layer geometry differs")}
+  let indices:array<u64>=[current.forward.input,current.forward.hidden,current.forward.input_bias,current.forward.hidden_bias,
+   current.reverse.input,current.reverse.hidden,current.reverse.input_bias,current.reverse.hidden_bias]
+  var p:u64=0
+  loop{if p==8{break}
+   let parameter:ref<weights.Parameter>=array.borrow(model.parameters.values,array.get(indices,p))
+   var j:u64=0
+   loop{if j==array.len(parameter.values){break}
+    array.push(canonical,array.get(parameter.values,j))
+    j+=1}
+   p+=1}
+  layer+=1}
+ let shape:array<u64>=[array.len(canonical)]
+ var value:tensor.Tensor=try tensor.from_f32(context,stream,array.view(canonical),array.view(shape),tensor.DType.F32) map_err error
+ let snapshot:lstm.Weights=try lstm.prepare_weights(stream,value,config,packed_limit) map_err error
+ let packed:u64=snapshot.packed_bytes
+ let properties:agpu.Properties=agpu.properties(context)
+ let algorithm:lstm.Algorithm=if first.hidden_features<=192 and properties.cc_major>=6{lstm.Algorithm.SmallHiddenPersistent}else{lstm.Algorithm.Standard}
+ array.push(state.entries,Entry{key:first.forward.input,weights:snapshot,plan:option.none(),algorithm:algorithm})
+ state.packs+=1
+ state.canonical_bytes+=array.len(canonical)*4
+ state.packed_bytes+=packed
+ result.ok(())
+}
+// Requires a startup snapshot. A missing key never falls back to manual math or
+// packs weights during a forward. Only sequence descriptors/workspace may change.
+pub fn forward(state:ref<State>,context:ref<GpuContext>,stream:ref<GpuStream>,key:u64,input:ref<tensor.Tensor>)->result<tensor.Tensor,string> effects {alloc,gpu} {
+ let index:u64=match find(state,key){some(v)=>v,none=>{return result.err("Retained recurrent weights were not prepared at startup")},}
+ if tensor.rank(input)!=3{return result.err("Retained recurrence requires dense TNC input")}
+ let steps:u64=array.get(input.dimensions,0)
+ let batch:u64=array.get(input.dimensions,1)
+ let entry:ref<Entry>=array.borrow(state.entries,index)
+ let config:lstm.Config=entry.weights.config
+ if array.get(input.dimensions,2)!=config.input_features{return result.err("Retained recurrent input width differs")}
+ let replace:bool=match entry.plan{none=>true,some(plan)=>plan.steps!=steps or plan.batch!=batch,}
+ if replace{
+  let plan:lstm.Plan=try lstm.prepare_sequence(stream,struct.borrow(entry,field=weights),steps,batch,entry.algorithm,state.workspace_limit) map_err error
+  entry.plan=option.some(plan)}
+ let ys:array<u64>=[steps,batch,config.hidden_features*config.directions]
+ let hs:array<u64>=[config.layers*config.directions,batch,config.hidden_features]
+ var hx:tensor.Tensor=try tensor.zeros(context,stream,array.view(hs),tensor.DType.F32) map_err error
+ var cx:tensor.Tensor=try tensor.zeros(context,stream,array.view(hs),tensor.DType.F32) map_err error
+ var y:tensor.Tensor=try tensor.empty(context,array.view(ys),tensor.DType.F32) map_err error
+ var hy:tensor.Tensor=try tensor.empty(context,array.view(hs),tensor.DType.F32) map_err error
+ var cy:tensor.Tensor=try tensor.empty(context,array.view(hs),tensor.DType.F32) map_err error
+ match entry.plan{some(plan)=>{let _=try lstm.forward_into(stream,plan,input,hx,cx,y,hy,cy) map_err error},none=>{return result.err("Retained recurrent sequence preparation missing")},}
+ if replace{state.sequence_prepares+=1}
+ state.calls+=1
+ result.ok(y)
+}

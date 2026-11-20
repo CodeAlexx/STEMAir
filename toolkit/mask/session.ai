@@ -1,0 +1,58 @@
+module stemair.mask.session
+import "config.ai" as config
+import "network.ai" as network
+import "host.ai" as host
+import "host_primitives.ai" as original
+import "host_session.ai" as envelope
+import "request.ai" as request
+import "../audio_result.ai" as audio
+import "../ops.ai" as ops
+import std.cpu_primitives as primitives
+import "bands.ai" as bands
+import "../complex_spectral.ai" as spectral
+pub type Session=struct{config:config.Config,network:network.Network,plans:array<spectral.Plan>,requests:u64=0,cpu:array<host.Backend>,cpu_preparations:u64=0,original_cpu:array<original.Backend>}
+pub fn open(path:str,settings:config.Config own)->result<Session,string> effects {alloc,fs.read} {
+ var c:config.Config=settings
+ let _=try config.validate(c)
+ let n:network.Network=try network.open(path,c.channels,c.levels,c.branches,c.bins)
+ let plans:array<spectral.Plan>=try bands.plans(c)
+ result.ok(Session{config:c,network:n,plans:plans,cpu:[],original_cpu:[]})
+}
+pub fn prepare_original_cpu(s:ref<Session>,adapter:str,host:str)->result<unit,string> effects {alloc,ffi}{
+ if array.len(s.original_cpu)!=0{
+  if array.borrow(s.original_cpu,0).adapter!=adapter{return result.err("Original CPU runtime changed; release the model first")}
+  return result.ok(())}
+ var guard:primitives.ThreadScope=try primitives.enter_threads(adapter,2)
+ let prepared:result<original.Backend,string>=original.prepare_for_host(struct.borrow(s.network,field=weights),adapter,host)
+ let restored:result<unit,string>=primitives.leave_threads(guard)
+ match prepared{err(e)=>{let _=try restored
+  result.err(e)},ok(value)=>{
+  var held:original.Backend=value
+  match restored{err(e)=>{let closed:result<unit,string>=original.close(held)
+   match closed{ok(_)=>{},err(_)=>{held.policy_valid=false
+    array.push(s.original_cpu,held)}}
+   result.err(e)},ok(_)=>{array.push(s.original_cpu,held)
+   result.ok(())}}}}
+}
+pub fn close_original_cpu(s:ref<Session>)->result<unit,string> effects {alloc,ffi}{
+ loop{if array.len(s.original_cpu)==0{break}
+  let at:u64=array.len(s.original_cpu)-1
+  let _=try original.close(array.borrow(s.original_cpu,at))
+  let _=array.pop(s.original_cpu)}
+ result.ok(())
+}
+fn predict_original_cpu(n:ref<network.Network>,bank:ref<original.Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta}{
+ original.predict(n,bank,library,input,cancel)
+}
+pub fn separate_original_cpu(s:ref<Session>,library:ref<CAbiLibrary>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>)->result<audio.Samples,string> effects {alloc,ffi,fs.meta,fs.write}{
+ var lower:array<f32>=[]
+ separate_original_cpu_with_band_input(s,library,c,input,cancel,progress,policy,array.view(lower))
+}
+pub fn separate_original_cpu_with_band_input(s:ref<Session>,library:ref<CAbiLibrary>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,lower:view<f32>)->result<audio.Samples,string> effects {alloc,ffi,fs.meta,fs.write}{
+ if array.len(s.original_cpu)!=1{return result.err("Original CPU mask state was not prepared at startup")}
+ let prepared:ref<original.Backend>=array.borrow(s.original_cpu,0)
+ let n:ref<network.Network>=struct.borrow(s,field=network)
+ let output:array<f64>=try envelope.separate_predicted_wide_with_cleanup_and_band_input<network.Network,original.Backend>(n,prepared,library,struct.borrow(s,field=plans),c,input,cancel,progress,predict_original_cpu,struct.borrow(policy,field=cleanup),lower)
+ s.requests+=1
+ result.ok(audio.from_wide(output))
+}

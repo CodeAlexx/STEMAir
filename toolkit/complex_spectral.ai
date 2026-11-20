@@ -1,0 +1,174 @@
+module stemair.complex_spectral
+import std.fft as fft
+import std.float as fp
+import "numeric.ai" as num
+import "ops.ai" as ops
+
+// Centered zero-padding and an F64 periodic Hann are distinct from the
+// reflected/F32 transform used by the complex encoder/decoder engines.
+pub type Plan=struct{n:u64,hop:u64,window:array<f64>,forward:fft.Plan,inverse:fft.Plan}
+pub type WideSpectrum=struct{real:array<f64>,imaginary:array<f64>,bins:u64,frames:u64}
+// Round the finite Euclidean norm once to complex64 magnitude. Wider shared
+// hypot avoids intermediate F32 rounding changing the selected phase on ties.
+pub fn magnitude(real:f32,imaginary:f32)->f32 effects {} {
+ let a:f64=cast.float(real)
+ let b:f64=cast.float(imaginary)
+ cast.float(fp.hypot(a,b))
+}
+pub fn plan(n:u64,hop:u64)->result<Plan,string> effects {alloc} {
+ if n<2 or n>65536 or n%2!=0 or hop==0 or hop>n{return result.err("Invalid complex transform geometry")}
+ var window:array<f64>=[]
+ let step:f64=6.2831853071795864769/cast.float(n)
+ var i:u64=0
+ loop{if i>=n{break}
+  array.push(window,0.5-0.5*fp.cos(cast.float(i)*step))
+  i+=1}
+ result.ok(Plan{n:n,hop:hop,window:window,forward:fft.plan(n,false),inverse:fft.plan(n,true)})
+}
+pub fn analyze(p:ref<Plan>,wave:view<f32>)->result<ops.Tensor,string> effects {alloc} {
+ if view.len(wave)==0 or view.len(wave)%2!=0 or not num.finite(wave){return result.err("Expected finite planar stereo input")}
+ let samples:u64=view.len(wave)/2
+ let frames:u64=1+samples/p.hop
+ let bins:u64=p.n/2+1
+ if frames>1073741824/(4*bins){return result.err("Complex spectrum exceeds its retained memory bound")}
+ var data:array<f32>=num.zeros(4*bins*frames)
+ var channel:u64=0
+ loop{if channel>=2{break}
+  var t:u64=0
+  loop{if t>=frames{break}
+   var input:array<f64>=[]
+   array.reserve(input,p.n)
+   var i:u64=0
+   loop{if i>=p.n{break}
+    let position:i64=cast.sat(t*p.hop+i)-cast.sat(p.n/2)
+    let index:u64=cast.sat(position)
+    let value:f64=if position>=0 and index<samples{cast.float(view.get(wave,channel*samples+index))}else{0.0}
+    array.push(input,value*array.get(p.window,i))
+    i+=1}
+   let spectrum:fft.Complex=fft.rfft_with(struct.borrow(p,field=forward),array.view(input))
+   i=0
+   loop{if i>=bins{break}
+    array.set(data,((2*channel)*bins+i)*frames+t,cast.float(array.get(spectrum.re,i)))
+    array.set(data,((2*channel+1)*bins+i)*frames+t,cast.float(array.get(spectrum.im,i)))
+    i+=1}
+   t+=1}
+  channel+=1}
+ result.ok(ops.tensor(4,bins,frames,data))
+}
+fn zeros(count:u64)->array<f64> effects {alloc} {
+ var out:array<f64>=[]
+ array.reserve(out,count)
+ var i:u64=0
+ loop{if i>=count{break}
+  array.push(out,0.0)
+  i+=1}
+ out
+}
+pub fn analyze_f64(p:ref<Plan>,wave:view<f64>)->result<WideSpectrum,string> effects {alloc} {
+ if view.len(wave)==0 or view.len(wave)%2!=0{return result.err("Expected finite planar stereo input")}
+ var at:u64=0
+ loop{if at==view.len(wave){break}
+  if not fp.is_finite(view.get(wave,at)){return result.err("Expected finite planar stereo input")}
+  at+=1}
+ let samples:u64=view.len(wave)/2
+ let frames:u64=1+samples/p.hop
+ let bins:u64=p.n/2+1
+ if frames>1073741824/(4*bins){return result.err("Complex spectrum exceeds its retained memory bound")}
+ var real:array<f64>=zeros(2*bins*frames)
+ var imaginary:array<f64>=zeros(2*bins*frames)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var time:u64=0
+  loop{if time==frames{break}
+   var input:array<f64>=[]
+   array.reserve(input,p.n)
+   var i:u64=0
+   loop{if i==p.n{break}
+    let position:i64=cast.sat(time*p.hop+i)-cast.sat(p.n/2)
+    let index:u64=cast.sat(position)
+    let value:f64=if position>=0 and index<samples{view.get(wave,channel*samples+index)}else{0.0}
+    array.push(input,value*array.get(p.window,i))
+    i+=1}
+   let spectrum:fft.Complex=fft.rfft_with(struct.borrow(p,field=forward),array.view(input))
+   i=0
+   loop{if i==bins{break}
+    array.set(real,(channel*bins+i)*frames+time,array.get(spectrum.re,i))
+    array.set(imaginary,(channel*bins+i)*frames+time,array.get(spectrum.im,i))
+    i+=1}
+   time+=1}
+  channel+=1}
+ result.ok(WideSpectrum{real:real,imaginary:imaginary,bins:bins,frames:frames})
+}
+fn round_sample(value:f64,single:bool)->f64 effects {} {
+ if single{let rounded:f32=cast.float(value)
+  cast.float(rounded)}else{value}
+}
+fn inverse(p:ref<Plan>,real:view<f64>,imaginary:view<f64>,frames:u64,single:bool)->result<array<f64>,string> effects {alloc} {
+ let bins:u64=p.n/2+1
+ if frames<2 or view.len(real)!=2*bins*frames or view.len(imaginary)!=view.len(real){return result.err("Invalid stereo inverse spectrum extent")}
+ let samples:u64=p.hop*(frames-1)
+ var output:array<f64>=[]
+ array.reserve(output,2*samples)
+ var normalization:array<f64>=zeros(samples+p.n)
+ var t:u64=0
+ loop{if t>=frames{break}
+  var i:u64=0
+  loop{if i>=p.n{break}
+   let window:f64=array.get(p.window,i)
+   array.set(normalization,t*p.hop+i,round_sample(array.get(normalization,t*p.hop+i)+window*window,single))
+   i+=1}
+  t+=1}
+ var channel:u64=0
+ loop{if channel>=2{break}
+  var accumulated:array<f64>=zeros(samples+p.n)
+  t=0
+  loop{if t>=frames{break}
+   var spectrum:fft.Complex=fft.Complex{re:[],im:[]}
+   var i:u64=0
+   loop{if i>=bins{break}
+    let re:f64=view.get(real,(channel*bins+i)*frames+t)
+    let im:f64=view.get(imaginary,(channel*bins+i)*frames+t)
+    if not fp.is_finite(re) or not fp.is_finite(im){return result.err("Non-finite inverse spectrum")}
+    array.push(spectrum.re,re)
+    array.push(spectrum.im,im)
+    i+=1}
+   let wave:array<f64>=fft.irfft_with(struct.borrow(p,field=inverse),spectrum,p.n)
+   i=0
+   loop{if i>=p.n{break}
+    let at:u64=t*p.hop+i
+    array.set(accumulated,at,round_sample(array.get(accumulated,at)+array.get(wave,i)*array.get(p.window,i),single))
+    i+=1}
+   t+=1}
+  var i:u64=0
+  loop{if i>=samples{break}
+   let at:u64=i+p.n/2
+   let denominator:f64=array.get(normalization,at)
+   var value:f64=array.get(accumulated,at)
+   if denominator>0.0000000000000000000000000000000000001{
+    if single{
+     let numerator:f32=cast.float(value)
+     let divisor:f32=cast.float(denominator)
+     let normalized:f32=numerator/divisor
+     value=cast.float(normalized)
+    }else{value=value/denominator}}
+   if not fp.is_finite(value){return result.err("Non-finite reconstructed waveform")}
+   array.push(output,value)
+   i+=1}
+  channel+=1}
+ result.ok(output)
+}
+pub fn synthesize(p:ref<Plan>,real:view<f64>,imaginary:view<f64>,frames:u64)->result<array<f64>,string> effects {alloc} {
+ inverse(p,real,imaginary,frames,false)
+}
+// Complex64 reconstruction rounds overlap-add and window sums to F32 at each
+// frame, then divides in F32. The FFT and periodic window remain F64.
+pub fn synthesize_f32(p:ref<Plan>,real:view<f64>,imaginary:view<f64>,frames:u64)->result<array<f32>,string> effects {alloc} {
+ let wide:array<f64>=try inverse(p,real,imaginary,frames,true)
+ var values:array<f32>=[]
+ array.reserve(values,array.len(wide))
+ var index:u64=0
+ loop{if index==array.len(wide){break}
+  array.push(values,cast.float(array.get(wide,index)))
+  index+=1}
+ result.ok(values)
+}

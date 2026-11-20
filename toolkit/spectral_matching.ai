@@ -1,0 +1,428 @@
+// Source-ordered recording spectra, independent of models, codecs and UI.
+module stemair.spectral_matching
+import "typed_selection.ai" as typed
+import "recording_resources.ai" as resources
+import "control.ai" as control
+import std.real_fft as real
+import std.fft as fft
+import std.vector_math as vector
+import std.libm as libm
+import std.cabi as foreign
+import std.float as fp
+
+pub type Recipe=enum{WindowsScalar,LinuxVector}
+pub type Plan=struct{window:array<f64>,transform:real.Plan,recipe:Recipe}
+pub type Spectrum=struct{real:array<f64>,imaginary:array<f64>,frames:u64,channels:u64,wide:bool}
+pub type Limits=struct{max_input_bytes:u64,max_working_bytes:u64}
+pub type Geometry=struct{frames:u64,spectral_frames:u64,bins:u64,working_bytes:u64}
+pub type Selected=struct{spectrum:Spectrum,mask:bytes}
+pub type Output=struct{samples:typed.Wave,frames:u64,channels:u64}
+pub type Final=struct{unclipped:typed.Wave,clipped:typed.Wave,residual:typed.Wave,aligned:typed.Wave,frames:u64,channels:u64,invocations:u64,parts:array<typed.Part>}
+type Slot=struct{wave:typed.Wave}
+type NarrowSlot=struct{samples:array<f32>}
+
+// Move selected dictionary values without cloning their sample allocations.
+// All source indices are validated before consuming the caller's candidate bank.
+pub fn take_values(waves:ref<array<typed.Wave>>,indices:view<u64>)->result<array<typed.Wave>,string> effects {alloc} {
+ let count:u64=array.len(waves)
+ var i:u64=0
+ loop{if i==view.len(indices){break}
+  if view.get(indices,i)>=count{return result.err("Spectral candidate index is outside its retained bank")}
+  var j:u64=0
+  loop{if j==i{break}
+   if view.get(indices,j)==view.get(indices,i){return result.err("Spectral candidate indices must be unique")}
+   j+=1}
+  i+=1}
+ var slots:array<Slot>=[]
+ array.reserve(slots,count)
+ loop{match array.pop(waves){none=>{break},some(value)=>{array.push(slots,Slot{wave:value})}}}
+ var chosen:array<typed.Wave>=[]
+ array.reserve(chosen,view.len(indices))
+ i=0
+ loop{if i==view.len(indices){break}
+  let slot:ref<Slot>=array.borrow(slots,count-1-view.get(indices,i))
+  let empty:typed.Wave=typed.Wave.Narrow([])
+  array.push(chosen,struct.replace(slot,empty,field=wave))
+  i+=1}
+ result.ok(chosen)
+}
+pub fn take_narrow_values(waves:ref<array<array<f32>>>,indices:view<u64>)->result<array<typed.Wave>,string> effects {alloc} {
+ let count:u64=array.len(waves)
+ var i:u64=0
+ loop{if i==view.len(indices){break}
+  if view.get(indices,i)>=count{return result.err("Spectral candidate index is outside its retained bank")}
+  var j:u64=0
+  loop{if j==i{break}
+   if view.get(indices,j)==view.get(indices,i){return result.err("Spectral candidate indices must be unique")}
+   j+=1}
+  i+=1}
+ var slots:array<NarrowSlot>=[]
+ array.reserve(slots,count)
+ loop{match array.pop(waves){none=>{break},some(value)=>{array.push(slots,NarrowSlot{samples:value})}}}
+ var chosen:array<typed.Wave>=[]
+ array.reserve(chosen,view.len(indices))
+ i=0
+ loop{if i==view.len(indices){break}
+  let slot:ref<NarrowSlot>=array.borrow(slots,count-1-view.get(indices,i))
+  let values:array<f32>=struct.replace(slot,[],field=samples)
+  array.push(chosen,typed.Wave.Narrow(values))
+  i+=1}
+ result.ok(chosen)
+}
+
+fn zeros(count:u64)->array<f64> effects {alloc} {
+ var values:array<f64>=[]
+ array.reserve(values,count)
+ var i:u64=0
+ loop{if i==count{break}
+  array.push(values,0.0)
+  i+=1}
+ values
+}
+pub fn plan(math:ref<CAbiLibrary>,recipe:Recipe)->result<Plan,string> effects {alloc,ffi} {
+ var window:array<f64>=[]
+ array.reserve(window,2048)
+ let step:f64=(3.141592653589793-(-3.141592653589793))/2048.0
+ var i:u64=0
+ loop{if i==2048{break}
+  let angle:f64=cast.float(i)*step+(-3.141592653589793)
+  let cosine:f64=if recipe==Recipe.WindowsScalar{try libm.cos(math,angle) map_err foreign.error_message}else{try vector.cos_pi_f64(angle)}
+  array.push(window,0.5+0.5*cosine)
+  i+=1}
+ result.ok(Plan{window:window,transform:try real.plan(2048),recipe:recipe})
+}
+pub fn geometry(samples:u64,channels:u64,wide:bool,limits:Limits)->result<Geometry,string> effects {alloc} {
+ if (channels!=1 and channels!=2) or samples==0 or samples%channels!=0{return result.err("Spectral matching requires complete nonempty mono or stereo frames")}
+ let input_bytes:u64=try resources.multiply(samples,if wide{8}else{4})
+ if input_bytes>limits.max_input_bytes{return result.err("Spectral matching exceeds its caller input limit")}
+ let frames:u64=samples/channels
+ let count:u64=1+frames/1024
+ let bins:u64=try resources.multiply(try resources.multiply(count,1025),channels)
+ let spectral_bytes:u64=try resources.multiply(bins,64)
+ let waveform_bytes:u64=try resources.multiply(try resources.checked_add(samples,8192),32)
+ let working:u64=try resources.checked_add(try resources.checked_add(spectral_bytes,waveform_bytes),1048576)
+ if working>limits.max_working_bytes{return result.err("Spectral matching exceeds its caller working-memory limit")}
+ result.ok(Geometry{frames:frames,spectral_frames:count,bins:bins,working_bytes:working})
+}
+pub fn analyze(plan:ref<Plan>,wave:ref<typed.Wave>,channels:u64,limits:Limits,cancel:str,progress:str)->result<Spectrum,string> effects {alloc,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Spectral matching cancelled")}
+ if array.len(plan.window)!=2048 or plan.transform.n!=2048{return result.err("Spectral matching transform plan is invalid")}
+ let shape:Geometry=try geometry(typed.length(wave),channels,typed.is_wide(wave),limits)
+ var re:array<f64>=zeros(shape.bins)
+ var im:array<f64>=zeros(shape.bins)
+ var ch:u64=0
+ loop{if ch==channels{break}
+  var t:u64=0
+  loop{if t==shape.spectral_frames{break}
+   if control.cancelled(cancel){return result.err("Spectral matching cancelled")}
+   var input:array<f64>=[]
+   array.reserve(input,2048)
+   var i:u64=0
+   loop{if i==2048{break}
+    let position:i64=cast.sat(t*1024+i)-1024
+    let index:u64=cast.wrap(position)
+    let value:f64=if position>=0 and index<shape.frames{typed.sample_wide(wave,index*channels+ch)}else{0.0}
+    if not fp.is_finite(value){return result.err("Spectral matching requires finite waveform values")}
+    array.push(input,array.get(plan.window,i)*value)
+    i+=1}
+   let spectrum:fft.Complex=try real.forward(struct.borrow(plan,field=transform),array.view(input))
+   i=0
+   loop{if i==1025{break}
+    let at:u64=(ch*1025+i)*shape.spectral_frames+t
+    let r:f64=array.get(spectrum.re,i)
+    let q:f64=array.get(spectrum.im,i)
+    if typed.is_wide(wave){array.set(re,at,r)
+     array.set(im,at,q)}else{
+     let rr:f32=cast.float(r)
+     let ii:f32=cast.float(q)
+     array.set(re,at,cast.float(rr))
+     array.set(im,at,cast.float(ii))}
+    i+=1}
+   control.report(progress,ch*shape.spectral_frames+t+1,channels*shape.spectral_frames)
+   t+=1}
+  ch+=1}
+ result.ok(Spectrum{real:re,imaginary:im,frames:shape.spectral_frames,channels:channels,wide:typed.is_wide(wave)})
+}
+fn rounded(value:f64,wide:bool)->f64 effects {} {
+ if wide{value}else{let stored:f32=cast.float(value)
+  cast.float(stored)}
+}
+pub fn magnitude(plan:ref<Plan>,math:ref<CAbiLibrary>,real:f64,imaginary:f64,wide:bool)->result<f64,string> effects {alloc,ffi} {
+ if wide{
+  result.ok(if plan.recipe==Recipe.LinuxVector{vector.magnitude_f64(real,imaginary)}else{try libm.hypot(math,real,imaginary) map_err foreign.error_message})
+ }else{
+  let a:f32=cast.float(real)
+  let b:f32=cast.float(imaginary)
+  let value:f32=if plan.recipe==Recipe.LinuxVector{vector.magnitude_f32(a,b)}else{cast.float(try libm.hypot(math,real,imaginary) map_err foreign.error_message)}
+  result.ok(cast.float(value))}
+}
+pub fn minimum(plan:ref<Plan>,math:ref<CAbiLibrary>,left:ref<Spectrum>,right:ref<Spectrum>,limits:Limits,cancel:str)->result<Selected,string> effects {alloc,ffi,fs.meta} {
+ if left.channels!=right.channels or (left.channels!=1 and left.channels!=2) or left.frames==0 or right.frames==0{return result.err("Spectral matching spectrum shapes are incompatible")}
+ let frames:u64=if left.frames<right.frames{left.frames}else{right.frames}
+ let rows:u64=left.channels*1025
+ let count:u64=try resources.multiply(rows,frames)
+ let left_count:u64=try resources.multiply(rows,left.frames)
+ let right_count:u64=try resources.multiply(rows,right.frames)
+ if array.len(left.real)!=left_count or array.len(left.imaginary)!=left_count or array.len(right.real)!=right_count or array.len(right.imaginary)!=right_count{return result.err("Spectral matching spectrum components are incomplete")}
+ let retained:u64=try resources.multiply(try resources.checked_add(left_count,right_count),16)
+ let required:u64=try resources.checked_add(retained,try resources.multiply(count,17))
+ if required>limits.max_working_bytes{return result.err("Spectral matching selector exceeds its caller working-memory limit")}
+ var re:array<f64>=[]
+ var im:array<f64>=[]
+ var mask:array<byte>=[]
+ array.reserve(re,count)
+ array.reserve(im,count)
+ array.reserve(mask,count)
+ var bin:u64=0
+ loop{if bin==left.channels*1025{break}
+  var t:u64=0
+  loop{if t==frames{break}
+   if t%1024==0 and control.cancelled(cancel){return result.err("Spectral matching cancelled")}
+   let a:u64=bin*left.frames+t
+   let b:u64=bin*right.frames+t
+   let lr:f64=array.get(left.real,a)
+   let li:f64=array.get(left.imaginary,a)
+   let rr:f64=array.get(right.real,b)
+   let ri:f64=array.get(right.imaginary,b)
+   let right_magnitude:f64=try magnitude(plan,math,rr,ri,right.wide)
+   let left_magnitude:f64=try magnitude(plan,math,lr,li,left.wide)
+   let use_right:bool=right_magnitude<=left_magnitude
+   array.push(re,if use_right{rr}else{lr})
+   array.push(im,if use_right{ri}else{li})
+   let selected:u8=if use_right{1}else{0}
+   array.push(mask,cast.bits(selected))
+   t+=1}
+  bin+=1}
+ result.ok(Selected{spectrum:Spectrum{real:re,imaginary:im,frames:frames,channels:left.channels,wide:left.wide or right.wide},mask:bytes.from_array(mask)})
+}
+pub fn synthesize(plan:ref<Plan>,spectrum:ref<Spectrum>,target_frames:u64,limits:Limits,cancel:str,progress:str)->result<typed.Wave,string> effects {alloc,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Spectral matching cancelled")}
+ if array.len(plan.window)!=2048 or plan.transform.n!=2048{return result.err("Spectral matching transform plan is invalid")}
+ if spectrum.frames==0 or (spectrum.channels!=1 and spectrum.channels!=2){return result.err("Spectral reconstruction shape is invalid")}
+ let count:u64=try resources.multiply(try resources.multiply(spectrum.frames,1025),spectrum.channels)
+ if array.len(spectrum.real)!=count or array.len(spectrum.imaginary)!=count{return result.err("Spectral reconstruction components are incomplete")}
+ let _=try geometry(try resources.multiply(target_frames,spectrum.channels),spectrum.channels,spectrum.wide,limits)
+ let raw_frames:u64=try resources.checked_add(2048,try resources.multiply(spectrum.frames-1,1024))
+ let retained:u64=try resources.checked_add(try resources.multiply(count,16),try resources.multiply(raw_frames,32))
+ let required:u64=try resources.checked_add(retained,try resources.multiply(try resources.multiply(target_frames,spectrum.channels),16))
+ if required>limits.max_working_bytes{return result.err("Spectral reconstruction exceeds its caller working-memory limit")}
+ let generated:u64=(spectrum.frames-1)*1024
+ var normalization:array<f64>=zeros(raw_frames)
+ var t:u64=0
+ loop{if t==spectrum.frames{break}
+  var i:u64=0
+  loop{if i==2048{break}
+   let window:f64=array.get(plan.window,i)
+   let square:f64=window*window
+   let at:u64=t*1024+i
+   array.set(normalization,at,rounded(array.get(normalization,at)+square,spectrum.wide))
+   i+=1}
+  t+=1}
+ var channels:array<array<f64>>=[]
+ var ch:u64=0
+ loop{if ch==spectrum.channels{break}
+  var accumulated:array<f64>=zeros(raw_frames)
+  t=0
+  loop{if t==spectrum.frames{break}
+   if control.cancelled(cancel){return result.err("Spectral matching cancelled")}
+   var bins:fft.Complex=fft.Complex{re:[],im:[]}
+   array.reserve(bins.re,1025)
+   array.reserve(bins.im,1025)
+   var i:u64=0
+   loop{if i==1025{break}
+    let at:u64=(ch*1025+i)*spectrum.frames+t
+    array.push(bins.re,array.get(spectrum.real,at))
+    array.push(bins.im,array.get(spectrum.imaginary,at))
+    i+=1}
+   let frame:array<f64>=try real.inverse(struct.borrow(plan,field=transform),bins)
+   i=0
+   loop{if i==2048{break}
+    let at:u64=t*1024+i
+    let value:f64=array.get(plan.window,i)*array.get(frame,i)
+    array.set(accumulated,at,rounded(array.get(accumulated,at)+value,spectrum.wide))
+    i+=1}
+   control.report(progress,ch*spectrum.frames+t+1,spectrum.channels*spectrum.frames)
+   t+=1}
+  var values:array<f64>=[]
+  array.reserve(values,target_frames)
+  var i:u64=0
+  loop{if i==target_frames{break}
+   var value:f64=0.0
+   if i<generated{
+    value=array.get(accumulated,1024+i)
+    let denominator:f64=array.get(normalization,1024+i)
+    if spectrum.wide{
+     if denominator>2.2250738585072014e-308{value=value/denominator}
+    }else{
+     if denominator>1.1754943508222875e-38{
+      let numerator:f32=cast.float(value)
+      let divisor:f32=cast.float(denominator)
+      let quotient:f32=numerator/divisor
+      value=cast.float(quotient)}}}
+   array.push(values,value)
+   i+=1}
+  array.push(channels,values)
+  ch+=1}
+ if spectrum.wide{
+  var output:array<f64>=[]
+  array.reserve(output,target_frames*spectrum.channels)
+  var i:u64=0
+  loop{if i==target_frames{break}
+   ch=0
+   loop{if ch==spectrum.channels{break}
+    array.push(output,array.get(array.borrow(channels,ch),i))
+    ch+=1}
+   i+=1}
+  result.ok(typed.Wave.Wide(output))
+ }else{
+  var output:array<f32>=[]
+  array.reserve(output,target_frames*spectrum.channels)
+  var i:u64=0
+  loop{if i==target_frames{break}
+   ch=0
+   loop{if ch==spectrum.channels{break}
+    array.push(output,cast.float(array.get(array.borrow(channels,ch),i)))
+    ch+=1}
+   i+=1}
+  result.ok(typed.Wave.Narrow(output))}
+}
+
+pub fn combine(plan:ref<Plan>,math:ref<CAbiLibrary>,waves:ref<array<typed.Wave>>,channels:u64,limits:Limits,cancel:str,progress:str)->result<Output,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if array.len(waves)<2{return result.err("Spectral matching requires at least two ordered waveforms")}
+ // The original helper's mono STFT is two-dimensional; its spectrum ensemble
+ // indexes a third extent before a one-dimensional inverse can be duplicated.
+ if channels==1{return result.err("Spectral matching cannot match a mono candidate matrix")}
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  let wave:ref<typed.Wave>=array.borrow(waves,i)
+  let shape:Geometry=try geometry(typed.length(wave),channels,typed.is_wide(wave),limits)
+  let bytes:u64=try resources.multiply(typed.length(wave),if typed.is_wide(wave){8}else{4})
+  total=try resources.checked_add(total,bytes)
+  if total>limits.max_input_bytes{return result.err("Spectral matching exceeds its summed caller input limit")}
+  if total>limits.max_working_bytes or shape.working_bytes>limits.max_working_bytes-total{return result.err("Spectral matching retained candidates exceed its caller working-memory limit")}
+  i+=1}
+ var selected:Spectrum=try analyze(plan,array.borrow(waves,0),channels,limits,cancel,progress)
+ i=1
+ loop{if i==array.len(waves){break}
+  var next:Spectrum=try analyze(plan,array.borrow(waves,i),channels,limits,cancel,progress)
+  var reduced:Selected=try minimum(plan,math,selected,next,limits,cancel)
+  let empty:Spectrum=Spectrum{real:[],imaginary:[],frames:0,channels:0,wide:false}
+  selected=struct.replace(reduced,empty,field=spectrum)
+  i+=1}
+ let frames:u64=typed.length(array.borrow(waves,1))/channels
+ let samples:typed.Wave=try synthesize(plan,selected,frames,limits,cancel,progress)
+ result.ok(Output{samples:samples,frames:frames,channels:channels})
+}
+
+fn clipped(wave:ref<typed.Wave>,cancel:str)->result<typed.Wave,string> effects {alloc,fs.meta} {
+ if typed.is_wide(wave){
+  var output:array<f64>=[]
+  array.reserve(output,typed.length(wave))
+  var i:u64=0
+  loop{if i==typed.length(wave){break}
+   if i%4096==0 and control.cancelled(cancel){return result.err("Spectral matching cancelled")}
+   let value:f64=typed.sample_wide(wave,i)
+   array.push(output,if value< -1.0{-1.0}else{if value>1.0{1.0}else{value}})
+   i+=1}
+  result.ok(typed.Wave.Wide(output))
+ }else{
+  var output:array<f32>=[]
+  array.reserve(output,typed.length(wave))
+  var i:u64=0
+  loop{if i==typed.length(wave){break}
+   if i%4096==0 and control.cancelled(cancel){return result.err("Spectral matching cancelled")}
+   let value:f32=typed.sample_narrow(wave,i)
+   array.push(output,if value< -1.0{-1.0}else{if value>1.0{1.0}else{value}})
+   i+=1}
+  result.ok(typed.Wave.Narrow(output))}
+}
+fn subtract(first:view<f32>,other:ref<typed.Wave>,cancel:str)->result<typed.Wave,string> effects {alloc,fs.meta} {
+ if view.len(first)!=typed.length(other){return result.err("Spectral residual shapes differ")}
+ if typed.is_wide(other){
+  var output:array<f64>=[]
+  array.reserve(output,view.len(first))
+  var i:u64=0
+  loop{if i==view.len(first){break}
+   if i%4096==0 and control.cancelled(cancel){return result.err("Spectral matching cancelled")}
+   array.push(output,cast.float(view.get(first,i))-typed.sample_wide(other,i))
+   i+=1}
+  result.ok(typed.Wave.Wide(output))
+ }else{
+  var output:array<f32>=[]
+  array.reserve(output,view.len(first))
+  var i:u64=0
+  loop{if i==view.len(first){break}
+   if i%4096==0 and control.cancelled(cancel){return result.err("Spectral matching cancelled")}
+   array.push(output,view.get(first,i)-typed.sample_narrow(other,i))
+   i+=1}
+  result.ok(typed.Wave.Narrow(output))}
+}
+fn doubled(wave:ref<typed.Wave>)->typed.Wave effects {alloc} {
+ if typed.is_wide(wave){
+  var output:array<f64>=[]
+  array.reserve(output,typed.length(wave)*2)
+  var i:u64=0
+  loop{if i==typed.length(wave){break}
+   let value:f64=typed.sample_wide(wave,i)
+   array.push(output,value)
+   array.push(output,value)
+   i+=1}
+  typed.Wave.Wide(output)
+ }else{
+  var output:array<f32>=[]
+  array.reserve(output,typed.length(wave)*2)
+  var i:u64=0
+  loop{if i==typed.length(wave){break}
+   let value:f32=typed.sample_narrow(wave,i)
+   array.push(output,value)
+   array.push(output,value)
+   i+=1}
+  typed.Wave.Narrow(output)}
+}
+// Caller supplies dictionary values in their original insertion order. Both
+// source spectral invocations are complete; save_aligned is an I/O policy.
+pub fn finish(plan:ref<Plan>,math:ref<CAbiLibrary>,first:view<f32>,waves:ref<array<typed.Wave>>,channels:u64,limits:Limits,cancel:str,progress:str)->result<Final,string> effects {alloc,ffi,fs.meta,fs.write} {
+ if array.len(waves)==0 or (channels!=1 and channels!=2) or view.len(first)==0 or view.len(first)%channels!=0{return result.err("Spectral alignment requires complete candidate frames")}
+ let frames:u64=view.len(first)/channels
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  if typed.length(array.borrow(waves,i))!=view.len(first){return result.err("Spectral alignment candidate lengths differ")}
+  i+=1}
+ var parts:array<typed.Part>=[]
+ var chosen:typed.Wave=if array.len(waves)>=2{
+  var combined:Output=try combine(plan,math,waves,channels,limits,cancel,progress)
+  let empty:typed.Wave=typed.Wave.Narrow([])
+  struct.replace(combined,empty,field=samples)
+ }else{
+  let indices:array<u64>=[0]
+  var selected:typed.Output=try typed.select_chunks(waves,array.view(indices),frames,channels,240,limits.max_working_bytes,cancel,progress)
+  parts=struct.replace(selected,[],field=parts)
+  let empty:typed.Wave=typed.Wave.Narrow([])
+  struct.replace(selected,empty,field=samples)}
+ var clipped:typed.Wave=try clipped(chosen,cancel)
+ var reconstructed:typed.Wave=try subtract(first,clipped,cancel)
+ var original:array<f32>=[]
+ array.reserve(original,view.len(first)*(if channels==1{2}else{1}))
+ i=0
+ loop{if i==view.len(first){break}
+  let value:f32=view.get(first,i)
+  array.push(original,value)
+  if channels==1{array.push(original,value)}
+  i+=1}
+ var pair:array<typed.Wave>=[]
+ if channels==1{array.push(pair,doubled(reconstructed))}else{array.push(pair,reconstructed)}
+ // The second entry is the original first recording, as in the source.
+ var copy:array<f32>=[]
+ array.reserve(copy,array.len(original))
+ i=0
+ loop{if i==array.len(original){break}
+  array.push(copy,array.get(original,i))
+  i+=1}
+ array.push(pair,typed.Wave.Narrow(copy))
+ var combined:Output=try combine(plan,math,pair,2,limits,cancel,progress)
+ var residual:typed.Wave=try subtract(array.view(original),struct.borrow(combined,field=samples),cancel)
+ let empty:typed.Wave=typed.Wave.Narrow([])
+ let aligned:typed.Wave=struct.replace(combined,empty,field=samples)
+ result.ok(Final{unclipped:chosen,clipped:clipped,residual:residual,aligned:aligned,frames:frames,channels:2,invocations:if array.len(waves)>=2{2}else{1},parts:parts})
+}

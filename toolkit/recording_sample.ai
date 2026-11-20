@@ -1,0 +1,38 @@
+// Recording sample geometry is independent of desktop, files and model state.
+module stemair.recording_sample
+import std.audio as audio
+
+pub type Plan=struct{start_frame:u64,requested_frames:u64,frames:u64,named_seconds:u64}
+
+pub fn plan(total_frames:u64,rate:u32,seconds:u64)->result<Plan,string> effects {alloc} {
+ if rate==0{return result.err("Sample rate must be positive")}
+ if seconds<5 or seconds>120{return result.err("Sample duration must be between 5 and 120 seconds")}
+ let whole:u64=total_frames/cast.wrap(rate)
+ let long:bool=whole>=seconds
+ let offset:u64=if long{whole/3}else{0}
+ let length:u64=if long{seconds}else{whole}
+ // offset * rate cannot exceed the already-representable total frame count;
+ // length is bounded by 120 and rate by u32, so both products fit u64.
+ let start:u64=offset*cast.wrap(rate)
+ let requested:u64=length*cast.wrap(rate)
+ let available:u64=total_frames-start
+ result.ok(Plan{start_frame:start,requested_frames:requested,
+  frames:if available<requested{available}else{requested},named_seconds:if long{seconds}else{0}})
+}
+
+pub fn extract(input:ref<audio.AudioBuffer>,seconds:u64,max_decoded_bytes:u64)->result<audio.AudioBuffer,string> effects {alloc} {
+ if input.channels!=1 and input.channels!=2{return result.err("Recording samples require mono or stereo input")}
+ let channels:u64=cast.wrap(input.channels)
+ if array.len(input.samples)%channels!=0{return result.err("Recording samples require complete interleaved frames")}
+ let region:Plan=try plan(array.len(input.samples)/channels,input.rate,seconds)
+ let count:u64=region.frames*channels
+ if count>max_decoded_bytes/4{return result.err("Recording sample exceeds the decoded-byte limit")}
+ var samples:array<f32>=[]
+ array.reserve(samples,count)
+ let start:u64=region.start_frame*channels
+ var i:u64=0
+ loop{if i==count{break}
+  array.push(samples,array.get(input.samples,start+i))
+  i+=1}
+ result.ok(audio.AudioBuffer{samples:samples,rate:input.rate,channels:input.channels})
+}

@@ -1,0 +1,149 @@
+module stemair.export_audio
+import "control.ai" as control
+import "numeric.ai" as num
+import std.audio as audio
+import std.files as files
+import std.float as fp
+import std.text as text
+
+pub type Settings=struct{subtype:string="s16",normalize:bool=false,durable:bool=false} derive codec(strict)
+pub type Report=struct{path:string,subtype:string,rate:u32,channels:u32,frames:u64,bytes:u64,
+ normalized:bool,staging_removed:bool,staging_path:string,directory_sync_completed:bool} derive codec(strict)
+pub type Prepared=struct{sink:option<files.Sink>,target:string,temporary:string,subtype:string,rate:u32,channels:u16,
+ frames:u64,bytes:u64,normalized:bool,durable:bool}
+pub fn subtype(name:str)->result<audio.WavSubtype,string> effects {alloc} {
+ if name=="u8"{return result.ok(audio.WavSubtype.PcmU8)}
+ if name=="s16"{return result.ok(audio.WavSubtype.Pcm16)}
+ if name=="s24"{return result.ok(audio.WavSubtype.Pcm24)}
+ if name=="s32"{return result.ok(audio.WavSubtype.Pcm32)}
+ if name=="f32"{return result.ok(audio.WavSubtype.Float32)}
+ if name=="f64"{return result.ok(audio.WavSubtype.Float64)}
+ result.err("Choose a supported WAV subtype: u8, s16, s24, s32, f32 or f64")
+}
+fn failure(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+fn retained(temporary:str)->string effects {alloc,fs.meta} {
+ match files.symlink_metadata(temporary){err(_)=>"",ok(_)=>text.concat("; export staging remains at ",temporary)}
+}
+fn peak(values:view<f32>)->f32 effects {} {
+ var peak:f32=0.0
+ var i:u64=0
+ loop{if i==view.len(values){break}
+  let value:f32=fp.abs(view.get(values,i))
+  if fp.is_nan(value){peak=value
+   break}
+  if value>peak{peak=value}
+  i+=1}
+ peak
+}
+fn prepared_bytes(source:ref<audio.AudioBuffer>,settings:ref<Settings>,kind:audio.WavSubtype,peak:f32)->result<bytes,string> effects {alloc} {
+ // This is the original optional above-one peak policy, not loudness scaling.
+ if not settings.normalize or not (peak>1.0){return result.ok(try audio.encode_wav_as(source,kind) map_err audio.message)}
+ var samples:array<f32>=num.copy(array.view(source.samples))
+ var i:u64=0
+ loop{if i==array.len(samples){break}
+  array.set(samples,i,array.get(samples,i)/peak)
+  i+=1}
+ let normalized:audio.AudioBuffer=audio.AudioBuffer{samples:samples,rate:source.rate,channels:source.channels}
+ result.ok(try audio.encode_wav_as(normalized,kind) map_err audio.message)
+}
+fn prepare_impl(source:ref<audio.AudioBuffer>,settings:ref<Settings>,target:str,cancel:str,progress:str,allow_empty:bool)->result<Prepared,string>
+ effects {alloc,fs.read,fs.write,fs.meta} {
+ let kind:audio.WavSubtype=try subtype(settings.subtype)
+ if str.len(target)==0{return result.err("Choose an output WAV path")}
+ if array.len(source.samples)==0 and not allow_empty{return result.err("Cannot export an empty recording")}
+ if control.cancelled(cancel){return result.err("Audio export cancelled")}
+ match files.symlink_metadata(target){ok(_)=>{return result.err("An output already exists; existing files are preserved")},err(error)=>{
+  if error.code!=1{return result.err("Cannot inspect the selected export path")}}}
+ control.status(progress,"Encoding WAV")
+ let maximum:f32=peak(array.view(source.samples))
+ let raw:bytes=try prepared_bytes(source,settings,kind,maximum)
+ stage_encoded(bytes.view(raw),settings,target,cancel,settings.normalize and maximum>1.0)
+}
+fn stage_encoded(raw:view<byte>,settings:ref<Settings>,target:str,cancel:str,normalized:bool)->result<Prepared,string>
+ effects {alloc,fs.read,fs.write,fs.meta} {
+ let info:audio.WavInfo=try audio.inspect_wav(raw) map_err audio.message
+ let temporary:string=text.concat(target,".export")
+ var sink:files.Sink=match files.sink_create(target,temporary){ok(v)=>v,err(error)=>{
+  return result.err(text.concat("Cannot create an exclusive export stage: ",failure(error)))}}
+ var position:u64=0
+ loop{if position==view.len(raw){break}
+  if control.cancelled(cancel){let _=files.sink_discard(sink)
+   return result.err(text.concat("Audio export cancelled",retained(temporary)))}
+  let stop:u64=if view.len(raw)-position<65536{view.len(raw)}else{position+65536}
+  match files.sink_write(sink,view.slice(raw,position,stop)){ok(_)=>{},err(error)=>{
+   let _=files.sink_discard(sink)
+   return result.err(text.concat(failure(error),retained(temporary)))}}
+  position=stop}
+ result.ok(Prepared{sink:option.some(sink),target:string.copy(target),temporary:temporary,subtype:string.copy(settings.subtype),
+  rate:info.rate,channels:info.channels,frames:info.frames,bytes:view.len(raw),normalized:normalized,durable:settings.durable})
+}
+// Retain source precision through normalization and the selected WAV conversion.
+pub fn prepare_f64(samples:view<f64>,rate:u32,channels:u16,settings:ref<Settings>,target:str,cancel:str,progress:str)->result<Prepared,string>
+ effects {alloc,fs.read,fs.write,fs.meta} {
+ let kind:audio.WavSubtype=try subtype(settings.subtype)
+ if str.len(target)==0{return result.err("Choose an output WAV path")}
+ if view.len(samples)==0{return result.err("Cannot export an empty recording")}
+ if control.cancelled(cancel){return result.err("Audio export cancelled")}
+ match files.symlink_metadata(target){ok(_)=>{return result.err("An output already exists; existing files are preserved")},err(error)=>{
+  if error.code!=1{return result.err("Cannot inspect the selected export path")}}}
+ var maximum:f64=0.0
+ var i:u64=0
+ loop{if i==view.len(samples){break}
+  let value:f64=fp.abs(view.get(samples,i))
+  if fp.is_nan(value){maximum=value
+   break}
+  if value>maximum{maximum=value}
+  i+=1}
+ control.status(progress,"Encoding WAV")
+ let normalize:bool=settings.normalize and maximum>1.0
+ let raw:bytes=if normalize{
+  var values:array<f64>=[]
+  array.reserve(values,view.len(samples))
+  i=0
+  loop{if i==view.len(samples){break}
+   array.push(values,view.get(samples,i)/maximum)
+   i+=1}
+  try audio.encode_wav_f64_as(array.view(values),rate,channels,kind) map_err audio.message
+ }else{try audio.encode_wav_f64_as(samples,rate,channels,kind) map_err audio.message}
+ stage_encoded(bytes.view(raw),settings,target,cancel,normalize)
+}
+// Existing exports retain their nonempty-recording contract.
+pub fn prepare(source:ref<audio.AudioBuffer>,settings:ref<Settings>,target:str,cancel:str,progress:str)->result<Prepared,string>
+ effects {alloc,fs.read,fs.write,fs.meta} {
+ prepare_impl(source,settings,target,cancel,progress,false)
+}
+// Explicit opt-in for valid empty clips, including subsecond sample selections.
+pub fn prepare_including_empty(source:ref<audio.AudioBuffer>,settings:ref<Settings>,target:str,cancel:str,progress:str)->result<Prepared,string>
+ effects {alloc,fs.read,fs.write,fs.meta} {
+ prepare_impl(source,settings,target,cancel,progress,true)
+}
+pub fn publish(work:Prepared own,cancel:str,progress:str)->result<Report,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ var ready:Prepared=work
+ let stage:string=string.copy(ready.temporary)
+ let owned:option<files.Sink>=struct.replace(ready,option.none(),field=sink)
+ let sink:files.Sink=match owned{some(v)=>v,none=>{return result.err("Export stage is unavailable")}}
+ if control.cancelled(cancel){let _=files.sink_discard(sink)
+  return result.err(text.concat("Audio export cancelled",retained(stage)))}
+ let outcome:files.Publication=match files.sink_publish_new(sink,ready.durable){ok(v)=>v,err(error)=>{
+  return result.err(text.concat("Cannot publish the verified WAV without replacing an existing file: ",text.concat(failure(error),retained(stage))))}}
+ control.status(progress,"Audio export complete")
+ result.ok(Report{path:string.copy(ready.target),subtype:string.copy(ready.subtype),rate:ready.rate,channels:cast.wrap(ready.channels),
+  frames:ready.frames,bytes:ready.bytes,normalized:ready.normalized,staging_removed:outcome.temporary_removed,
+  staging_path:if outcome.temporary_removed{""}else{string.copy(outcome.temporary)},directory_sync_completed:outcome.directory_sync_completed})
+}
+pub fn run(source:ref<audio.AudioBuffer>,settings:ref<Settings>,target:str,cancel:str,progress:str)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta} {
+ let prepared:Prepared=try prepare(source,settings,target,cancel,progress)
+ publish(prepared,cancel,progress)
+}
+
+pub fn run_including_empty(source:ref<audio.AudioBuffer>,settings:ref<Settings>,target:str,cancel:str,progress:str)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta} {
+ let prepared:Prepared=try prepare_including_empty(source,settings,target,cancel,progress)
+ publish(prepared,cancel,progress)
+}
+pub fn run_f64(samples:view<f64>,rate:u32,channels:u16,settings:ref<Settings>,target:str,cancel:str,progress:str)->result<Report,string>
+ effects {alloc,fs.read,fs.write,fs.meta} {
+ let prepared:Prepared=try prepare_f64(samples,rate,channels,settings,target,cancel,progress)
+ publish(prepared,cancel,progress)
+}

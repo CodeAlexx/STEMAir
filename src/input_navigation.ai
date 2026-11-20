@@ -1,0 +1,18 @@
+module stemair.input_navigation
+import "input_selection.ai" as selection
+import "queue_config.ai" as queue
+import "listen.ai" as listen
+
+pub fn audio_target(state:ref<selection.State>,inputs:ref<array<string>>,key:str)->result<string,string> effects {alloc} {
+ if array.len(inputs)!=state.count{return result.err("The input list changed; select its current rows")}
+ let row:u64=try (if key==""{selection.one(state,array.len(inputs))}else{selection.index(state,key)})
+ result.ok(string.copy(array.get(inputs,row)))
+}
+pub fn queue_target(state:ref<selection.State>,inputs:ref<array<queue.Item>>,key:str)->result<string,string> effects {alloc} {
+ if array.len(inputs)!=state.count{return result.err("The input list changed; select its current rows")}
+ let row:u64=try (if key==""{selection.one(state,array.len(inputs))}else{selection.index(state,key)})
+ result.ok(string.copy(array.borrow(inputs,row).input))
+}
+pub fn open(file:str,folder:bool)->result<unit,string> effects {alloc,env,fs.read,fs.meta,process,time} {
+ if folder{listen.reveal(file)}else{listen.open_external(file)}
+}

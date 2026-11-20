@@ -1,0 +1,94 @@
+module stemair.artifact_cleanup
+import "numeric.ai" as num
+import "control.ai" as control
+import std.float as fp
+
+// Temporal cleanup of a retained planar confidence mask, independent of models.
+pub type Settings=struct{enabled:bool=false,threshold:f64=0.2}
+pub type Report=struct{eligible_frames:u64,spans:u64,changed_samples:u64,no_eligible:bool}
+pub fn disabled()->Settings effects {} {Settings{}}
+pub fn validate(settings:ref<Settings>)->result<unit,string> effects {alloc} {
+ if not fp.is_finite(settings.threshold) or settings.threshold<0.0 or settings.threshold>=1.0{
+  return result.err("Artifact cleanup threshold must be at least zero and below one")}
+ result.ok(())
+}
+fn ramp(weights:ref<array<f32>>,start:u64,down:bool)->unit effects {} {
+ let step:f64=if down{-1.0/31.0}else{1.0/31.0}
+ var i:u64=0
+ loop{if i==32{break}
+  // The source forms a Float64 linspace, assigns its endpoint, then stores F32.
+  let value:f64=if i==31{if down{0.0}else{1.0}}else{if down{1.0+cast.float(i)*step}else{cast.float(i)*step}}
+  array.set(weights,start+i,cast.float(value))
+  i+=1}
+ ()
+}
+pub fn apply(mask:ref<array<f32>>,channels:u64,bins:u64,frames:u64,settings:Settings,cancel:str)->result<Report,string> effects {alloc,fs.meta} {
+ var request:Settings=Settings{enabled:settings.enabled,threshold:settings.threshold}
+ let _=try validate(request)
+ if not settings.enabled{return result.ok(Report{eligible_frames:0,spans:0,changed_samples:0,no_eligible:false})}
+ if channels==0 or bins==0 or channels>536870912/bins or (frames>0 and channels*bins>536870912/frames) or array.len(mask)!=channels*bins*frames{
+  return result.err("Invalid artifact cleanup mask geometry or sample extent")}
+ if not num.finite(array.view(mask)){return result.err("Non-finite artifact cleanup mask")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let threshold:f32=cast.float(settings.threshold)
+ var starts:array<u64>=[]
+ var ends:array<u64>=[]
+ var active:bool=false
+ var eligible:u64=0
+ var t:u64=0
+ loop{if t==frames{break}
+  var selected:bool=true
+  var plane:u64=0
+  loop{if plane==channels*bins{break}
+   if not (array.get(mask,plane*frames+t)>threshold){selected=false
+    break}
+   plane+=1}
+  if selected{
+   eligible+=1
+   if not active{array.push(starts,t)
+    active=true}
+  }else{if active{array.push(ends,t-1)
+   active=false}}
+  t+=1}
+ if active{array.push(ends,frames-1)}
+ // Empty np.where indexes are caught by the original routine before any mutation.
+ if eligible==0{return result.ok(Report{eligible_frames:0,spans:0,changed_samples:0,no_eligible:true})}
+ var weights:array<f32>=num.zeros(frames)
+ var spans:u64=0
+ var previous:option<u64>=option.none()
+ var n:u64=0
+ loop{if n==array.len(starts){break}
+  var start:u64=array.get(starts,n)
+  let end:u64=array.get(ends,n)
+  // Literal endpoint difference: 65 eligible frames are excluded; 66 qualify.
+  if end-start>64{
+   match previous{none=>{},some(old)=>{if start-old<32{start=old-64}}}
+   if start!=0{ramp(weights,start,false)}
+   // end is the last eligible index, never frames: retain the original half-open fade.
+   ramp(weights,end-32,true)
+   var at:u64=if start==0{0}else{start+32}
+   loop{if at>=end-32{break}
+    array.set(weights,at,1.0)
+    at+=1}
+   previous=option.some(end)
+   spans+=1}
+  n+=1}
+ var changed:u64=0
+ var plane:u64=0
+ loop{if plane==channels*bins{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  t=0
+  loop{if t==frames{break}
+   let at:u64=plane*frames+t
+   let old:f32=array.get(mask,at)
+   let residual:f32=1.0-old
+   let weighted:f32=array.get(weights,t)*residual
+   let value:f32=old+weighted
+   let before:u32=cast.bits(old)
+   let after:u32=cast.bits(value)
+   if before!=after{changed+=1}
+   array.set(mask,at,value)
+   t+=1}
+  plane+=1}
+ result.ok(Report{eligible_frames:eligible,spans:spans,changed_samples:changed,no_eligible:false})
+}

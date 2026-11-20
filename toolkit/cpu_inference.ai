@@ -1,0 +1,33 @@
+module stemair.cpu_inference
+import "model_cache.ai" as cache
+import "recording_cpu_cache.ai" as recording
+import "recording_cpu.ai" as family
+import "recording_context.ai" as context
+import "mask/request.ai" as request
+import "audio_result.ai" as audio
+import "inference_pitch_cpu.ai" as pitch
+import "recording_bag_cached.ai" as bag
+// One mutable accepted context is passed through the complete caller traversal.
+// Unrelated engines retain their original request/policy execution route.
+pub fn separate_with_policy(bank:ref<cache.Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,controls:ref<context.Context>)->result<audio.Samples,string> effects {alloc,ffi,fs.meta,fs.write} {
+ var lower:array<f32>=[]
+ separate_with_policy_and_band_input(bank,index,input,cancel,progress,policy,controls,array.view(lower))
+}
+pub fn separate_with_policy_and_band_input(bank:ref<cache.Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,controls:ref<context.Context>,lower:view<f32>)->result<audio.Samples,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try context.validate(controls)
+ pitch.separate(bank,index,input,cancel,progress,policy,controls,lower,separate_unpitched)
+}
+fn separate_unpitched(bank:ref<cache.Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,controls:ref<context.Context>,lower:view<f32>)->result<audio.Samples,string> effects {alloc,ffi,fs.meta,fs.write} {
+ let _=try context.validate(controls)
+ if index>=array.len(bank.entries){return result.err("CPU inference member is out of range")}
+ if array.borrow(bank.entries,index).model.profile.kind=="recording-bundle"{
+  if view.len(lower)>0{return result.err("Lower-band recording input requires a mask model")}
+  return bag.separate_cpu(bank,index,input,cancel,progress,controls)}
+ if not controls.enabled or not family.supported(array.borrow(bank.entries,index).model.profile.kind){return cache.separate_cpu_typed_with_policy_and_band_input(bank,index,input,cancel,progress,policy,lower)}
+ if view.len(lower)>0{return result.err("Lower-band recording input requires a mask model")}
+ var options=controls.options
+ let limits=controls.limits
+ let stream=array.borrow(controls.streams,0)
+ var output=try recording.separate(bank,index,input,cancel,progress,options,stream,limits)
+ result.ok(struct.replace(output,audio.from_single([]),field=samples))
+}

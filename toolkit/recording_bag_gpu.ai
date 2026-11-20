@@ -1,0 +1,107 @@
+module stemair.recording_bag_gpu
+import "recording_bag_state.ai" as state
+import "recording_bag_request.ai" as request
+import "recording_context.ai" as context
+import "recording_inference.ai" as inference
+import "recording_moments.ai" as moments
+import "audio_normalization.ai" as normalization
+import "weighted_sources.ai" as weighted
+import "numeric.ai" as num
+import "control.ai" as control
+import "device_ops.ai" as ops
+import "attention/config.ai" as attention_config
+import "attention/session.ai" as attention
+import "attention/bag_recording.ai" as attention_recording
+import "hybrid/config.ai" as hybrid_config
+import "hybrid/session.ai" as hybrid
+import "hybrid/recording.ai" as hybrid_recording
+import "hybrid/frontend.ai" as frontend
+import "residual_waveform/config.ai" as residual_config
+import "residual_waveform/session.ai" as residual
+import std.codec as codec
+import std.gpu as gpuapi
+import std.tensor as tensor
+import std.mkl_vml as math
+fn error(e:gpu.error)->string effects {alloc}{string.copy(e.message)}
+fn transform(limits:ref<request.Limits>)->frontend.Limits effects {}{
+ frontend.Limits{workspace_bytes:67108864,clone_bytes:limits.transform_bytes,retained_bytes:limits.transform_bytes}
+}
+fn run_attention(ctx:ref<GpuContext>,stream:ref<GpuStream>,s:ref<attention.Session>,c:ref<attention_config.Config>,size:u64,invocation:ref<request.Invocation>,preparation:normalization.Prepared own,cancel:str,progress:str,limits:ref<request.Limits>)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu}{
+ var parameters:array<tensor.Tensor>=try ops.upload(ctx,stream,struct.borrow(s.network,field=weights))
+ let group=try request.group(invocation,c)
+ let allowance=transform(limits)
+ attention_recording.separate_gpu_group(ctx,stream,parameters,s,math.default_runtime(),c,size,struct.borrow(invocation,field=schedule),preparation,group,cancel,progress,allowance)
+}
+fn run_hybrid(ctx:ref<GpuContext>,stream:ref<GpuStream>,s:ref<hybrid.Session>,c:ref<hybrid_config.Config>,invocation:ref<request.Invocation>,preparation:normalization.Prepared own,cancel:str,progress:str,limits:ref<request.Limits>)->result<array<f32>,string> effects {alloc, env, ffi, fs.meta, fs.write, gpu}{
+ var parameters:array<tensor.Tensor>=try ops.upload(ctx,stream,struct.borrow(s.network,field=weights))
+ let group=try request.group(invocation,c)
+ let allowance=transform(limits)
+ let geometry:hybrid_recording.Limits=hybrid_recording.Limits{max_frontends:limits.max_frontends}
+ hybrid_recording.separate_normalized_group_once(ctx,stream,parameters,s,math.default_runtime(),c,struct.borrow(invocation,field=schedule),preparation,group,cancel,progress,geometry,allowance)
+}
+fn run_residual(ctx:ref<GpuContext>,stream:ref<GpuStream>,s:ref<residual.Session>,c:ref<residual_config.Config>,invocation:ref<request.Invocation>,preparation:normalization.Prepared own,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ var parameters:array<tensor.Tensor>=try ops.upload(ctx,stream,struct.borrow(s.network,field=weights))
+ let group=try request.group(invocation,c)
+ var library:math.Vml=try math.open_default()
+ let _=try residual.prepare_gpu(ctx,stream,s,library)
+ let outcome:result<array<f32>,string>=residual.separate_normalized_group(ctx,stream,parameters,s,c,struct.borrow(invocation,field=schedule),preparation,group,cancel,progress)
+ s.gpu=[]
+ outcome
+}
+// Each position has its own request context. Stream-owned recurrent snapshots
+// are released before the next member; the host checkpoint pool stays resident.
+fn member(slot:ref<state.Slot>,position:ref<state.Member>,controls:ref<context.Context>,preparation:normalization.Prepared own,cancel:str,progress:str,limits:ref<request.Limits>)->result<request.MemberOutput,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ let identity:string=string.copy(slot.identity)
+ let frames:u64=preparation.frames
+ var ctx:GpuContext=try gpuapi.open(controls.device_index) map_err error
+ var stream:GpuStream=try gpuapi.compute_stream(ctx) map_err error
+ match slot.model{
+  Attention(model)=>{
+   var c:attention_config.Config=try attention_config.Config_decode(identity) map_err codec.describe
+   let _=request.configure(c,controls)
+   let size:u64=try request.segment(position,controls,model.network.training_length)
+   var invocation=try request.begin(c,controls,frames,size)
+   let outcome:result<array<f32>,string>=run_attention(ctx,stream,model,c,size,invocation,preparation,cancel,progress,limits)
+   let observation=request.finish(invocation,controls)
+   result.ok(request.MemberOutput{values:try outcome,observation:observation})},
+  Hybrid(model)=>{
+   var c:hybrid_config.Config=try hybrid_config.Config_decode(identity) map_err codec.describe
+   let _=request.configure(c,controls)
+   c.segment_samples=try request.segment(position,controls,if c.segment_samples!=0{c.segment_samples}else{model.network.constructor.kwargs.segment*44100})
+   var invocation=try request.begin(c,controls,frames,c.segment_samples)
+   let outcome:result<array<f32>,string>=run_hybrid(ctx,stream,model,c,invocation,preparation,cancel,progress,limits)
+   let observation=request.finish(invocation,controls)
+   result.ok(request.MemberOutput{values:try outcome,observation:observation})},
+  Residual(model)=>{
+   var c:residual_config.Config=try residual_config.Config_decode(identity) map_err codec.describe
+   let _=request.configure(c,controls)
+   c.segment_samples=try request.segment(position,controls,residual.segment(model,c))
+   var invocation=try request.begin(c,controls,frames,c.segment_samples)
+   let outcome:result<array<f32>,string>=run_residual(ctx,stream,model,c,invocation,preparation,cancel,progress)
+   let observation=request.finish(invocation,controls)
+   result.ok(request.MemberOutput{values:try outcome,observation:observation})}}
+}
+pub fn separate(s:ref<state.State>,input:view<f32>,controls:ref<context.Context>,limits:ref<request.Limits>,cancel:str,progress:str)->result<request.Output,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ let _=try request.preflight(s,input,controls,limits)
+ let preparation:normalization.Prepared=try moments.prepare(input,2)
+ let sources:u64=array.len(s.targets)
+ if preparation.scale==0.0{return result.ok(request.Output{values:num.zeros(2*sources*preparation.frames),observations:[]})}
+ var accumulator:weighted.Accumulator=try weighted.create(preparation.frames,sources)
+ var observations:array<inference.Observation>=[]
+ var i:u64=0
+ loop{if i==array.len(s.members){break}
+  if control.cancelled(cancel){return result.err("Recording bundle cancelled")}
+  var position:state.Member=state.Member{slot:array.borrow(s.members,i).slot,segment_samples:array.borrow(s.members,i).segment_samples,weights:[]}
+  var source:u64=0
+  loop{if source==sources{break}
+   array.push(position.weights,array.get(array.borrow(s.members,i).weights,source))
+   source+=1}
+  var output:request.MemberOutput=try member(array.borrow(s.slots,position.slot),position,controls,request.copy(preparation),cancel,progress,limits)
+  let _=try weighted.add(accumulator,array.view(output.values),array.view(position.weights))
+  array.push(observations,output.observation)
+  i+=1}
+ let combined:array<f32>=try weighted.finish(accumulator)
+ let values:array<f32>=try normalization.restore_sources(array.view(combined),preparation.frames,sources,preparation.mean,preparation.scale)
+ s.requests+=1
+ result.ok(request.Output{values:values,observations:observations})
+}

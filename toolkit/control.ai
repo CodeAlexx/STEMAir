@@ -1,0 +1,17 @@
+module stemair.control
+import std.files as files
+import std.text as text
+pub fn cancelled(path:str)->bool effects {fs.meta} {
+ if str.len(path)==0{return false}
+ match files.exists(path){ok(v)=>v,err(_)=>false,}
+}
+pub fn status(path:str,message:str)->unit effects {alloc,fs.write} {
+ if str.len(path)>0{let _=files.write_atomic(path,text.concat(path,".tmp"),message)}
+ ()
+}
+pub fn report(path:str,completed:u64,total:u64)->unit effects {alloc,fs.write} {
+ if str.len(path)==0{return ()}
+ let message:string=text.concat(text.concat("Processing chunk ",str.view(string.from_int(completed))),text.concat(" / ",str.view(string.from_int(total))))
+ let _=files.write_atomic(path,text.concat(path,".tmp"),str.view(message))
+ ()
+}

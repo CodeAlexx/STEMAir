@@ -1,0 +1,7 @@
+{
+  "model": "learned-mix-v1",
+  "source": "https://github.com/Anjok07/ultimatevocalremovergui/blob/a5f88453bfb2b38b05a965bcf67727243e0cbf19/lib_v5/mixer.ckpt",
+  "bytes": 1208,
+  "sha256": "ea781bd52c6a523b825fa6cdbb6189f52e318edd8b17e6fe404f76f7af8caa9c",
+  "credit": "Original checkpoint and Mixer class from Ultimate Vocal Remover, Anjok07 and aufr33; source credit retained under THIRD-PARTY.md"
+}

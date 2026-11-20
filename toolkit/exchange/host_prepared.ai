@@ -1,0 +1,148 @@
+module stemair.exchange.host_prepared
+import "plan.ai" as plan
+import "host.ai" as scalar
+import "../weights.ai" as weights
+import "../numeric.ai" as num
+import "../control.ai" as control
+import std.cpu_conv2d as convolution
+import std.cpu_matmul as matrix
+import std.cpu_transpose_conv2d as transpose
+import std.system as system
+
+type Pack=enum{None,Forward(convolution.Prepared),Dense(matrix.Matrix),Transpose(transpose.Prepared)}
+type Slot=struct{weight:u64,prepared:Pack}
+// Owned by the same immutable loaded graph for its entire session lifetime.
+// No dynamic library or image-global thread policy is owned by this bank.
+pub type Backend=struct{slots:array<Slot>,nodes:u64,parameters:u64,packs:u64,bytes:u64}
+type Value=weights.Parameter
+fn shape(values:view<u64>)->array<u64> effects {alloc} {
+ var out:array<u64>=[]
+ var i:u64=0
+ loop{if i==view.len(values){break}
+  array.push(out,view.get(values,i))
+  i+=1}
+ out
+}
+fn copy(v:ref<Value>)->Value effects {alloc} {weights.Parameter{shape:shape(array.view(v.shape)),values:num.copy(array.view(v.values))}}
+fn operand(parameters:ref<array<Value>>,pool:ref<array<option<Value>>>,id:u64,original:u64)->result<Value,string> effects {alloc} {
+ if id<original{return result.ok(copy(array.borrow(parameters,id)))}
+ if id-original>=array.len(pool){return result.err("Prepared graph operand index exceeds its plan")}
+ match array.borrow(pool,id-original){none=>result.err("Prepared graph operand is not live"),some(v)=>result.ok(copy(v))}
+}
+fn options(n:ref<plan.Node>)->convolution.Options effects {} {
+ convolution.Options{groups:n.groups,stride_height:n.stride_h,stride_width:n.stride_w,padding_height:n.pad_h,padding_width:n.pad_w,dilation_height:n.dilation_h,dilation_width:n.dilation_w}
+}
+fn nonoverlap(n:ref<plan.Node>,w:ref<Value>)->bool effects {} {
+ array.len(w.shape)==4 and n.pad_h==0 and n.pad_w==0 and n.dilation_h==1 and n.dilation_w==1 and n.stride_h==array.get(w.shape,2) and n.stride_w==array.get(w.shape,3)
+}
+pub fn prepare(p:ref<plan.Plan>)->result<Backend,string> effects {alloc,fs.read} {
+ var bytes:u64=0
+ var count:u64=0
+ var i:u64=0
+ loop{if i==array.len(p.nodes){break}
+  let n:ref<plan.Node>=array.borrow(p.nodes,i)
+  if n.operation==plan.Operation.Convolution or n.operation==plan.Operation.Matmul or n.operation==plan.Operation.Dense or n.operation==plan.Operation.TransposeConvolution{
+   if array.len(n.inputs)<2 or array.get(n.inputs,1)>=p.original_parameters{return result.err("CPU contractions require retained original initializer weights")}
+   if array.len(n.inputs)==3 and array.get(n.inputs,2)>=p.original_parameters{return result.err("CPU contraction bias must be a retained initializer")}
+   let w:ref<Value>=array.borrow(p.weights.parameters.values,array.get(n.inputs,1))
+   if array.len(w.values)>(268435456-bytes)/4{return result.err("Retained CPU packed weights exceed the selected256MiB bank")}
+   bytes+=4*array.len(w.values)
+   count+=1
+  }
+  i+=1}
+ let memory:system.Memory=match system.memory(){ok(v)=>v,err(_)=>{return result.err("Cannot query host memory for retained CPU preparation")}}
+ if memory.available_bytes<1073741824+2*bytes{return result.err("Not enough host RAM for retained CPU weights and bounded graph workspace")}
+ var slots:array<Slot>=[]
+ i=0
+ loop{if i==array.len(p.nodes){break}
+  let n:ref<plan.Node>=array.borrow(p.nodes,i)
+  var id:u64=0
+  let pack:Pack=match n.operation{
+   Convolution=>{id=array.get(n.inputs,1)
+    let w:ref<Value>=array.borrow(p.weights.parameters.values,id)
+    Pack.Forward(try convolution.prepare(array.view(w.values),array.view(w.shape)))},
+   Matmul=>{id=array.get(n.inputs,1)
+    let w:ref<Value>=array.borrow(p.weights.parameters.values,id)
+    if array.len(w.shape)!=2{return result.err("Prepared CPU dense weights require rank two")}
+    Pack.Dense(try matrix.prepare(array.view(w.values),array.get(w.shape,0),array.get(w.shape,1),matrix.Limits{}))},
+   Dense=>{id=array.get(n.inputs,1)
+    let w:ref<Value>=array.borrow(p.weights.parameters.values,id)
+    if array.len(w.shape)!=2{return result.err("Prepared CPU dense weights require rank two")}
+    Pack.Dense(try matrix.prepare(array.view(w.values),array.get(w.shape,0),array.get(w.shape,1),matrix.Limits{}))},
+   TransposeConvolution=>{id=array.get(n.inputs,1)
+    let w:ref<Value>=array.borrow(p.weights.parameters.values,id)
+    if not nonoverlap(n,w){return result.err("Prepared CPU transpose convolution requires nonoverlapping kernel=stride, zero padding and unit dilation")}
+    Pack.Transpose(try transpose.prepare(array.view(w.values),array.view(w.shape),n.groups,transpose.Limits{matrix:matrix.Limits{}}))},
+   _=>Pack.None}
+  array.push(slots,Slot{weight:id,prepared:pack})
+  i+=1}
+ result.ok(Backend{slots:slots,nodes:array.len(p.nodes),parameters:p.original_parameters,packs:count,bytes:bytes})
+}
+fn execute(p:ref<plan.Plan>,bank:ref<Backend>,library:ref<CAbiLibrary>,pool:ref<array<option<Value>>>,index:u64)->result<Value,string> effects {alloc,ffi} {
+ let n:ref<plan.Node>=array.borrow(p.nodes,index)
+ let slot:ref<Slot>=array.borrow(bank.slots,index)
+ match slot.prepared{
+  None=>scalar.execute_noncontraction(struct.borrow(p.weights.parameters,field=values),pool,n,p.original_parameters),
+  _=>{
+   if array.get(n.inputs,1)!=slot.weight{return result.err("Retained CPU bank is not bound to this graph")}
+   var x:Value=try operand(struct.borrow(p.weights.parameters,field=values),pool,array.get(n.inputs,0),p.original_parameters)
+   var bias:array<f32>=[]
+   if array.len(n.inputs)==3{bias=num.copy(array.view(array.borrow(p.weights.parameters.values,array.get(n.inputs,2)).values))}
+   match slot.prepared{
+    Forward(w)=>{
+     if n.operation!=plan.Operation.Convolution{return result.err("CPU forward preparation operation differs")}
+     let g:convolution.Geometry=try convolution.geometry(array.view(x.shape),array.view(w.shape),options(n))
+     let out:array<f32>=try convolution.convolve_blas(library,array.view(x.values),array.view(x.shape),w,array.view(bias),options(n),8388608)
+     result.ok(weights.Parameter{shape:[g.batch,g.output_channels,g.output_height,g.output_width],values:out})},
+    Dense(w)=>{
+     let linear:bool=n.operation==plan.Operation.Dense
+     if (n.operation!=plan.Operation.Matmul and not linear) or array.len(x.shape)<2 or (not linear and array.len(bias)!=0){return result.err("CPU dense preparation operation or rank differs")}
+     let inner:u64=array.get(x.shape,array.len(x.shape)-1)
+     if inner!=(if linear{w.columns}else{w.rows}) or inner==0 or array.len(x.values)%inner!=0{return result.err("CPU dense activation inner dimension differs")}
+     var a:matrix.Matrix=try matrix.prepare(array.view(x.values),array.len(x.values)/inner,inner,matrix.Limits{})
+     var out:array<f32>=try matrix.multiply(library,a,matrix.Operation.Identity,w,if linear{matrix.Operation.Transpose}else{matrix.Operation.Identity},matrix.Limits{})
+     let columns:u64=if linear{w.rows}else{w.columns}
+     if array.len(bias)!=0{
+      if array.len(bias)!=columns{return result.err("CPU dense bias width differs")}
+      var i:u64=0
+      loop{if i==array.len(out){break}
+       array.set(out,i,array.get(out,i)+array.get(bias,i%columns))
+       i+=1}}
+     array.set(x.shape,array.len(x.shape)-1,columns)
+     result.ok(weights.Parameter{shape:struct.replace(x,[],field=shape),values:out})},
+    Transpose(w)=>{
+     if n.operation!=plan.Operation.TransposeConvolution{return result.err("CPU transpose preparation operation differs")}
+     let limits:transpose.Limits=transpose.Limits{matrix:matrix.Limits{}}
+     let g:transpose.Geometry=try transpose.geometry(array.view(x.shape),w,limits)
+     let out:array<f32>=try transpose.convolve(library,array.view(x.values),array.view(x.shape),w,array.view(bias),limits)
+     result.ok(weights.Parameter{shape:[g.batch,g.output_channels,g.output_height,g.output_width],values:out})},
+    None=>result.err("Missing CPU contraction preparation")}
+  }}
+}
+pub fn forward(p:ref<plan.Plan>,bank:ref<Backend>,library:ref<CAbiLibrary>,input:Value own,cancel:str)->result<Value,string> effects {alloc,ffi,fs.meta} {
+ if bank.nodes!=array.len(p.nodes) or bank.parameters!=p.original_parameters or array.len(bank.slots)!=bank.nodes{return result.err("Retained CPU bank geometry differs from its loaded graph")}
+ var pool:array<option<Value>>=[]
+ var uses:array<u64>=[]
+ var i:u64=0
+ loop{if i==p.values{break}
+  if i>=p.original_parameters{array.push(pool,option.none())}
+  array.push(uses,array.get(p.uses,i))
+  i+=1}
+ let _=ref.swap(array.borrow(pool,p.input-p.original_parameters),option.some(input))
+ i=0
+ loop{if i==array.len(p.nodes){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let out:Value=try execute(p,bank,library,pool,i)
+  let n:ref<plan.Node>=array.borrow(p.nodes,i)
+  let _=ref.swap(array.borrow(pool,n.output-p.original_parameters),option.some(out))
+  var j:u64=0
+  loop{if j==array.len(n.inputs){break}
+   let id:u64=array.get(n.inputs,j)
+   if array.get(uses,id)==0{return result.err("Prepared graph use counter is exhausted")}
+   let remaining:u64=array.get(uses,id)-1
+   array.set(uses,id,remaining)
+   if remaining==0 and id>=p.original_parameters{let _=ref.swap(array.borrow(pool,id-p.original_parameters),option.none())}
+   j+=1}
+  i+=1}
+ operand(struct.borrow(p.weights.parameters,field=values),pool,p.output,p.original_parameters)
+}

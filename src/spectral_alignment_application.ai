@@ -1,0 +1,100 @@
+// Optional waveform-only alignment finalization over checked retained buffers.
+module stemair.spectral_alignment_application
+import "recording_alignment_application.ai" as base
+import "direct_alignment_io.ai" as direct_io
+import "alignment_choices.ai" as choices
+import "../toolkit/ensemble_alignment.ai" as ensemble
+import "../toolkit/direct_alignment.ai" as direct
+import "../toolkit/spectral_matching.ai" as spectral
+import "../toolkit/typed_selection.ai" as typed
+import "../toolkit/recording_preparation.ai" as preparation
+import "../toolkit/recording_resources.ai" as resources
+import "../toolkit/local_residual.ai" as local
+import "../toolkit/control.ai" as control
+import std.audio as audio
+import std.cpu_dot as dot
+import std.cpu_fft as fft
+import std.cabi as native
+import std.files as files
+import std.codec as codec
+
+pub type Intro=struct{divisor:u64,index:u64,left_lag:i64,right_lag:i64,raw_frames:u64,promoted:bool,unique_index:u64} derive codec(strict)
+pub type Cost=struct{wide:bool,word:string} derive codec(strict)
+pub type Output=struct{preparation:preparation.Observation,intros:array<Intro>,costs:array<Cost>,indices:array<u64>,finalization:spectral.Final}
+fn problem(e:fs.error)->string effects {alloc} {string.copy(fs.error.message(e))}
+fn word(value:typed.Scalar)->result<Cost,string> effects {alloc} {
+ match value{Narrow(v)=>{let a:array<f32>=[v]
+  let b:dot.Buffer=try dot.pack(array.view(a))
+  result.ok(Cost{wide:false,word:bytes.hex(bytes.view(b.data))})},Wide(v)=>{let a:array<f64>=[v]
+  let b:dot.BufferF64=try dot.pack_f64(array.view(a))
+  result.ok(Cost{wide:true,word:bytes.hex(bytes.view(b.data))})}}
+}
+// The caller owns the whole-image BLAS lease. This API verifies source-one only.
+pub fn compute_buffers(settings:ref<base.Settings>,recipe:ref<choices.Recipe>,first:ref<audio.AudioBuffer>,second:ref<audio.AudioBuffer>,cancel:str,progress:str,capture:bool)->result<Output,string>
+ effects {alloc,ffi,fs.read,fs.meta,fs.write} {
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ if not recipe.spectral_match{return result.err("Spectral alignment requires its explicit recipe option")}
+ let _=try choices.validate_any(recipe)
+ if first.rate!=44100 or second.rate!=44100 or (first.channels!=1 and first.channels!=2) or (second.channels!=1 and second.channels!=2){return result.err("Spectral alignment requires44100-Hz mono or stereo inputs")}
+ if array.len(first.samples)%cast.wrap(first.channels)!=0 or array.len(second.samples)%cast.wrap(second.channels)!=0{return result.err("Spectral alignment requires complete interleaved frames")}
+ let limits:resources.Limits=resources.Limits{max_decoded_bytes:settings.max_decoded_bytes,max_working_bytes:settings.max_working_bytes}
+ let host:spectral.Recipe=if settings.host_recipe=="windows-ucrt"{spectral.Recipe.WindowsScalar}else{
+  if settings.host_recipe!="linux-vector-roundoff"{return result.err("Spectral alignment requires its explicit host arithmetic recipe")}
+  spectral.Recipe.LinuxVector}
+ if recipe.windows=="none"{
+  let _=try direct_io.validate(settings)
+  let selection:choices.DirectSelection=try choices.validate_direct(recipe)
+  let _=try direct.plan_spectral(audio.num_frames(first),cast.wrap(first.channels),audio.num_frames(second),cast.wrap(second.channels),selection.intros,selection.gain,limits)
+ }else{
+  let _=try base.validate(settings)
+  let selection:choices.Selection=try choices.validate(recipe)
+  let _=try ensemble.plan_spectral(audio.num_frames(first),cast.wrap(first.channels),audio.num_frames(second),cast.wrap(second.channels),selection.windows,selection.intros,selection.gain,selection.phase,limits,capture)}
+ let dot_identity:string=try files.sha256(settings.dot_runtime) map_err problem
+ if dot_identity!=settings.dot_sha256{return result.err("CPU dot runtime bytes differ from the explicit pinned identity")}
+ var engine:dot.Engine=try dot.open(settings.dot_runtime,"0.3.20","Zen")
+ let _=try dot.require_threads(engine,1)
+ let _=try dot.check_f64(engine)
+ var math:CAbiLibrary=try native.open(settings.math_runtime) map_err native.error_message
+ var transform:spectral.Plan=try spectral.plan(math,host)
+ var intros:array<Intro>=[]
+ var costs:array<Cost>=[]
+ if recipe.windows=="none"{
+  let selection:choices.DirectSelection=try choices.validate_direct(recipe)
+  var value:direct.SpectralOutput=try direct.process_spectral(engine,math,transform,array.view(first.samples),cast.wrap(first.channels),array.view(second.samples),cast.wrap(second.channels),selection.intros,selection.gain,selection.preparation,limits,cancel,progress,capture)
+  var i:u64=0
+  loop{if i==array.len(value.intros){break}
+   let item:ref<direct.Intro>=array.borrow(value.intros,i)
+   array.push(intros,Intro{divisor:item.divisor,index:item.index,left_lag:item.left_lag,right_lag:item.right_lag,raw_frames:item.raw_frames,promoted:item.promoted,unique_index:item.unique_index})
+   i+=1}
+  i=0
+  loop{if i==array.len(value.candidates){break}
+   array.push(costs,try word(array.borrow(value.candidates,i).cost))
+   i+=1}
+  let indices:array<u64>=struct.replace(value,[],field=indices)
+  let output:Output=Output{preparation:preparation.copy_observation(struct.borrow(value,field=preparation)),intros:intros,costs:costs,indices:indices,finalization:struct.replace(value,spectral.Final{unclipped:typed.Wave.Narrow([]),clipped:typed.Wave.Narrow([]),residual:typed.Wave.Narrow([]),aligned:typed.Wave.Narrow([]),frames:0,channels:0,invocations:0,parts:[]},field=finalization)}
+  let _=try native.close(math) map_err native.error_message
+  dot.close(engine)
+  return result.ok(output)
+ }
+ let selection:choices.Selection=try choices.validate(recipe)
+ let fft_identity:string=try files.sha256(settings.fft_runtime) map_err problem
+ if fft_identity!=settings.fft_sha256{return result.err("CPU transform runtime bytes differ from the explicit pinned identity")}
+ var fft_engine:fft.Engine=try fft.open(settings.fft_runtime)
+ let hann:local.Recipe=try base.validate(settings)
+ var value:ensemble.SpectralOutput=try ensemble.process_spectral_with_preparation(engine,fft_engine,math,transform,array.view(first.samples),cast.wrap(first.channels),array.view(second.samples),cast.wrap(second.channels),hann,selection.windows,selection.intros,selection.gain,selection.phase,selection.preparation,limits,cancel,progress,capture)
+ var i:u64=0
+ loop{if i==array.len(value.intros){break}
+  let item:ref<ensemble.Intro>=array.borrow(value.intros,i)
+  array.push(intros,Intro{divisor:item.divisor,index:item.index,left_lag:item.left_lag,right_lag:item.right_lag,raw_frames:item.raw_frames,promoted:item.promoted,unique_index:item.unique_index})
+  i+=1}
+ i=0
+ loop{if i==array.len(value.coarse_costs){break}
+  array.push(costs,try word(typed.Scalar.Narrow(array.get(value.coarse_costs,i))))
+  i+=1}
+ let indices:array<u64>=struct.replace(value,[],field=coarse_indices)
+ let output:Output=Output{preparation:preparation.copy_observation(struct.borrow(value,field=preparation)),intros:intros,costs:costs,indices:indices,finalization:struct.replace(value,spectral.Final{unclipped:typed.Wave.Narrow([]),clipped:typed.Wave.Narrow([]),residual:typed.Wave.Narrow([]),aligned:typed.Wave.Narrow([]),frames:0,channels:0,invocations:0,parts:[]},field=finalization)}
+ let _=try native.close(math) map_err native.error_message
+ let _=try fft.close(fft_engine)
+ dot.close(engine)
+ result.ok(output)
+}

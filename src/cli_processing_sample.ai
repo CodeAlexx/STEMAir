@@ -1,0 +1,38 @@
+module stemair.cli_processing_sample
+import "cli_audio_policy.ai" as policy
+import "checked_input.ai" as checked
+import "processing_sample.ai" as prepare
+import "recording_sample_application.ai" as sample
+import "recording_sample_runtime.ai" as runtime
+import std.path as path
+import std.text as text
+
+// CPU-only ownership boundary shared by the CLI model and audio-tool routes.
+pub type Input=struct{path:string,lease:option<prepare.Lease>}
+pub fn options(settings:ref<policy.Settings>,input:ref<checked.Options>)->result<option<sample.Options>,string>
+ effects {alloc,env,fs.read,time} {
+ if not settings.processing_sample{return result.ok(option.none())}
+ let _=try policy.validate(settings)
+ var selected:sample.Options=try runtime.options(try policy.root(settings),settings.codec_directory,
+  try policy.absolute_optional(settings.sample_decoder),string.from_int(settings.sample_seconds),
+  path.dirname(input.scratch_directory),try policy.budget_choice(settings.audio_buffer_mib),input.scratch_directory,input.cancel_file)
+ // Queue and model intake share the caller's original absolute deadline.
+ selected.input.deadline_ns=input.deadline_ns
+ result.ok(option.some(selected))
+}
+pub fn finish(input:ref<Input>,outcome:result<unit,string> own)->result<unit,string> effects {alloc,fs.write} {
+ match input.lease{none=>outcome,some(lease)=>match prepare.close(lease){ok(_)=>outcome,err(cleanup)=>{
+  match outcome{ok(_)=>result.err(cleanup),err(problem)=>result.err(text.concat(problem,text.concat(" ",cleanup)))}}}}
+}
+pub fn open(settings:ref<policy.Settings>,file:str,input:ref<checked.Options>,progress:str)->result<Input,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let original:string=try policy.absolute(file)
+ match try options(settings,input){none=>result.ok(Input{path:original,lease:option.none()}),some(selected)=>{
+  var lease:prepare.Lease=try prepare.open(original,text.concat(input.scratch_directory,"-sample"),selected,try policy.absolute_optional(progress))
+  if not prepare.ready(lease){
+   let problem:string=prepare.problem(lease)
+   var failed:Input=Input{path:"",lease:option.some(lease)}
+   match finish(failed,result.err(problem)){err(message)=>{return result.err(message)},ok(_)=>{return result.err("Processing sample is unavailable")}}}
+  let prepared:string=string.copy(lease.path)
+  result.ok(Input{path:prepared,lease:option.some(lease)})}}
+}

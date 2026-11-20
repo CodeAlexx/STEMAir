@@ -1,0 +1,23 @@
+{
+  "model": "recording-hybrid-v1",
+  "filename": "recording-hybrid-v1.yaml",
+  "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/repro_mdx_a_hybrid_only.yaml",
+  "bytes": 69,
+  "sha256": "25ebdda777fbce91881e723f1fdb98a0e746638ac7c46100b74259669c509cfc",
+  "configuration": "configs/recording-hybrid-v1.json",
+  "credit": "Original Demucs models by Meta Platforms and collaborators, MIT license; attention-MIT.txt, hybrid-MIT.txt and waveform-MIT.txt. Original identifiers preserve checkpoint compatibility.",
+  "dependencies": [
+    {
+      "filename": "hybrid-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/fa0cb7f9-100d8bf4.th",
+      "bytes": 167405675,
+      "sha256": "100d8bf4dc5e228edfd9bb7a2ec44ad9f44d8f0a845964d38ee8c11ea8ca1399"
+    },
+    {
+      "filename": "hybrid-repro-pair-v1.th",
+      "url": "https://dl.fbaipublicfiles.com/demucs/mdx_final/902315c2-b39ce9c9.th",
+      "bytes": 167405611,
+      "sha256": "b39ce9c97b5603fbaee99ec59fe1d2db570c77a37356c9c85542d881517c3302"
+    }
+  ]
+}

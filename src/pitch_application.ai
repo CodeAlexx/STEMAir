@@ -1,0 +1,124 @@
+module stemair.pitch_application
+import "wav_export.ai" as wav
+import "checked_input.ai" as checked_input
+import "container_export.ai" as container
+import "application.ai" as app
+import "../toolkit/pitch_resample.ai" as pitch
+import "../toolkit/control.ai" as control
+import std.audio as audio
+import std.codec as codec
+import std.files as files
+import std.path as path
+
+pub type Settings=struct{semitones:f64=0.0,normalize:bool=false} derive codec(strict)
+type Manifest=struct{operation:string,semitones:f64,normalize:bool,duration_preserved:bool,
+ input:string,input_frames:u64,frames:u64,sample_rate:u32,file:string,backend:string,checkpoint_loads:u64} derive codec(strict)
+pub fn read(file:str)->result<Settings,string> effects {alloc,fs.read} {
+ let raw:string=match files.read_text(file){ok(v)=>v,err(_)=>{return result.err("Cannot read pitch resampling recipe")}}
+ decode(raw)
+}
+pub fn decode(raw:str)->result<Settings,string> effects {alloc} {
+ let settings:Settings=try Settings_decode(raw) map_err codec.describe
+ let _=try pitch.validate(settings.semitones)
+ result.ok(settings)
+}
+pub fn preflight(directory:str)->result<unit,string> effects {alloc,fs.meta} {
+ if not match files.is_dir(directory){ok(v)=>v,err(_)=>false}{return result.err("Output directory must already exist")}
+ let names:array<string>=["pitched.wav","pitch.json"]
+ var i:u64=0
+ loop{if i==2{break}
+  if match files.exists(path.join(directory,array.get(names,i))){ok(v)=>v,err(_)=>true}{
+   return result.err("A pitch resampling output already exists; choose an empty directory")}
+  i+=1}
+ result.ok(())
+}
+type Computed=struct{output:pitch.Output,input_frames:u64}
+fn compute(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str,input_options:ref<option<checked_input.Options>>)->result<Computed,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ var source:audio.AudioBuffer=try match input_options{none=>app.read_recording(input,44100,directory),some(options)=>checked_input.buffer(input,44100,options)} map_err app.recording_error
+ let input_frames:u64=audio.num_frames(source)
+ let planar:array<f32>=try app.planar(source,44100)
+ var output:pitch.Output=try pitch.process(array.view(planar),settings.semitones,settings.normalize,cancel,progress)
+ result.ok(Computed{output:output,input_frames:input_frames})
+}
+fn run_impl(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str,encoding:option<audio.WavSubtype>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let _=try pitch.validate(settings.semitones)
+ if control.cancelled(cancel){return result.err("Pitch resampling cancelled")}
+ match encoding{some(kind)=>{let _=try preflight_as(directory,kind)},none=>{let _=try preflight(directory)}}
+ var input_options:option<checked_input.Options>=option.none()
+ var computed:Computed=try compute(settings,input,directory,cancel,progress,input_options)
+ let input_frames:u64=computed.input_frames
+ let output:ref<pitch.Output>=struct.borrow(computed,field=output)
+ let interleaved:array<f32>=wav.interleave(array.view(output.values),output.frames,2)
+ if control.cancelled(cancel){return result.err("Pitch resampling cancelled")}
+ var buffer:audio.AudioBuffer=audio.AudioBuffer{samples:interleaved,rate:44100,channels:2}
+ match encoding{some(kind)=>{let _=try wav.write_buffer_controlled(path.join(directory,"pitched.wav"),buffer,kind,cancel,progress)},none=>{
+ let encoded:bytes=try audio.encode_wav(buffer,32) map_err audio.message
+ let _=match files.write_new_bytes(path.join(directory,"pitched.wav"),bytes.view(encoded)){
+  ok(_)=>(),err(_)=>{return result.err("Cannot create pitch WAV; existing files are preserved")}}
+ }}
+ var manifest:Manifest=Manifest{operation:"pitch-resample",semitones:settings.semitones,normalize:settings.normalize,duration_preserved:false,
+  input:string.copy(input),input_frames:input_frames,frames:output.frames,sample_rate:44100,file:"pitched.wav",backend:"native-air-cpu-f32",checkpoint_loads:0}
+ let text:string=try Manifest_encode(manifest) map_err codec.describe
+ match encoding{some(kind)=>wav.write_metadata(path.join(directory,"pitch.json"),text,kind),none=>{
+ match files.write_new_text(path.join(directory,"pitch.json"),text){ok(_)=>result.ok(()),err(_)=>result.err("Cannot create pitch manifest; the WAV remains available")}
+ }}
+}
+pub fn run(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ run_impl(settings,input,directory,cancel,progress,option.none())
+}
+pub fn run_as(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ run_impl(settings,input,directory,cancel,progress,option.some(kind))
+}
+
+
+pub fn preflight_as(directory:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.meta} {
+ let _=try preflight(directory)
+ let names:array<string>=["pitched.wav","pitch.json"]
+ var i:u64=0
+ loop{if i==array.len(names){break}
+  let _=try wav.preflight_file(path.join(directory,array.get(names,i)))
+  i+=1}
+ result.ok(())
+}
+
+
+pub fn preflight_to(directory:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ let _=try container.verify(plan)
+ let _=try container.require_directory(directory)
+ let _=try container.preflight_tracked(container.target(directory,"pitched",plan),plan,log)
+ container.preflight_metadata_tracked(path.join(directory,"pitch.json"),log)
+}
+
+fn run_to_impl(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>,input_options:ref<option<checked_input.Options>>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let _=try pitch.validate(settings.semitones)
+ if control.cancelled(cancel){return result.err("Pitch resampling cancelled")}
+ let start:u64=array.len(log.artifacts)
+ let _=try preflight_to(directory,plan,log)
+ var computed:Computed=try compute(settings,input,directory,cancel,progress,input_options)
+ let input_frames:u64=computed.input_frames
+ let output:ref<pitch.Output>=struct.borrow(computed,field=output)
+ let interleaved:array<f32>=wav.interleave(array.view(output.values),output.frames,2)
+ if control.cancelled(cancel){return result.err("Pitch resampling cancelled")}
+ var buffer:audio.AudioBuffer=audio.AudioBuffer{samples:interleaved,rate:44100,channels:2}
+ let _=try container.write_buffer(container.target(directory,"pitched",plan),buffer,plan,log,cancel,progress)
+ var manifest:Manifest=Manifest{operation:"pitch-resample",semitones:settings.semitones,normalize:settings.normalize,duration_preserved:false,
+  input:string.copy(input),input_frames:input_frames,frames:output.frames,sample_rate:44100,file:container.filename("pitched",plan),backend:"native-air-cpu-f32",checkpoint_loads:0}
+ let text:string=try Manifest_encode(manifest) map_err codec.describe
+ container.write_metadata(path.join(directory,"pitch.json"),text,plan,log,start)
+}
+pub fn run_to(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ var input_options:option<checked_input.Options>=option.none()
+ let outcome:result<unit,string>=run_to_impl(settings,input,directory,cancel,progress,plan,log,input_options)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+
+pub fn run_with_input_to(settings:ref<Settings>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>,input_options:ref<option<checked_input.Options>>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=run_to_impl(settings,input,directory,cancel,progress,plan,log,input_options)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}

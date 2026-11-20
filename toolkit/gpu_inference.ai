@@ -1,0 +1,35 @@
+module stemair.gpu_inference
+import "model_cache.ai" as cache
+import "engine.ai" as engine
+import "device_engine.ai" as device
+import "recording_gpu.ai" as recording
+import "recording_context.ai" as context
+import "mask/request.ai" as request
+import "audio_result.ai" as audio
+import "inference_pitch_gpu.ai" as pitch
+import "recording_bag_cached.ai" as bag
+// One caller-owned stream follows the complete model/callback/queue traversal.
+pub fn separate_with_policy(bank:ref<cache.Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,controls:ref<context.Context>)->result<audio.Samples,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ separate_with_policy_and_band_input(bank,index,input,cancel,progress,policy,controls,[])
+}
+pub fn separate_with_policy_and_band_input(bank:ref<cache.Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,controls:ref<context.Context>,lower:view<f32>)->result<audio.Samples,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ let _=try context.validate(controls)
+ pitch.separate(bank,index,input,cancel,progress,policy,controls,lower,separate_unpitched)
+}
+fn separate_unpitched(bank:ref<cache.Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,controls:ref<context.Context>,lower:view<f32>)->result<audio.Samples,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ let _=try context.validate(controls)
+ let _=try request.validate_policy(policy)
+ if index>=array.len(bank.entries){return result.err("GPU inference member is out of range")}
+ if array.borrow(bank.entries,index).model.profile.kind=="recording-bundle"{
+  if view.len(lower)>0{return result.err("Lower-band recording input requires a mask model")}
+  return bag.separate_gpu(bank,index,input,cancel,progress,controls)}
+ if controls.enabled and array.borrow(bank.entries,index).model.profile.kind=="attention-bundle"{return result.err("Live shift-count controls for recording bundles require the bundle adapter")}
+ if not controls.enabled or not recording.supported(array.borrow(bank.entries,index).model.profile.kind){
+  return device.separate_typed_with_device_transform_budget_and_band_input(struct.borrow(array.borrow(bank.entries,index),field=model),input,cancel,progress,policy,controls.transform_bytes,lower,controls.device_index)}
+ var options=controls.options
+ let work=controls.limits
+ let stream=array.borrow(controls.streams,0)
+ let limits:recording.Limits=recording.Limits{max_frontends:65,transform_bytes:controls.transform_bytes,device_index:controls.device_index}
+ var output:recording.Output=try recording.separate(struct.borrow(array.borrow(bank.entries,index),field=model),input,cancel,progress,options,stream,work,limits)
+ result.ok(struct.replace(output,audio.from_single([]),field=samples))
+}

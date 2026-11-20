@@ -1,0 +1,88 @@
+module stemair.codec_process
+import "control.ai" as control
+import std.files as files
+import std.path as path
+import std.process as proc
+import std.text as text
+pub type Tool=struct{path:string,sha256:string} derive codec(strict)
+pub type Lifetime=struct{quiescent:bool=true}
+pub type Capture=struct{argv:array<string>,pid:u64,code:i64,reaped:bool,
+ stdout_bytes:u64,stderr_bytes:u64,stdout_truncated:bool,stderr_truncated:bool} derive codec(strict)
+fn failure(error:fs.error)->string effects {alloc} {string.copy(fs.error.message(error))}
+pub fn verify(tool:ref<Tool>)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ if not path.is_absolute(tool.path) or str.len(tool.sha256)!=64{return result.err("Codec tools require absolute paths and SHA256 identities")}
+ let info:fs.meta=try files.metadata(tool.path) map_err failure
+ if not info.is_file or info.size==0 or info.size>536870912{return result.err("Codec executable is empty or exceeds 512 MiB")}
+ let actual:string=try files.sha256(tool.path) map_err failure
+ if actual!=tool.sha256{return result.err("Codec executable SHA256 differs from the selected identity")}
+ result.ok(())
+}
+fn retain(target:ref<bytes>,data:view<byte>)->bool effects {alloc} {
+ let size:u64=view.len(bytes.view(target))
+ let count:u64=if view.len(data)>65536-size{65536-size}else{view.len(data)}
+ bytes.append(target,view.slice(data,0,count))
+ count<view.len(data)
+}
+// A failed close cannot prove cleanup safe. Callers retain workspace in that case.
+pub fn run_observed(argv:array<string> own,working:str,log_prefix:str,output:str,cancel:str,deadline:u64,max_output_bytes:u64,lifetime:ref<Lifetime>)->result<Capture,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ if str.len(output)>0 and max_output_bytes==0{return result.err("Codec output byte limit must be positive")}
+ if control.cancelled(cancel){return result.err("Audio export cancelled")}
+ if time.monotonic_ns()>=deadline{return result.err("Codec deadline reached")}
+ var arguments:array<string>=argv
+ lifetime.quiescent=false
+ var child:Child=try proc.spawn_piped_in(arguments,working) map_err failure
+ let pid:u64=proc.child_pid(child)
+ let _=proc.close_stdin(child)
+ var stdout:bytes=bytes.copy(b"")
+ var stderr:bytes=bytes.copy(b"")
+ var out_open:bool=true
+ var err_open:bool=true
+ var out_truncated:bool=false
+ var err_truncated:bool=false
+ var problem:string=""
+ loop{
+  if control.cancelled(cancel){problem="Audio export cancelled"
+   break}
+  if time.monotonic_ns()>=deadline{problem="Codec deadline reached"
+   break}
+  if str.len(output)>0{match files.file_size(output){ok(size)=>{if size>max_output_bytes{problem="Codec output exceeds its byte bound"
+    break}},err(error)=>{if error.code!=1{problem=failure(error)
+    break}}}}
+  if out_open{match proc.read_stdout(child,4096,proc.deadline_in(5)){
+   ok(data)=>{if view.len(bytes.view(data))==0{out_open=false}else{if retain(stdout,bytes.view(data)){out_truncated=true}}},
+   err(error)=>{if error.code!=10{problem=failure(error)
+    break}}}}
+  if err_open{match proc.read_stderr(child,4096,proc.deadline_in(5)){
+   ok(data)=>{if view.len(bytes.view(data))==0{err_open=false}else{if retain(stderr,bytes.view(data)){err_truncated=true}}},
+   err(error)=>{if error.code!=10{problem=failure(error)
+    break}}}}
+  if not out_open and not err_open{match proc.poll(child){some(_)=>{break},none=>{time.sleep_ms(1)}}}
+ }
+ if str.len(problem)>0{let _=proc.terminate(child,200)
+  lifetime.quiescent=result.is_ok(proc.close(child))
+  let _=files.write_new_bytes(text.concat(log_prefix,".out"),bytes.view(stdout))
+  let _=files.write_new_bytes(text.concat(log_prefix,".err"),bytes.view(stderr))
+  return result.err(problem)}
+ let waited:result<process.status,fs.error>=proc.wait(child,deadline)
+ let closed:result<process.status,fs.error>=proc.close(child)
+ lifetime.quiescent=result.is_ok(closed)
+ let _=try files.write_new_bytes(text.concat(log_prefix,".out"),bytes.view(stdout)) map_err failure
+ let _=try files.write_new_bytes(text.concat(log_prefix,".err"),bytes.view(stderr)) map_err failure
+ let ended:process.status=try waited map_err failure
+ let _=try closed map_err failure
+ // Fast writers may finish between polls. Check after closure before acceptance.
+ if str.len(output)>0{match files.file_size(output){ok(size)=>{if size>max_output_bytes{return result.err("Codec output exceeds its byte bound")}},
+  err(error)=>{if error.code!=1{return result.err(failure(error))}}}}
+ result.ok(Capture{argv:arguments,pid:pid,code:cast.wrap(proc.exit_code(ended)),reaped:true,stdout_bytes:view.len(bytes.view(stdout)),
+ stderr_bytes:view.len(bytes.view(stderr)),stdout_truncated:out_truncated,stderr_truncated:err_truncated})
+}
+pub fn run_limited(argv:array<string> own,working:str,log_prefix:str,output:str,cancel:str,deadline:u64,max_output_bytes:u64)->result<Capture,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ var lifetime:Lifetime=Lifetime{}
+ run_observed(argv,working,log_prefix,output,cancel,deadline,max_output_bytes,lifetime)
+}
+pub fn run(argv:array<string> own,working:str,log_prefix:str,output:str,cancel:str,deadline:u64)->result<Capture,string>
+ effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ run_limited(argv,working,log_prefix,output,cancel,deadline,67112960)
+}

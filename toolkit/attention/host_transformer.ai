@@ -1,0 +1,185 @@
+module stemair.attention.host_transformer
+import "transformer.ai" as definition
+import "../weights.ai" as weights
+import "../numeric.ai" as num
+import "../control.ai" as control
+import std.cpu_matmul as matrix
+import std.cpu_neural_f32 as neural
+import std.float as fp
+
+pub type Tensor=struct{batch:u64,tokens:u64,width:u64,values:array<f32>}
+type Linear=struct{parameter:u64,start:u64,packed:matrix.Matrix}
+pub type Backend=struct{linears:array<Linear>,packs:u64,bytes:u64,affine:neural.Affine}
+pub fn prepare(w:ref<weights.Model>,affine:neural.Affine)->result<Backend,string> effects {alloc} {
+ var out:array<Linear>=[]
+ var total:u64=0
+ var id:u64=0
+ loop{if id==array.len(w.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(w.parameters.values,id)
+  if array.len(p.shape)==2{
+   let rows:u64=array.get(p.shape,0)
+   let columns:u64=array.get(p.shape,1)
+   if rows==3*columns and (columns==512 or columns==384){
+    var slice:u64=0
+    loop{if slice==3{break}
+     let start:u64=slice*columns
+     let packed:matrix.Matrix=try matrix.prepare(view.slice(array.view(p.values),start*columns,(start+columns)*columns),columns,columns,matrix.Limits{})
+     total+=view.len(bytes.view(packed.data))
+     array.push(out,Linear{parameter:id,start:start,packed:packed})
+     slice+=1}
+   }else{
+    let packed:matrix.Matrix=try matrix.prepare(array.view(p.values),rows,columns,matrix.Limits{})
+    total+=view.len(bytes.view(packed.data))
+    array.push(out,Linear{parameter:id,start:0,packed:packed})}}
+  id+=1}
+ let count:u64=array.len(out)
+ result.ok(Backend{linears:out,packs:count,bytes:total,affine:affine})
+}
+fn valid(x:ref<Tensor>)->bool effects {} {
+ x.batch>0 and x.batch<=32 and x.tokens>0 and x.tokens<=8192 and x.width>0 and x.width<=8192 and x.batch*x.tokens*x.width<=67108864 and array.len(x.values)==x.batch*x.tokens*x.width
+}
+pub fn linear(w:ref<weights.Model>,backend:ref<Backend>,library:ref<CAbiLibrary>,x:ref<Tensor>,p:definition.Linear)->result<Tensor,string> effects {alloc,ffi} {
+ if not valid(x) or x.width!=p.input{return result.err("CPU attention linear input geometry differs")}
+ var found:u64=0
+ loop{if found==array.len(backend.linears){return result.err("CPU attention linear was not prepared")}
+  let entry:ref<Linear>=array.borrow(backend.linears,found)
+  if entry.parameter==p.weight and entry.start==p.start{break}
+  found+=1}
+ let input:matrix.Matrix=try matrix.prepare(array.view(x.values),x.batch*x.tokens,p.input,matrix.Limits{})
+ let packed:ref<Linear>=array.borrow(backend.linears,found)
+ var values:array<f32>=try matrix.multiply(library,input,matrix.Operation.Identity,struct.borrow(packed,field=packed),matrix.Operation.Transpose,matrix.Limits{})
+ let bias:ref<weights.Parameter>=array.borrow(w.parameters.values,p.bias)
+ var row:u64=0
+ loop{if row==x.batch*x.tokens{break}
+  var channel:u64=0
+  loop{if channel==p.output{break}
+   let at:u64=row*p.output+channel
+   array.set(values,at,array.get(values,at)+array.get(bias.values,p.start+channel))
+   channel+=1}
+  row+=1}
+ result.ok(Tensor{batch:x.batch,tokens:x.tokens,width:p.output,values:values})
+}
+pub fn normalize(w:ref<weights.Model>,backend:ref<Backend>,x:ref<Tensor>,form:definition.Norm)->result<Tensor,string> effects {alloc} {
+ if not valid(x){return result.err("CPU attention normalization input geometry differs")}
+ let gamma:ref<weights.Parameter>=array.borrow(w.parameters.values,form.weight)
+ let beta:ref<weights.Parameter>=array.borrow(w.parameters.values,form.bias)
+ let limits:neural.Limits=neural.Limits{lanes:8}
+ if not form.group{
+  return result.ok(Tensor{batch:x.batch,tokens:x.tokens,width:x.width,values:try neural.layer_norm_rows(array.view(x.values),array.view(gamma.values),array.view(beta.values),x.batch*x.tokens,x.width,0.00001,limits)})}
+ var planar:array<f32>=[]
+ array.reserve(planar,array.len(x.values))
+ var batch:u64=0
+ loop{if batch==x.batch{break}
+  var channel:u64=0
+  loop{if channel==x.width{break}
+   var time:u64=0
+   loop{if time==x.tokens{break}
+    array.push(planar,array.get(x.values,(batch*x.tokens+time)*x.width+channel))
+    time+=1}
+   channel+=1}
+  batch+=1}
+ let normalized:array<f32>=try neural.group_norm_nchw_with_affine(array.view(planar),array.view(gamma.values),array.view(beta.values),x.batch,x.width,x.tokens,1,0.00001,backend.affine,limits)
+ planar=[]
+ var output:array<f32>=[]
+ array.reserve(output,array.len(normalized))
+ batch=0
+ loop{if batch==x.batch{break}
+  var time:u64=0
+  loop{if time==x.tokens{break}
+   var channel:u64=0
+   loop{if channel==x.width{break}
+    array.push(output,array.get(normalized,(batch*x.width+channel)*x.tokens+time))
+    channel+=1}
+   time+=1}
+  batch+=1}
+ result.ok(Tensor{batch:x.batch,tokens:x.tokens,width:x.width,values:output})
+}
+pub fn attend(w:ref<weights.Model>,backend:ref<Backend>,library:ref<CAbiLibrary>,a:definition.Attention,q:ref<Tensor>,k:ref<Tensor>,cancel:str)->result<Tensor,string> effects {alloc,ffi,fs.meta} {
+ if not valid(q) or not valid(k) or q.batch!=k.batch or q.width!=a.width or k.width!=a.width or a.heads==0 or a.width%a.heads!=0 or q.batch*a.heads*q.tokens*k.tokens>134217728{return result.err("CPU attention input or workspace geometry differs")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let query:Tensor=try linear(w,backend,library,q,a.query)
+ let key:Tensor=try linear(w,backend,library,k,a.key)
+ let value:Tensor=try linear(w,backend,library,k,a.value)
+ let features:u64=a.width/a.heads
+ let scale:f32=1.0/fp.sqrt(cast.float(features))
+ var joined:array<f32>=num.zeros(q.batch*q.tokens*a.width)
+ var batch:u64=0
+ loop{if batch==q.batch{break}
+  var head:u64=0
+  loop{if head==a.heads{break}
+   if control.cancelled(cancel){return result.err("Separation cancelled")}
+   var qs:array<f32>=[]
+   var ks:array<f32>=[]
+   var vs:array<f32>=[]
+   array.reserve(qs,q.tokens*features)
+   array.reserve(ks,k.tokens*features)
+   array.reserve(vs,k.tokens*features)
+   var row:u64=0
+   loop{if row==q.tokens{break}
+    var channel:u64=0
+    loop{if channel==features{break}
+     array.push(qs,array.get(query.values,(batch*q.tokens+row)*a.width+head*features+channel)*scale)
+     channel+=1}
+    row+=1}
+   row=0
+   loop{if row==k.tokens{break}
+    var channel:u64=0
+    loop{if channel==features{break}
+     let at:u64=(batch*k.tokens+row)*a.width+head*features+channel
+     array.push(ks,array.get(key.values,at))
+     array.push(vs,array.get(value.values,at))
+     channel+=1}
+    row+=1}
+   let qm:matrix.Matrix=try matrix.prepare(array.view(qs),q.tokens,features,matrix.Limits{})
+   let km:matrix.Matrix=try matrix.prepare(array.view(ks),k.tokens,features,matrix.Limits{})
+   qs=[]
+   ks=[]
+   var scores:array<f32>=try matrix.multiply(library,qm,matrix.Operation.Identity,km,matrix.Operation.Transpose,matrix.Limits{})
+   var probabilities:array<f32>=try neural.softmax_rows(array.view(scores),q.tokens,k.tokens,neural.Limits{lanes:16})
+   scores=[]
+   let pm:matrix.Matrix=try matrix.prepare(array.view(probabilities),q.tokens,k.tokens,matrix.Limits{})
+   probabilities=[]
+   let vm:matrix.Matrix=try matrix.prepare(array.view(vs),k.tokens,features,matrix.Limits{})
+   vs=[]
+   let weighted:array<f32>=try matrix.multiply(library,pm,matrix.Operation.Identity,vm,matrix.Operation.Identity,matrix.Limits{})
+   row=0
+   loop{if row==q.tokens{break}
+    var channel:u64=0
+    loop{if channel==features{break}
+     array.set(joined,(batch*q.tokens+row)*a.width+head*features+channel,array.get(weighted,row*features+channel))
+     channel+=1}
+    row+=1}
+   head+=1}
+  batch+=1}
+ let merged:Tensor=Tensor{batch:q.batch,tokens:q.tokens,width:a.width,values:joined}
+ linear(w,backend,library,merged,a.projection)
+}
+fn residual(w:ref<weights.Model>,x:ref<Tensor>,branch:ref<Tensor>,gamma:u64)->result<Tensor,string> effects {alloc} {
+ if x.batch!=branch.batch or x.tokens!=branch.tokens or x.width!=branch.width{return result.err("CPU attention residual shape differs")}
+ let p:ref<weights.Parameter>=array.borrow(w.parameters.values,gamma)
+ if array.len(p.values)!=x.width{return result.err("CPU attention residual scale shape differs")}
+ var values:array<f32>=[]
+ array.reserve(values,array.len(x.values))
+ var i:u64=0
+ loop{if i==array.len(x.values){break}
+  array.push(values,array.get(x.values,i)+array.get(branch.values,i)*array.get(p.values,i%x.width))
+  i+=1}
+ result.ok(Tensor{batch:x.batch,tokens:x.tokens,width:x.width,values:values})
+}
+pub fn forward(w:ref<weights.Model>,backend:ref<Backend>,library:ref<CAbiLibrary>,block:definition.Block,input:ref<Tensor>,other:ref<Tensor>,cancel:str)->result<Tensor,string> effects {alloc,ffi,fs.meta} {
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var query:Tensor=try normalize(w,backend,input,block.norm1)
+ var keys:Tensor=if block.cross{try normalize(w,backend,other,block.norm2)}else{Tensor{batch:query.batch,tokens:query.tokens,width:query.width,values:num.copy(array.view(query.values))}}
+ var attention:Tensor=try attend(w,backend,library,block.attention,query,keys,cancel)
+ query.values=[]
+ keys.values=[]
+ var x:Tensor=try residual(w,input,attention,block.gamma1)
+ attention.values=[]
+ let form:definition.Norm=if block.cross{match block.norm3{some(v)=>v,none=>{return result.err("CPU cross-layer third normalization missing")}}}else{block.norm2}
+ var mlp:Tensor=try normalize(w,backend,x,form)
+ mlp=try linear(w,backend,library,mlp,block.first)
+ mlp.values=try neural.gelu(array.view(mlp.values),neural.Limits{})
+ mlp=try linear(w,backend,library,mlp,block.second)
+ x=try residual(w,x,mlp,block.gamma2)
+ normalize(w,backend,x,block.final_norm)
+}

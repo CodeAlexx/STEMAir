@@ -1,0 +1,27 @@
+{
+  "source": "https://github.com/OpenMathLib/OpenBLAS",
+  "revision": "0b678b19dc03f2a999d6e038814c4c50b9640a4e",
+  "version": "0.3.20",
+  "api": "cblas_sdot64_",
+  "abi": "ILP64; contiguous F32; selected Zen core family",
+  "windows_sha256": "b863f35d267fd95c74ca502ac85977f00ebc3effa3373da7ff47b1eac08192d9",
+  "linux_sha256": "558cce71bf736752a83d3dd01e60748ac7e70d393785c984dbe24aadd42d8d4f",
+  "windows_imports": [
+    "KERNEL32.dll",
+    "msvcrt.dll",
+    "USER32.dll"
+  ],
+  "linux_imports": [
+    "libm.so.6",
+    "libc.so.6",
+    "ELF loader"
+  ],
+  "linux_highest_glibc": "2.38",
+  "linux_cpu_requirement": "AVX2 FMA",
+  "notices": [
+    "cpu-dot-reference-BSD.txt",
+    "cpu-dot-qualified-windows-notices.txt"
+  ],
+  "vendor_binaries_committed": false,
+  "python_runtime_required": false
+}

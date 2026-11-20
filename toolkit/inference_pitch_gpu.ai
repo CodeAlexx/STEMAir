@@ -1,0 +1,51 @@
+module stemair.inference_pitch_gpu
+import "model_cache.ai" as cache
+import "recording_context.ai" as context
+import "mask/request.ai" as request
+import "audio_result.ai" as audio
+import "inference_pitch.ai" as pitch
+import "inference_pitch_output.ai" as output
+import "exchange/config.ai" as config
+import "exchange/audio.ai" as envelope
+import "exchange/session.ai" as session
+import "exchange/device.ai" as device
+import "exchange/frequency_match.ai" as frequency
+import "spectral.ai" as spectral
+import std.codec as codec
+import std.gpu as agpu
+import std.tensor as tensor
+fn failure(error:gpu.error)->string effects {alloc}{string.copy(error.message)}
+
+pub fn separate(bank:ref<cache.Cache>,index:u64,input:view<f32>,cancel:str,progress:str,policy:ref<request.Policy>,controls:ref<context.Context>,lower:view<f32>,predict:fn(ref<cache.Cache>,u64,view<f32>,str,str,ref<request.Policy>,ref<context.Context>,view<f32>)->result<audio.Samples,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write})->result<audio.Samples,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ controls.frequency_reference=[]
+ let _=try request.validate_policy(policy)
+ if index>=array.len(bank.entries){return result.err("Pitched model index is out of range")}
+ let kind:string=string.copy(array.borrow(bank.entries,index).model.profile.kind)
+ if (not controls.pitch.enabled and not controls.pitch.match_frequency) or not output.supported(kind){return predict(bank,index,input,cancel,progress,policy,controls,lower)}
+ if view.len(lower)>0{return result.err("Lower-band input is only valid for mask inference")}
+ var prepared:pitch.Prepared=try pitch.prepare(input,controls.pitch)
+ let values:array<f32>=struct.replace(prepared,[],field=values)
+ if kind=="exchange"{
+  let model=struct.borrow(array.borrow(bank.entries,index),field=model)
+  var settings:config.Config=try config.Config_decode(model.profile.identity) map_err codec.describe
+  let _=try config.validate_typed(settings)
+  var gpu:GpuContext=try agpu.open(controls.device_index) map_err failure
+  var stream:GpuStream=try agpu.compute_stream(gpu) map_err failure
+  var transform:spectral.Plan=spectral.plan(settings.n_fft,settings.hop,spectral.hann(settings.n_fft))
+  match model.exchange{none=>{return result.err("Pitched interchange session is unavailable")},some(value)=>{
+   var parameters:array<tensor.Tensor>=try device.upload(gpu,stream,struct.borrow(value,field=graph))
+   var state:envelope.State=try session.separate_state(gpu,stream,parameters,struct.borrow(value,field=graph),transform,settings,array.view(values),cancel,progress)
+   let result:audio.Samples=try output.exchange(state,prepared,input,settings.compensation)
+   if prepared.settings.match_frequency{
+    let matched:array<f32>=try pitch.matched_mix(input,prepared.settings)
+    let primary:str=array.get(settings.targets,0)
+    controls.frequency_reference=if primary=="vocals" or primary=="instrumental"{try frequency.gpu(gpu,stream,settings,array.view(matched),cancel,progress)}else{matched}}
+   model.requests+=1
+   return result.ok(result)}}}
+ let sources:u64=array.len(array.borrow(bank.entries,index).model.profile.targets)
+ var result:audio.Samples=try predict(bank,index,array.view(values),cancel,progress,policy,controls,[])
+ if result.precision!=audio.Precision.Float32{return result.err("Recording pitch requires the model's Float32 output")}
+ let restored:array<f32>=try pitch.finish_sources(array.view(result.single),sources,prepared)
+ if kind=="spectral" and controls.pitch.match_frequency and controls.pitch.enabled and controls.pitch.semitones!=0.0{controls.frequency_reference=try pitch.matched_mix(input,controls.pitch)}
+ result.ok(audio.from_single(restored))
+}

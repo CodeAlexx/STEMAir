@@ -1,0 +1,129 @@
+module stemair.attention.bundle_config
+import "config.ai" as config
+import std.codec as codec
+import std.float as fp
+import std.text as text
+import std.json as json
+
+pub type Identity=struct{signature:string,filename:string} derive codec(strict)
+pub type Config=struct{engine:string="attention-bundle",model:config.Config,members:array<Identity>}
+pub type Definition=struct{models:array<string>,weights:option<array<array<f64>>>,segment:option<f64>}
+fn keys(document:ref<json.Document>,allowed:view<str>)->result<unit,string> effects {alloc}{
+ let names:array<string>=match json.keys(document,0){some(v)=>v,none=>{return result.err("Expected a bundle object")}}
+ var i:u64=0
+ loop{if i==array.len(names){break}
+  let name:str=array.get(names,i)
+  var found:bool=false
+  var j:u64=0
+  loop{if j==view.len(allowed){break}
+   if name==view.get(allowed,j){found=true}
+   j+=1}
+  if not found{return result.err("Unknown bundle field")}
+  j=0
+  loop{if j==i{break}
+   if name==array.get(names,j){return result.err("Duplicate bundle field")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn decode(raw:str)->result<Config,string> effects {alloc}{
+ var document:json.Document=try json.parse(raw) map_err json.message
+ var r:codec.Reader=codec.root_reader(codec.strict())
+ let engine:string=try codec.text_field(document,r,"engine") map_err codec.describe
+ var model_reader:codec.Reader=try codec.object_field(document,r,"model",codec.strict()) map_err codec.describe
+ let model_raw:string=option.unwrap(json.raw(document,codec.node_index(model_reader)))
+ let model:config.Config=try config.Config_decode(model_raw) map_err codec.describe
+ var items:codec.Items=try codec.items_field(document,r,"members",codec.strict()) map_err codec.describe
+ var members:array<Identity>=[]
+ loop{match try codec.next_object(document,items) map_err codec.describe{none=>{break},some(item)=>{
+  var row:codec.Reader=item
+  let signature:string=try codec.text_field(document,row,"signature") map_err codec.describe
+  let filename:string=try codec.text_field(document,row,"filename") map_err codec.describe
+  let _=try codec.reader_finish(document,row) map_err codec.describe
+  array.push(members,Identity{signature:signature,filename:filename})}}}
+ let _=try codec.reader_finish(document,r) map_err codec.describe
+ let c:Config=Config{engine:engine,model:model,members:members}
+ let _=try validate(c)
+ result.ok(c)
+}
+pub fn definition(raw:str)->result<Definition,string> effects {alloc}{
+ var document:json.Document=try json.parse(raw) map_err json.message
+ let allowed:array<str>=["models","weights","segment"]
+ let _=try keys(document,array.view(allowed))
+ var r:codec.Reader=codec.root_reader(codec.lenient())
+ let models:array<string>=try codec.text_array_field(document,r,"models") map_err codec.describe
+ var weights:option<array<array<f64>>>=option.none()
+ match json.get(document,0,"weights"){none=>{},some(index)=>{
+  if option.unwrap(json.kind(document,index))!=json.Kind.Null{
+   if option.unwrap(json.kind(document,index))!=json.Kind.Array{return result.err("Bundle weights must be an array")}
+   let count:u64=option.unwrap(json.len(document,index))
+   if count!=array.len(models){return result.err("Bundle weight row count differs")}
+   var rows:array<array<f64>>=[]
+   var i:u64=0
+   loop{if i==count{break}
+    let at:u64=option.unwrap(json.at(document,index,i))
+    if option.unwrap(json.kind(document,at))!=json.Kind.Array{return result.err("Bundle source weights must be an array")}
+    let width:u64=option.unwrap(json.len(document,at))
+    if width<2 or width>8{return result.err("Bundle source weight count differs")}
+    var row:array<f64>=[]
+    var j:u64=0
+    loop{if j==width{break}
+     let value:f64=match json.as_f64(document,option.unwrap(json.at(document,at,j))){some(v)=>v,none=>{return result.err("Bundle weight is not numeric")}}
+     if not fp.is_finite(value) or value<0.0{return result.err("Bundle weight is invalid")}
+     array.push(row,value)
+     j+=1}
+    array.push(rows,row)
+    i+=1}
+   weights=option.some(rows)}}}
+ var segment:option<f64>=option.none()
+ match json.get(document,0,"segment"){none=>{},some(index)=>{
+  if option.unwrap(json.kind(document,index))!=json.Kind.Null{
+   segment=option.some(match json.as_f64(document,index){some(v)=>v,none=>{return result.err("Bundle segment is not numeric")}})}}}
+ result.ok(Definition{models:models,weights:weights,segment:segment})
+}
+pub fn validate(c:ref<Config>)->result<unit,string> effects {alloc}{
+ if c.engine!="attention-bundle" or array.len(c.members)==0 or array.len(c.members)>16{return result.err("Invalid attention bundle profile")}
+ let _=try config.validate(struct.borrow(c,field=model))
+ var i:u64=0
+ loop{if i==array.len(c.members){break}
+  let member:ref<Identity>=array.borrow(c.members,i)
+  if str.len(member.signature)==0 or str.len(member.signature)>64 or str.len(member.filename)==0 or str.len(member.filename)>128 or text.contains(member.filename,"/") or text.contains(member.filename,"\\") or member.filename=="." or member.filename==".."{return result.err("Invalid bundle member identity")}
+  var j:u64=0
+  loop{if j==i{break}
+   let previous:ref<Identity>=array.borrow(c.members,j)
+   if str.view(struct.borrow(member,field=signature))==str.view(struct.borrow(previous,field=signature)) or str.view(struct.borrow(member,field=filename))==str.view(struct.borrow(previous,field=filename)){return result.err("Duplicate bundle member identity")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn validate_definition(c:ref<Config>,d:ref<Definition>)->result<unit,string> effects {alloc}{
+ let _=try validate(c)
+ if array.len(d.models)!=array.len(c.members){return result.err("Bundle definition and identities differ")}
+ var i:u64=0
+ loop{if i==array.len(d.models){break}
+  let signature:str=array.get(d.models,i)
+  if signature!=str.view(struct.borrow(array.borrow(c.members,i),field=signature)){return result.err("Bundle model order differs from pinned identities")}
+  i+=1}
+ match d.segment{none=>{},some(value)=>{if not fp.is_finite(value) or value<=0.0 or value*44100.0!=cast.float(c.model.segment_samples){return result.err("Bundle segment differs from the selected profile")}}}
+ let member_count:u64=array.len(d.models)
+ match d.weights{none=>{},some(rows)=>{
+  if array.len(rows)!=member_count{return result.err("Bundle weight matrix differs")}
+  i=0
+  loop{if i==array.len(rows){break}
+   if array.len(array.borrow(rows,i))!=array.len(c.model.targets){return result.err("Bundle source weight count differs")}
+   i+=1}
+  var source:u64=0
+  loop{if source==array.len(c.model.targets){break}
+   var total:f64=0.0
+   i=0
+   loop{if i==array.len(rows){break}
+    let weight:f64=array.get(array.borrow(rows,i),source)
+    let rounded:f32=cast.float(weight)
+    if not fp.is_finite(weight) or not fp.is_finite(rounded) or weight<0.0{return result.err("Invalid source weight")}
+    total+=weight
+    i+=1}
+   let rounded:f32=cast.float(total)
+   if not fp.is_finite(rounded) or rounded<=0.0{return result.err("A source has no finite positive total weight")}
+   source+=1}}}
+ result.ok(())
+}

@@ -1,0 +1,478 @@
+module stemair.job
+import "mask_inference_policy.ai" as inference_policy
+import "recording_inference_policy.ai" as recording_policy
+import "../toolkit/recording_context.ai" as recording_context
+import "../toolkit/recording_state.ai" as recording_state
+import "../toolkit/cpu_inference.ai" as cpu_inference
+import "../toolkit/gpu_inference.ai" as gpu_inference
+import "../toolkit/device_selection.ai" as device_selection
+import "../toolkit/audio_result.ai" as audio_result
+import "../toolkit/mask/request.ai" as mask_request
+import "application.ai" as app
+import "learned_cleanup_output.ai" as learned_output
+import "learned_cleanup_single.ai" as learned_single
+import "../toolkit/learned_cleanup_request.ai" as learned_request
+import "../toolkit/numeric.ai" as numeric
+import "cpu_model_runtime.ai" as cpu_runtime
+import "checked_input.ai" as checked_input
+import "model_input.ai" as model_input
+import "../toolkit/recording_sources.ai" as recording_sources
+import "ensemble_application.ai" as ensemble_app
+import "audio_tool_application.ai" as audio_tools
+import "pitch_application.ai" as pitch
+import "alignment_application.ai" as alignment
+import "recording_alignment_application.ai" as recording_alignment
+import "recording_alignment_io.ai" as recording_io
+import "alignment_choices.ai" as alignment_choices
+import "alignment_thread_policy.ai" as alignment_threads
+import "ensemble_alignment_io.ai" as ensemble_alignment_io
+import "time_application.ai" as audio_time
+import "wav_export.ai" as wav
+import "container_export.ai" as container
+import "output_naming.ai" as naming
+import "../toolkit/compressed_export.ai" as compressed
+import "model_selection.ai" as model_selection
+import "../toolkit/asset_acquisition.ai" as acquisition
+import "secondary_application.ai" as secondary_app
+import "../toolkit/secondary_config.ai" as secondary_config
+import "../toolkit/secondary.ai" as secondary
+import "../toolkit/secondary_device.ai" as secondary_device
+import "../toolkit/typed_secondary.ai" as typed_secondary
+import "../toolkit/typed_secondary_device.ai" as typed_secondary_device
+import "../toolkit/typed_model_ensemble_device.ai" as typed_model_ensemble_device
+import "../toolkit/typed_ensemble_processing_device.ai" as typed_processing_device
+import "../toolkit/typed_secondary_cpu.ai" as typed_secondary_cpu
+import "secondary_resource_policy.ai" as secondary_resources
+import "model_ensemble_application.ai" as model_ensemble_app
+import "ensemble_processing_application.ai" as processing_app
+import "../toolkit/ensemble_processing.ai" as processing
+import "../toolkit/typed_ensemble_processing.ai" as typed_processing
+import "../toolkit/typed_ensemble_processing_cpu.ai" as typed_processing_cpu
+import "../toolkit/ensemble_processing_device.ai" as processing_device
+import "../toolkit/model_ensemble.ai" as model_ensemble
+import "../toolkit/typed_model_ensemble.ai" as typed_model_ensemble
+import "../toolkit/typed_source_wave.ai" as typed_source
+import "../toolkit/model_ensemble_config.ai" as model_ensemble_config
+import "../toolkit/model_ensemble_device.ai" as model_ensemble_device
+import "../toolkit/engine.ai" as engine
+import "../toolkit/model_cache.ai" as cache
+import "../toolkit/device_engine.ai" as device_engine
+import "../toolkit/control.ai" as control
+import "queue_config.ai" as queue_config
+import std.audio as audio
+import std.files as files
+import std.text as text
+import std.codec as codec
+
+fn recording_budget(options:ref<option<checked_input.Options>>)->u64 effects {} {match options{none=>536870912,some(value)=>value.limits.max_decoded_bytes}}
+pub type Work=struct{retained:option<cache.Cache>,settings:string,checkpoint:string,input:string,output:string,cancel:string,progress:string,use_gpu:bool,gpu_index:u32=0,application_root:string="",mask_high_band:u32=0,mask_cleanup:bool=false,mask_cleanup_threshold:f64=0.2,mask_controls:string="",learned_controls:string="",recording_controls:string="",recording_state:string="",wav_choice:u32=4,codec_recipe:string="",export_max_frames:u64=0,export_max_stage_bytes:u64=0,export_max_encoded_bytes:u64=0}
+pub type Completed=struct{recording_state:string="",retained:option<cache.Cache>,ok:bool,message:string,queue_report:option<queue_config.Report>,directory:string="",
+ catalog_profile:string="",catalog_settings:string="",catalog_checkpoint:string="",catalog_report:string="",export_report:string="",verification_report:string="",sample_report:string="",paired_report:string="",paired_report_file:string="",paired_snapshot:string="",mastering_report:string=""}
+pub type CatalogWork=struct{retained:option<cache.Cache>,request:model_selection.Request,cancel:string,progress:string}
+pub fn run_catalog(work:CatalogWork own)->Completed effects {alloc,fs.read,fs.write,fs.meta,net,random,time} {
+ var w:CatalogWork=work
+ let options:acquisition.Options=acquisition.Options{}
+ let outcome:result<model_selection.Outcome,string>=model_selection.run(struct.borrow(w,field=request),options,w.cancel,w.progress)
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ match outcome{err(problem)=>Completed{retained:retained,ok:false,queue_report:option.none(),
+  message:text.concat(problem,model_selection.staging_note(struct.borrow(w,field=request)))},
+ ok(value)=>{
+  let report:string=match value.report{none=>"",some(r)=>match acquisition.Report_encode(r){ok(v)=>v,err(_)=>""}}
+  Completed{retained:retained,ok:true,message:string.copy(value.message),queue_report:option.none(),catalog_profile:string.copy(value.profile),
+   catalog_settings:string.copy(value.settings),catalog_checkpoint:string.copy(value.checkpoint),catalog_report:report}}}
+}
+pub type EnsembleWork=struct{retained:option<cache.Cache>,settings:ensemble_app.Settings,output:string,cancel:string,progress:string,wav_choice:u32=4,codec_recipe:string="",export_max_frames:u64=0,export_max_stage_bytes:u64=0,export_max_encoded_bytes:u64=0}
+pub type AudioToolWork=struct{retained:option<cache.Cache>,settings:audio_tools.Settings,output:string,cancel:string,progress:string,wav_choice:u32=4,codec_recipe:string="",export_max_frames:u64=0,export_max_stage_bytes:u64=0,export_max_encoded_bytes:u64=0}
+pub type PitchWork=struct{retained:option<cache.Cache>,settings:pitch.Settings,input:string,output:string,cancel:string,progress:string,wav_choice:u32=4,codec_recipe:string="",export_max_frames:u64=0,export_max_stage_bytes:u64=0,export_max_encoded_bytes:u64=0}
+pub type AlignmentWork=struct{retained:option<cache.Cache>,settings:alignment.Settings,first:string,second:string,output:string,cancel:string,progress:string,wav_choice:u32=4,codec_recipe:string="",export_max_frames:u64=0,export_max_stage_bytes:u64=0,export_max_encoded_bytes:u64=0}
+pub type TimeWork=struct{retained:option<cache.Cache>,settings:audio_time.Settings,input:string,output:string,cancel:string,progress:string,wav_choice:u32=4,codec_recipe:string="",export_max_frames:u64=0,export_max_stage_bytes:u64=0,export_max_encoded_bytes:u64=0}
+pub type RecordingAlignmentWork=struct{retained:option<cache.Cache>,settings:recording_alignment.Settings,selection:option<alignment_choices.Recipe>,first:string,second:string,output:string,cancel:string,progress:string,wav_choice:u32=4,codec_recipe:string="",export_max_frames:u64=0,export_max_stage_bytes:u64=0,export_max_encoded_bytes:u64=0}
+pub fn run_recording_alignment(work:RecordingAlignmentWork own,options:checked_input.Options own)->Completed effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ var w:RecordingAlignmentWork=work
+ var policy:checked_input.Options=options
+ var journal:container.Journal=container.empty_journal()
+ let selected:option<alignment_choices.Recipe>=struct.replace(w,option.none(),field=selection)
+ let ready:result<unit,string>=match w.retained{none=>result.ok(()),some(bank)=>cache.require_cpu_policy(bank)}
+ let guarded:result<unit,alignment_threads.Failure>=match ready{err(e)=>result.err(alignment_threads.failure(e)),ok(_)=>match export_plan_limited(w.wav_choice,w.codec_recipe,w.export_max_frames,w.export_max_stage_bytes,w.export_max_encoded_bytes){err(e)=>result.err(alignment_threads.failure(e)),ok(plan)=>match selected{
+  none=>recording_io.run_guarded(struct.borrow(w,field=settings),w.first,w.second,w.output,w.cancel,w.progress,plan,journal,policy),
+  some(recipe)=>ensemble_alignment_io.run_guarded(struct.borrow(w,field=settings),recipe,w.first,w.second,w.output,w.cancel,w.progress,plan,journal,policy)}}}
+ let outcome:result<unit,string>=match guarded{ok(_)=>result.ok(()),err(error)=>{
+  if error.poison_cpu{
+   match w.retained{none=>{var bank:cache.Cache=cache.empty()
+    cache.poison_cpu(bank)
+    w.retained=option.some(bank)},some(bank)=>cache.poison_cpu(bank)}}
+  result.err(alignment_threads.describe(error))}}
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ let completed:Completed=match outcome{ok(_)=>Completed{retained:retained,ok:true,directory:string.copy(w.output),message:"Detailed alignment and subtraction complete",queue_report:option.none()},
+  err(e)=>Completed{retained:retained,ok:false,message:e,queue_report:option.none()}}
+ attach_export(completed,journal,w.output)
+}
+fn run_time_impl(work:TimeWork own,options:option<checked_input.Options> own)->Completed effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ var w:TimeWork=work
+ var input_options:option<checked_input.Options>=options
+ var journal:container.Journal=container.empty_journal()
+ let outcome:result<audio_time.Report,string>=match export_plan_limited(w.wav_choice,w.codec_recipe,w.export_max_frames,w.export_max_stage_bytes,w.export_max_encoded_bytes){err(e)=>result.err(e),ok(plan)=>audio_time.run_with_input_to(struct.borrow(w,field=settings),w.input,w.output,w.cancel,w.progress,plan,journal,input_options)}
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ let completed:Completed=match outcome{err(e)=>Completed{retained:retained,ok:false,message:e,queue_report:option.none()},ok(report)=>{
+  var message:string=text.concat("Audio processing complete: ",text.concat(string.from_int(report.frames),text.concat(" frames, ",text.concat(string.from_int(report.channels)," channels"))))
+  if report.bypassed{string.append(message," (unchanged audio)")}
+  if not report.temporary_removed{string.append(message,text.concat("; temporary audio remains at ",report.work_directory))}
+  Completed{retained:retained,ok:true,directory:string.copy(w.output),message:message,queue_report:option.none()}}}
+ attach_export(completed,journal,w.output)
+}
+pub fn run_time(work:TimeWork own)->Completed effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ run_time_impl(work,option.none())
+}
+pub fn run_time_checked(work:TimeWork own,options:checked_input.Options own)->Completed effects {alloc,fs.read,fs.write,fs.meta,process,time,env} {
+ run_time_impl(work,option.some(options))
+}
+fn run_alignment_impl(work:AlignmentWork own,options:option<checked_input.Options> own)->Completed effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ var w:AlignmentWork=work
+ var input_options:option<checked_input.Options>=options
+ var journal:container.Journal=container.empty_journal()
+ let ready:result<unit,string>=match w.retained{none=>result.ok(()),some(bank)=>cache.require_cpu_policy(bank)}
+ let outcome:result<unit,string>=match ready{err(e)=>result.err(e),ok(_)=>match export_plan_limited(w.wav_choice,w.codec_recipe,w.export_max_frames,w.export_max_stage_bytes,w.export_max_encoded_bytes){err(e)=>result.err(e),ok(plan)=>alignment.run_with_input_to(struct.borrow(w,field=settings),w.first,w.second,w.output,w.cancel,w.progress,plan,journal,input_options)}}
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ let completed:Completed=match outcome{ok(_)=>Completed{retained:retained,ok:true,directory:string.copy(w.output),message:"Alignment and subtraction complete",queue_report:option.none()},
+  err(e)=>Completed{retained:retained,ok:false,message:e,queue_report:option.none()}}
+ attach_export(completed,journal,w.output)
+}
+pub fn run_alignment(work:AlignmentWork own)->Completed effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ run_alignment_impl(work,option.none())
+}
+pub fn run_alignment_checked(work:AlignmentWork own,options:checked_input.Options own)->Completed effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ run_alignment_impl(work,option.some(options))
+}
+pub type SecondaryWork=struct{retained:option<cache.Cache>,settings:secondary_config.Recipe,input:string,output:string,cancel:string,progress:string,use_gpu:bool,gpu_index:u32=0,application_root:string="",mask_high_band:u32=0,mask_cleanup:bool=false,mask_cleanup_threshold:f64=0.2,mask_controls:string="",learned_controls:string="",recording_controls:string="",recording_state:string="",wav_choice:u32=4,codec_recipe:string="",export_max_frames:u64=0,export_max_stage_bytes:u64=0,export_max_encoded_bytes:u64=0}
+fn execute_secondary(w:ref<SecondaryWork>,journal:ref<container.Journal>,input_options:ref<option<checked_input.Options>>,naming_options:ref<option<naming.Chain>>)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ let configurations:array<string>=recording_policy.configurations<secondary_config.Model>(struct.borrow(w.settings,field=models))
+ var recording:recording_context.Context=try recording_policy.resolve_sources(w.recording_controls,recording_budget(input_options),w.recording_state,configurations)
+ recording.device_index=w.gpu_index
+ if w.use_gpu{let _=try device_selection.available(w.gpu_index)}
+ let outcome:result<unit,string>=execute_secondary_controlled(w,journal,input_options,naming_options,recording)
+ w.recording_state=try recording_state.encode(recording)
+ outcome
+}
+
+fn execute_secondary_controlled(w:ref<SecondaryWork>,journal:ref<container.Journal>,input_options:ref<option<checked_input.Options>>,naming_options:ref<option<naming.Chain>>,recording:ref<recording_context.Context>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,gpu,process,time,env,ffi} {
+ let _=try learned_request.decode(w.learned_controls)
+ var request:mask_request.Policy=try inference_policy.resolve(w.mask_high_band,w.mask_cleanup,w.mask_cleanup_threshold,w.mask_controls)
+ var plan:container.Plan=try export_plan_limited(w.wav_choice,w.codec_recipe,w.export_max_frames,w.export_max_stage_bytes,w.export_max_encoded_bytes)
+ let empty:bool=match w.retained{none=>true,some(_)=>false}
+ if empty{w.retained=option.some(cache.empty())}
+ let serialized:string=try secondary_config.Recipe_encode(struct.borrow(w,field=settings)) map_err codec.describe
+ var settings:secondary_config.Recipe=try secondary_config.Recipe_decode(serialized) map_err codec.describe
+ let input:string=string.copy(w.input)
+ let output:string=string.copy(w.output)
+ let cancel:string=string.copy(w.cancel)
+ let progress:string=string.copy(w.progress)
+ let use_gpu:bool=w.use_gpu
+ let root:string=string.copy(w.application_root)
+ let learned_raw:string=string.copy(w.learned_controls)
+ var destination:string=string.copy(output)
+ let outcome:result<unit,string>=match w.retained{none=>result.err("Secondary model cache is unavailable"),some(bank)=>{
+  let _=try cache.select_learned(bank,learned_raw)
+  var inputs:recording_sources.Set=recording_sources.empty()
+  var prepared:secondary_app.Prepared=match naming_options{none=>{
+   try secondary_app.prepare_typed_with_sources_to(bank,settings,input,output,cancel,plan,input_options,use_gpu,root,inputs)},some(context)=>{
+   var named:secondary_app.NamedPrepared=try secondary_app.prepare_typed_named_with_sources_to(bank,settings,input,output,cancel,plan,input_options,context,use_gpu,root,inputs)
+   plan=struct.replace(named,container.wav_plan(plan.working_wav),field=format)
+   struct.replace(named,secondary_app.Prepared{bindings:[],plan:secondary.Plan{required:[],outputs:[]},input:[],input_path:"",directory:""},field=prepared)}}
+  destination=string.copy(prepared.directory)
+  let _=try if use_gpu{cache.configure_learned_gpu_on_device(bank,learned_raw,recording.device_index)}else{cache.configure_learned_cpu(bank,learned_raw)}
+  if use_gpu{
+   let master:audio_result.Samples=audio_result.from_single(struct.replace(prepared,[],field=input))
+   var output:typed_secondary.Output=try typed_secondary_device.separate_with_policy_controlled_inputs(bank,struct.borrow(prepared,field=bindings),struct.borrow(prepared,field=plan),settings,master,secondary_resources.limits(),plan.working_wav,request,cancel,progress,recording,inputs)
+   secondary_app.export_typed_to(bank,settings,prepared,output,true,cancel,progress,plan,journal)
+  }else{
+   let master:audio_result.Samples=audio_result.from_single(struct.replace(prepared,[],field=input))
+   var output:typed_secondary.Output=try typed_secondary_cpu.separate_with_policy_controlled_inputs(bank,struct.borrow(prepared,field=bindings),struct.borrow(prepared,field=plan),settings,master,secondary_resources.limits(),plan.working_wav,request,cancel,progress,recording,inputs)
+   secondary_app.export_typed_to(bank,settings,prepared,output,false,cancel,progress,plan,journal)
+  }
+ }}
+ w.output=destination
+ outcome
+}
+pub fn run_secondary(work:SecondaryWork own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_secondary_impl(work,option.none(),option.none())
+}
+pub fn run_secondary_named(work:SecondaryWork own,context:naming.Chain own,options:option<checked_input.Options> own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_secondary_impl(work,options,option.some(context))
+}
+fn run_secondary_impl(work:SecondaryWork own,options:option<checked_input.Options> own,context:option<naming.Chain> own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var w:SecondaryWork=work
+ var journal:container.Journal=container.empty_journal()
+ var input_options:option<checked_input.Options>=options
+ var naming_options:option<naming.Chain>=context
+ let result:result<unit,string>=execute_secondary(w,journal,input_options,naming_options)
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ let completed:Completed=match result{ok(_)=>Completed{recording_state:string.copy(w.recording_state),retained:retained,ok:true,directory:string.copy(w.output),message:if w.settings.vocal_split>0{"Vocal chain complete"}else{if array.len(w.settings.models)==1{"Separation complete"}else{"Secondary processing complete"}},queue_report:option.none()},err(e)=>Completed{recording_state:string.copy(w.recording_state),retained:retained,ok:false,message:e,queue_report:option.none()}}
+ attach_export(completed,journal,w.output)
+}
+fn run_audio_tool_impl(work:AudioToolWork own,options:option<checked_input.Options> own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var w:AudioToolWork=work
+ var input_options:option<checked_input.Options>=options
+ var journal:container.Journal=container.empty_journal()
+ let result:result<unit,string>=match export_plan_limited(w.wav_choice,w.codec_recipe,w.export_max_frames,w.export_max_stage_bytes,w.export_max_encoded_bytes){err(e)=>result.err(e),ok(plan)=>audio_tools.run_with_input_to(struct.borrow(w,field=settings),w.output,w.cancel,w.progress,plan,journal,input_options)}
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ let completed:Completed=match result{ok(_)=>Completed{retained:retained,ok:true,directory:string.copy(w.output),message:"Audio tool complete",queue_report:option.none()},err(e)=>Completed{retained:retained,ok:false,message:e,queue_report:option.none()}}
+ attach_export(completed,journal,w.output)
+}
+pub fn run_audio_tool(work:AudioToolWork own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ run_audio_tool_impl(work,option.none())
+}
+pub fn run_audio_tool_checked(work:AudioToolWork own,options:checked_input.Options own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ run_audio_tool_impl(work,option.some(options))
+}
+fn run_pitch_impl(work:PitchWork own,options:option<checked_input.Options> own)->Completed effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ var w:PitchWork=work
+ var input_options:option<checked_input.Options>=options
+ var journal:container.Journal=container.empty_journal()
+ let result:result<unit,string>=match export_plan_limited(w.wav_choice,w.codec_recipe,w.export_max_frames,w.export_max_stage_bytes,w.export_max_encoded_bytes){err(e)=>result.err(e),ok(plan)=>pitch.run_with_input_to(struct.borrow(w,field=settings),w.input,w.output,w.cancel,w.progress,plan,journal,input_options)}
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ let completed:Completed=match result{ok(_)=>Completed{retained:retained,ok:true,directory:string.copy(w.output),message:"Pitch and duration complete",queue_report:option.none()},err(e)=>Completed{retained:retained,ok:false,message:e,queue_report:option.none()}}
+ attach_export(completed,journal,w.output)
+}
+pub fn run_pitch(work:PitchWork own)->Completed effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ run_pitch_impl(work,option.none())
+}
+pub fn run_pitch_checked(work:PitchWork own,options:checked_input.Options own)->Completed effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ run_pitch_impl(work,option.some(options))
+}
+pub type ModelEnsembleWork=struct{retained:option<cache.Cache>,settings:model_ensemble_config.Recipe,input:string,output:string,cancel:string,progress:string,use_gpu:bool,gpu_index:u32=0,application_root:string="",mask_high_band:u32=0,mask_cleanup:bool=false,mask_cleanup_threshold:f64=0.2,mask_controls:string="",learned_controls:string="",recording_controls:string="",recording_state:string="",wav_choice:u32=4,codec_recipe:string="",export_max_frames:u64=0,export_max_stage_bytes:u64=0,export_max_encoded_bytes:u64=0}
+fn execute_model_ensemble(w:ref<ModelEnsembleWork>,journal:ref<container.Journal>,input_options:ref<option<checked_input.Options>>,naming_options:ref<option<naming.Ensemble>>)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var configurations:array<string>=recording_policy.configurations<model_ensemble_config.Model>(struct.borrow(w.settings,field=models))
+ var i:u64=0
+ loop{if i==array.len(w.settings.models){break}
+  let _=try recording_policy.include_processing(configurations,array.borrow(w.settings.models,i).processing)
+  i+=1}
+ var recording:recording_context.Context=try recording_policy.resolve_sources(w.recording_controls,recording_budget(input_options),w.recording_state,configurations)
+ recording.device_index=w.gpu_index
+ if w.use_gpu{let _=try device_selection.available(w.gpu_index)}
+ let outcome:result<unit,string>=execute_model_ensemble_controlled(w,journal,input_options,naming_options,recording)
+ w.recording_state=try recording_state.encode(recording)
+ outcome
+}
+
+fn execute_model_ensemble_controlled(w:ref<ModelEnsembleWork>,journal:ref<container.Journal>,input_options:ref<option<checked_input.Options>>,naming_options:ref<option<naming.Ensemble>>,recording:ref<recording_context.Context>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,gpu,process,time,env,ffi} {
+ let _=try learned_request.decode(w.learned_controls)
+ var request:mask_request.Policy=try inference_policy.resolve(w.mask_high_band,w.mask_cleanup,w.mask_cleanup_threshold,w.mask_controls)
+ var plan:container.Plan=try export_plan_limited(w.wav_choice,w.codec_recipe,w.export_max_frames,w.export_max_stage_bytes,w.export_max_encoded_bytes)
+ let empty:bool=match w.retained{none=>true,some(_)=>false}
+ if empty{w.retained=option.some(cache.empty())}
+ let serialized:string=try model_ensemble_config.Recipe_encode(struct.borrow(w,field=settings)) map_err codec.describe
+ var settings:model_ensemble_config.Recipe=try model_ensemble_config.Recipe_decode(serialized) map_err codec.describe
+ let input:string=string.copy(w.input)
+ let output:string=string.copy(w.output)
+ let cancel:string=string.copy(w.cancel)
+ let progress:string=string.copy(w.progress)
+ let use_gpu:bool=w.use_gpu
+ let root:string=string.copy(w.application_root)
+ let learned_raw:string=string.copy(w.learned_controls)
+ match w.retained{none=>result.err("Model ensemble cache is unavailable"),some(bank)=>{
+  let _=try cache.select_learned(bank,learned_raw)
+  if processing_app.enabled(settings){
+   var inputs:recording_sources.Set=recording_sources.empty()
+   var prepared:processing_app.Prepared=match naming_options{none=>{
+    try processing_app.prepare_typed_with_sources_to(bank,settings,input,output,cancel,plan,input_options,use_gpu,root,inputs)},some(context)=>{
+    var named:processing_app.NamedPrepared=try processing_app.prepare_typed_named_with_sources_to(bank,settings,input,output,cancel,plan,input_options,context,use_gpu,root,inputs)
+    plan=struct.replace(named,container.wav_plan(plan.working_wav),field=format)
+    struct.replace(named,processing_app.Prepared{members:[],options:model_ensemble_config.Options{outputs:[]},input:[],input_path:"",directory:""},field=prepared)}}
+   let budget:typed_secondary_cpu.Limits=secondary_resources.limits()
+   let _=try if use_gpu{cache.configure_learned_gpu_on_device(bank,learned_raw,recording.device_index)}else{cache.configure_learned_cpu(bank,learned_raw)}
+   let limits:typed_processing.Limits=typed_processing.Limits{max_retained_bytes:budget.max_retained_bytes,max_working_bytes:budget.max_working_bytes,allow_provisional_spectral:budget.allow_provisional_spectral}
+   var master:audio_result.Samples=audio_result.from_single(struct.replace(prepared,[],field=input))
+   var result:typed_processing.Output=if use_gpu{try typed_processing_device.separate_with_policy_as_controlled_inputs(bank,struct.borrow(prepared,field=members),struct.borrow(prepared,field=options),master,cancel,progress,request,plan.working_wav,limits,recording,inputs)}else{try typed_processing_cpu.separate_with_policy_as_controlled_inputs(bank,struct.borrow(prepared,field=members),struct.borrow(prepared,field=options),master,cancel,progress,request,plan.working_wav,limits,recording,inputs)}
+   return processing_app.export_typed_to(bank,prepared,result,use_gpu,cancel,progress,plan,journal)
+  }
+  var inputs:recording_sources.Set=recording_sources.empty()
+  var prepared:model_ensemble_app.Prepared=match naming_options{none=>{
+   try model_ensemble_app.prepare_typed_with_sources_to(bank,settings,input,output,cancel,progress,plan,input_options,use_gpu,root,inputs)},some(context)=>{
+   var named:model_ensemble_app.NamedPrepared=try model_ensemble_app.prepare_typed_named_with_sources_to(bank,settings,input,output,cancel,progress,plan,input_options,context,use_gpu,root,inputs)
+   plan=struct.replace(named,container.wav_plan(plan.working_wav),field=format)
+   struct.replace(named,model_ensemble_app.Prepared{members:[],options:model_ensemble_config.Options{outputs:[]},input:[],input_path:"",directory:""},field=prepared)}}
+  let _=try if use_gpu{cache.configure_learned_gpu_on_device(bank,learned_raw,recording.device_index)}else{cache.configure_learned_cpu(bank,learned_raw)}
+  if use_gpu{
+   let budget:typed_secondary_cpu.Limits=secondary_resources.limits()
+   let limits:typed_source.Limits=typed_source.Limits{max_working_bytes:budget.max_working_bytes,allow_provisional_spectral:budget.allow_provisional_spectral}
+   var result:typed_model_ensemble.Output=try typed_model_ensemble_device.separate_with_policy_as_controlled_inputs(bank,array.view(prepared.members),struct.borrow(prepared,field=options),array.view(prepared.input),cancel,progress,request,plan.working_wav,limits,recording,inputs)
+   model_ensemble_app.export_typed_to(bank,settings,prepared,result,true,cancel,progress,plan,journal)
+  }else{
+   let budget:typed_secondary_cpu.Limits=secondary_resources.limits()
+   let limits:typed_source.Limits=typed_source.Limits{max_working_bytes:budget.max_working_bytes}
+   var result:typed_model_ensemble.Output=try typed_model_ensemble.separate_cpu_with_policy_as_controlled_inputs(bank,array.view(prepared.members),struct.borrow(prepared,field=options),array.view(prepared.input),cancel,progress,request,plan.working_wav,limits,recording,inputs)
+   model_ensemble_app.export_typed_to(bank,settings,prepared,result,false,cancel,progress,plan,journal)
+  }
+ }}
+}
+pub fn run_model_ensemble(work:ModelEnsembleWork own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_model_ensemble_impl(work,option.none(),option.none())
+}
+pub fn run_model_ensemble_named(work:ModelEnsembleWork own,context:naming.Ensemble own,options:option<checked_input.Options> own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_model_ensemble_impl(work,options,option.some(context))
+}
+fn run_model_ensemble_impl(work:ModelEnsembleWork own,options:option<checked_input.Options> own,context:option<naming.Ensemble> own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var w:ModelEnsembleWork=work
+ var journal:container.Journal=container.empty_journal()
+ var input_options:option<checked_input.Options>=options
+ var naming_options:option<naming.Ensemble>=context
+ let result:result<unit,string>=execute_model_ensemble(w,journal,input_options,naming_options)
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ let completed:Completed=match result{ok(_)=>Completed{recording_state:string.copy(w.recording_state),retained:retained,ok:true,directory:string.copy(w.output),message:"Model ensemble complete",queue_report:option.none()},err(e)=>Completed{recording_state:string.copy(w.recording_state),retained:retained,ok:false,message:e,queue_report:option.none()}}
+ attach_export(completed,journal,w.output)
+}
+fn run_ensemble_impl(work:EnsembleWork own,options:option<checked_input.Options> own)->Completed effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ var w:EnsembleWork=work
+ var input_options:option<checked_input.Options>=options
+ var journal:container.Journal=container.empty_journal()
+ let result:result<unit,string>=match export_plan_limited(w.wav_choice,w.codec_recipe,w.export_max_frames,w.export_max_stage_bytes,w.export_max_encoded_bytes){err(e)=>result.err(e),ok(plan)=>ensemble_app.run_with_input_to(struct.borrow(w,field=settings),w.output,w.cancel,w.progress,plan,journal,input_options)}
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ let completed:Completed=match result{ok(_)=>Completed{retained:retained,ok:true,directory:string.copy(w.output),message:"Ensemble complete",queue_report:option.none()},err(e)=>Completed{retained:retained,ok:false,message:e,queue_report:option.none()}}
+ attach_export(completed,journal,w.output)
+}
+pub fn run_ensemble(work:EnsembleWork own)->Completed effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ run_ensemble_impl(work,option.none())
+}
+pub fn run_ensemble_checked(work:EnsembleWork own,options:checked_input.Options own)->Completed effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ run_ensemble_impl(work,option.some(options))
+}
+fn status(path:str,message:str)->unit effects {alloc,fs.write} {
+ let _=files.write_atomic(path,text.concat(path,".tmp"),message)
+ ()
+}
+fn execute(w:ref<Work>,journal:ref<container.Journal>,input_options:ref<option<checked_input.Options>>,naming_options:ref<option<naming.Context>>)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ let configurations:array<string>=[string.copy(w.settings)]
+ var recording:recording_context.Context=try recording_policy.resolve_sources(w.recording_controls,recording_budget(input_options),w.recording_state,configurations)
+ recording.device_index=w.gpu_index
+ if w.use_gpu{let _=try device_selection.available(w.gpu_index)}
+ let outcome:result<unit,string>=execute_controlled(w,journal,input_options,naming_options,recording)
+ w.recording_state=try recording_state.encode(recording)
+ outcome
+}
+
+fn execute_controlled(w:ref<Work>,journal:ref<container.Journal>,input_options:ref<option<checked_input.Options>>,naming_options:ref<option<naming.Context>>,recording:ref<recording_context.Context>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,gpu,process,time,env,ffi} {
+ let learned:learned_request.Settings=try learned_request.decode(w.learned_controls)
+ var request:mask_request.Policy=try inference_policy.resolve(w.mask_high_band,w.mask_cleanup,w.mask_cleanup_threshold,w.mask_controls)
+ var plan:container.Plan=try export_plan_limited(w.wav_choice,w.codec_recipe,w.export_max_frames,w.export_max_stage_bytes,w.export_max_encoded_bytes)
+ if control.cancelled(str.view(w.cancel)){return result.err("Separation cancelled")}
+ var settings:engine.Profile=try engine.read_typed(str.view(w.settings))
+ match naming_options{none=>{},some(context)=>{
+  var selected:naming.Selected=try naming.select(w.input,w.output,context,struct.borrow(settings,field=targets),plan)
+  let _=try container.require_directory(w.output)
+  if context.model_folder{match files.mkdirs(selected.directory){ok(_)=>{},err(_)=>{return result.err("Cannot create the selected model output folder")}}}
+  w.output=struct.replace(selected,"",field=directory)
+  plan=struct.replace(selected,container.wav_plan(plan.working_wav),field=plan)}}
+ var learned_plan:container.Plan=try learned_output.planned(plan,struct.borrow(settings,field=targets),learned,false,false)
+ let _=try app.preflight_to(str.view(w.output),array.len(learned_plan.source_names),learned_plan,journal)
+ var inputs:recording_sources.Set=recording_sources.empty()
+ var accepted:array<engine.Profile>=[try engine.decode_typed(settings.identity)]
+ var source:audio.AudioBuffer=try match input_options{
+  none=>app.read_recording(str.view(w.input),settings.sample_rate,str.view(w.output)),
+  some(options)=>model_input.prepare_into(w.input,settings.sample_rate,accepted,options,inputs),
+ } map_err app.recording_error
+ let _=try container.preflight_extent(array.len(source.samples),source.rate,source.channels,plan)
+ let input:array<f32>=try app.planar(source,settings.sample_rate) map_err app.recording_error
+ let lower:array<f32>=try recording_sources.lower(inputs,settings.identity,typed_source.Limits{max_working_bytes:secondary_resources.limits().max_working_bytes})
+ let empty:bool=match w.retained{none=>true,some(_)=>false}
+ if empty{w.retained=option.some(cache.empty())}
+ let cancel:string=string.copy(str.view(w.cancel))
+ let progress:string=string.copy(str.view(w.progress))
+ let destination:string=string.copy(str.view(w.output))
+ let checkpoint:string=string.copy(w.checkpoint)
+ let use_gpu:bool=w.use_gpu
+ let root:string=string.copy(w.application_root)
+ let learned_raw:string=string.copy(w.learned_controls)
+ match w.retained{
+  none=>result.err("Model session unavailable"),
+  some(retained)=>{
+   status(str.view(progress),"Preparing separation model")
+   let copy:engine.Profile=try engine.decode_typed(settings.identity)
+   var backend:option<cache.CpuBackend>=if use_gpu or not cpu_runtime.needs_selection(retained,settings){option.none()}else{try cpu_runtime.selected(root,settings)}
+   let index:u64=if use_gpu{try cache.acquire_typed(retained,checkpoint,copy)}else{try cache.acquire_cpu_typed(retained,checkpoint,copy,backend)}
+   let _=try if use_gpu{cache.configure_learned_gpu_on_device(retained,learned_raw,recording.device_index)}else{cache.configure_learned_cpu(retained,learned_raw)}
+   let model:ref<engine.Loaded>=struct.borrow(array.borrow(retained.entries,index),field=model)
+   if str.view(settings.identity)!=str.view(model.profile.identity){return result.err("Model configuration changed; reload the model before processing")}
+   status(str.view(progress),"Separating audio")
+   var output:audio_result.Samples=if use_gpu{
+    try gpu_inference.separate_with_policy_and_band_input(retained,index,array.view(input),str.view(cancel),str.view(progress),request,recording,array.view(lower))
+   }else{try cpu_inference.separate_with_policy_and_band_input(retained,index,array.view(input),str.view(cancel),str.view(progress),request,recording,array.view(lower))}
+   if control.cancelled(str.view(cancel)){return result.err("Separation cancelled")}
+   let samples:u64=audio_result.count(output)/(2*array.len(settings.targets))
+   status(str.view(progress),if container.extension(plan)=="wav"{"Writing source WAVs"}else{"Writing source audio"})
+   let backend:str=if use_gpu{if output.precision==audio_result.Precision.Float64{"native-air-gpu-f64"}else{"native-air-gpu-f32"}}else{if output.precision==audio_result.Precision.Float64{"native-air-cpu-f64"}else{"native-air-cpu-f32"}}
+   if learned.noise or learned.room{
+    let master:audio_result.Samples=audio_result.from_single(numeric.copy(array.view(input)))
+    let limits:typed_source.Limits=typed_source.Limits{max_working_bytes:8589934592}
+    var waves:array<typed_source.Wave>=if use_gpu{try learned_single.finish_gpu(retained,settings.kind,struct.borrow(settings,field=targets),master,output,cancel,limits,array.view(recording.frequency_reference))}else{try learned_single.finish_cpu(retained,settings.kind,struct.borrow(settings,field=targets),master,output,cancel,limits,array.view(recording.frequency_reference))}
+    return app.export_waves_to(destination,settings.sample_rate,waves,backend,cache.loads(retained)+cache.learned_loads(retained),cancel,progress,learned_plan,journal)}
+   app.export_typed_to(str.view(destination),settings.sample_rate,struct.borrow(settings,field=targets),output,samples,backend,cache.loads(retained),cancel,progress,plan,journal)
+  },}
+}
+pub fn run(work:Work own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_single(work,option.none(),option.none())
+}
+
+// Opt-in checked input; the same execution/export path returns the retained bank.
+pub fn run_checked(work:Work own,options:checked_input.Options own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_single(work,option.some(options),option.none())
+}
+pub fn run_named(work:Work own,context:naming.Context own,options:option<checked_input.Options> own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_single(work,options,option.some(context))
+}
+fn run_single(work:Work own,options:option<checked_input.Options> own,context:option<naming.Context> own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ var w:Work=work
+ var journal:container.Journal=container.empty_journal()
+ var input_options:option<checked_input.Options>=options
+ var naming_options:option<naming.Context>=context
+ let result:result<unit,string>=execute(w,journal,input_options,naming_options)
+ let retained:option<cache.Cache>=struct.replace(w,option.none(),field=retained)
+ let completed:Completed=match result{ok(_)=>Completed{recording_state:string.copy(w.recording_state),retained:retained,ok:true,directory:string.copy(w.output),message:"Separation complete",queue_report:option.none()},
+  err(e)=>Completed{recording_state:string.copy(w.recording_state),retained:retained,ok:false,message:e,queue_report:option.none()}}
+ attach_export(completed,journal,w.output)
+}
+
+// Runtime selection belongs to the caller; this verifies the explicit recipe again.
+pub fn export_plan(choice:u32,recipe:str)->result<container.Plan,string> effects {alloc,fs.read,fs.meta} {
+ export_plan_limited(choice,recipe,0,0,0)
+}
+pub fn export_plan_limited(choice:u32,recipe:str,max_frames:u64,max_stage_bytes:u64,max_encoded_bytes:u64)->result<container.Plan,string> effects {alloc,fs.read,fs.meta} {
+ let kind:audio.WavSubtype=try wav.from_choice(choice)
+ if view.len(str.bytes(recipe))>16384{return result.err("Codec recipe exceeds 16 KiB")}
+ var plan:container.Plan=if str.len(recipe)==0{container.wav_plan(kind)}else{
+  let settings:compressed.Settings=try compressed.Settings_decode(recipe) map_err codec.describe
+  try container.compressed_plan(kind,settings)}
+ if max_frames>0 or max_stage_bytes>0 or max_encoded_bytes>0{
+  plan=try container.with_limits(plan,compressed.Limits{max_frames:max_frames,max_stage_bytes:max_stage_bytes,max_encoded_bytes:max_encoded_bytes})}
+ let _=try container.verify(plan)
+ result.ok(plan)
+}
+fn attach_export(completed:Completed own,journal:ref<container.Journal>,directory:str)->Completed effects {alloc} {
+ var value:Completed=completed
+ if not value.ok and str.len(journal.failure)==0{container.record_failure(journal,"",value.message)}
+ let count:u64=array.len(journal.artifacts)
+ match container.encode_journal(journal){ok(report)=>{value.export_report=report},err(problem)=>{
+  value.ok=false
+  string.append(value.message,text.concat("; cannot serialize export reports: ",problem))}}
+ if count>0 and not value.ok{
+  string.append(value.message,text.concat("; ",text.concat(string.from_int(count)," audio files published")))
+  if str.len(value.directory)==0{value.directory=string.copy(directory)}}
+ var retained:u64=0
+ var first:string=""
+ var at:u64=0
+ loop{if at==count{break}
+  let artifact:ref<container.Artifact>=array.borrow(journal.artifacts,at)
+  let path:string=match artifact.compressed{none=>match artifact.wav{none=>"",some(report)=>if report.staging_removed{""}else{string.copy(report.staging_path)}},some(report)=>if report.work_retained{string.copy(report.work_path)}else{if report.staging_removed{""}else{string.copy(report.staging_path)}}}
+  if str.len(path)>0{retained+=1
+   if str.len(first)==0{first=string.copy(path)}}
+  at+=1}
+ if retained>0{string.append(value.message,text.concat("; ",text.concat(string.from_int(retained),text.concat(" export work retained; first: ",first))))}
+ value
+}
+
+pub fn run_secondary_checked(work:SecondaryWork own,options:checked_input.Options own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_secondary_impl(work,option.some(options),option.none())
+}
+
+pub fn run_model_ensemble_checked(work:ModelEnsembleWork own,options:checked_input.Options own)->Completed effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu, process, random, time} {
+ run_model_ensemble_impl(work,option.some(options),option.none())
+}

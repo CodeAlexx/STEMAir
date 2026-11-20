@@ -1,0 +1,169 @@
+module stemair.typed_secondary
+import "audio_result.ai" as audio
+import "typed_secondary_cache.ai" as retained
+import "typed_source_wave.ai" as source
+import "typed_audio_math.ai" as math
+import "typed_vocal_chain.ai" as vocal
+import "secondary.ai" as plan
+import "secondary_config.ai" as config
+import "model_ensemble_config.ai" as selection
+import "control.ai" as control
+
+pub type Output=struct{stems:array<source.Wave>,saved:array<retained.Prediction>,inputs:array<retained.StageInput>}
+fn request(name:str)->selection.Target effects {alloc} {
+ selection.Target{target:string.copy(name),method:"",exclude:if str.starts_with(name,"no_") and str.len(name)>3{string.copy(str.slice(name,3,str.len(name)))}else{""}}
+}
+fn settings(c:ref<config.Recipe>)->vocal.Settings effects {} {
+ vocal.Settings{rebalance:plan.rebalance(c),mixes:c.vocal_mixes,mix_only:c.vocal_mix_only,vocal_only:c.vocal_save_only,normalize:c.normalize}
+}
+fn save_primary(name:str,c:ref<config.Recipe>)->bool effects {} {
+ plan.vocal_model(c)==0 or (not (c.vocal_mix_only and name=="vocals") and not (c.vocal_save_only and name=="instrumental"))
+}
+fn unpack(state:ref<retained.State>,model:u64,stage:str,limits:source.Limits)->result<array<source.Wave>,string> effects {alloc} {
+ let index:u64=try retained.find(state,model,stage)
+ let item:ref<retained.Prediction>=array.borrow(state.predictions,index)
+ var waves:array<source.Wave>=[]
+ var i:u64=0
+ loop{if i==array.len(item.sources){break}
+  let w:ref<source.Wave>=array.borrow(item.sources,i)
+  array.push(waves,source.Wave{frequency_reference:try source.copy_reference(w,limits),frequency_residual:w.frequency_residual,target:string.copy(w.target),samples:try source.copy(struct.borrow(w,field=samples),limits),frames:w.frames})
+  i+=1}
+ result.ok(waves)
+}
+fn selected(state:ref<retained.State>,model:u64,name:str,complement:str,input:ref<audio.Samples>,limits:source.Limits)->result<audio.Samples,string> effects {alloc, env, ffi, fs.read} {
+ var waves:array<source.Wave>=try unpack(state,model,"recording",limits)
+ var target:selection.Target=request(name)
+ source.select(waves,target,complement,input,limits)
+}
+pub fn instrumental_input(state:ref<retained.State>,c:ref<config.Recipe>,input:ref<audio.Samples>,limits:source.Limits)->result<audio.Samples,string> effects {alloc, env, ffi, fs.read} {
+ if c.preprocess==0{return result.err("No instrumental preprocessor is selected")}
+ let frames:u64=try source.frames(input)
+ if frames==0{return result.err("Preprocessing requires a stereo recording")}
+ if c.preprocess_complement=="direct"{return selected(state,c.preprocess,"instrumental","sum",input,limits)}
+ if c.preprocess_complement=="spectral"{return selected(state,c.preprocess,"instrumental","spectral",input,limits)}
+ var waves:array<source.Wave>=try unpack(state,c.preprocess,"recording",limits)
+ let at:u64=match source.find(waves,"vocals"){some(i)=>i,none=>{return result.err("Preprocessor vocals are missing")}}
+ let w:ref<source.Wave>=array.borrow(waves,at)
+ let fitted:audio.Samples=try source.fit(struct.borrow(w,field=samples),frames,limits)
+ w.samples=fitted
+ w.frames=frames
+ var target:selection.Target=selection.Target{target:"instrumental",method:"",exclude:"vocals"}
+ source.select(waves,target,"residual",input,limits)
+}
+// Assignment follows the filtered primary destination dtype, not the widest input.
+pub fn primary(state:ref<retained.State>,c:ref<config.Recipe>,limits:source.Limits)->result<array<source.Wave>,string> effects {alloc} {
+ if c.preprocess==0{return unpack(state,0,"recording",limits)}
+ var base:array<source.Wave>=try unpack(state,0,"instrumental",limits)
+ var original:array<source.Wave>=try unpack(state,0,"recording",limits)
+ let dest:u64=match source.find(base,"vocals"){some(i)=>i,none=>{return result.err("Preprocessed vocals are missing")}}
+ let from:u64=match source.find(original,"vocals"){some(i)=>i,none=>{return result.err("Primary vocals are missing")}}
+ let destination:ref<source.Wave>=array.borrow(base,dest)
+ let fitted:audio.Samples=try source.fit(struct.borrow(array.borrow(original,from),field=samples),destination.frames,limits)
+ let _=try source.assign(struct.borrow(destination,field=samples),0,fitted,limits)
+ result.ok(base)
+}
+fn blended(waves:ref<array<source.Wave>>,state:ref<retained.State>,c:ref<config.Recipe>,name:str,input:ref<audio.Samples>,limits:source.Limits)->result<audio.Samples,string> effects {alloc, env, ffi, fs.read} {
+ var target:selection.Target=request(name)
+ var values:audio.Samples=try source.select(waves,target,c.complement,input,limits)
+ match plan.adjustment(c,name){none=>{},some(index)=>{
+  let rule:ref<config.Adjustment>=array.borrow(c.adjustments,index)
+  let second:audio.Samples=try selected(state,rule.model,name,c.complement,input,limits)
+  values=try math.blend(values,second,2,rule.primary_weight,math.Limits{max_working_bytes:limits.max_working_bytes})}}
+ result.ok(values)
+}
+fn chain_master(waves:ref<array<source.Wave>>,state:ref<retained.State>,c:ref<config.Recipe>,name:str,input:ref<audio.Samples>,limits:source.Limits)->result<audio.Samples,string> effects {alloc, env, ffi, fs.read} {
+ var samples:audio.Samples=try blended(waves,state,c,name,input,limits)
+ if save_primary(name,c){let _=try math.normalize(samples,c.normalize)}
+ result.ok(samples)
+}
+pub fn vocal_input(state:ref<retained.State>,c:ref<config.Recipe>,input:ref<audio.Samples>,limits:source.Limits,cancel:str,progress:str)->result<audio.Samples,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ if plan.vocal_model(c)==0{return result.err("No vocal splitter is selected")}
+ var waves:array<source.Wave>=try primary(state,c,limits)
+ let voice:audio.Samples=try chain_master(waves,state,c,"vocals",input,limits)
+ var instrumental:option<audio.Samples>=if plan.rebalance(c)>0.0{option.some(try chain_master(waves,state,c,"instrumental",input,limits))}else{option.none()}
+ var policy:vocal.Settings=settings(c)
+ vocal.prepare(voice,instrumental,policy,vocal.Limits{max_working_bytes:limits.max_working_bytes},cancel,progress)
+}
+fn remainder(waves:ref<array<source.Wave>>,state:ref<retained.State>,p:ref<plan.Plan>,c:ref<config.Recipe>,input:ref<audio.Samples>,limits:source.Limits)->result<audio.Samples,string> effects {alloc, env, ffi, fs.read} {
+ var instruments:array<source.Wave>=[]
+ var i:u64=0
+ loop{if i==array.len(waves){break}
+  let w:ref<source.Wave>=array.borrow(waves,i)
+  if str.view(w.target)!="vocals"{array.push(instruments,source.Wave{frequency_reference:try source.copy_reference(w,limits),frequency_residual:w.frequency_residual,target:string.copy(w.target),samples:try source.copy(struct.borrow(w,field=samples),limits),frames:w.frames})}
+  i+=1}
+ let mixture:audio.Samples=try instrumental_input(state,c,input,limits)
+ var target:selection.Target=selection.Target{target:"other_instruments",method:"",exclude:string.copy(array.get(p.outputs,0))}
+ source.select(instruments,target,c.complement,mixture,limits)
+}
+fn append(stems:ref<array<source.Wave>>,name:str,samples:audio.Samples own)->unit effects {alloc} {
+ var held:audio.Samples=samples
+ let frames:u64=audio.count(held)/2
+ array.push(stems,source.Wave{frequency_reference:[],target:string.copy(name),samples:held,frames:frames})
+ ()
+}
+pub fn finish(state:ref<retained.State>,p:ref<plan.Plan>,c:ref<config.Recipe>,input:ref<audio.Samples>,limits:source.Limits,cancel:str,progress:str)->result<Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write} {
+ var captured:array<source.Wave>=[]
+ finish_impl(state,p,c,input,limits,cancel,progress,captured,false)
+}
+pub fn finish_captured(state:ref<retained.State>,p:ref<plan.Plan>,c:ref<config.Recipe>,input:ref<audio.Samples>,limits:source.Limits,cancel:str,progress:str,captured:ref<array<source.Wave>>)->result<Output,string> effects {alloc,env,ffi,fs.meta,fs.read,fs.write}{
+ finish_impl(state,p,c,input,limits,cancel,progress,captured,true)
+}
+fn finish_impl(state:ref<retained.State>,p:ref<plan.Plan>,c:ref<config.Recipe>,input:ref<audio.Samples>,limits:source.Limits,cancel:str,progress:str,captured:ref<array<source.Wave>>,capture:bool)->result<Output,string> effects {alloc,env,ffi,fs.meta,fs.read,fs.write}{
+ let _=try plan.validate(c)
+ var stages:array<plan.Stage>=plan.stages(p,c)
+ if array.len(state.predictions)!=array.len(stages){return result.err("Secondary prediction count differs from its plan")}
+ var i:u64=0
+ loop{if i==array.len(stages){break}
+  let stage:ref<plan.Stage>=array.borrow(stages,i)
+  let _=try retained.find(state,stage.model,stage.source)
+  i+=1}
+ var waves:array<source.Wave>=try primary(state,c,limits)
+ var output:array<source.Wave>=[]
+ i=0
+ loop{if i==array.len(p.outputs){break}
+  if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+  let name:str=array.get(p.outputs,i)
+  if save_primary(name,c){
+   var values:audio.Samples=try blended(waves,state,c,name,input,limits)
+   if capture{append(captured,name,try source.copy(values,limits))}
+   let _=try math.normalize(values,c.normalize)
+   append(output,name,values)}
+  control.report(progress,i+1,array.len(p.outputs))
+  i+=1}
+ if plan.extra_instrumental(p,c){
+  var values:audio.Samples=try remainder(waves,state,p,c,input,limits)
+  if capture{append(captured,"other_instruments",try source.copy(values,limits))}
+  let _=try math.normalize(values,c.normalize)
+  append(output,"other_instruments",values)}
+ if plan.vocal_model(c)>0{
+  if control.cancelled(cancel){return result.err("Secondary processing cancelled")}
+  let voice:audio.Samples=try chain_master(waves,state,c,"vocals",input,limits)
+  var instrumental:option<audio.Samples>=if c.vocal_mixes{option.some(try chain_master(waves,state,c,"instrumental",input,limits))}else{option.none()}
+  let prediction_index:u64=try retained.find(state,plan.vocal_model(c),"vocals")
+  let prediction:ref<retained.Prediction>=array.borrow(state.predictions,prediction_index)
+  var split:array<vocal.Stem>=[]
+  i=0
+  loop{if i==array.len(prediction.write_order){break}
+   let index:u64=match source.find(struct.borrow(prediction,field=sources),array.get(prediction.write_order,i)){some(v)=>v,none=>{return result.err("Vocal source write order differs")}}
+   let w:ref<source.Wave>=array.borrow(prediction.sources,index)
+   array.push(split,vocal.Stem{target:string.copy(w.target),samples:try source.copy(struct.borrow(w,field=samples),limits),frames:w.frames})
+   i+=1}
+  var policy:vocal.Settings=settings(c)
+  var before_save:array<vocal.Stem>=[]
+  var extra:array<vocal.Stem>=if capture{try vocal.finish_captured(split,voice,instrumental,policy,vocal.Limits{max_working_bytes:limits.max_working_bytes},cancel,progress,before_save)}else{try vocal.finish(split,voice,instrumental,policy,vocal.Limits{max_working_bytes:limits.max_working_bytes},cancel,progress)}
+  var saved_index:u64=0
+  loop{if saved_index==array.len(before_save){break}
+   let held:ref<vocal.Stem>=array.borrow(before_save,saved_index)
+   let label:string=string.copy(held.target)
+   append(captured,label,struct.replace(held,audio.from_single([]),field=samples))
+   saved_index+=1}
+  i=0
+  loop{if i==array.len(extra){break}
+   let w:ref<vocal.Stem>=array.borrow(extra,i)
+   let name:string=string.copy(w.target)
+   append(output,name,struct.replace(w,audio.from_single([]),field=samples))
+   i+=1}}
+ let saved:array<retained.Prediction>=if c.keep_members{struct.replace(state,[],field=predictions)}else{[]}
+ let inputs:array<retained.StageInput>=if c.keep_members{struct.replace(state,[],field=inputs)}else{[]}
+ result.ok(Output{stems:output,saved:saved,inputs:inputs})
+}

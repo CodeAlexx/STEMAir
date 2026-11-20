@@ -1,0 +1,114 @@
+module stemair.waveform.session
+import "config.ai" as config
+import "network.ai" as network
+import "device.ai" as device
+import "audio.ai" as audio
+import "host_session.ai" as host
+import "../ops.ai" as ops
+import "../recording_shifts.ai" as shifts
+import "../recording_moments.ai" as source_moments
+import "../audio_normalization.ai" as normalization
+import "../windowed_sinc.ai" as sinc
+import "../windowed_sinc_source.ai" as source_sinc
+import std.tensor as tensor
+import std.mkl_vml as vml
+import std.gpu as agpu
+
+pub type Session=struct{network:network.Network,cpu:array<host.Prepared>,cpu_preparations:u64=0,gpu:array<device.Backend>,gpu_preparations:u64=0,gpu_weight_packs:u64=0,gpu_recurrent_calls:u64=0,gpu_workspace_peak:u64=0,gpu_coefficients:array<sinc.Plan>}
+pub type GpuLimits=struct{workspace_bytes:u64,packed_bytes:u64}
+pub fn gpu_limits()->GpuLimits effects {}{GpuLimits{workspace_bytes:4294967296,packed_bytes:2147483648}}
+pub fn prepare_cpu(s:ref<Session>)->result<unit,string> effects {alloc} {
+ if array.len(s.cpu)==0{array.push(s.cpu,try host.prepare(struct.borrow(s,field=network)))
+  s.cpu_preparations+=1}
+ if array.len(s.cpu)!=1{return result.err("CPU waveform session must own one retained weight bank")}
+ result.ok(())
+}
+pub fn prepare_cpu_with_blas(s:ref<Session>,runtime:str,version:str)->result<unit,string> effects {alloc,ffi}{
+ if array.len(s.cpu)==0{array.push(s.cpu,try host.prepare_with_blas(struct.borrow(s,field=network),runtime,version))
+  s.cpu_preparations+=1}
+ if array.len(s.cpu)!=1 or array.len(array.borrow(s.cpu,0).backend.legacy_matrix)!=1{return result.err("Waveform bank was already prepared without the explicit matrix recipe")}
+ result.ok(())}
+pub fn open(path:str,settings:ref<config.Config>)->result<Session,string> effects {alloc,fs.read} {
+ let _=try config.validate(settings)
+ if str.view(settings.engine)!="waveform"{return result.err("Waveform profile engine differs")}
+ let n:network.Network=try if settings.generation==2{network.open_resampled(path)}else{network.open(path)}
+ result.ok(Session{network:n,cpu:[],gpu:[],gpu_coefficients:[]})
+}
+// Plan construction happens once per loaded second-generation session. The
+// source CPU coefficients remain resident; no checkpoint reads occur here.
+pub fn upload(context:ref<GpuContext>,stream:ref<GpuStream>,s:ref<Session>)->result<array<tensor.Tensor>,string> effects {alloc,gpu,env,ffi,fs.meta}{
+ if s.network.options.generation!=2{return device.upload(context,stream,struct.borrow(s,field=network))}
+ if array.len(s.gpu_coefficients)==0{
+  var runtime:vml.Vml=try vml.open_default()
+  let up:sinc.Plan=try source_sinc.plan(runtime,1,2)
+  let down:sinc.Plan=try source_sinc.plan(runtime,2,1)
+  array.push(s.gpu_coefficients,up)
+  array.push(s.gpu_coefficients,down)}
+ if array.len(s.gpu_coefficients)!=2{return result.err("Retained interpolation coefficient bank differs")}
+ var parameters:array<tensor.Tensor>=try device.upload_weights(context,stream,struct.borrow(s,field=network))
+ array.push(parameters,try device.upload_coefficient(context,stream,array.borrow(s.gpu_coefficients,0)))
+ array.push(parameters,try device.upload_coefficient(context,stream,array.borrow(s.gpu_coefficients,1)))
+ let _=try agpu.sync(context) map_err gpu_message
+ result.ok(parameters)
+}
+fn gpu_message(e:gpu.error)->string effects {alloc}{string.copy(e.message)}
+fn waveform_predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta} {
+ device.forward(context,stream,parameters,n,input,cancel)
+}
+fn waveform_length(n:ref<network.Network>,length:u64)->result<u64,string> effects {alloc} {
+ network.valid_length(n.options,length)
+}
+pub fn separate(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,
+ n:ref<network.Network>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if n.options.generation!=c.generation{return result.err("Waveform generation differs from retained network")}
+ let prepared:normalization.Prepared=try source_moments.prepare(input,2)
+ audio.separate_prepared(context,stream,parameters,n,c,prepared,cancel,progress,waveform_predict,waveform_length)
+}
+
+pub fn separate_scheduled(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,n:ref<network.Network>,c:ref<config.Config>,schedule:ref<shifts.Schedule>,input:view<f32>,cancel:str,progress:str)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write} {
+ if n.options.generation!=c.generation{return result.err("Waveform generation differs from retained network")}
+ let prepared:normalization.Prepared=try source_moments.prepare(input,2)
+ audio.separate_scheduled_prepared(context,stream,parameters,n,c,schedule,prepared,cancel,progress,waveform_predict,waveform_length)
+}
+fn prepared_predict(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<Session>,input:ref<tensor.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,gpu,fs.meta}{
+ let output:result<ops.Tensor,string>=device.forward_prepared(context,stream,parameters,struct.borrow(s,field=gpu),struct.borrow(s,field=network),input,cancel)
+ if array.len(s.gpu)==1{
+  let bank:ref<device.Backend>=array.borrow(s.gpu,0)
+  var i:u64=0
+  var peak:u64=0
+  loop{if i==array.len(bank.recurrent.entries){break}
+   match array.borrow(bank.recurrent.entries,i).plan{none=>{},some(plan)=>{if plan.workspace_bytes>peak{peak=plan.workspace_bytes}}}
+   i+=1}
+  if peak>s.gpu_workspace_peak{s.gpu_workspace_peak=peak}}
+ output
+}
+fn release_work(s:ref<Session>)->unit effects {alloc}{
+ if array.len(s.gpu)==1{
+  s.gpu_weight_packs+=array.borrow(s.gpu,0).recurrent.packs
+  s.gpu_recurrent_calls+=array.borrow(s.gpu,0).recurrent.calls}
+ s.gpu=[]
+}
+fn prepared_length(s:ref<Session>,length:u64)->result<u64,string> effects {alloc}{network.valid_length(s.network.options,length)}
+fn prepare_work(context:ref<GpuContext>,stream:ref<GpuStream>,s:ref<Session>,limits:ref<GpuLimits>)->result<unit,string> effects {alloc,gpu}{
+ if array.len(s.gpu)!=0{return result.err("Previous waveform GPU work was not released")}
+ array.push(s.gpu,try device.prepare(context,stream,struct.borrow(s,field=network),limits.workspace_bytes,limits.packed_bytes))
+ s.gpu_preparations+=1
+ result.ok(())
+}
+pub fn separate_prepared_state(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<Session>,c:ref<config.Config>,input:view<f32>,cancel:str,progress:str,limits:ref<GpuLimits>)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write}{
+ if s.network.options.generation!=c.generation{return result.err("Waveform generation differs from retained network")}
+ let preparation:normalization.Prepared=try source_moments.prepare(input,2)
+ let _=try prepare_work(context,stream,s,limits)
+ let outcome:result<array<f32>,string>=audio.separate_prepared(context,stream,parameters,s,c,preparation,cancel,progress,prepared_predict,prepared_length)
+ release_work(s)
+ outcome
+}
+pub fn separate_scheduled_state(context:ref<GpuContext>,stream:ref<GpuStream>,parameters:ref<array<tensor.Tensor>>,s:ref<Session>,c:ref<config.Config>,schedule:ref<shifts.Schedule>,input:view<f32>,cancel:str,progress:str,limits:ref<GpuLimits>)->result<array<f32>,string> effects {alloc,gpu,fs.meta,fs.write}{
+ if s.network.options.generation!=c.generation{return result.err("Waveform generation differs from retained network")}
+ let preparation:normalization.Prepared=try source_moments.prepare(input,2)
+ let _=try prepare_work(context,stream,s,limits)
+ let outcome:result<array<f32>,string>=audio.separate_scheduled_prepared(context,stream,parameters,s,c,schedule,preparation,cancel,progress,prepared_predict,prepared_length)
+ release_work(s)
+ outcome
+}

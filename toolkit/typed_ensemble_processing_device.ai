@@ -1,0 +1,121 @@
+module stemair.typed_ensemble_processing_device
+import "recording_context.ai" as recording_context
+import "gpu_inference.ai" as gpu_request
+import "recording_sources.ai" as recording_sources
+import "typed_ensemble_processing.ai" as processing
+import "ensemble_processing.ai" as legacy
+import "typed_secondary.ai" as secondary
+import "typed_secondary_cache.ai" as retained
+import "typed_source_wave.ai" as wave
+import "typed_model_result.ai" as model_result
+import "learned_cleanup_waves.ai" as learned
+import "typed_model_ensemble.ai" as ensemble
+import "audio_result.ai" as audio
+import "wave_boundary.ai" as boundary
+import "secondary.ai" as plan
+import "model_ensemble_config.ai" as config
+import "model_cache.ai" as cache
+import "model_roles.ai" as roles
+import "mask/request.ai" as request
+import "control.ai" as control
+import "device_engine.ai" as device
+import "engine.ai" as engine
+import std.audio as wav
+
+fn waveform(kind:str)->bool effects {} {kind=="waveform" or kind=="temporal" or kind=="residual-waveform" or kind=="hybrid" or kind=="attention" or kind=="attention-bundle" or kind=="recording-bundle"}
+pub fn separate_with_policy_as(bank:ref<cache.Cache>,members:ref<array<legacy.Member>>,c:ref<config.Options>,input:ref<audio.Samples>,cancel:str,progress:str,policy:ref<request.Policy>,kind:wav.WavSubtype,limits:processing.Limits)->result<processing.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ var inputs:recording_sources.Set=recording_sources.empty()
+ separate_with_policy_as_inputs(bank,members,c,input,cancel,progress,policy,kind,limits,inputs)
+}
+pub fn separate_with_policy_as_inputs(bank:ref<cache.Cache>,members:ref<array<legacy.Member>>,c:ref<config.Options>,input:ref<audio.Samples>,cancel:str,progress:str,policy:ref<request.Policy>,kind:wav.WavSubtype,requested:processing.Limits,inputs:ref<recording_sources.Set>)->result<processing.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ var controls:recording_context.Context=recording_context.disabled()
+ separate_with_policy_as_controlled_inputs(bank,members,c,input,cancel,progress,policy,kind,requested,controls,inputs)
+}
+pub fn separate_with_policy_as_controlled(bank:ref<cache.Cache>,members:ref<array<legacy.Member>>,c:ref<config.Options>,input:ref<audio.Samples>,cancel:str,progress:str,policy:ref<request.Policy>,kind:wav.WavSubtype,requested:processing.Limits,controls:ref<recording_context.Context>)->result<processing.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ var inputs:recording_sources.Set=recording_sources.empty()
+ separate_with_policy_as_controlled_inputs(bank,members,c,input,cancel,progress,policy,kind,requested,controls,inputs)
+}
+pub fn separate_with_policy_as_controlled_inputs(bank:ref<cache.Cache>,members:ref<array<legacy.Member>>,c:ref<config.Options>,input:ref<audio.Samples>,cancel:str,progress:str,policy:ref<request.Policy>,kind:wav.WavSubtype,requested:processing.Limits,controls:ref<recording_context.Context>,inputs:ref<recording_sources.Set>)->result<processing.Output,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, gpu} {
+ let _=try recording_context.validate(controls)
+ var limits:processing.Limits=requested
+ limits.max_working_bytes=try recording_sources.available(inputs,limits.max_working_bytes)
+ limits.max_retained_bytes=try recording_sources.available(inputs,limits.max_retained_bytes)
+ let _=try request.validate_policy(policy)
+ let _=try legacy.validate_options(members,c)
+ let _=try legacy.validate_bank(bank,members,false)
+ // Validate every dispatch before any inference can change a retained bank.
+ var i:u64=0
+ loop{if i==array.len(members){break}
+  let member:ref<legacy.Member>=array.borrow(members,i)
+  var checked_stages:array<plan.Stage>=plan.stages(struct.borrow(member,field=plan),struct.borrow(member,field=recipe))
+  var j:u64=0
+  loop{if j==array.len(checked_stages){break}
+   let stage:ref<plan.Stage>=array.borrow(checked_stages,j)
+   if stage.model>=array.len(member.recipe.models){return result.err("A processed ensemble stage model is out of range")}
+   let at:u64=try plan.binding(struct.borrow(member,field=bindings),stage.model)
+   let _=try roles.targets(struct.borrow(array.borrow(bank.entries,at).model,field=profile),array.borrow(member.recipe.models,stage.model),stage.source)
+   j+=1}
+  i+=1}
+ var recording:processing.Recording=try processing.empty(input,limits)
+ var acc:ensemble.Accumulator=try ensemble.begin(c,kind,processing.work(limits))
+ var processed:array<secondary.Output>=[]
+ i=0
+ loop{if i==array.len(members){break}
+  let member:ref<legacy.Member>=array.borrow(members,i)
+  let primary_index:u64=try plan.binding(struct.borrow(member,field=bindings),0)
+  var primary_input:audio.Samples=try recording_sources.master(inputs,array.borrow(bank.entries,primary_index).model.profile.identity,input,processing.work(limits))
+  var stages:array<plan.Stage>=plan.stages(struct.borrow(member,field=plan),struct.borrow(member,field=recipe))
+  var state:retained.State=retained.empty()
+  var j:u64=0
+  loop{if j==array.len(stages){break}
+   if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+   let stage:ref<plan.Stage>=array.borrow(stages,j)
+   let selected:u64=try plan.binding(struct.borrow(member,field=bindings),stage.model)
+   let identity:string=try legacy.key(member,stage)
+   let found:u64=match processing.find(recording,selected,identity){some(at)=>at,none=>{
+    let local:u64=try retained.extent(state,retained.Limits{max_retained_bytes:limits.max_retained_bytes})
+    let _=try processing.room(recording,local,limits)
+    let available:u64=limits.max_working_bytes-(try processing.extent(recording))-local
+    let work:wave.Limits=wave.Limits{max_working_bytes:available,allow_provisional_spectral:limits.allow_provisional_spectral}
+    var master:audio.Samples=if stage.source=="instrumental"{try secondary.instrumental_input(state,struct.borrow(member,field=recipe),primary_input,work)}else{try recording_sources.master(inputs,array.borrow(bank.entries,selected).model.profile.identity,input,work)}
+    let master_bytes:u64=try processing.bytes(master)
+    let _=try processing.room(recording,try processing.checked_add(local,master_bytes),limits)
+    let family:string=string.copy(array.borrow(bank.entries,selected).model.profile.kind)
+    let names:array<string>=try roles.targets(struct.borrow(array.borrow(bank.entries,selected).model,field=profile),array.borrow(member.recipe.models,stage.model),stage.source)
+    let tensor:array<f32>=if str.view(family)=="mask" and stage.source!="recording"{
+     try boundary.serialized_f32(master,44100,2,kind,boundary.Limits{max_working_bytes:available})
+    }else{try boundary.model_f32(master,boundary.Limits{max_working_bytes:available})}
+    var stage_policy:request.Policy=request.with_foreground(policy,roles.foreground(array.borrow(member.recipe.models,stage.model),stage.source))
+    let lower:array<f32>=if stage.source=="recording"{try recording_sources.lower(inputs,array.borrow(bank.entries,selected).model.profile.identity,work)}else{[]}
+    let prediction:audio.Samples=try gpu_request.separate_with_policy_and_band_input(bank,selected,array.view(tensor),cancel,progress,stage_policy,controls,array.view(lower))
+    let _=try processing.room(recording,try processing.checked_add(local,try processing.checked_add(try processing.checked_add(master_bytes,4*array.len(tensor)),try processing.bytes(prediction))),limits)
+    var finished:model_result.Output=try model_result.finish_with_reference(family,stage.source,names,master,prediction,work,array.view(controls.frequency_reference))
+    let _=try learned.noise_gpu(bank,family,struct.borrow(finished,field=sources),master,work,cancel)
+    let sources:array<wave.Wave>=struct.replace(finished,[],field=sources)
+    let order:array<string>=struct.replace(finished,[],field=write_order)
+    try processing.store(recording,selected,identity,sources,order,master,limits)}}
+   let _=try processing.restore(recording,found,stage,state,member.recipe.keep_members and stage.source!="recording",limits)
+   j+=1}
+  let primary:u64=try plan.binding(struct.borrow(member,field=bindings),0)
+  let family:string=string.copy(array.borrow(bank.entries,primary).model.profile.kind)
+  if waveform(family){let _=try processing.publish_source(recording,primary,state,struct.borrow(member,field=recipe),limits)}
+  let local:u64=try retained.extent(state,retained.Limits{max_retained_bytes:limits.max_retained_bytes})
+  let _=try processing.room(recording,local,limits)
+  let available:u64=limits.max_working_bytes-(try processing.extent(recording))-local
+  let selected=cache.learned_settings(bank)
+  var raw:array<wave.Wave>=[]
+  var output:secondary.Output=if selected.room and plan.vocal_model(struct.borrow(member,field=recipe))>0{try secondary.finish_captured(state,struct.borrow(member,field=plan),struct.borrow(member,field=recipe),primary_input,wave.Limits{max_working_bytes:available,allow_provisional_spectral:limits.allow_provisional_spectral},cancel,progress,raw)}else{try secondary.finish(state,struct.borrow(member,field=plan),struct.borrow(member,field=recipe),primary_input,wave.Limits{max_working_bytes:available,allow_provisional_spectral:limits.allow_provisional_spectral},cancel,progress)}
+  if selected.room and plan.vocal_model(struct.borrow(member,field=recipe))>0{
+   let originals:array<wave.Wave>=struct.replace(output,[],field=stems)
+   output.stems=try learned.room_saved_gpu(bank,originals,raw,true,true,member.recipe.normalize,cancel)}
+  state=retained.empty()
+  if waveform(family){let _=try processing.export_feedback(recording,primary,struct.borrow(member,field=recipe),output,limits)}
+  let _=try processing.append(recording,acc,c,output,limits,cancel)
+  if c.keep_members{array.push(processed,output)}
+  i+=1}
+ // Reduction keeps the retained estimates while building final F32 outputs.
+ // Reserve a conservative extra copy of all retained sample payloads.
+ let _=try processing.room(recording,try processing.extent(recording),limits)
+ let combined:ensemble.Output=try ensemble.finish(acc,c,cancel,progress)
+ result.ok(processing.Output{combined:combined,processed:processed})
+}

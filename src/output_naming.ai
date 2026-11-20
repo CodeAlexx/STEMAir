@@ -1,0 +1,111 @@
+module stemair.output_naming
+import "container_export.ai" as container
+import "../toolkit/output_names.ai" as names
+import "../toolkit/stem_names.ai" as stems
+import std.codec as codec
+import std.path as path
+
+// Labels retain custom source spelling independently of canonical target IDs.
+pub type Label=struct{target:string,label:string} derive codec(strict)
+pub type Context=struct{model:string,labels:array<Label>,ordinal:u64=1,timestamp:u64=0,
+ testing:bool=false,append_model:bool=false,model_folder:bool=false} derive codec(strict)
+pub type Chain=struct{main:Context,models:array<Context>} derive codec(strict)
+pub type Ensemble=struct{main:Context,members:array<Chain>,label:string="",default_label:bool=true,append_label:bool=false} derive codec(strict)
+pub type Selection=enum{Single(Context),Secondary(Chain),ModelEnsemble(Ensemble)}
+pub type QueueItem=struct{input:string,folder:string,ordinal:u64} derive codec(strict)
+pub type Queue=struct{selection:Selection,items:array<QueueItem>}
+type SelectionRecord=struct{single:option<Context>,secondary:option<Chain>,ensemble:option<Ensemble>} derive codec(strict)
+type QueueRecord=struct{selection:SelectionRecord,items:array<QueueItem>} derive codec(strict)
+pub type Selected=struct{directory:string,plan:container.Plan}
+pub fn copy(context:ref<Context>)->result<Context,string> effects {alloc} {
+ let encoded:string=try Context_encode(context) map_err codec.describe
+ result.ok(try Context_decode(encoded) map_err codec.describe)
+}
+pub fn with_ordinal(context:ref<Selection>,ordinal:u64)->result<Selection,string> effects {alloc} {
+ if ordinal==0{return result.err("Recording numbers begin at one")}
+ let copied:Selection=try copy_selection(context)
+ result.ok(match copied{Single(value)=>{var selected:Context=value
+  selected.ordinal=ordinal
+  Selection.Single(selected)},Secondary(value)=>{var selected:Chain=value
+  selected.main.ordinal=ordinal
+  Selection.Secondary(selected)},ModelEnsemble(value)=>{var selected:Ensemble=value
+  selected.main.ordinal=ordinal
+  Selection.ModelEnsemble(selected)}})
+}
+fn selection_record(context:ref<Selection>)->result<SelectionRecord,string> effects {alloc} {
+ result.ok(match context{Single(value)=>SelectionRecord{single:option.some(try copy(value)),secondary:option.none(),ensemble:option.none()},
+  Secondary(value)=>{let encoded:string=try Chain_encode(value) map_err codec.describe
+   SelectionRecord{single:option.none(),secondary:option.some(try Chain_decode(encoded) map_err codec.describe),ensemble:option.none()}},
+  ModelEnsemble(value)=>{let encoded:string=try Ensemble_encode(value) map_err codec.describe
+   SelectionRecord{single:option.none(),secondary:option.none(),ensemble:option.some(try Ensemble_decode(encoded) map_err codec.describe)}}})
+}
+fn selection_value(record:SelectionRecord own)->result<Selection,string> effects {alloc} {
+ var selected:SelectionRecord=record
+ let count:u32=(match selected.single{some(_)=>1,none=>0})+(match selected.secondary{some(_)=>1,none=>0})+(match selected.ensemble{some(_)=>1,none=>0})
+ if count!=1{return result.err("Choose exactly one naming workflow")}
+ let single:option<Context>=struct.replace(selected,option.none(),field=single)
+ match single{some(value)=>{return result.ok(Selection.Single(value))},none=>{}}
+ let secondary:option<Chain>=struct.replace(selected,option.none(),field=secondary)
+ match secondary{some(value)=>{return result.ok(Selection.Secondary(value))},none=>{}}
+ match struct.replace(selected,option.none(),field=ensemble){some(value)=>result.ok(Selection.ModelEnsemble(value)),none=>result.err("Choose exactly one naming workflow")}
+}
+pub fn copy_selection(context:ref<Selection>)->result<Selection,string> effects {alloc} {
+ selection_value(try selection_record(context))
+}
+pub fn encode_selection(context:ref<Selection>)->result<string,string> effects {alloc} {
+ let record:SelectionRecord=try selection_record(context)
+ result.ok(try SelectionRecord_encode(record) map_err codec.describe)
+}
+pub fn decode_selection(raw:str)->result<Selection,string> effects {alloc} {
+ selection_value(try SelectionRecord_decode(raw) map_err codec.describe)
+}
+pub fn encode_queue(queue:ref<Queue>)->result<string,string> effects {alloc} {
+ var items:array<QueueItem>=[]
+ var index:u64=0
+ loop{if index==array.len(queue.items){break}
+  let item:ref<QueueItem>=array.borrow(queue.items,index)
+  array.push(items,QueueItem{input:string.copy(item.input),folder:string.copy(item.folder),ordinal:item.ordinal})
+  index+=1}
+ let record:QueueRecord=QueueRecord{selection:try selection_record(struct.borrow(queue,field=selection)),items:items}
+ result.ok(try QueueRecord_encode(record) map_err codec.describe)
+}
+pub fn decode_queue(raw:str)->result<Queue,string> effects {alloc} {
+ var record:QueueRecord=try QueueRecord_decode(raw) map_err codec.describe
+ let selection:SelectionRecord=struct.replace(record,SelectionRecord{single:option.none(),secondary:option.none(),ensemble:option.none()},field=selection)
+ result.ok(Queue{selection:try selection_value(selection),items:struct.replace(record,[],field=items)})
+}
+pub fn layout(input:str,context:ref<Context>)->result<names.Layout,string> effects {alloc} {
+ let request:names.Request=names.Request{recording:path.basename(input),model:string.copy(context.model),ordinal:context.ordinal,
+  timestamp:context.timestamp,testing:context.testing,append_model:context.append_model,model_folder:context.model_folder}
+ names.separation(request)
+}
+pub fn label(context:ref<Context>,target:str)->string effects {alloc} {
+ var value:string=stems.output_label(target)
+ var index:u64=0
+ loop{if index==array.len(context.labels){break}
+  let selected:ref<Label>=array.borrow(context.labels,index)
+  if str.view(selected.target)==target{value=string.copy(selected.label)}
+  index+=1}
+ value
+}
+pub fn select(input:str,directory:str,context:ref<Context>,targets:ref<array<string>>,plan:ref<container.Plan>)->result<Selected,string> effects {alloc} {
+ let chosen:names.Layout=try layout(input,context)
+ var at:u64=0
+ loop{if at==array.len(context.labels){break}
+  let label:ref<Label>=array.borrow(context.labels,at)
+  if str.len(label.target)==0 or not names.component(label.label){return result.err("Choose complete source labels without path separators")}
+  var previous:u64=0
+  loop{if previous==at{break}
+   if str.view(array.borrow(context.labels,previous).target)==str.view(label.target){return result.err("Source label targets must be distinct")}
+   previous+=1}
+  at+=1}
+ var filenames:array<string>=[]
+ at=0
+ loop{if at==array.len(targets){break}
+  let target:str=array.get(targets,at)
+  array.push(filenames,try names.stem_output(chosen.base,label(context,target)))
+  at+=1}
+ let selected:container.Plan=try container.with_source_names(plan,filenames)
+ let destination:string=if str.len(chosen.subdirectory)==0{string.copy(directory)}else{path.join(directory,chosen.subdirectory)}
+ result.ok(Selected{directory:destination,plan:selected})
+}

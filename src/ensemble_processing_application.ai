@@ -1,0 +1,698 @@
+module stemair.ensemble_processing_application
+import "wav_export.ai" as wav
+import "container_export.ai" as container
+import "output_naming.ai" as naming
+import "ensemble_naming.ai" as named_ensemble
+import "secondary_naming.ai" as named_chain
+import "application.ai" as app
+import "checked_input.ai" as checked_input
+import "model_input.ai" as model_input
+import "../toolkit/recording_sources.ai" as recording_sources
+import "cpu_model_runtime.ai" as cpu_runtime
+import "model_ensemble_application.ai" as plain
+import "secondary_application.ai" as secondary_app
+import "../toolkit/ensemble_processing.ai" as processing
+import "../toolkit/typed_ensemble_processing.ai" as typed_processing
+import "../toolkit/typed_ensemble_processing_cpu.ai" as typed_cpu
+import "../toolkit/typed_secondary.ai" as typed_secondary
+import "../toolkit/typed_model_ensemble.ai" as typed_ensemble
+import "../toolkit/audio_result.ai" as typed_samples
+import "../toolkit/mask/request.ai" as typed_request
+import "../toolkit/secondary.ai" as secondary
+import "../toolkit/secondary_config.ai" as settings
+import "../toolkit/model_ensemble.ai" as ensemble
+import "../toolkit/model_ensemble_config.ai" as config
+import "../toolkit/model_cache.ai" as cache
+import "../toolkit/engine.ai" as engine
+import "../toolkit/control.ai" as control
+import std.audio as audio
+import std.codec as codec
+import std.files as files
+import std.path as path
+import std.text as text
+
+type Draft=struct{member:processing.Member,profiles:array<engine.Profile>,original_model_count:u64}
+pub type Prepared=struct{members:array<processing.Member>,options:config.Options,input:array<f32>,input_path:string,directory:string}
+pub type NamedPrepared=struct{prepared:Prepared,format:container.Plan}
+pub fn enabled(c:ref<config.Recipe>)->bool effects {} {
+ plain.has_processing(c)
+}
+pub fn recipe(value:str)->result<settings.Recipe,string> effects {alloc,fs.read} {
+ match settings.Recipe_decode(value){ok(c)=>result.ok(c),err(_)=>secondary_app.read(value)}
+}
+pub fn attachment(selected:ref<config.Model>,value:str)->result<string,string> effects {alloc,fs.read} {
+ var c:settings.Recipe=try recipe(value)
+ let _=try secondary_app.validate(c)
+ let requested:string=try cache.checkpoint_id(selected.checkpoint)
+ let original:string=try cache.checkpoint_id(array.borrow(c.models,0).checkpoint)
+ if requested!=original{return result.err("Choose processing settings whose first model is the last ensemble member")}
+ var expected:engine.Profile=try engine.read(selected.config)
+ var actual:engine.Profile=try engine.read(array.borrow(c.models,0).config)
+ if str.view(expected.identity)!=str.view(actual.identity){return result.err("Processing settings use a different primary model profile")}
+ if c.vocal_split>0 or c.vocal_rebalance!=0.0 or c.vocal_mixes or c.vocal_mix_only or c.vocal_save_only{return result.err("Vocal splitting is disabled for ensemble members")}
+ let encoded:string=try settings.Recipe_encode(c) map_err codec.describe
+ result.ok(encoded)
+}
+fn draft(selected:ref<config.Model>,profile:ref<engine.Profile>,options:ref<config.Options>)->result<Draft,string> effects {alloc,fs.read} {
+ draft_mode(selected,profile,options,false)
+}
+fn draft_mode(selected:ref<config.Model>,profile:ref<engine.Profile>,options:ref<config.Options>,typed:bool)->result<Draft,string> effects {alloc,fs.read} {
+ var c:settings.Recipe=if str.len(selected.processing)>0{try recipe(selected.processing)}else{
+  settings.Recipe{models:[settings.Model{config:string.copy(selected.config),checkpoint:string.copy(selected.checkpoint)}],outputs:[],adjustments:[]}}
+ let _=try secondary_app.validate(c)
+ let original:string=try cache.checkpoint_id(array.borrow(c.models,0).checkpoint)
+ let requested:string=try cache.checkpoint_id(selected.checkpoint)
+ if original!=requested{return result.err("An attached processing recipe must start with its ensemble member")}
+ let original_model_count:u64=array.len(c.models)
+ var profiles:array<engine.Profile>=[]
+ var index:u64=0
+ loop{if index==array.len(c.models){break}
+  array.push(profiles,if typed{try engine.read_typed(array.borrow(c.models,index).config)}else{try engine.read(array.borrow(c.models,index).config)})
+  index+=1}
+ if str.view(array.borrow(profiles,0).identity)!=str.view(profile.identity){return result.err("Attached processing settings differ from the ensemble member profile")}
+ c.outputs=processing.outputs(options)
+ c.normalize=options.normalize
+ c.keep_members=options.keep_members
+ c.complement=string.copy(options.complement)
+ var output_names:array<string>=ensemble.names(struct.borrow(c,field=outputs))
+ var rules:array<settings.Adjustment>=[]
+ index=0
+ loop{if index==array.len(c.adjustments){break}
+  let rule:ref<settings.Adjustment>=array.borrow(c.adjustments,index)
+  if option.is_some(ensemble.find(output_names,rule.target)){
+   array.push(rules,settings.Adjustment{target:string.copy(rule.target),model:rule.model,primary_weight:rule.primary_weight})}
+  index+=1}
+ c.adjustments=rules
+ if array.len(c.adjustments)==0 and c.preprocess==0 and c.vocal_split==0{
+  let model:settings.Model=settings.Model{config:string.copy(array.borrow(c.models,0).config),checkpoint:string.copy(array.borrow(c.models,0).checkpoint)}
+  let primary:engine.Profile=if typed{try engine.decode_typed(array.borrow(profiles,0).identity)}else{try engine.decode(array.borrow(profiles,0).identity)}
+  c.models=[model]
+  profiles=[primary]}
+ var plan:secondary.Plan=try secondary.materialize(profiles,c)
+ if c.vocal_split>0 or c.vocal_rebalance!=0.0 or c.vocal_mixes or c.vocal_mix_only or c.vocal_save_only{return result.err("Vocal splitting is disabled for ensemble members")}
+ result.ok(Draft{member:processing.Member{recipe:c,plan:plan,bindings:[]},profiles:profiles,original_model_count:original_model_count})
+}
+type Pending=struct{drafts:array<Draft>,options:config.Options,input:array<f32>}
+type Drafts=struct{members:array<Draft>,options:config.Options}
+fn read_drafts(bank:ref<cache.Cache>,c:ref<config.Recipe>,use_gpu:bool,cancel:str)->result<Drafts,string> effects {alloc,fs.read,fs.meta} {
+ read_drafts_mode(bank,c,use_gpu,cancel,false)
+}
+fn read_drafts_mode(bank:ref<cache.Cache>,c:ref<config.Recipe>,use_gpu:bool,cancel:str,typed:bool)->result<Drafts,string> effects {alloc,fs.read,fs.meta} {
+ let _=try plain.validate(c)
+ if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+ var profiles:array<engine.Profile>=[]
+ var index:u64=0
+ loop{if index==array.len(c.models){break}
+  array.push(profiles,if typed{try engine.read_typed(array.borrow(c.models,index).config)}else{try engine.read(array.borrow(c.models,index).config)})
+  index+=1}
+ var options:config.Options=try ensemble.materialize(profiles,struct.borrow(c,field=options))
+ var drafts:array<Draft>=[]
+ index=0
+ loop{if index==array.len(c.models){break}
+  var candidate:Draft=try draft_mode(array.borrow(c.models,index),array.borrow(profiles,index),options,typed)
+  var at:u64=0
+  loop{if at==array.len(candidate.member.plan.required){break}
+   let local:u64=array.get(candidate.member.plan.required,at)
+   let kind:str=array.borrow(candidate.profiles,local).kind
+   if not use_gpu and kind!="spectral" and kind!="exchange"{return result.err("A selected processing model currently requires GPU execution")}
+   at+=1}
+  array.push(drafts,candidate)
+  index+=1}
+ let _=try validate_profiles(bank,drafts)
+ result.ok(Drafts{members:drafts,options:options})
+}
+fn pending_impl(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,use_gpu:bool,cancel:str,progress:str,encoding:option<audio.WavSubtype>,selected:option<container.Plan> own,input_options:ref<option<checked_input.Options>>)->result<Pending,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ let drafts:Drafts=try read_drafts(bank,c,use_gpu,cancel)
+ pending_drafts(drafts,input,directory,encoding,selected,input_options)
+}
+fn pending_drafts(loaded:Drafts own,input:str,directory:str,encoding:option<audio.WavSubtype>,selected:option<container.Plan> own,input_options:ref<option<checked_input.Options>>)->result<Pending,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var inputs:recording_sources.Set=recording_sources.empty()
+ pending_drafts_inputs(loaded,input,directory,encoding,selected,input_options,inputs,false)
+}
+fn pending_drafts_inputs(loaded:Drafts own,input:str,directory:str,encoding:option<audio.WavSubtype>,selected:option<container.Plan> own,input_options:ref<option<checked_input.Options>>,inputs:ref<recording_sources.Set>,source_readers:bool)->result<Pending,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var accepted:Drafts=loaded
+ var drafts:array<Draft>=struct.replace(accepted,[],field=members)
+ var options:config.Options=struct.replace(accepted,config.Options{outputs:[]},field=options)
+ match selected{none=>{match encoding{some(kind)=>{let _=try app.preflight_as(directory,array.len(options.outputs),kind)
+  let _=try wav.preflight_file(path.join(directory,"model-ensemble.json"))},none=>{let _=try app.preflight(directory,array.len(options.outputs))}}},some(format)=>{
+  var journal:container.Journal=container.empty_journal()
+  let _=try app.preflight_to(directory,array.len(options.outputs),format,journal)
+  let _=try container.preflight_metadata_tracked(path.join(directory,"model-ensemble.json"),journal)}}
+ let existing:array<string>=["model-ensemble.json","members","processing"]
+ var index:u64=0
+ loop{if index==array.len(existing){break}
+  let exists:bool=match files.exists(path.join(directory,array.get(existing,index))){ok(v)=>v,err(_)=>{return result.err("Cannot inspect model ensemble output")}}
+  if exists{return result.err("A model ensemble output already exists")}
+  index+=1}
+ var source_profiles:array<engine.Profile>=[]
+ var member_index:u64=0
+ loop{if member_index==array.len(drafts){break}
+  let member:ref<Draft>=array.borrow(drafts,member_index)
+  var profile_index:u64=0
+  loop{if profile_index==array.len(member.profiles){break}
+   let profile:ref<engine.Profile>=array.borrow(member.profiles,profile_index)
+   array.push(source_profiles,try engine.decode_typed(profile.identity))
+   profile_index+=1}
+  member_index+=1}
+ var decoded:audio.AudioBuffer=try match input_options{
+  none=>app.read_recording(input,44100,directory),some(options)=>if source_readers{model_input.prepare_into(input,44100,source_profiles,options,inputs)}else{model_input.profiles(input,44100,source_profiles,options)}
+ } map_err app.recording_error
+ let samples:array<f32>=try app.planar(decoded,44100) map_err app.recording_error
+ result.ok(Pending{drafts:drafts,options:options,input:samples})
+}
+fn prepare_impl(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,use_gpu:bool,cancel:str,progress:str,encoding:option<audio.WavSubtype>,selected:option<container.Plan> own,input_options:ref<option<checked_input.Options>>)->result<Prepared,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ let pending:Pending=try pending_impl(bank,c,input,directory,use_gpu,cancel,progress,encoding,selected,input_options)
+ acquire_pending(bank,input,directory,cancel,pending)
+}
+fn acquire_pending(bank:ref<cache.Cache>,input:str,directory:str,cancel:str,loaded:Pending own)->result<Prepared,string> effects {alloc,fs.read,fs.meta} {
+ acquire_pending_mode(bank,input,directory,cancel,loaded,false)
+}
+fn acquire_pending_mode(bank:ref<cache.Cache>,input:str,directory:str,cancel:str,loaded:Pending own,typed:bool)->result<Prepared,string> effects {alloc,fs.read,fs.meta} {
+ var pending:Pending=loaded
+ var drafts:array<Draft>=struct.replace(pending,[],field=drafts)
+ var options:config.Options=struct.replace(pending,config.Options{outputs:[]},field=options)
+ let samples:array<f32>=struct.replace(pending,[],field=input)
+ var index:u64=0
+ var members:array<processing.Member>=[]
+ index=0
+ loop{if index==array.len(drafts){break}
+  let selected:ref<Draft>=array.borrow(drafts,index)
+  var at:u64=0
+  loop{if at==array.len(selected.member.plan.required){break}
+   if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+   let local:u64=array.get(selected.member.plan.required,at)
+   let profile:engine.Profile=if typed{try engine.decode_typed(array.borrow(selected.profiles,local).identity)}else{try engine.decode(array.borrow(selected.profiles,local).identity)}
+   let loaded:u64=if typed{try cache.acquire_typed(bank,array.borrow(selected.member.recipe.models,local).checkpoint,profile)}else{try cache.acquire(bank,array.borrow(selected.member.recipe.models,local).checkpoint,profile)}
+   array.push(struct.borrow(struct.borrow(selected,field=member),field=bindings),secondary.Binding{model:local,member:loaded})
+   at+=1}
+  let held:processing.Member=struct.replace(selected,processing.Member{recipe:settings.Recipe{models:[],outputs:[],adjustments:[]},plan:secondary.Plan{required:[],outputs:[]},bindings:[]},field=member)
+  array.push(members,held)
+  index+=1}
+ let _=try processing.validate(members)
+ let _=try processing.validate_options(members,options)
+ result.ok(Prepared{members:members,options:options,input:samples,input_path:string.copy(input),directory:string.copy(directory)})
+}
+pub fn prepare_cpu_with_input_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,root:str)->result<Prepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let pending:Pending=try pending_impl(bank,c,input,directory,true,cancel,progress,option.none(),option.some(try container.copy_plan(format)),input_options)
+ acquire_pending_cpu(bank,input,directory,cancel,pending,root)
+}
+fn acquire_pending_cpu(bank:ref<cache.Cache>,input:str,directory:str,cancel:str,loaded:Pending own,root:str)->result<Prepared,string> effects {alloc,env,fs.read,fs.meta,ffi} {
+ acquire_pending_cpu_mode(bank,input,directory,cancel,loaded,root,false)
+}
+fn acquire_pending_cpu_mode(bank:ref<cache.Cache>,input:str,directory:str,cancel:str,loaded:Pending own,root:str,typed:bool)->result<Prepared,string> effects {alloc,env,fs.read,fs.meta,ffi} {
+ var pending:Pending=loaded
+ var at:u64=0
+ loop{if at==array.len(pending.drafts){break}
+  let member:ref<Draft>=array.borrow(pending.drafts,at)
+  var local:u64=0
+  loop{if local==array.len(member.member.plan.required){break}
+   let index:u64=array.get(member.member.plan.required,local)
+   let _=try cpu_runtime.preflight(bank,root,array.borrow(member.profiles,index))
+   local+=1}
+  at+=1}
+ var drafts:array<Draft>=struct.replace(pending,[],field=drafts)
+ var options:config.Options=struct.replace(pending,config.Options{outputs:[]},field=options)
+ let samples:array<f32>=struct.replace(pending,[],field=input)
+ var index:u64=0
+ var backend:option<cache.CpuBackend>=option.none()
+ var members:array<processing.Member>=[]
+ index=0
+ loop{if index==array.len(drafts){break}
+  let selected:ref<Draft>=array.borrow(drafts,index)
+  var at:u64=0
+  loop{if at==array.len(selected.member.plan.required){break}
+   if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+   let local:u64=array.get(selected.member.plan.required,at)
+   let profile:engine.Profile=if typed{try engine.decode_typed(array.borrow(selected.profiles,local).identity)}else{try engine.decode(array.borrow(selected.profiles,local).identity)}
+   let loaded:u64=if typed{try cache.acquire_cpu_typed(bank,array.borrow(selected.member.recipe.models,local).checkpoint,profile,backend)}else{try cache.acquire_cpu(bank,array.borrow(selected.member.recipe.models,local).checkpoint,profile,backend)}
+   array.push(struct.borrow(struct.borrow(selected,field=member),field=bindings),secondary.Binding{model:local,member:loaded})
+   at+=1}
+  let held:processing.Member=struct.replace(selected,processing.Member{recipe:settings.Recipe{models:[],outputs:[],adjustments:[]},plan:secondary.Plan{required:[],outputs:[]},bindings:[]},field=member)
+  array.push(members,held)
+  index+=1}
+ let _=try processing.validate(members)
+ let _=try processing.validate_options(members,options)
+ result.ok(Prepared{members:members,options:options,input:samples,input_path:string.copy(input),directory:string.copy(directory)})
+}
+pub fn prepare_named_with_input_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,context:ref<naming.Ensemble>,use_gpu:bool,root:str)->result<NamedPrepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ prepare_named_mode(bank,c,input,directory,cancel,format,input_options,context,use_gpu,root,false)
+}
+fn prepare_named_mode(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,context:ref<naming.Ensemble>,use_gpu:bool,root:str,typed:bool)->result<NamedPrepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var inputs:recording_sources.Set=recording_sources.empty()
+ prepare_named_mode_inputs(bank,c,input,directory,cancel,format,input_options,context,use_gpu,root,typed,inputs,false)
+}
+fn prepare_named_mode_inputs(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,context:ref<naming.Ensemble>,use_gpu:bool,root:str,typed:bool,inputs:ref<recording_sources.Set>,source_readers:bool)->result<NamedPrepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ if array.len(context.members)!=array.len(c.models){return result.err("Choose one naming context for each ensemble member")}
+ var drafts:Drafts=try read_drafts_mode(bank,c,true,cancel,typed)
+ var selected:naming.Selected=try named_ensemble.select(input,directory,context,struct.borrow(drafts,field=options),format)
+ let keep_members:bool=drafts.options.keep_members
+ var index:u64=0
+ loop{if index==array.len(drafts.members){break}
+  let draft:ref<Draft>=array.borrow(drafts.members,index)
+  let supplied:ref<naming.Chain>=array.borrow(context.members,index)
+  if array.len(supplied.models)!=draft.original_model_count{return result.err("Choose one naming context for each processing model")}
+  if keep_members{
+   var labels:array<naming.Context>=[]
+   var at:u64=0
+   loop{if at==array.len(draft.member.recipe.models){break}
+    array.push(labels,try naming.copy(array.borrow(supplied.models,at)))
+    at+=1}
+   var chain_context:naming.Chain=naming.Chain{main:try named_ensemble.member_context(context,index),models:labels}
+   var nested:naming.Selected=if typed{try named_chain.select_typed(input,directory,chain_context,struct.borrow(draft,field=profiles),struct.borrow(struct.borrow(draft,field=member),field=recipe),format)}else{try named_chain.select(input,directory,chain_context,struct.borrow(draft,field=profiles),struct.borrow(struct.borrow(draft,field=member),field=recipe),format)}
+   let key:string=text.concat("processing/model-",string.from_int(index+1))
+   selected.plan=try container.with_scope_names(struct.borrow(selected,field=plan),key,struct.borrow(struct.borrow(nested,field=plan),field=source_names))
+   at=0
+   loop{if at==array.len(nested.plan.source_scopes){break}
+    let child:ref<container.SourceScope>=array.borrow(nested.plan.source_scopes,at)
+    selected.plan=try container.with_scope_names(struct.borrow(selected,field=plan),text.concat(key,text.concat("/",child.key)),struct.borrow(child,field=names))
+    at+=1}}
+  index+=1}
+ let pending:Pending=try pending_drafts_inputs(drafts,input,selected.directory,option.none(),option.some(try container.copy_plan(struct.borrow(selected,field=plan))),input_options,inputs,source_readers)
+ let prepared:Prepared=if use_gpu{try acquire_pending_mode(bank,input,selected.directory,cancel,pending,typed)}else{
+  try acquire_pending_cpu_mode(bank,input,selected.directory,cancel,pending,root,typed)}
+ let export_plan:container.Plan=struct.replace(selected,container.wav_plan(format.working_wav),field=plan)
+ result.ok(NamedPrepared{prepared:prepared,format:export_plan})
+}
+pub fn prepare(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,use_gpu:bool,cancel:str,progress:str)->result<Prepared,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var input_options:option<checked_input.Options>=option.none()
+ prepare_impl(bank,c,input,directory,use_gpu,cancel,progress,option.none(),option.none(),input_options)
+}
+pub fn prepare_as(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,use_gpu:bool,cancel:str,progress:str,kind:audio.WavSubtype)->result<Prepared,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var input_options:option<checked_input.Options>=option.none()
+ prepare_impl(bank,c,input,directory,use_gpu,cancel,progress,option.some(kind),option.none(),input_options)
+}
+
+fn validate_profiles(bank:ref<cache.Cache>,drafts:ref<array<Draft>>)->result<unit,string> effects {alloc,fs.read} {
+ var paths:array<string>=[]
+ var signatures:array<string>=[]
+ var index:u64=0
+ loop{if index==array.len(bank.entries){break}
+  let loaded:ref<cache.Entry>=array.borrow(bank.entries,index)
+  array.push(paths,string.copy(loaded.checkpoint))
+  array.push(signatures,string.copy(loaded.model.profile.identity))
+  index+=1}
+ index=0
+ loop{if index==array.len(drafts){break}
+  let selected:ref<Draft>=array.borrow(drafts,index)
+  var at:u64=0
+  loop{if at==array.len(selected.member.plan.required){break}
+   let local:u64=array.get(selected.member.plan.required,at)
+   let identity:string=try cache.checkpoint_id(array.borrow(selected.member.recipe.models,local).checkpoint)
+   let signature:str=array.borrow(selected.profiles,local).identity
+   var known:bool=false
+   var previous:u64=0
+   loop{if previous==array.len(paths){break}
+    let known_path:str=array.get(paths,previous)
+    let known_signature:str=array.get(signatures,previous)
+    if known_path==str.view(identity){
+     if known_signature!=signature{return result.err("Conflicting settings for a shared checkpoint; release loaded models or use consistent profiles")}
+     known=true}
+    previous+=1}
+   if not known{array.push(paths,identity)
+    array.push(signatures,string.copy(signature))}
+   at+=1}
+  index+=1}
+ result.ok(())
+}
+fn clone_indices(values:ref<array<u64>>)->array<u64> effects {alloc} {
+ var output:array<u64>=[]
+ var index:u64=0
+ loop{if index==array.len(values){break}
+  array.push(output,array.get(values,index))
+  index+=1}
+ output
+}
+fn export_stages(bank:ref<cache.Cache>,member:ref<processing.Member>,output:ref<secondary.Output>,input:str,directory:str,use_gpu:bool)->result<unit,string> effects {alloc,fs.write,fs.meta} {
+ match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create processed member directory")}}
+ var bindings:array<secondary.Binding>=[]
+ var index:u64=0
+ loop{if index==array.len(member.bindings){break}
+  let binding:ref<secondary.Binding>=array.borrow(member.bindings,index)
+  array.push(bindings,secondary.Binding{model:binding.model,member:binding.member})
+  index+=1}
+ let plan:secondary.Plan=secondary.Plan{required:clone_indices(struct.borrow(struct.borrow(member,field=plan),field=required)),outputs:ensemble.names(struct.borrow(struct.borrow(member,field=plan),field=outputs))}
+ var prepared:secondary_app.Prepared=secondary_app.Prepared{bindings:bindings,plan:plan,input:[],input_path:string.copy(input),directory:string.copy(directory)}
+ secondary_app.export(bank,struct.borrow(member,field=recipe),prepared,output,use_gpu,"")
+}
+pub fn export(bank:ref<cache.Cache>,prepared:ref<Prepared>,output:ref<processing.Output>,use_gpu:bool,cancel:str)->result<unit,string> effects {alloc,fs.write,fs.meta} {
+ if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+ let backend:str=if use_gpu{"native-air-gpu-f32"}else{"native-air-cpu-f32"}
+ var models:array<config.ModelRecord>=[]
+ var indices:array<u64>=[]
+ var members:array<config.ProcessingMember>=[]
+ var loads:u64=0
+ let member_count:u64=array.len(prepared.members)
+ var index:u64=0
+ loop{if index==array.len(prepared.members){break}
+  let member:ref<processing.Member>=array.borrow(prepared.members,index)
+  var bindings:array<config.ProcessingBinding>=[]
+  var at:u64=0
+  loop{if at==array.len(member.bindings){break}
+   let binding:ref<secondary.Binding>=array.borrow(member.bindings,at)
+   var found:option<u64>=option.none()
+   var previous:u64=0
+   loop{if previous==array.len(indices){break}
+    if array.get(indices,previous)==binding.member{found=option.some(previous)}
+    previous+=1}
+   let number:u64=match found{some(v)=>v,none=>{
+    let loaded:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,binding.member),field=model)
+    let selected:ref<settings.Model>=array.borrow(member.recipe.models,binding.model)
+    let number:u64=array.len(models)
+    let count:u64=engine.loads(loaded)
+    loads+=count
+    array.push(indices,binding.member)
+    array.push(models,config.ModelRecord{config:string.copy(selected.config),checkpoint:string.copy(selected.checkpoint),engine:string.copy(loaded.profile.kind),profile:string.copy(loaded.profile.identity),parameter_tensors:engine.parameter_count(loaded),checkpoint_loads:count,bytes_read:engine.bytes_read(loaded),inference_requests:loaded.requests})
+    number}}
+   array.push(bindings,config.ProcessingBinding{model:binding.model,loaded_model:number})
+   at+=1}
+  array.push(members,config.ProcessingMember{recipe:try settings.Recipe_encode(struct.borrow(member,field=recipe)) map_err codec.describe,bindings:bindings})
+  if prepared.options.keep_members{
+   if array.len(output.processed)!=member_count or array.len(output.combined.saved)!=member_count{return result.err("Processed ensemble saved member count differs")}
+   let name:string=text.concat("model-",string.from_int(index+1))
+   let directory:string=path.join(path.join(prepared.directory,"members"),name)
+   match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create ensemble member directory")}}
+   let saved:ref<ensemble.MemberOutput>=array.borrow(output.combined.saved,index)
+   let _=try app.export_ragged(directory,44100,struct.borrow(saved,field=targets),array.view(saved.values),struct.borrow(saved,field=target_frames),backend,1)
+   let _=try export_stages(bank,member,array.borrow(output.processed,index),prepared.input_path,path.join(path.join(prepared.directory,"processing"),name),use_gpu)}
+  index+=1}
+ let combined:ref<ensemble.Output>=struct.borrow(output,field=combined)
+ let _=try app.export_ragged(prepared.directory,44100,struct.borrow(combined,field=targets),array.view(combined.values),struct.borrow(combined,field=target_frames),backend,loads)
+ let encoded:string=try config.Options_encode(struct.borrow(prepared,field=options)) map_err codec.describe
+ let options:config.Options=try config.Options_decode(encoded) map_err codec.describe
+ var manifest:config.ProcessingManifest=config.ProcessingManifest{input:string.copy(prepared.input_path),sample_rate:44100,frames:combined.frames,frame_counts:clone_indices(struct.borrow(combined,field=target_frames)),options:options,models:models,members:members,backend:string.copy(backend)}
+ let text:string=try config.ProcessingManifest_encode(manifest) map_err codec.describe
+ match files.write_new_text(path.join(prepared.directory,"model-ensemble.json"),text){ok(_)=>result.ok(()),err(_)=>result.err("Cannot create processed ensemble manifest; source WAVs remain available")}
+}
+pub fn run_cpu(c:ref<config.Recipe>,input:str,directory:str)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var bank:cache.Cache=cache.empty()
+ var prepared:Prepared=try prepare(bank,c,input,directory,false,"","")
+ var output:processing.Output=try processing.separate_cpu(bank,struct.borrow(prepared,field=members),struct.borrow(prepared,field=options),array.view(prepared.input),"","")
+ export(bank,prepared,output,false,"")
+}
+
+pub fn export_as(bank:ref<cache.Cache>,prepared:ref<Prepared>,output:ref<processing.Output>,use_gpu:bool,cancel:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ let _=try app.preflight_as(prepared.directory,array.len(output.combined.targets),kind)
+ let _=try wav.preflight_file(path.join(prepared.directory,"model-ensemble.json"))
+ if prepared.options.keep_members{
+  let count:u64=array.len(prepared.members)
+  if array.len(output.processed)!=count or array.len(output.combined.saved)!=count{return result.err("Processed ensemble saved member count differs")}
+  var checked:u64=0
+  loop{if checked==count{break}
+   let name:string=text.concat("model-",string.from_int(checked+1))
+   let saved:ref<ensemble.MemberOutput>=array.borrow(output.combined.saved,checked)
+   let _=try app.preflight_source_files(path.join(path.join(prepared.directory,"members"),name),array.len(saved.targets))
+   let member:ref<processing.Member>=array.borrow(prepared.members,checked)
+   let _=try secondary_app.preflight_outputs_as(struct.borrow(member,field=recipe),array.borrow(output.processed,checked),path.join(path.join(prepared.directory,"processing"),name),kind)
+   checked+=1}}
+ if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+ let backend:str=if use_gpu{"native-air-gpu-f32"}else{"native-air-cpu-f32"}
+ var models:array<config.ModelRecord>=[]
+ var indices:array<u64>=[]
+ var members:array<config.ProcessingMember>=[]
+ var loads:u64=0
+ let member_count:u64=array.len(prepared.members)
+ var index:u64=0
+ loop{if index==array.len(prepared.members){break}
+  let member:ref<processing.Member>=array.borrow(prepared.members,index)
+  var bindings:array<config.ProcessingBinding>=[]
+  var at:u64=0
+  loop{if at==array.len(member.bindings){break}
+   let binding:ref<secondary.Binding>=array.borrow(member.bindings,at)
+   var found:option<u64>=option.none()
+   var previous:u64=0
+   loop{if previous==array.len(indices){break}
+    if array.get(indices,previous)==binding.member{found=option.some(previous)}
+    previous+=1}
+   let number:u64=match found{some(v)=>v,none=>{
+    let loaded:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,binding.member),field=model)
+    let selected:ref<settings.Model>=array.borrow(member.recipe.models,binding.model)
+    let number:u64=array.len(models)
+    let count:u64=engine.loads(loaded)
+    loads+=count
+    array.push(indices,binding.member)
+    array.push(models,config.ModelRecord{config:string.copy(selected.config),checkpoint:string.copy(selected.checkpoint),engine:string.copy(loaded.profile.kind),profile:string.copy(loaded.profile.identity),parameter_tensors:engine.parameter_count(loaded),checkpoint_loads:count,bytes_read:engine.bytes_read(loaded),inference_requests:loaded.requests})
+    number}}
+   array.push(bindings,config.ProcessingBinding{model:binding.model,loaded_model:number})
+   at+=1}
+  array.push(members,config.ProcessingMember{recipe:try settings.Recipe_encode(struct.borrow(member,field=recipe)) map_err codec.describe,bindings:bindings})
+  if prepared.options.keep_members{
+   if array.len(output.processed)!=member_count or array.len(output.combined.saved)!=member_count{return result.err("Processed ensemble saved member count differs")}
+   let name:string=text.concat("model-",string.from_int(index+1))
+   let directory:string=path.join(path.join(prepared.directory,"members"),name)
+   match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create ensemble member directory")}}
+   let saved:ref<ensemble.MemberOutput>=array.borrow(output.combined.saved,index)
+   let _=try app.export_ragged_as(directory,44100,struct.borrow(saved,field=targets),array.view(saved.values),struct.borrow(saved,field=target_frames),backend,1,kind)
+   let _=try export_stages_as(bank,member,array.borrow(output.processed,index),prepared.input_path,path.join(path.join(prepared.directory,"processing"),name),use_gpu,kind)}
+  index+=1}
+ let combined:ref<ensemble.Output>=struct.borrow(output,field=combined)
+ let _=try app.export_ragged_as(prepared.directory,44100,struct.borrow(combined,field=targets),array.view(combined.values),struct.borrow(combined,field=target_frames),backend,loads,kind)
+ let encoded:string=try config.Options_encode(struct.borrow(prepared,field=options)) map_err codec.describe
+ let options:config.Options=try config.Options_decode(encoded) map_err codec.describe
+ var manifest:config.ProcessingManifest=config.ProcessingManifest{input:string.copy(prepared.input_path),sample_rate:44100,frames:combined.frames,frame_counts:clone_indices(struct.borrow(combined,field=target_frames)),options:options,models:models,members:members,backend:string.copy(backend)}
+ let text:string=try config.ProcessingManifest_encode(manifest) map_err codec.describe
+ wav.write_metadata(path.join(prepared.directory,"model-ensemble.json"),text,kind)
+}
+
+fn export_stages_as(bank:ref<cache.Cache>,member:ref<processing.Member>,output:ref<secondary.Output>,input:str,directory:str,use_gpu:bool,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta} {
+ match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create processed member directory")}}
+ var bindings:array<secondary.Binding>=[]
+ var index:u64=0
+ loop{if index==array.len(member.bindings){break}
+  let binding:ref<secondary.Binding>=array.borrow(member.bindings,index)
+  array.push(bindings,secondary.Binding{model:binding.model,member:binding.member})
+  index+=1}
+ let plan:secondary.Plan=secondary.Plan{required:clone_indices(struct.borrow(struct.borrow(member,field=plan),field=required)),outputs:ensemble.names(struct.borrow(struct.borrow(member,field=plan),field=outputs))}
+ var prepared:secondary_app.Prepared=secondary_app.Prepared{bindings:bindings,plan:plan,input:[],input_path:string.copy(input),directory:string.copy(directory)}
+ secondary_app.export_as(bank,struct.borrow(member,field=recipe),prepared,output,use_gpu,"",kind)
+}
+
+pub fn run_cpu_as(c:ref<config.Recipe>,input:str,directory:str,kind:audio.WavSubtype)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var bank:cache.Cache=cache.empty()
+ var prepared:Prepared=try prepare_as(bank,c,input,directory,false,"","",kind)
+ var output:processing.Output=try processing.separate_cpu_as(bank,struct.borrow(prepared,field=members),struct.borrow(prepared,field=options),array.view(prepared.input),"","",kind)
+ export_as(bank,prepared,output,false,"",kind)
+}
+
+fn export_to_impl(bank:ref<cache.Cache>,prepared:ref<Prepared>,output:ref<processing.Output>,use_gpu:bool,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let start:u64=array.len(log.artifacts)
+ let export_cancel:string=if container.extension(plan)=="wav"{""}else{string.copy(cancel)}
+ let _=try app.preflight_to(prepared.directory,array.len(output.combined.targets),plan,log)
+ let _=try container.preflight_metadata_tracked(path.join(prepared.directory,"model-ensemble.json"),log)
+ if prepared.options.keep_members{
+  let count:u64=array.len(prepared.members)
+  if array.len(output.processed)!=count or array.len(output.combined.saved)!=count{return result.err("Processed ensemble saved member count differs")}
+  var checked:u64=0
+  loop{if checked==count{break}
+   let name:string=text.concat("model-",string.from_int(checked+1))
+   let saved:ref<ensemble.MemberOutput>=array.borrow(output.combined.saved,checked)
+   var member_plan:container.Plan=try container.scoped(plan,text.concat("members/",name))
+   var stage_plan:container.Plan=try container.scoped(plan,text.concat("processing/",name))
+   let _=try app.preflight_source_files_to(path.join(path.join(prepared.directory,"members"),name),array.len(saved.targets),member_plan,log)
+   let member:ref<processing.Member>=array.borrow(prepared.members,checked)
+   let _=try secondary_app.preflight_outputs_to(struct.borrow(member,field=recipe),array.borrow(output.processed,checked),path.join(path.join(prepared.directory,"processing"),name),stage_plan,log)
+   checked+=1}}
+ if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+ let backend:str=if use_gpu{"native-air-gpu-f32"}else{"native-air-cpu-f32"}
+ var models:array<config.ModelRecord>=[]
+ var indices:array<u64>=[]
+ var members:array<config.ProcessingMember>=[]
+ var loads:u64=0
+ let member_count:u64=array.len(prepared.members)
+ var index:u64=0
+ loop{if index==array.len(prepared.members){break}
+  let member:ref<processing.Member>=array.borrow(prepared.members,index)
+  var bindings:array<config.ProcessingBinding>=[]
+  var at:u64=0
+  loop{if at==array.len(member.bindings){break}
+   let binding:ref<secondary.Binding>=array.borrow(member.bindings,at)
+   var found:option<u64>=option.none()
+   var previous:u64=0
+   loop{if previous==array.len(indices){break}
+    if array.get(indices,previous)==binding.member{found=option.some(previous)}
+    previous+=1}
+   let number:u64=match found{some(v)=>v,none=>{
+    let loaded:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,binding.member),field=model)
+    let selected:ref<settings.Model>=array.borrow(member.recipe.models,binding.model)
+    let number:u64=array.len(models)
+    let count:u64=engine.loads(loaded)
+    loads+=count
+    array.push(indices,binding.member)
+    array.push(models,config.ModelRecord{config:string.copy(selected.config),checkpoint:string.copy(selected.checkpoint),engine:string.copy(loaded.profile.kind),profile:string.copy(loaded.profile.identity),parameter_tensors:engine.parameter_count(loaded),checkpoint_loads:count,bytes_read:engine.bytes_read(loaded),inference_requests:loaded.requests})
+    number}}
+   array.push(bindings,config.ProcessingBinding{model:binding.model,loaded_model:number})
+   at+=1}
+  array.push(members,config.ProcessingMember{recipe:try settings.Recipe_encode(struct.borrow(member,field=recipe)) map_err codec.describe,bindings:bindings})
+  if prepared.options.keep_members{
+   if array.len(output.processed)!=member_count or array.len(output.combined.saved)!=member_count{return result.err("Processed ensemble saved member count differs")}
+   let name:string=text.concat("model-",string.from_int(index+1))
+   let directory:string=path.join(path.join(prepared.directory,"members"),name)
+   match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create ensemble member directory")}}
+   let saved:ref<ensemble.MemberOutput>=array.borrow(output.combined.saved,index)
+   var member_plan:container.Plan=try container.scoped(plan,text.concat("members/",name))
+   var stage_plan:container.Plan=try container.scoped(plan,text.concat("processing/",name))
+   let _=try app.export_ragged_to(directory,44100,struct.borrow(saved,field=targets),array.view(saved.values),struct.borrow(saved,field=target_frames),backend,1,export_cancel,progress,member_plan,log)
+   let _=try export_stages_to(bank,member,array.borrow(output.processed,index),prepared.input_path,path.join(path.join(prepared.directory,"processing"),name),use_gpu,export_cancel,progress,stage_plan,log)}
+  index+=1}
+ let combined:ref<ensemble.Output>=struct.borrow(output,field=combined)
+ let _=try app.export_ragged_to(prepared.directory,44100,struct.borrow(combined,field=targets),array.view(combined.values),struct.borrow(combined,field=target_frames),backend,loads,export_cancel,progress,plan,log)
+ let encoded:string=try config.Options_encode(struct.borrow(prepared,field=options)) map_err codec.describe
+ let options:config.Options=try config.Options_decode(encoded) map_err codec.describe
+ var manifest:config.ProcessingManifest=config.ProcessingManifest{input:string.copy(prepared.input_path),sample_rate:44100,frames:combined.frames,frame_counts:clone_indices(struct.borrow(combined,field=target_frames)),options:options,models:models,members:members,backend:string.copy(backend)}
+ let text:string=try config.ProcessingManifest_encode(manifest) map_err codec.describe
+ container.write_metadata(path.join(prepared.directory,"model-ensemble.json"),text,plan,log,start)
+}
+pub fn export_to(bank:ref<cache.Cache>,prepared:ref<Prepared>,output:ref<processing.Output>,use_gpu:bool,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=export_to_impl(bank,prepared,output,use_gpu,cancel,progress,plan,log)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+
+fn export_stages_to(bank:ref<cache.Cache>,member:ref<processing.Member>,output:ref<secondary.Output>,input:str,directory:str,use_gpu:bool,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create processed member directory")}}
+ var bindings:array<secondary.Binding>=[]
+ var index:u64=0
+ loop{if index==array.len(member.bindings){break}
+  let binding:ref<secondary.Binding>=array.borrow(member.bindings,index)
+  array.push(bindings,secondary.Binding{model:binding.model,member:binding.member})
+  index+=1}
+ let stage_plan:secondary.Plan=secondary.Plan{required:clone_indices(struct.borrow(struct.borrow(member,field=plan),field=required)),outputs:ensemble.names(struct.borrow(struct.borrow(member,field=plan),field=outputs))}
+ var prepared:secondary_app.Prepared=secondary_app.Prepared{bindings:bindings,plan:stage_plan,input:[],input_path:string.copy(input),directory:string.copy(directory)}
+ secondary_app.export_to(bank,struct.borrow(member,field=recipe),prepared,output,use_gpu,cancel,progress,plan,log)
+}
+
+pub fn prepare_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,use_gpu:bool,cancel:str,progress:str,plan:ref<container.Plan>)->result<Prepared,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ let _=try container.verify(plan)
+ var input_options:option<checked_input.Options>=option.none()
+ prepare_impl(bank,c,input,directory,use_gpu,cancel,progress,option.none(),option.some(try container.copy_plan(plan)),input_options)
+}
+
+fn run_cpu_to_impl(c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ var bank:cache.Cache=cache.empty()
+ var prepared:Prepared=try prepare_to(bank,c,input,directory,false,cancel,progress,plan)
+ var output:processing.Output=try processing.separate_cpu_as(bank,struct.borrow(prepared,field=members),struct.borrow(prepared,field=options),array.view(prepared.input),cancel,progress,plan.working_wav)
+ export_to(bank,prepared,output,false,cancel,progress,plan,log)
+}
+pub fn run_cpu_to(c:ref<config.Recipe>,input:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=run_cpu_to_impl(c,input,directory,cancel,progress,plan,log)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+
+pub fn prepare_with_input_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,use_gpu:bool,cancel:str,progress:str,plan:ref<container.Plan>,input_options:ref<option<checked_input.Options>>)->result<Prepared,string> effects {alloc, env, ffi, fs.meta, fs.read, fs.write, process, time} {
+ let _=try container.verify(plan)
+ prepare_impl(bank,c,input,directory,use_gpu,cancel,progress,option.none(),option.some(try container.copy_plan(plan)),input_options)
+}
+
+// Typed siblings preserve accepted profile identities and the old input policy.
+pub fn prepare_typed_with_input_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,use_gpu:bool,root:str)->result<Prepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let _=try container.verify(format)
+ let drafts:Drafts=try read_drafts_mode(bank,c,true,cancel,true)
+ let pending:Pending=try pending_drafts(drafts,input,directory,option.none(),option.some(try container.copy_plan(format)),input_options)
+ if use_gpu{acquire_pending_mode(bank,input,directory,cancel,pending,true)}else{acquire_pending_cpu_mode(bank,input,directory,cancel,pending,root,true)}
+}
+pub fn prepare_typed_with_sources_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,use_gpu:bool,root:str,inputs:ref<recording_sources.Set>)->result<Prepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ let _=try container.verify(format)
+ let drafts:Drafts=try read_drafts_mode(bank,c,true,cancel,true)
+ let pending:Pending=try pending_drafts_inputs(drafts,input,directory,option.none(),option.some(try container.copy_plan(format)),input_options,inputs,true)
+ if use_gpu{acquire_pending_mode(bank,input,directory,cancel,pending,true)}else{acquire_pending_cpu_mode(bank,input,directory,cancel,pending,root,true)}
+}
+pub fn prepare_typed_named_with_input_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,context:ref<naming.Ensemble>,use_gpu:bool,root:str)->result<NamedPrepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ prepare_named_mode(bank,c,input,directory,cancel,format,input_options,context,use_gpu,root,true)
+}
+pub fn prepare_typed_named_with_sources_to(bank:ref<cache.Cache>,c:ref<config.Recipe>,input:str,directory:str,cancel:str,format:ref<container.Plan>,input_options:ref<option<checked_input.Options>>,context:ref<naming.Ensemble>,use_gpu:bool,root:str,inputs:ref<recording_sources.Set>)->result<NamedPrepared,string> effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ prepare_named_mode_inputs(bank,c,input,directory,cancel,format,input_options,context,use_gpu,root,true,inputs,true)
+}
+
+fn export_typed_to_impl(bank:ref<cache.Cache>,prepared:ref<Prepared>,output:ref<typed_processing.Output>,use_gpu:bool,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ let start:u64=array.len(log.artifacts)
+ let export_cancel:string=if container.extension(plan)=="wav"{""}else{string.copy(cancel)}
+ let _=try app.preflight_to(prepared.directory,array.len(output.combined.targets),plan,log)
+ let _=try container.preflight_metadata_tracked(path.join(prepared.directory,"model-ensemble.json"),log)
+ if prepared.options.keep_members{
+  let count:u64=array.len(prepared.members)
+  if array.len(output.processed)!=count or array.len(output.combined.saved)!=count{return result.err("Processed ensemble saved member count differs")}
+  var checked:u64=0
+  loop{if checked==count{break}
+   let name:string=text.concat("model-",string.from_int(checked+1))
+   let saved:ref<typed_ensemble.MemberOutput>=array.borrow(output.combined.saved,checked)
+   var member_plan:container.Plan=try container.scoped(plan,text.concat("members/",name))
+   var stage_plan:container.Plan=try container.scoped(plan,text.concat("processing/",name))
+   let _=try app.preflight_source_files_to(path.join(path.join(prepared.directory,"members"),name),array.len(saved.waves),member_plan,log)
+   let member:ref<processing.Member>=array.borrow(prepared.members,checked)
+   let _=try secondary_app.preflight_typed_outputs_to(struct.borrow(member,field=recipe),array.borrow(output.processed,checked),path.join(path.join(prepared.directory,"processing"),name),stage_plan,log)
+   checked+=1}}
+ if control.cancelled(cancel){return result.err("Model ensemble cancelled")}
+ let backend:str=if use_gpu{"native-air-gpu-f32"}else{"native-air-cpu-f32"}
+ var models:array<config.ModelRecord>=[]
+ var indices:array<u64>=[]
+ var members:array<config.ProcessingMember>=[]
+ var loads:u64=0
+ let member_count:u64=array.len(prepared.members)
+ var index:u64=0
+ loop{if index==array.len(prepared.members){break}
+  let member:ref<processing.Member>=array.borrow(prepared.members,index)
+  var bindings:array<config.ProcessingBinding>=[]
+  var at:u64=0
+  loop{if at==array.len(member.bindings){break}
+   let binding:ref<secondary.Binding>=array.borrow(member.bindings,at)
+   var found:option<u64>=option.none()
+   var previous:u64=0
+   loop{if previous==array.len(indices){break}
+    if array.get(indices,previous)==binding.member{found=option.some(previous)}
+    previous+=1}
+   let number:u64=match found{some(v)=>v,none=>{
+    let loaded:ref<engine.Loaded>=struct.borrow(array.borrow(bank.entries,binding.member),field=model)
+    let selected:ref<settings.Model>=array.borrow(member.recipe.models,binding.model)
+    let number:u64=array.len(models)
+    let count:u64=engine.loads(loaded)
+    loads+=count
+    array.push(indices,binding.member)
+    array.push(models,config.ModelRecord{config:string.copy(selected.config),checkpoint:string.copy(selected.checkpoint),engine:string.copy(loaded.profile.kind),profile:string.copy(loaded.profile.identity),parameter_tensors:engine.parameter_count(loaded),checkpoint_loads:count,bytes_read:engine.bytes_read(loaded),inference_requests:loaded.requests})
+    number}}
+   array.push(bindings,config.ProcessingBinding{model:binding.model,loaded_model:number})
+   at+=1}
+  array.push(members,config.ProcessingMember{recipe:try settings.Recipe_encode(struct.borrow(member,field=recipe)) map_err codec.describe,bindings:bindings})
+  if prepared.options.keep_members{
+   if array.len(output.processed)!=member_count or array.len(output.combined.saved)!=member_count{return result.err("Processed ensemble saved member count differs")}
+   let name:string=text.concat("model-",string.from_int(index+1))
+   let directory:string=path.join(path.join(prepared.directory,"members"),name)
+   match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create ensemble member directory")}}
+   let saved:ref<typed_ensemble.MemberOutput>=array.borrow(output.combined.saved,index)
+   var member_plan:container.Plan=try container.scoped(plan,text.concat("members/",name))
+   var stage_plan:container.Plan=try container.scoped(plan,text.concat("processing/",name))
+   let primary:u64=try secondary.binding(struct.borrow(member,field=bindings),0)
+   let member_loads:u64=engine.loads(struct.borrow(array.borrow(bank.entries,primary),field=model))
+   let _=try app.export_waves_to(directory,44100,struct.borrow(saved,field=waves),if use_gpu{"native-air-gpu-typed"}else{"native-air-cpu-typed"},member_loads,export_cancel,progress,member_plan,log)
+   let _=try export_typed_stages_to(bank,member,array.borrow(output.processed,index),prepared.input_path,path.join(path.join(prepared.directory,"processing"),name),use_gpu,export_cancel,progress,stage_plan,log)}
+  index+=1}
+ let combined:ref<typed_ensemble.Output>=struct.borrow(output,field=combined)
+ let _=try app.export_ragged_to(prepared.directory,44100,struct.borrow(combined,field=targets),array.view(combined.values),struct.borrow(combined,field=target_frames),backend,loads,export_cancel,progress,plan,log)
+ let encoded:string=try config.Options_encode(struct.borrow(prepared,field=options)) map_err codec.describe
+ let options:config.Options=try config.Options_decode(encoded) map_err codec.describe
+ var manifest:config.ProcessingManifest=config.ProcessingManifest{input:string.copy(prepared.input_path),sample_rate:44100,frames:combined.frames,frame_counts:clone_indices(struct.borrow(combined,field=target_frames)),options:options,models:models,members:members,backend:string.copy(backend)}
+ let text:string=try config.ProcessingManifest_encode(manifest) map_err codec.describe
+ container.write_metadata(path.join(prepared.directory,"model-ensemble.json"),text,plan,log,start)
+}
+fn export_typed_stages_to(bank:ref<cache.Cache>,member:ref<processing.Member>,output:ref<typed_secondary.Output>,input:str,directory:str,use_gpu:bool,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ match files.mkdirs(directory){ok(_)=>{},err(_)=>{return result.err("Cannot create processed member directory")}}
+ var bindings:array<secondary.Binding>=[]
+ var index:u64=0
+ loop{if index==array.len(member.bindings){break}
+  let binding:ref<secondary.Binding>=array.borrow(member.bindings,index)
+  array.push(bindings,secondary.Binding{model:binding.model,member:binding.member})
+  index+=1}
+ let stage_plan:secondary.Plan=secondary.Plan{required:clone_indices(struct.borrow(struct.borrow(member,field=plan),field=required)),outputs:ensemble.names(struct.borrow(struct.borrow(member,field=plan),field=outputs))}
+ var prepared:secondary_app.Prepared=secondary_app.Prepared{bindings:bindings,plan:stage_plan,input:[],input_path:string.copy(input),directory:string.copy(directory)}
+ secondary_app.export_typed_to(bank,struct.borrow(member,field=recipe),prepared,output,use_gpu,cancel,progress,plan,log)
+}
+pub fn export_typed_to(bank:ref<cache.Cache>,prepared:ref<Prepared>,output:ref<typed_processing.Output>,use_gpu:bool,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.write,fs.meta,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=export_typed_to_impl(bank,prepared,output,use_gpu,cancel,progress,plan,log)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}

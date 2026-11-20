@@ -1,0 +1,79 @@
+module stemair.audio_normalization
+import "numeric.ai" as num
+import std.float as fp
+
+pub type Prepared=struct{samples:array<f32>,frames:u64,mean:f32,scale:f32}
+// The application reference is the mono mean of the retained stereo input.
+// Exactly silent audio has a defined zero result; other zero-variance references
+// cannot be normalized and are refused before running a graph.
+pub fn prepare(input:view<f32>)->result<Prepared,string> effects {alloc} {
+ if view.len(input)%2!=0 or view.len(input)<4 or not num.finite(input){return result.err("Waveform input must be finite stereo audio with at least two frames")}
+ let length:u64=view.len(input)/2
+ var total:f64=0.0
+ var time:u64=0
+ loop{if time==length{break}
+  let mono:f32=(view.get(input,time)+view.get(input,length+time))/2.0
+  total+=cast.float(mono)
+  time+=1}
+ let mean:f32=cast.float(total/cast.float(length))
+ var variance:f64=0.0
+ time=0
+ loop{if time==length{break}
+  let mono:f32=(view.get(input,time)+view.get(input,length+time))/2.0
+  let difference:f64=cast.float(mono)-cast.float(mean)
+  variance+=difference*difference
+  time+=1}
+ let scale:f32=cast.float(fp.sqrt(variance/cast.float(length-1)))
+ if not fp.is_finite(mean) or not fp.is_finite(scale){return result.err("Waveform normalization is non-finite")}
+ if scale==0.0{
+  var at:u64=0
+  loop{if at==view.len(input){break}
+   if view.get(input,at)!=0.0{return result.err("Waveform mono reference has no variance")}
+   at+=1}
+  return result.ok(Prepared{samples:[],frames:length,mean:mean,scale:scale})}
+ var normalized:array<f32>=[]
+ array.reserve(normalized,2*length)
+ var index:u64=0
+ loop{if index==2*length{break}
+  array.push(normalized,(view.get(input,index)-mean)/scale)
+  index+=1}
+ result.ok(Prepared{samples:normalized,frames:length,mean:mean,scale:scale})
+}
+// The four-source application order exchanges the first two graph sources.
+pub fn restore(input:view<f32>,length:u64,mean:f32,scale:f32)->result<array<f32>,string> effects {alloc} {
+ if view.len(input)!=8*length{return result.err("Separated waveform extent differs")}
+ var output:array<f32>=num.zeros(8*length)
+ var source:u64=0
+ loop{if source==4{break}
+  let original:u64=if source==0{1}else{if source==1{0}else{source}}
+  var channel:u64=0
+  loop{if channel==2{break}
+   var time:u64=0
+   loop{if time==length{break}
+    array.set(output,(source*2+channel)*length+time,view.get(input,(original*2+channel)*length+time)*scale+mean)
+    time+=1}
+   channel+=1}
+  source+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite separated waveform")}
+ result.ok(output)
+}
+
+pub fn restore_sources(input:view<f32>,length:u64,sources:u64,mean:f32,scale:f32)->result<array<f32>,string> effects {alloc} {
+ if sources==4{return restore(input,length,mean,scale)}
+ if sources<2 or sources>18446744073709551615/2 or length>18446744073709551615/(2*sources){return result.err("Separated source-count extent overflows")}
+ if view.len(input)!=2*sources*length{return result.err("Separated waveform extent differs")}
+ var output:array<f32>=num.zeros(2*sources*length)
+ var source:u64=0
+ loop{if source==sources{break}
+  let original:u64=if source==0{1}else{if source==1{0}else{source}}
+  var channel:u64=0
+  loop{if channel==2{break}
+   var time:u64=0
+   loop{if time==length{break}
+    array.set(output,(source*2+channel)*length+time,view.get(input,(original*2+channel)*length+time)*scale+mean)
+    time+=1}
+   channel+=1}
+  source+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite separated waveform")}
+ result.ok(output)
+}

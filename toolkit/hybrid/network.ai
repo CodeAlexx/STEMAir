@@ -1,0 +1,167 @@
+module stemair.hybrid.network
+import "../weights.ai" as weights
+import "../device_ops.ai" as ops
+import "residual.ai" as residual
+import "spectral.ai" as spectral
+import std.pytorch_checkpoint as checkpoint
+import std.codec as codec
+import std.text as text
+import "packed.ai" as packed
+
+pub type Options=struct{sources:array<string>,audio_channels:u64,samplerate:u64,segment:u64,
+ channels:u64,channels_time:option<u64>,growth:f64,nfft:u64,wiener_iters:i64,end_iters:i64,
+ wiener_residual:bool,cac:bool,depth:u64,rewrite:bool,hybrid:bool,hybrid_old:bool,
+ multi_freqs:array<f64>,multi_freqs_depth:u64,freq_emb:f64,emb_scale:f64,emb_smooth:bool,
+ kernel_size:u64,stride:u64,time_stride:u64,context:u64,context_enc:u64,norm_starts:u64,
+ norm_groups:u64,dconv_mode:u64,dconv_depth:u64,dconv_comp:f64,dconv_attn:u64,dconv_lstm:u64,
+ dconv_init:f64,rescale:f64} derive codec(strict)
+pub type Constructor=struct{args:array<u64>,kwargs:Options} derive codec(strict)
+pub type Encoder=struct{conv:ops.Convolution,norm1:option<ops.Normalization>,
+ residual:option<u64>,rewrite:ops.Convolution,norm2:option<ops.Normalization>,frequency:bool,empty:bool,stride:u64}
+pub type Decoder=struct{conv:ops.Convolution,norm2:option<ops.Normalization>,
+ rewrite:ops.Convolution,norm1:option<ops.Normalization>,residual:option<u64>,frequency:bool,empty:bool,last:bool,pad:u64}
+pub type EncoderBands=struct{layers:array<Encoder>}
+pub type DecoderBands=struct{layers:array<Decoder>}
+pub type Network=struct{weights:weights.Model,constructor:Constructor,encoder:array<Encoder>,decoder:array<Decoder>,
+ tencoder:array<Encoder>,tdecoder:array<Decoder>,encoder_bands:array<EncoderBands>,decoder_bands:array<DecoderBands>,
+ residuals:array<residual.Block>,embedding:u64,spectral:spectral.Plan}
+fn key(base:str,index:u64)->string effects {alloc} {text.concat(base,string.from_int(index))}
+fn normalization(w:ref<weights.Model>,name:str,channels:u64,enabled:bool)->result<option<ops.Normalization>,string> effects {alloc} {
+ if not enabled{return result.ok(option.none())}
+ result.ok(option.some(try ops.bind_norm(w,name,channels,4)))
+}
+fn convolution(w:ref<weights.Model>,name:str,input:u64,output:u64,kernel:u64,stride:u64,pad:u64,frequency:bool,up:bool)->result<ops.Convolution,string> effects {alloc} {
+ var c:ops.Convolution=try ops.bind_conv(w,name,input,output,if frequency{kernel}else{1},if frequency{1}else{kernel},not frequency,up)
+ if frequency{c.stride_h=stride
+  c.pad_h=pad}else{c.stride_w=stride
+  c.pad_w=pad}
+ result.ok(c)
+}
+fn encode(w:ref<weights.Model>,bank:ref<array<residual.Block>>,base:str,input:u64,output:u64,
+ kernel:u64,stride:u64,pad:u64,frequency:bool,empty:bool,level:u64,norm_enabled:bool)->result<Encoder,string> effects {alloc} {
+ bind_encoder(w,bank,base,input,output,kernel,stride,pad,frequency,empty,norm_enabled,4,level>=4,level>=4)
+}
+pub fn bind_encoder(w:ref<weights.Model>,bank:ref<array<residual.Block>>,base:str,input:u64,output:u64,
+ kernel:u64,stride:u64,pad:u64,frequency:bool,empty:bool,norm_enabled:bool,compression:u64,recurrence:bool,state:bool)->result<Encoder,string> effects {alloc} {
+ let first:ops.Convolution=try convolution(w,text.concat(base,".conv"),input,output,kernel,stride,pad,frequency,false)
+ var norm1:option<ops.Normalization>=option.none()
+ var norm2:option<ops.Normalization>=option.none()
+ var index:option<u64>=option.none()
+ // The empty bridge intentionally contains only its first convolution.
+ var rewrite:ops.Convolution=first
+ if not empty{
+  norm1=try normalization(w,text.concat(base,".norm1"),output,norm_enabled)
+  rewrite=try convolution(w,text.concat(base,".rewrite"),output,output*2,1,1,0,frequency,false)
+  norm2=try normalization(w,text.concat(base,".norm2"),output*2,norm_enabled)
+  index=option.some(array.len(bank))
+  array.push(bank,try residual.bind_compressed(w,text.concat(base,".dconv"),output,2,compression,recurrence,state))}
+ result.ok(Encoder{conv:first,norm1:norm1,residual:index,rewrite:rewrite,norm2:norm2,
+  frequency:frequency,empty:empty,stride:stride})
+}
+fn decode(w:ref<weights.Model>,base:str,input:u64,output:u64,kernel:u64,stride:u64,pad:u64,
+ frequency:bool,empty:bool,level:u64,norm_enabled:bool,context_frequency:bool)->result<Decoder,string> effects {alloc} {
+ let first:ops.Convolution=try convolution(w,text.concat(base,".conv_tr"),input,output,kernel,stride,0,frequency,true)
+ let norm2:option<ops.Normalization>=try normalization(w,text.concat(base,".norm2"),output,norm_enabled)
+ var rewrite:ops.Convolution=first
+ var norm1:option<ops.Normalization>=option.none()
+ if not empty{
+  rewrite=try ops.bind_conv(w,text.concat(base,".rewrite"),input,input*2,if frequency and context_frequency{3}else{1},3,not frequency,false)
+  rewrite.pad_h=if frequency and context_frequency{1}else{0}
+  rewrite.pad_w=1
+  norm1=try normalization(w,text.concat(base,".norm1"),input*2,norm_enabled)}
+ result.ok(Decoder{conv:first,norm2:norm2,rewrite:rewrite,norm1:norm1,residual:option.none(),frequency:frequency,
+  empty:empty,last:level==0,pad:pad})
+}
+pub fn bind_decoder(w:ref<weights.Model>,bank:ref<array<residual.Block>>,base:str,input:u64,output:u64,
+ kernel:u64,stride:u64,pad:u64,frequency:bool,level:u64,compression:u64)->result<Decoder,string> effects {alloc} {
+ bind_decoder_with_norm(w,bank,base,input,output,kernel,stride,pad,frequency,level,compression,level>=4)
+}
+pub fn bind_decoder_with_norm(w:ref<weights.Model>,bank:ref<array<residual.Block>>,base:str,input:u64,output:u64,
+ kernel:u64,stride:u64,pad:u64,frequency:bool,level:u64,compression:u64,norm_enabled:bool)->result<Decoder,string> effects {alloc} {
+ var block:Decoder=try decode(w,base,input,output,kernel,stride,pad,frequency,false,level,norm_enabled,true)
+ block.residual=option.some(array.len(bank))
+ array.push(bank,try residual.bind_compressed(w,text.concat(base,".dconv"),input,2,compression,false,false))
+ result.ok(block)
+}
+pub fn open(path:str)->result<Network,string> effects {alloc,fs.read} {
+ var policy:checkpoint.Limits=checkpoint.defaults()
+ policy.root=checkpoint.Root.ModelState
+ policy.symbolic_classes=true
+ policy.opaque_metadata=true
+ policy.legacy_little_endian=true
+ var w:weights.Model=try packed.open(path,policy)
+ var constructor:Constructor=try Constructor_decode(w.metadata) map_err codec.describe
+ if array.len(constructor.args)!=0{return result.err("Unsupported hybrid positional constructor arguments")}
+ let c:ref<Options>=struct.borrow(constructor,field=kwargs)
+ if c.audio_channels!=2 or c.samplerate!=44100 or c.channels!=48 or option.is_some(c.channels_time) or
+  c.growth!=2.0 or c.nfft!=4096 or c.depth!=6 or not c.hybrid or
+  c.wiener_iters!=0 or c.end_iters!=0 or c.wiener_residual or not c.rewrite or
+  c.kernel_size!=8 or c.stride!=4 or c.time_stride!=2 or c.context!=1 or c.context_enc!=0 or
+  (c.norm_starts!=4 and c.norm_starts!=999) or c.norm_groups!=4 or c.dconv_mode!=1 or c.dconv_depth!=2 or c.dconv_comp!=4.0 or
+  c.dconv_attn!=4 or c.dconv_lstm!=4 or c.freq_emb!=0.2 or c.emb_scale!=10.0 or (array.len(c.sources)!=4 and array.len(c.sources)!=2){
+  return result.err("Unsupported hybrid architecture metadata")}
+ let multi:bool=array.len(c.multi_freqs)!=0
+ if multi and (array.len(c.multi_freqs)!=2 or array.get(c.multi_freqs,0)!=0.1 or array.get(c.multi_freqs,1)!=0.3 or
+  c.multi_freqs_depth!=2 or c.norm_starts!=999 or not c.cac or c.hybrid_old or array.len(c.sources)!=4){return result.err("Unsupported hybrid frequency split constructor")}
+ let sources:u64=array.len(c.sources)
+ if sources==2 and (not c.cac or c.hybrid_old or c.norm_starts!=4){return result.err("Unsupported paired hybrid constructor")}
+ let names:array<string>=if sources==2{["vocals","non_vocals"]}else{["drums","bass","other","vocals"]}
+ var i:u64=0
+ loop{if i==sources{break}
+  let actual:str=array.get(c.sources,i)
+  let expected:str=array.get(names,i)
+  if actual!=expected{return result.err("Hybrid source order differs")}
+  i+=1}
+ var encoder:array<Encoder>=[]
+ var decoder:array<Decoder>=[]
+ var tencoder:array<Encoder>=[]
+ var tdecoder:array<Decoder>=[]
+ var encoder_bands:array<EncoderBands>=[]
+ var decoder_bands:array<DecoderBands>=[]
+ var bank:array<residual.Block>=[]
+ var incoming:u64=if c.cac{4}else{2}
+ var incoming_time:u64=2
+ var channels:u64=48
+ var frequencies:u64=2048
+ i=0
+ loop{if i==6{break}
+  let frequency:bool=frequencies>1
+  let bridge:bool=frequency and frequencies<=8
+  let kernel:u64=if not frequency{4}else{if bridge{frequencies}else{8}}
+  let stride:u64=if frequency{4}else{2}
+  let pad:u64=if bridge{0}else{kernel/4}
+  let out:u64=if i==0{sources*(if c.cac{4}else{2})}else{incoming}
+  var encoders:array<Encoder>=[]
+  var decoders:array<Decoder>=[]
+  if multi and i<c.multi_freqs_depth{
+   var band:u64=0
+   loop{if band>array.len(c.multi_freqs){break}
+    let enc:string=key(text.concat(key("encoder.",i),".layers."),band)
+    let dec:string=key(text.concat(key("decoder.",5-i),".layers."),band)
+    array.push(encoders,try encode(w,bank,enc,incoming,channels,kernel,stride,0,frequency,false,i,false))
+    array.push(decoders,try decode(w,dec,channels,out,kernel,stride,0,frequency,false,i,false,false))
+    band+=1}
+   array.push(encoder,array.get(encoders,0))
+   array.push(decoder,array.get(decoders,0))
+  }else{
+   array.push(encoder,try encode(w,bank,key("encoder.",i),incoming,channels,kernel,stride,pad,frequency,false,i,i>=c.norm_starts))
+   array.push(decoder,try decode(w,key("decoder.",5-i),channels,out,kernel,stride,pad,frequency,false,i,i>=c.norm_starts,true))}
+  array.push(encoder_bands,EncoderBands{layers:encoders})
+  array.push(decoder_bands,DecoderBands{layers:decoders})
+  if frequency{
+   array.push(tencoder,try encode(w,bank,key("tencoder.",i),incoming_time,channels,8,4,2,false,bridge,i,i>=c.norm_starts))
+   let out_time:u64=if i==0{2*sources}else{incoming_time}
+   array.push(tdecoder,try decode(w,key("tdecoder.",4-i),channels,out_time,8,4,2,false,bridge,i,i>=c.norm_starts,true))}
+  incoming=channels
+  incoming_time=channels
+  channels*=2
+  if frequency{frequencies=if bridge{1}else{frequencies/4}}
+  i+=1}
+ let embedding_shape:array<u64>=[512,48]
+ let embedding:u64=try weights.index(w,"freq_emb.embedding.weight",array.view(embedding_shape))
+ let expected:u64=if multi{481}else{if c.norm_starts==999{377}else{395}}
+ if array.len(w.parameters.values)!=expected{return result.err("Hybrid parameter inventory differs")}
+ let plan:spectral.Plan=try spectral.plan(c.nfft,c.hybrid_old)
+ result.ok(Network{weights:w,constructor:constructor,encoder:encoder,decoder:decoder,tencoder:tencoder,tdecoder:tdecoder,encoder_bands:encoder_bands,decoder_bands:decoder_bands,
+  residuals:bank,embedding:embedding,spectral:plan})
+}

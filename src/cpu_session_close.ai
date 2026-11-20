@@ -1,0 +1,17 @@
+module stemair.cpu_session_close
+import "../toolkit/model_cache.ai" as cache
+import std.text as text
+pub fn retained_all(bank:ref<option<cache.Cache>>)->result<unit,string> effects {alloc,ffi,gpu}{
+ match bank{none=>{},some(value)=>{let _=try cache.close_all(value)}}
+ let _=ref.swap(bank,option.none())
+ result.ok(())
+}
+pub fn retained(bank:ref<option<cache.Cache>>)->result<unit,string> effects {alloc,ffi}{
+ match bank{none=>{},some(value)=>{let _=try cache.close(value)}}
+ let _=ref.swap(bank,option.none())
+ result.ok(())
+}
+pub fn finish(bank:ref<cache.Cache>,outcome:result<unit,string> own)->result<unit,string> effects {alloc,ffi}{
+ let closed:result<unit,string>=cache.close(bank)
+ match closed{ok(_)=>outcome,err(problem)=>{match outcome{ok(_)=>result.err(text.concat("CPU session close failed: ",problem)),err(original)=>result.err(text.concat(original,text.concat("; CPU session close failed: ",problem)))}}}
+}

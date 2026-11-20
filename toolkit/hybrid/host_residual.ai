@@ -1,0 +1,41 @@
+module stemair.hybrid.host_residual
+import "network.ai" as network
+import "residual.ai" as form
+import "host_ops.ai" as host
+import "host_prepared.ai" as prepared
+import "host_recurrent.ai" as recurrent
+import "host_local_state.ai" as local_state
+import "../control.ai" as control
+import "../weights.ai" as weights
+
+pub fn forward(n:ref<network.Network>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,index:u64,input:host.Tensor own,cancel:str)->result<host.Tensor,string> effects {alloc,ffi,fs.meta} {
+ forward_block(struct.borrow(n,field=weights),p,library,array.borrow(n.residuals,index),input,cancel)
+}
+pub fn forward_block(model:ref<weights.Model>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,block:ref<form.Block>,input:host.Tensor own,cancel:str)->result<host.Tensor,string> effects {alloc,ffi,fs.meta}{
+ var x:host.Tensor=input
+ let channels:u64=block.channels
+ let count:u64=array.len(block.branches)
+ if x.c!=channels or x.h!=1{return result.err("CPU hybrid residual shape differs")}
+ var i:u64=0
+ loop{if i==count{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let b:form.Branch=array.get(block.branches,i)
+  var y:host.Tensor=try prepared.convolve_weights(model,p,library,x,b.expand)
+  y=try host.normalize(model,y,option.some(b.norm1))
+  y=host.gelu(y)
+  match b.recurrence{some(r)=>{y=try recurrent.forward_weights(model,p,library,r,y,cancel)},none=>{}}
+  match b.state{some(s)=>{y=try local_state.forward_weights(model,p,library,s,y,cancel)},none=>{}}
+  var projected:host.Tensor=try prepared.convolve_weights(model,p,library,y,b.project)
+  host.release(y)
+  projected=try host.normalize(model,projected,option.some(b.norm2))
+  projected=try host.glu(projected)
+  let scale:ref<array<f32>>=struct.borrow(array.borrow(model.parameters.values,b.scale),field=values)
+  var at:u64=0
+  let plane:u64=projected.h*projected.w
+  loop{if at==array.len(projected.data){break}
+   array.set(projected.data,at,array.get(projected.data,at)*array.get(scale,(at/plane)%projected.c))
+   at+=1}
+  x=try host.add(x,projected)
+  i+=1}
+ result.ok(x)
+}

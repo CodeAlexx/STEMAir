@@ -1,0 +1,76 @@
+module stemair.queue_config
+import std.codec as codec
+import std.files as files
+import std.path as path
+import std.text as text
+
+pub type Item=struct{input:string,folder:string} derive codec(strict)
+pub type Plan=struct{items:array<Item>,config:string="",checkpoint:string="",ensemble:string="",secondary:string="",audio_time:string="",pitch:string="",continue_on_error:bool=false} derive codec(strict)
+pub type Outcome=struct{input:string,folder:string,state:string="pending",message:string=""} derive codec(strict)
+pub fn copy_items(items:ref<array<Item>>)->array<Item> effects {alloc} {
+ var copied:array<Item>=[]
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  let item:ref<Item>=array.borrow(items,i)
+  array.push(copied,Item{input:string.copy(item.input),folder:string.copy(item.folder)})
+  i+=1}
+ copied
+}
+pub type Report=struct{items:array<Outcome>,configurations:array<string>,checkpoints:array<string>,use_gpu:bool=true,state:string="pending",succeeded:u64=0,skipped:u64=0,failed:u64=0,
+ checkpoint_loads:u64=0,bytes_read:u64=0,inference_requests:u64=0} derive codec(strict)
+pub fn folder(index:u64,input:str)->string effects {alloc} {
+ let stem:string=path.stem(input)
+ var clean:array<byte>=[]
+ let source:view<byte>=str.bytes(stem)
+ var i:u64=0
+ loop{if i==view.len(source) or i==64{break}
+  let b:byte=view.get(source,i)
+  array.push(clean,if text.ascii_is_alnum(b) or b==45 or b==95 or b==46{b}else{95})
+  i+=1}
+ if array.len(clean)>0{if array.get(clean,array.len(clean)-1)==46{array.set(clean,array.len(clean)-1,95)}}
+ let name:string=match str.from_bytes(array.view(clean)){some(v)=>string.copy(v),none=>"recording"}
+ let chosen:string=if str.len(name)==0{"recording"}else{string.copy(name)}
+ text.concat(string.from_int(index+1),text.concat("_",chosen))
+}
+pub fn validate(items:ref<array<Item>>)->result<unit,string> effects {alloc} {
+ if array.len(items)==0 or array.len(items)>4096{return result.err("Select between one and 4096 queued recordings")}
+ var i:u64=0
+ loop{if i==array.len(items){break}
+  let item:ref<Item>=array.borrow(items,i)
+  let name:str=item.folder
+  if str.len(item.input)==0 or str.len(name)<2 or str.len(name)>128{return result.err("A queued recording or output folder is empty or too long")}
+  if not text.ascii_is_digit(view.get(str.bytes(name),0)){return result.err("Queue folders must start with their recording number")}
+  let folded:string=text.lower_ascii(name)
+  let chars:view<byte>=str.bytes(name)
+  if view.get(chars,view.len(chars)-1)==46{return result.err("A queue folder must not end with a period")}
+  var j:u64=0
+  loop{if j==view.len(chars){break}
+   let b:byte=view.get(chars,j)
+   if not text.ascii_is_alnum(b) and b!=45 and b!=95 and b!=46{return result.err("Queue folders use letters, digits, periods, underscores and hyphens")}
+   j+=1}
+  j=0
+  loop{if j==i{break}
+   if text.lower_ascii(array.borrow(items,j).folder)==folded{return result.err("Queued recordings must have distinct output folders")}
+   j+=1}
+  i+=1}
+ result.ok(())
+}
+pub fn read(file:str)->result<Plan,string> effects {alloc,fs.read} {
+ let raw:string=match files.read_text(file){ok(v)=>v,err(_)=>{return result.err("Cannot read the recording queue recipe")}}
+ var plan:Plan=try Plan_decode(raw) map_err codec.describe
+ let _=try validate(struct.borrow(plan,field=items))
+ let _=try validate_selection(plan)
+ result.ok(plan)
+}
+pub fn validate_selection(plan:ref<Plan>)->result<unit,string> effects {alloc} {
+ var selected:u64=0
+ if str.len(plan.ensemble)>0{selected+=1}
+ if str.len(plan.secondary)>0{selected+=1}
+ if str.len(plan.audio_time)>0{selected+=1}
+ if str.len(plan.pitch)>0{selected+=1}
+ if str.len(plan.config)>0 or str.len(plan.checkpoint)>0{
+  if str.len(plan.config)==0 or str.len(plan.checkpoint)==0{return result.err("Choose both model configuration and weights for the queue")}
+  selected+=1}
+ if selected!=1{return result.err("A queue selects exactly one model, ensemble, secondary, tempo or pitch recipe")}
+ result.ok(())
+}

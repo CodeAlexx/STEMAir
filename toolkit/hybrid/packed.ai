@@ -1,0 +1,171 @@
+module stemair.hybrid.packed
+import "../grouped_weights.ai" as grouped
+import "../weights.ai" as weights
+import std.pytorch_checkpoint as ck
+import std.codec as codec
+import std.text as text
+import std.files as files
+type ShapeOptions=struct{sources:array<string>,audio_channels:u64,channels:u64,channels_time:option<u64>,growth:f64,
+ nfft:u64,depth:u64,kernel_size:u64,stride:u64,time_stride:u64,context:u64,context_enc:u64,norm_starts:u64,norm_groups:u64,
+ dconv_mode:u64,dconv_depth:u64,dconv_comp:f64,dconv_attn:u64,dconv_lstm:u64,cac:bool,hybrid:bool,
+ multi_freqs:array<f64>,multi_freqs_depth:u64} derive codec(lenient)
+type ShapeConstructor=struct{args:array<u64>,kwargs:ShapeOptions} derive codec(lenient)
+fn key(base:str,index:u64)->string effects {alloc}{text.concat(text.concat(base,"."),string.from_int(index))}
+fn add_spec(specs:ref<array<grouped.Spec>>,name:str,shape:array<u64> own)->unit effects {alloc}{
+ var count:u64=1
+ var i:u64=0
+ loop{if i==array.len(shape){break}
+  count*=array.get(shape,i)
+  i+=1}
+ array.push(specs,grouped.Spec{name:string.copy(name),shape:shape,elements:count})
+}
+fn pair(specs:ref<array<grouped.Spec>>,base:str,shape:array<u64> own,bias:u64)->unit effects {alloc}{
+ add_spec(specs,text.concat(base,".weight"),shape)
+ add_spec(specs,text.concat(base,".bias"),[bias])
+}
+fn recurrent(specs:ref<array<grouped.Spec>>,base:str,h:u64)->unit effects {alloc}{
+ var layer:u64=0
+ loop{if layer==2{break}
+  var direction:u64=0
+  loop{if direction==2{break}
+   let tail:string=text.concat(text.concat("_l",string.from_int(layer)),if direction==0{""}else{"_reverse"})
+   add_spec(specs,text.concat(text.concat(base,".lstm.weight_ih"),tail),[4*h,if layer==0{h}else{2*h}])
+   add_spec(specs,text.concat(text.concat(base,".lstm.weight_hh"),tail),[4*h,h])
+   add_spec(specs,text.concat(text.concat(base,".lstm.bias_ih"),tail),[4*h])
+   add_spec(specs,text.concat(text.concat(base,".lstm.bias_hh"),tail),[4*h])
+   direction+=1}
+  layer+=1}
+ pair(specs,text.concat(base,".linear"),[h,2*h],h)
+}
+fn residual(specs:ref<array<grouped.Spec>>,base:str,channels:u64,deep:bool)->unit effects {alloc}{
+ let hidden:u64=channels/4
+ var depth:u64=0
+ loop{if depth==2{break}
+  let p:string=key(text.concat(base,".layers"),depth)
+  pair(specs,text.concat(p,".0"),[hidden,channels,3],hidden)
+  pair(specs,text.concat(p,".1"),[hidden],hidden)
+  var cursor:u64=3
+  if deep{
+   recurrent(specs,key(p,cursor),hidden)
+   cursor+=1
+   let a:string=key(p,cursor)
+   pair(specs,text.concat(a,".content"),[hidden,hidden,1],hidden)
+   pair(specs,text.concat(a,".query"),[hidden,hidden,1],hidden)
+   pair(specs,text.concat(a,".key"),[hidden,hidden,1],hidden)
+   pair(specs,text.concat(a,".query_decay"),[16,hidden,1],16)
+   pair(specs,text.concat(a,".proj"),[hidden,hidden,1],hidden)
+   cursor+=1}
+  pair(specs,key(p,cursor),[2*channels,hidden,1],2*channels)
+  pair(specs,key(p,cursor+1),[2*channels],2*channels)
+  add_spec(specs,text.concat(key(p,cursor+3),".scale"),[channels])
+  depth+=1}
+}
+fn encoder(specs:ref<array<grouped.Spec>>,base:str,input:u64,output:u64,kernel:u64,frequency:bool,empty:bool,norm:bool,deep:bool)->unit effects {alloc}{
+ pair(specs,text.concat(base,".conv"),if frequency{[output,input,kernel,1]}else{[output,input,kernel]},output)
+ if empty{return ()}
+ if norm{pair(specs,text.concat(base,".norm1"),[output],output)}
+ pair(specs,text.concat(base,".rewrite"),if frequency{[2*output,output,1,1]}else{[2*output,output,1]},2*output)
+ if norm{pair(specs,text.concat(base,".norm2"),[2*output],2*output)}
+ residual(specs,text.concat(base,".dconv"),output,deep)
+}
+fn decoder(specs:ref<array<grouped.Spec>>,base:str,input:u64,output:u64,kernel:u64,frequency:bool,empty:bool,norm:bool,multi:bool)->unit effects {alloc}{
+ pair(specs,text.concat(base,".conv_tr"),if frequency{[input,output,kernel,1]}else{[input,output,kernel]},output)
+ if norm{pair(specs,text.concat(base,".norm2"),[output],output)}
+ if empty{return ()}
+ pair(specs,text.concat(base,".rewrite"),if frequency{[2*input,input,if multi{1}else{3},3]}else{[2*input,input,3]},2*input)
+ if norm{pair(specs,text.concat(base,".norm1"),[2*input],2*input)}
+}
+pub fn specifications(metadata:str)->result<array<grouped.Spec>,string> effects {alloc}{
+ var constructor:ShapeConstructor=try ShapeConstructor_decode(metadata) map_err codec.describe
+ let c:ref<ShapeOptions>=struct.borrow(constructor,field=kwargs)
+ let multi:bool=array.len(c.multi_freqs)!=0
+ if array.len(constructor.args)!=0 or array.len(c.sources)!=4 or c.audio_channels!=2 or c.channels!=48 or option.is_some(c.channels_time) or c.growth!=2.0 or
+  c.nfft!=4096 or c.depth!=6 or c.kernel_size!=8 or c.stride!=4 or c.time_stride!=2 or c.context!=1 or c.context_enc!=0 or
+  (c.norm_starts!=4 and c.norm_starts!=999) or c.norm_groups!=4 or c.dconv_mode!=1 or c.dconv_depth!=2 or c.dconv_comp!=4.0 or
+  c.dconv_attn!=4 or c.dconv_lstm!=4 or not c.hybrid{return result.err("Unsupported grouped hybrid parameter constructor")}
+ if multi and (array.len(c.multi_freqs)!=2 or array.get(c.multi_freqs,0)!=0.1 or array.get(c.multi_freqs,1)!=0.3 or c.multi_freqs_depth!=2 or c.norm_starts!=999 or not c.cac){return result.err("Unsupported grouped hybrid frequency splits")}
+ let names:array<string>=["drums","bass","other","vocals"]
+ var i:u64=0
+ loop{if i==4{break}
+  let actual:str=array.get(c.sources,i)
+  let expected:str=array.get(names,i)
+  if actual!=expected{return result.err("Grouped hybrid source order differs")}
+  i+=1}
+ var specs:array<grouped.Spec>=[]
+ // Module registration order, not the interleaved bind/forward order.
+ i=0
+ loop{if i==6{break}
+  let channels:u64=48*(1 << cast.wrap(i))
+  let incoming:u64=if i==0{if c.cac{4}else{2}}else{channels/2}
+  let frequency:bool=i<5
+  let wrapped:bool=multi and i<c.multi_freqs_depth
+  var band:u64=0
+  loop{if band==(if wrapped{3}else{1}){break}
+   let base:string=if wrapped{key(text.concat(key("encoder",i),".layers"),band)}else{key("encoder",i)}
+   encoder(specs,base,incoming,channels,if i==5{4}else{8},frequency,false,i>=c.norm_starts,i>=4)
+   band+=1}
+  i+=1}
+ i=0
+ loop{if i==6{break}
+  let level:u64=5-i
+  let channels:u64=48*(1 << cast.wrap(level))
+  let output:u64=if level==0{if c.cac{16}else{8}}else{channels/2}
+  let wrapped:bool=multi and level<c.multi_freqs_depth
+  var band:u64=0
+  loop{if band==(if wrapped{3}else{1}){break}
+   let base:string=if wrapped{key(text.concat(key("decoder",i),".layers"),band)}else{key("decoder",i)}
+   decoder(specs,base,channels,output,if level==5{4}else{8},level<5,false,level>=c.norm_starts,wrapped)
+   band+=1}
+  i+=1}
+ i=0
+ loop{if i==5{break}
+  let channels:u64=48*(1 << cast.wrap(i))
+  encoder(specs,key("tencoder",i),if i==0{2}else{channels/2},channels,8,false,i==4,i>=c.norm_starts,i>=4)
+  i+=1}
+ i=0
+ loop{if i==5{break}
+  let level:u64=4-i
+  let channels:u64=48*(1 << cast.wrap(level))
+  decoder(specs,key("tdecoder",i),channels,if level==0{8}else{channels/2},8,false,level==4,level>=c.norm_starts,false)
+  i+=1}
+ add_spec(specs,"freq_emb.embedding.weight",[512,48])
+ if array.len(specs)!=(if multi{481}else{if c.norm_starts==999{377}else{395}}){return result.err("Grouped hybrid parameter roster differs")}
+ result.ok(specs)
+}
+pub fn restore(source:ref<ck.InertCheckpoint>)->result<weights.Model,string> effects {alloc}{
+ let class:u64=try ck.inert_field(source,source.root,"klass")
+ let node:ref<ck.InertNode>=array.borrow(source.nodes,class)
+ if node.kind!=ck.InertKind.Global or node.word!="demucs.hdemucs\nHDemucs"{return result.err("Grouped hybrid model class differs")}
+ var specs:array<grouped.Spec>=try specifications(source.arguments_json)
+ grouped.restore(source,specs)
+}
+fn dictionary_count(source:ref<ck.InertCheckpoint>,id:u64)->result<u64,string> effects {alloc}{
+ let value:ref<ck.InertNode>=array.borrow(source.nodes,id)
+ if value.kind!=ck.InertKind.Dictionary or array.len(value.items)%2!=0{return result.err("Hybrid checkpoint state is not a dictionary")}
+ result.ok(array.len(value.items))
+}
+fn marked(source:ref<ck.InertCheckpoint>)->result<bool,string> effects {alloc}{
+ let state:u64=try ck.inert_field(source,source.root,"state")
+ let count:u64=try dictionary_count(source,state)
+ var i:u64=0
+ loop{if i==count{break}
+  let key:u64=try ck.inert_child(source,state,i)
+  let name:ref<ck.InertNode>=array.borrow(source.nodes,key)
+  if name.kind==ck.InertKind.Text and name.word=="__quantized"{
+   let id:u64=try ck.inert_field(source,state,"__quantized")
+   let flag:ref<ck.InertNode>=array.borrow(source.nodes,id)
+   if flag.kind!=ck.InertKind.Boolean{return result.err("Hybrid quantized marker must be boolean")}
+   return result.ok(flag.number==1)}
+  i+=2}
+ result.ok(false)
+}
+pub fn open(path:str,policy:ck.Limits)->result<weights.Model,string> effects {alloc,fs.read}{
+ var raw:bytes=match files.read_limited(path,policy.archive_bytes){ok(v)=>v,err(_)=>{return result.err("Cannot read hybrid checkpoint within archive bound")}}
+ let data:view<byte>=bytes.view(raw)
+ let p:u8=80
+ let k:u8=75
+ if view.len(data)<4 or view.get(data,0)!=cast.bits(p) or view.get(data,1)!=cast.bits(k){return weights.from_promoted_bytes(raw,policy)}
+ var source:ck.InertCheckpoint=try ck.inert_from_bytes(raw,policy)
+ if try marked(source){return restore(source)}
+ weights.from_promoted_bytes(struct.replace(source,bytes.copy(b""),field=archive),policy)
+}

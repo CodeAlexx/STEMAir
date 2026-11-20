@@ -1,0 +1,165 @@
+module stemair.ensemble
+import "numeric.ai" as num
+import "ops.ai" as ops
+import "complex_spectral.ai" as spectral
+import "control.ai" as control
+import std.float as fp
+
+pub type Output=struct{values:array<f32>,frames:u64,compared_frames:u64}
+pub fn valid_method(method:str)->bool effects {} {method=="minimum" or method=="maximum" or method=="average"}
+pub fn valid_domain(domain:str)->bool effects {} {domain=="spectrum" or domain=="waveform"}
+fn choose(incoming:f32,current:f32,maximum:bool)->bool effects {} {
+ if maximum{incoming>=current}else{incoming<=current}
+}
+// Compare complex magnitudes and retain the selected complex value, including
+// phase. Equality selects the later estimate in both original source methods.
+pub fn select_spectra(inputs:ref<array<ops.Tensor>>,maximum:bool)->result<ops.Tensor,string> effects {alloc} {
+ if array.len(inputs)<2{return result.err("An ensemble needs at least two inputs")}
+ let bins:u64=array.get(inputs,0).h
+ var frames:u64=array.get(inputs,0).w
+ var i:u64=0
+ loop{if i==array.len(inputs){break}
+  let x:ref<ops.Tensor>=array.borrow(inputs,i)
+  if x.c!=4 or x.h!=bins or bins==0 or x.w==0 or array.len(x.data)!=4*bins*x.w or not num.finite(array.view(x.data)){
+   return result.err("Ensemble spectra must be finite planar stereo with matching frequency bins")}
+  if x.w<frames{frames=x.w}
+  i+=1}
+ var out:array<f32>=num.zeros(4*bins*frames)
+ var channel:u64=0
+ loop{if channel==2{break}
+  var bin:u64=0
+  loop{if bin==bins{break}
+   var t:u64=0
+   loop{if t==frames{break}
+    let first:ref<ops.Tensor>=array.borrow(inputs,0)
+    var real:f32=array.get(first.data,(2*channel*bins+bin)*first.w+t)
+    var imag:f32=array.get(first.data,((2*channel+1)*bins+bin)*first.w+t)
+    var magnitude:f32=spectral.magnitude(real,imag)
+    i=1
+    loop{if i==array.len(inputs){break}
+     let x:ref<ops.Tensor>=array.borrow(inputs,i)
+     let re:f32=array.get(x.data,(2*channel*bins+bin)*x.w+t)
+     let im:f32=array.get(x.data,((2*channel+1)*bins+bin)*x.w+t)
+     let value:f32=spectral.magnitude(re,im)
+     if choose(value,magnitude,maximum){real=re
+      imag=im
+      magnitude=value}
+     i+=1}
+    array.set(out,(2*channel*bins+bin)*frames+t,real)
+    array.set(out,((2*channel+1)*bins+bin)*frames+t,imag)
+    t+=1}
+   bin+=1}
+  channel+=1}
+ result.ok(ops.tensor(4,bins,frames,out))
+}
+pub fn normalize(values:ref<array<f32>>,enabled:bool)->result<unit,string> effects {alloc} {
+ match num.normalize_peak(values,enabled){ok(_)=>result.ok(()),err(_)=>result.err("Non-finite ensemble output")}
+}
+pub fn combine(inputs:ref<array<array<f32>>>,method:str,domain:str,normalize_peaks:bool,
+ cancel:str,progress:str)->result<Output,string> effects {alloc,fs.meta,fs.write} {
+ if not valid_method(method) or not valid_domain(domain){return result.err("Unknown ensemble method or domain")}
+ if array.len(inputs)<2{return result.err("An ensemble needs at least two inputs")}
+ if control.cancelled(cancel){return result.err("Ensemble cancelled")}
+ var longest:u64=0
+ var shortest:u64=18446744073709551615
+ var first_longest:u64=0
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(inputs){break}
+  let x:ref<array<f32>>=array.borrow(inputs,i)
+  let size:u64=array.len(x)
+  if size==0 or size%2!=0 or not num.finite(array.view(x)){return result.err("Ensemble inputs must be finite planar stereo")}
+  if size>536870912-total{return result.err("Ensemble exceeds its retained host memory bound")}
+  total+=size
+  let frames:u64=size/2
+  if frames>longest{longest=frames
+   first_longest=i}
+  if frames<shortest{shortest=frames}
+  i+=1}
+ var output:array<f32>=num.zeros(2*longest)
+ var compared:u64=shortest
+ if method=="average"{
+  // The original average starts with the first longest waveform, then adds
+  // the remaining inputs in their order, with right-zero-padding.
+  let first:ref<array<f32>>=array.borrow(inputs,first_longest)
+  var at:u64=0
+  loop{if at==2*longest{break}
+   array.set(output,at,array.get(first,at))
+   at+=1}
+  i=0
+  loop{if i==array.len(inputs){break}
+   if control.cancelled(cancel){return result.err("Ensemble cancelled")}
+   if i!=first_longest{
+    let x:ref<array<f32>>=array.borrow(inputs,i)
+    let frames:u64=array.len(x)/2
+    var channel:u64=0
+    loop{if channel==2{break}
+     var t:u64=0
+     loop{if t==frames{break}
+      let index:u64=channel*longest+t
+      array.set(output,index,array.get(output,index)+array.get(x,channel*frames+t))
+      t+=1}
+     channel+=1}}
+   control.report(progress,i+1,array.len(inputs))
+   i+=1}
+  let divisor:f32=cast.float(array.len(inputs))
+  at=0
+  loop{if at==2*longest{break}
+   array.set(output,at,array.get(output,at)/divisor)
+   at+=1}
+  compared=longest
+ }else{if domain=="waveform"{
+  var channel:u64=0
+  loop{if channel==2{break}
+   var t:u64=0
+   loop{if t==shortest{break}
+    let first:ref<array<f32>>=array.borrow(inputs,0)
+    let first_frames:u64=array.len(first)/2
+    var value:f32=array.get(first,channel*first_frames+t)
+    i=1
+    loop{if i==array.len(inputs){break}
+     let x:ref<array<f32>>=array.borrow(inputs,i)
+     let incoming:f32=array.get(x,channel*(array.len(x)/2)+t)
+     if choose(fp.abs(incoming),fp.abs(value),method=="maximum"){value=incoming}
+     i+=1}
+    array.set(output,channel*longest+t,value)
+    t+=1}
+   channel+=1}
+ }else{
+  var plan:spectral.Plan=try spectral.plan(2048,1024)
+  var spectra:array<ops.Tensor>=[]
+  i=0
+  loop{if i==array.len(inputs){break}
+   if control.cancelled(cancel){return result.err("Ensemble cancelled")}
+   array.push(spectra,try spectral.analyze(plan,array.view(array.borrow(inputs,i))))
+   control.report(progress,i+1,array.len(inputs)+1)
+   i+=1}
+  if control.cancelled(cancel){return result.err("Ensemble cancelled")}
+  var selected:ops.Tensor=try select_spectra(spectra,method=="maximum")
+  // A single centered frame reconstructs zero samples in the original default
+  // inverse transform. The manual wrapper then pads back to the longest input.
+  compared=(selected.w-1)*1024
+  if selected.w>1{
+   var real:array<f64>=[]
+   var imaginary:array<f64>=[]
+   var channel:u64=0
+   loop{if channel==2{break}
+    var at:u64=0
+    loop{if at==selected.h*selected.w{break}
+     array.push(real,cast.float(array.get(selected.data,2*channel*selected.h*selected.w+at)))
+     array.push(imaginary,cast.float(array.get(selected.data,(2*channel+1)*selected.h*selected.w+at)))
+     at+=1}
+    channel+=1}
+   let wave:array<f32>=try spectral.synthesize_f32(plan,array.view(real),array.view(imaginary),selected.w)
+   channel=0
+   loop{if channel==2{break}
+    var t:u64=0
+    loop{if t==compared{break}
+     array.set(output,channel*longest+t,cast.float(array.get(wave,channel*compared+t)))
+     t+=1}
+    channel+=1}}
+  control.report(progress,array.len(inputs)+1,array.len(inputs)+1)}}
+ if control.cancelled(cancel){return result.err("Ensemble cancelled")}
+ let _=try normalize(output,normalize_peaks)
+ result.ok(Output{values:output,frames:longest,compared_frames:compared})
+}

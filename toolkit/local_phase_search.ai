@@ -1,0 +1,67 @@
+// Gain-major phase search retaining one winner and complete scalar diagnostics.
+module stemair.local_phase_search
+import "phase_tracks.ai" as phase
+import "local_residual.ai" as local
+import "control.ai" as control
+import std.cpu_fft as cpu
+import std.cpu_dot as dot
+import std.float as fp
+import std.pairwise_mean as mean
+
+pub type Selection=struct{value:local.WindowResult,selected:u64,costs:array<f64>,peaks:array<u64>,delays:array<i64>,hashes:array<string>}
+pub fn replaces(current:f64,next:f64)->bool effects {} {next==current or next<current}
+fn digest(values:view<f64>)->result<string,string> effects {alloc} {
+ let packed:dot.BufferF64=try dot.pack_f64(values)
+ result.ok(bytes.hex(hash.sha256(bytes.view(packed.data))))
+}
+pub fn select(engine:ref<cpu.Engine>,math:ref<CAbiLibrary>,first:view<f32>,second:view<f64>,weights:view<f64>,gains:view<f64>,choice:local.WindowChoice,phase_choice:phase.Choice,recipe:local.Recipe,cancel:str,capture:bool)->result<Selection,string> effects {alloc,ffi,fs.meta} {
+ let size:u64=local.window_frames(choice)
+ if view.len(first)!=size or view.len(second)!=size or view.len(weights)!=size or view.len(gains)<2 or view.len(gains)>42{return result.err("Phase search input or gain extents differ")}
+ if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+ var i:u64=0
+ loop{if i==view.len(gains){break}
+  if not fp.is_finite(view.get(gains,i)){return result.err("Phase search gain factors must be finite")}
+  i+=1}
+ var a:array<f64>=[]
+ var b:array<f64>=[]
+ array.reserve(a,size)
+ array.reserve(b,size)
+ i=0
+ loop{if i==size{break}
+  let reference:f64=cast.float(view.get(first,i))
+  array.push(a,reference*view.get(weights,i))
+  let weighted:f64=view.get(second,i)*view.get(weights,i)
+  array.push(b,weighted*view.get(gains,0))
+  i+=1}
+ var prepared:phase.Prepared=try phase.prepare(engine,array.view(b),phase_choice,size)
+ let phase_count:u64=phase.count(phase_choice)
+ let count:u64=(view.len(gains)-1)*phase_count
+ var output:Selection=Selection{value:local.WindowResult{residual:[],step:local.Step{start:0,channel:0,peak_index:0,delay:0}},selected:0,costs:[],peaks:[],delays:[],hashes:[]}
+ var best_cost:f64=0.0
+ i=0
+ loop{if i==count{break}
+  if control.cancelled(cancel){return result.err("Recording alignment cancelled")}
+  var target:array<f64>=try phase.candidate(prepared,math,if recipe==local.Recipe.WindowsScalar{phase.Math.WindowsScalar}else{phase.Math.LinuxVector},i%phase_count)
+  let gain:f64=view.get(gains,i/phase_count+1)
+  var j:u64=0
+  loop{if j==size{break}
+   array.set(target,j,array.get(target,j)*gain)
+   j+=1}
+  let value:local.WindowResult=try local.weighted_residual(engine,a,target,0,0,choice)
+  var absolute:array<f64>=[]
+  array.reserve(absolute,size)
+  j=0
+  loop{if j==size{break}
+   array.push(absolute,fp.abs(array.get(value.residual,j)))
+   j+=1}
+  let cost:f64=mean.mean_f64(array.view(absolute))
+  array.push(output.costs,cost)
+  array.push(output.peaks,value.step.peak_index)
+  array.push(output.delays,value.step.delay)
+  if capture{array.push(output.hashes,try digest(array.view(value.residual)))}
+  if i==0 or replaces(best_cost,cost){output.value=value
+   output.selected=i
+   best_cost=cost}
+  i+=1}
+ result.ok(output)
+}

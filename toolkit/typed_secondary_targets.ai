@@ -1,0 +1,33 @@
+module stemair.typed_secondary_targets
+import "secondary.ai" as secondary
+import "secondary_config.ai" as config
+import "model_ensemble.ai" as names
+
+// The filename plan follows the typed writer's actual order. Split names are
+// supplied in the selected model's write order after role mapping.
+pub fn outputs(plan:ref<secondary.Plan>,recipe:ref<config.Recipe>,split:ref<array<string>>)->result<array<string>,string> effects {alloc} {
+ let active:bool=secondary.vocal_model(recipe)>0
+ if active and (array.len(split)!=2 or not option.is_some(names.find(split,"lead")) or not option.is_some(names.find(split,"backing"))){return result.err("A typed vocal filename plan requires lead and backing targets")}
+ var out:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(plan.outputs){break}
+  let name:str=array.get(plan.outputs,i)
+  if not active or (not (recipe.vocal_mix_only and name=="vocals") and not (recipe.vocal_save_only and name=="instrumental")){array.push(out,string.copy(name))}
+  i+=1}
+ if secondary.extra_instrumental(plan,recipe){array.push(out,"other_instruments")}
+ if not active{return result.ok(out)}
+ if secondary.rebalance(recipe)>0.0{
+  if not recipe.vocal_mix_only{array.push(out,"backing")
+   array.push(out,"lead")}
+  if recipe.vocal_mixes and not recipe.vocal_save_only{array.push(out,"instrumental_with_backing")
+   array.push(out,"instrumental_with_lead")}
+ }else{
+  i=0
+  loop{if i==array.len(split){break}
+   let name:str=array.get(split,i)
+   if not recipe.vocal_mix_only{array.push(out,string.copy(name))}
+   if recipe.vocal_mixes and not recipe.vocal_save_only{array.push(out,if name=="backing"{"instrumental_with_backing"}else{"instrumental_with_lead"})}
+   i+=1}
+ }
+ result.ok(out)
+}

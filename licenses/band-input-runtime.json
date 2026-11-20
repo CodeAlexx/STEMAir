@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "windows": {
+    "library_sha256": "850ea5aeb4cb7be7134b8d1f97d343f93d857d6dc8d7ef7f3a34460952f54719",
+    "version_string": "libsamplerate-0.1.9 (c) 2002-2008 Erik de Castro Lopo",
+    "adapter": "air_audio_rate.dll",
+    "library": "libsamplerate-64bit.dll",
+    "adapter_sha256": "6693fb04d2aa2a6a93afecbc4e33e59a012e7383b7f2309f38bc6780b9f23a9f"
+  },
+  "linux": {
+    "library_sha256": "e5ca19288cc5bee8bf170db1a3964d0324f8e2500d2c23adf749629262742b34",
+    "host": "WSL Ubuntu glibc2.43; physical Linux untested",
+    "version_string": "libsamplerate-0.1.9 (c) 2002-2008 Erik de Castro Lopo",
+    "library": "libsamplerate.so.0",
+    "adapter": "libair_audio_rate.so",
+    "adapter_sha256": "6ae7c8ee0e126129d339a8abc89ff3b3aa7a9ae9947e04d0d326455c82bdbbb6"
+  },
+  "fast_filter": {
+    "bytes": 99100,
+    "source_revision": "1e96fa7539cc99aa9115f6cde54011c60f05c489",
+    "license": "ISC",
+    "sha256": "8289150d2cd8f5cae2b60af483fcce0b9dd8a740c6294277f569317573e0a095",
+    "path": "assets/rate-filter-fast-v1.npz",
+    "source": "resampy0.4.2/data/kaiser_fast.npz",
+    "notice": "licenses/rate-filter-ISC.txt"
+  },
+  "library_source": {
+    "license": "BSD-2-Clause",
+    "revision": "f6730d03c3e7660bb6ecad8816f1b09c5825142a",
+    "notice": "licenses/audio-rate-BSD-2.txt",
+    "version": "0.1.9",
+    "repository": "https://github.com/libsndfile/libsamplerate"
+  },
+  "runtime_layout": "runtime/audio-rate; explicit installed identity, development build/runtime/audio-rate fallback only when installed entry absent",
+  "rules_asset": {
+    "bytes": 20144,
+    "sha256": "409c36e69a70be924ee9382e6553499746dd4f423042c32c85c1819a7197f640",
+    "file": "assets/mask-input-rules-v1.json"
+  }
+}

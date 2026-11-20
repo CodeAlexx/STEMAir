@@ -1,0 +1,57 @@
+module stemair.cpu_model_runtime
+import "alignment_runtime.ai" as runtime
+import "../toolkit/model_cache.ai" as cache
+import "../toolkit/engine.ai" as engine
+import "../toolkit/mask/config.ai" as mask
+import "../toolkit/waveform/config.ai" as waveform
+import "../toolkit/hybrid/config.ai" as hybrid
+import "../toolkit/attention/config.ai" as attention
+import std.codec as codec
+import std.text as text
+import std.system as system
+import std.mkl_vml as transforms
+import "spectral_cpu_runtime.ai" as spectral_runtime
+
+// Application deployment policy reuses the existing optional pinned runtime.
+// Prepared interchange, admitted masks and both waveform generations share
+// the same pinned image. Loaded waveform geometry is checked before packing.
+pub fn selected(root:str,profile:ref<engine.Profile>)->result<option<cache.CpuBackend>,string> effects {alloc,env,fs.read,fs.meta} {
+ if profile.kind=="spectral" and not cache.spectral_cpu_profile(profile){return result.ok(option.none())}
+ if profile.kind!="mask" and profile.kind!="exchange" and profile.kind!="waveform" and profile.kind!="hybrid" and profile.kind!="residual-waveform" and profile.kind!="spectral" and profile.kind!="temporal" and profile.kind!="attention" and profile.kind!="attention-bundle" and profile.kind!="recording-bundle"{return result.ok(option.none())}
+ if profile.kind=="attention"{
+  let settings:attention.Config=try attention.Config_decode(profile.identity) map_err codec.describe
+  let _=try attention.validate(settings)
+ }
+ // Empty application root is the explicit dependency-free toolkit/test policy.
+ if (profile.kind=="exchange" or profile.kind=="spectral") and str.len(root)==0{return result.ok(option.none())}
+ if profile.kind=="hybrid"{
+  let settings:hybrid.Config=try hybrid.Config_decode(profile.identity) map_err codec.describe
+  let _=try hybrid.validate(settings)
+ }
+ if profile.kind=="waveform" or profile.kind=="temporal"{
+  let settings:waveform.Config=try waveform.Config_decode(profile.identity) map_err codec.describe
+  let _=try waveform.validate(settings)
+  if settings.generation!=1 and settings.generation!=2{return result.ok(option.none())}
+ }
+ if profile.kind=="mask"{
+  let settings:mask.Config=try mask.Config_decode(profile.identity) map_err codec.describe
+  if settings.architecture=="recurrent"{
+   if settings.channels!=48 or settings.recurrent_width!=128 or settings.levels!=4 or settings.branches!=5 or settings.bins!=672{return result.ok(option.none())}
+  }else{if settings.architecture!="cascade" or settings.levels!=4 or not (((settings.channels==16 or settings.channels==32) and settings.branches==5 and settings.bins==768) or (settings.channels==64 and settings.branches==7 and settings.bins==640)){return result.ok(option.none())}}
+ }
+ let selected=try runtime.settings(root,false,false) map_err contextual
+ let spectral_recipe:string=if profile.kind=="spectral"{try spectral_runtime.selected(root)}else{""}
+ let mask_recipe:string=if cache.original_mask_cpu_profile(profile){try spectral_runtime.selected(root)}else{""}
+ result.ok(option.some(cache.CpuBackend{path:string.copy(selected.runtime),sha256:string.copy(selected.runtime_sha256),version:"0.3.20",core:"Zen",host:system.platform(),spectral_recipe:spectral_recipe,mask_recipe:mask_recipe,transform_runtime:if profile.kind=="hybrid" or profile.kind=="recording-bundle"{transforms.default_runtime()}else{""}}))
+}
+pub fn needs_selection(bank:ref<cache.Cache>,profile:ref<engine.Profile>)->bool effects {alloc}{
+ array.len(bank.cpu)==0 or ((profile.kind=="hybrid" or profile.kind=="recording-bundle") and str.len(bank.transform_runtime)==0) or (profile.kind=="spectral" and str.len(bank.spectral_recipe)==0) or (cache.original_mask_cpu_profile(profile) and str.len(bank.learned_mask_recipe)==0)
+}
+fn contextual(problem:string own)->string effects {alloc} {text.concat("Prepared CPU audio runtime: ",problem)}
+
+// Validate every required engine before acquisition; retain one library per bank.
+pub fn preflight(bank:ref<cache.Cache>,root:str,profile:ref<engine.Profile>)->result<unit,string> effects {alloc,env,fs.read,fs.meta,ffi} {
+ if profile.kind!="mask" and profile.kind!="spectral" and profile.kind!="exchange" and profile.kind!="waveform" and profile.kind!="hybrid" and profile.kind!="residual-waveform" and profile.kind!="temporal" and profile.kind!="attention" and profile.kind!="attention-bundle" and profile.kind!="recording-bundle"{return result.err("A selected processing model currently requires GPU execution")}
+ var backend:option<cache.CpuBackend>=if needs_selection(bank,profile){try selected(root,profile)}else{option.none()}
+ cache.ensure_cpu_backend(bank,profile,backend)
+}

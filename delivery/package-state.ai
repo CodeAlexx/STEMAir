@@ -1,0 +1,26 @@
+module stemair.delivery.package_state
+import "../src/preferences.ai" as preferences
+import std.files as files
+import std.codec as codec
+type State=struct{location:string,present:bool,error:string} derive codec(strict)
+fn emit(state:ref<State>)->unit effects {alloc,io.write} {
+ match State_encode(state){ok(value)=>{io.write(value)
+  io.write("\n")},err(_)=>{io.ewrite("Cannot encode package state\n")}}
+}
+// Presence only: never read, parse, create or rewrite a preference file.
+// Exit0 absent,3 present,1 structured location/metadata error,2 usage.
+pub fn main(args:view<str>)->i32 effects {alloc,env,fs.meta,io.write} {
+ if view.len(args)!=1{return 2}
+ let location:string=match preferences.location(){ok(value)=>value,err(error)=>{
+  let failed:State=State{location:"",present:false,error:error}
+  emit(failed)
+  return 1}}
+ let present:bool=match files.symlink_metadata(location){ok(_)=>true,err(error)=>{
+  if error.code!=1{let failed:State=State{location:location,present:false,error:string.copy(fs.error.message(error))}
+   emit(failed)
+   return 1}
+  false}}
+ let state:State=State{location:location,present:present,error:""}
+ emit(state)
+ if present{3}else{0}
+}

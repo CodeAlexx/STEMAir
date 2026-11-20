@@ -1,0 +1,152 @@
+// Application routing only; reusable decoding/resampling stays in toolkit.
+module stemair.model_input
+import "checked_input.ai" as checked
+import "source_input_runtime.ai" as runtime
+import "../toolkit/recording_input.ai" as recording
+import "../toolkit/engine.ai" as engine
+import std.audio as audio
+import "application.ai" as app
+import "band_input_runtime.ai" as band_runtime
+import "../toolkit/band_recording_input.ai" as band_reader
+import "../toolkit/band_input_rule.ai" as band_rules
+import "../toolkit/mask/config.ai" as mask
+import "../toolkit/recording_sources.ai" as sources
+import std.codec as codec
+import std.text as text
+
+pub fn source_family(kind:str)->bool effects {} {
+ kind=="exchange" or kind=="spectral" or kind=="waveform" or kind=="temporal" or kind=="residual-waveform" or kind=="hybrid" or kind=="attention" or kind=="attention-bundle" or kind=="recording-bundle"
+}
+pub fn buffer(input:str,rate:u32,kind:str,options:ref<checked.Options>)->result<audio.AudioBuffer,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ if str.len(options.source_root)==0 or not source_family(kind) or rate!=44100{return checked.buffer(input,rate,options)}
+ let root:string=string.copy(options.source_root)
+ let library:string=string.copy(options.source_library)
+ var session:recording.Session=try runtime.open(root,library)
+ let value:result<audio.AudioBuffer,string>=checked.buffer_source(session,input,options)
+ recording.close(session)
+ value
+}
+// A shared master can use this route when every member has the same original
+// complete-file reader. Mixed band-reader families retain their legacy route.
+pub fn profiles(input:str,rate:u32,profiles:ref<array<engine.Profile>>,options:ref<checked.Options>)->result<audio.AudioBuffer,string>
+ effects {alloc,env,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var eligible:bool=array.len(profiles)>0
+ var i:u64=0
+ loop{if i==array.len(profiles){break}
+  let profile:ref<engine.Profile>=array.borrow(profiles,i)
+  if not source_family(profile.kind) or profile.sample_rate!=44100{eligible=false
+   break}
+  i+=1}
+ buffer(input,rate,if eligible{"exchange"}else{"mask"},options)
+}
+
+pub type Prepared=struct{common:audio.AudioBuffer,inputs:sources.Set}
+pub fn prepare_into(input:str,rate:u32,accepted:ref<array<engine.Profile>>,options:ref<checked.Options>,inputs:ref<sources.Set>)->result<audio.AudioBuffer,string>
+ effects {alloc,env,ffi,fs.read,fs.write,fs.meta,process,time}{
+ var prepared:Prepared=try prepare_profiles(input,rate,accepted,options)
+ let _=ref.swap(inputs,struct.replace(prepared,sources.empty(),field=inputs))
+ result.ok(struct.replace(prepared,audio.AudioBuffer{samples:[],rate:rate,channels:2},field=common))
+}
+type Group=struct{band:bool,rate:u32,method:string,profiles:array<string>}
+fn groups(profiles:ref<array<engine.Profile>>,selected:ref<option<band_runtime.Selected>>)->result<array<Group>,string> effects {alloc}{
+ var result:array<Group>=[]
+ var i:u64=0
+ loop{if i==array.len(profiles){break}
+  let profile:ref<engine.Profile>=array.borrow(profiles,i)
+  let is_band:bool=profile.kind=="mask"
+  var method:string="kaiser_best"
+  if is_band{
+   var config:mask.Config=try mask.Config_decode(profile.identity) map_err codec.describe
+   let mapping:ref<band_runtime.Selected>=match selected{some(value)=>value,none=>{return result.err("Band recording rules are unavailable")}}
+   let bound:band_rules.Binding=try band_rules.select(config,struct.borrow(mapping,field=rules))
+   method=string.copy(bound.method)
+  }else{if not source_family(profile.kind) or profile.sample_rate!=44100{return result.err("This model has no accepted complete-file source reader")}}
+  var at:option<u64>=option.none()
+  var j:u64=0
+  loop{if j==array.len(result){break}
+   let g:ref<Group>=array.borrow(result,j)
+   if g.band==is_band and g.rate==profile.sample_rate and str.view(g.method)==str.view(method){at=option.some(j)
+    break}
+   j+=1}
+  match at{none=>array.push(result,Group{band:is_band,rate:profile.sample_rate,method:method,profiles:[string.copy(profile.identity)]}),some(index)=>array.push(struct.borrow(array.borrow(result,index),field=profiles),string.copy(profile.identity))}
+  i+=1}
+ result.ok(result)
+}
+fn names(values:ref<array<string>>)->array<string> effects {alloc}{
+ var result:array<string>=[]
+ var i:u64=0
+ loop{if i==array.len(values){break}
+  array.push(result,string.copy(array.get(values,i)))
+  i+=1}
+ result
+}
+fn read_groups(input:str,options:ref<checked.Options>,planned:ref<array<Group>>,band:ref<option<band_runtime.Selected>>,ordinary:ref<option<recording.Session>>)->result<Prepared,string>
+ effects {alloc,env,ffi,fs.read,fs.write,fs.meta,process,time}{
+ var common:audio.AudioBuffer=audio.AudioBuffer{samples:[],rate:44100,channels:2}
+ var inputs:sources.Set=sources.empty()
+ var total:u64=0
+ let cancel:string=string.copy(options.cancel_file)
+ var i:u64=0
+ loop{if i==array.len(planned){break}
+  let group:ref<Group>=array.borrow(planned,i)
+  if total>=options.limits.max_decoded_bytes{return result.err("Selected per-model recording buffers exceed the audio buffer limit")}
+  var item:checked.Options=checked.queue_item(options,i,cancel)
+  item.limits.max_decoded_bytes=options.limits.max_decoded_bytes-total
+  var lower:array<f32>=[]
+  var value:audio.AudioBuffer=if group.band{
+   let owner:ref<band_runtime.Selected>=match band{some(value)=>value,none=>{return result.err("Band recording session is unavailable")}}
+   let session:ref<band_reader.Session>=match owner.session{some(value)=>value,none=>{return result.err("Band recording session has closed")}}
+   let rule:band_reader.Rule=band_reader.Rule{rate:group.rate,method:string.copy(group.method)}
+   var decode_options:recording.Options=recording.Options{limits:item.limits,codec:struct.replace(item,option.none(),field=tool),scratch_directory:string.copy(item.scratch_directory),cancel_file:string.copy(item.cancel_file),deadline_ns:item.deadline_ns,log_limit:item.log_limit,progress_file:""}
+   var decoded:band_reader.Loaded=try band_reader.read(session,input,rule,decode_options)
+   match struct.replace(decoded,option.none(),field=lower){none=>{},some(buffer)=>{lower=try app.planar(buffer,group.rate)}}
+   struct.replace(decoded,audio.AudioBuffer{samples:[],rate:group.rate,channels:2},field=highest)
+  }else{
+   let session:ref<recording.Session>=match ordinary{some(value)=>value,none=>{return result.err("Recording session is unavailable")}}
+   try checked.buffer_source(session,input,item)}
+  let samples:u64=array.len(value.samples)
+  let extra:u64=array.len(lower)
+  if samples>18446744073709551615/4 or extra>18446744073709551615/4 or samples*4>options.limits.max_decoded_bytes-total or extra*4>options.limits.max_decoded_bytes-total-samples*4{return result.err("Selected per-model recording buffers exceed the audio buffer limit")}
+  total+=samples*4+extra*4
+  if i==0{
+   common=value
+   inputs.common_profiles=names(struct.borrow(group,field=profiles))
+   inputs.common_lower=lower
+  }else{
+   array.push(inputs.variants,sources.Variant{profiles:names(struct.borrow(group,field=profiles)),samples:try app.planar(value,group.rate),lower:lower})}
+  i+=1}
+ let common_bytes:u64=4*array.len(common.samples)
+ inputs.owned_bytes=total-common_bytes
+ let _=try sources.extent(inputs)
+ result.ok(Prepared{common:common,inputs:inputs})
+}
+// Current app-owned path: each distinct accepted reader acts on the original
+// file, while identical rules share one immutable result. Weight identities and
+// all legacy one-master public APIs above remain unchanged.
+pub fn prepare_profiles(input:str,rate:u32,accepted:ref<array<engine.Profile>>,options:ref<checked.Options>)->result<Prepared,string>
+ effects {alloc,env,ffi,fs.read,fs.write,fs.meta,process,time}{
+ if array.len(accepted)==0{return result.err("No processing model was selected")}
+ if str.len(options.source_root)==0{return result.ok(Prepared{common:try profiles(input,rate,accepted,options),inputs:sources.empty()})}
+ var needs_band:bool=false
+ var needs_ordinary:bool=false
+ var i:u64=0
+ loop{if i==array.len(accepted){break}
+  if array.borrow(accepted,i).kind=="mask"{needs_band=true}else{needs_ordinary=true}
+  i+=1}
+ var band:option<band_runtime.Selected>=if needs_band{option.some(try band_runtime.open(options.source_root,options.source_library))}else{option.none()}
+ var ordinary:option<recording.Session>=option.none()
+ // Any opened band session is explicitly closed even if later setup fails.
+ let result:result<Prepared,string>=prepare_opened(input,options,accepted,band,ordinary,needs_ordinary)
+ let closed:result<unit,string>=match ref.swap(band,option.none()){none=>result.ok(()),some(selected)=>band_runtime.close(selected)}
+ match ref.swap(ordinary,option.none()){none=>{},some(session)=>recording.close(session)}
+ let prepared:Prepared=try result
+ let _=try closed
+ result.ok(prepared)
+}
+fn prepare_opened(input:str,options:ref<checked.Options>,profiles:ref<array<engine.Profile>>,band:ref<option<band_runtime.Selected>>,ordinary:ref<option<recording.Session>>,needs_ordinary:bool)->result<Prepared,string>
+ effects {alloc,env,ffi,fs.read,fs.write,fs.meta,process,time}{
+ let planned:array<Group>=try groups(profiles,band)
+ if needs_ordinary{let _=ref.swap(ordinary,option.some(try runtime.open(options.source_root,options.source_library)))}
+ read_groups(input,options,planned,band,ordinary)
+}

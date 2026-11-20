@@ -1,0 +1,28 @@
+module stemair.audio_io_policy
+import "checked_input.ai" as checked
+import "codec_runtime.ai" as runtime
+import "../toolkit/compressed_export.ai" as compressed
+import std.audio as audio
+import std.process as proc
+import std.path as path
+
+// Product policy is separate from reusable readers, codecs and model workers.
+pub fn budget(choice:u32)->result<u64,string> effects {alloc} {
+ if choice==0{return result.ok(268435456)}
+ if choice==1{return result.ok(536870912)}
+ if choice==2{return result.ok(1073741824)}
+ if choice==3{return result.ok(2147483648)}
+ result.err("Choose an available audio buffer limit")
+}
+pub fn input(root:str,directory:str,choice:u32,scratch:str,cancel:str)->result<checked.Options,string> effects {alloc,env,fs.read,time} {
+ let bytes:u64=try budget(choice)
+ if not path.is_absolute(scratch){return result.err("Audio conversion needs an absolute temporary directory")}
+ result.ok(checked.Options{limits:audio.WavReadLimits{max_file_bytes:bytes*4,max_frames:bytes/8,max_channels:64,max_decoded_bytes:bytes},
+  tool:try runtime.input_tool(root,directory),scratch_directory:string.copy(scratch),cancel_file:string.copy(cancel),
+  deadline_ns:proc.deadline_in(86400000),log_limit:65536,source_root:string.copy(root)})
+}
+pub fn output(choice:u32,encoded:bool)->result<compressed.Limits,string> effects {alloc} {
+ let bytes:u64=try budget(choice)
+ if not encoded{return result.ok(compressed.Limits{max_frames:0,max_stage_bytes:0,max_encoded_bytes:0})}
+ result.ok(compressed.Limits{max_frames:bytes/8,max_stage_bytes:bytes*2+4096,max_encoded_bytes:bytes*2+4096})
+}

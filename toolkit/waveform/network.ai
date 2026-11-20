@@ -1,0 +1,114 @@
+module stemair.waveform.network
+import "../weights.ai" as weights
+import "../recurrent.ai" as recurrent
+import "../windowed_sinc.ai" as sinc
+import std.pytorch_checkpoint as checkpoint
+import std.text as text
+import std.codec as codec
+import std.table as table
+
+pub type Options=struct{audio_channels:u64,channels:u64,context:u64,depth:u64,
+ glu:bool,growth:f64,kernel_size:u64,lstm_layers:u64,rescale:f64,rewrite:bool,
+ sources:u64,stride:u64,upsample:bool,generation:u64=1,resample:bool=false,
+ normalize:bool=false} derive codec(strict)
+type Constructor=struct{args:array<u64>,kwargs:Options} derive codec(strict)
+pub type Convolution=struct{weight:u64,bias:u64,stride:u64,up:bool}
+pub type Block=struct{first:Convolution,rewrite:Convolution}
+pub type Network=struct{weights:weights.Model,options:Options,encoder:array<Block>,decoder:array<Block>,
+ layers:array<recurrent.Bidirectional>,projection_weight:u64,projection_bias:u64,
+ upsample_plan:sinc.Plan,downsample_plan:sinc.Plan}
+fn key(prefix:str,index:u64,suffix:str)->string effects {alloc} {
+ text.concat(text.concat(prefix,string.from_int(index)),suffix)
+}
+fn convolution(w:ref<weights.Model>,base:str,input:u64,output:u64,kernel:u64,stride:u64,up:bool)->result<Convolution,string> effects {alloc} {
+ let shape:array<u64>=if up{[input,output,kernel]}else{[output,input,kernel]}
+ let bias_shape:array<u64>=[output]
+ result.ok(Convolution{weight:try weights.index(w,text.concat(base,".weight"),array.view(shape)),
+  bias:try weights.index(w,text.concat(base,".bias"),array.view(bias_shape)),stride:stride,up:up})
+}
+pub fn open(path:str)->result<Network,string> effects {alloc,fs.read} {
+ var policy:checkpoint.Limits=checkpoint.defaults()
+ // Public 100-channel tuple checkpoints are 2,594,202,563 bytes.
+ policy.archive_bytes=3221225472
+ policy.legacy_stream=true
+ policy.symbolic_classes=true
+ policy.root=checkpoint.Root.TupleState
+ var w:weights.Model=try weights.open_legacy_with_policy(path,policy,false)
+ var constructor:Constructor=try Constructor_decode(w.metadata) map_err codec.describe
+ let c:Options=constructor.kwargs
+ if array.len(constructor.args)!=0{return result.err("Unsupported waveform positional metadata")}
+ bind(w,c)
+}
+pub fn open_resampled(path:str)->result<Network,string> effects {alloc,fs.read} {
+ var w:weights.Model=try weights.open(path)
+ let index:u64=match table.index_of(struct.borrow(w,field=parameters),"encoder.0.0.weight"){
+  some(value)=>value,none=>{return result.err("Missing waveform input convolution")},}
+ let first:ref<weights.Parameter>=array.borrow(w.parameters.values,index)
+ if array.len(first.shape)!=3 or array.get(first.shape,1)!=2 or array.get(first.shape,2)!=8{
+  return result.err("Invalid waveform input convolution geometry")}
+ let channels:u64=array.get(first.shape,0)
+ let c:Options=Options{audio_channels:2,channels:channels,context:3,depth:6,glu:true,
+  growth:2.0,kernel_size:8,lstm_layers:2,rescale:0.1,rewrite:true,sources:4,stride:4,
+  upsample:false,generation:2,resample:true,normalize:false}
+ bind(w,c)
+}
+fn bind(source:weights.Model own,c:Options)->result<Network,string> effects {alloc} {
+ var w:weights.Model=source
+ if c.audio_channels!=2 or c.channels<4 or c.channels>128 or
+  c.depth==0 or c.depth>6 or c.kernel_size!=8 or c.stride!=4 or c.context!=3 or
+  c.growth!=2.0 or not c.glu or not c.rewrite or c.upsample or c.sources!=4 or
+  c.lstm_layers==0 or c.lstm_layers>4 or c.generation<1 or c.generation>2 or
+  c.resample!=(c.generation==2) or c.normalize{return result.err("Unsupported waveform architecture metadata")}
+ var encoder:array<Block>=[]
+ var decoder:array<Block>=[]
+ var widths:array<u64>=[]
+ var incoming:u64=c.audio_channels
+ var channels:u64=c.channels
+ var i:u64=0
+ loop{if i==c.depth{break}
+  array.push(widths,channels)
+  array.push(encoder,Block{
+   first:try convolution(w,key("encoder.",i,".0"),incoming,channels,c.kernel_size,c.stride,false),
+   rewrite:try convolution(w,key("encoder.",i,".2"),channels,2*channels,1,1,false)})
+  incoming=channels
+  channels*=2
+  i+=1}
+ var layers:array<recurrent.Bidirectional>=[]
+ let hidden:u64=incoming
+ i=0
+ loop{if i==c.lstm_layers{break}
+  array.push(layers,try recurrent.bind_layer(w,"lstm.lstm",if i==0{hidden}else{2*hidden},hidden,i))
+  i+=1}
+ let projection_shape:array<u64>=[hidden,2*hidden]
+ let projection_bias:array<u64>=[hidden]
+ let pw:u64=try weights.index(w,"lstm.linear.weight",array.view(projection_shape))
+ let pb:u64=try weights.index(w,"lstm.linear.bias",array.view(projection_bias))
+ i=0
+ loop{if i==c.depth{break}
+  let level:u64=c.depth-1-i
+  let input:u64=array.get(widths,level)
+  let output:u64=if level==0{c.sources*c.audio_channels}else{array.get(widths,level-1)}
+  array.push(decoder,Block{
+   first:try convolution(w,key("decoder.",i,".2"),input,output,c.kernel_size,c.stride,true),
+   rewrite:try convolution(w,key("decoder.",i,".0"),input,2*input,c.context,1,false)})
+  i+=1}
+ if array.len(w.parameters.values)!=8*c.depth+8*c.lstm_layers+2{return result.err("Unexpected waveform parameter inventory")}
+ let upsample_plan:sinc.Plan=try sinc.plan(1,if c.resample{2}else{1})
+ let downsample_plan:sinc.Plan=try sinc.plan(if c.resample{2}else{1},1)
+ result.ok(Network{weights:w,options:c,encoder:encoder,decoder:decoder,layers:layers,projection_weight:pw,projection_bias:pb,
+  upsample_plan:upsample_plan,downsample_plan:downsample_plan})
+}
+pub fn valid_length(c:Options,length:u64)->result<u64,string> effects {alloc} {
+ if length==0 or length>4410000{return result.err("Waveform segment length is outside supported bounds")}
+ var value:u64=if c.resample{2*length}else{length}
+ var i:u64=0
+ loop{if i==c.depth{break}
+  value=if value<=c.kernel_size{1}else{(value-c.kernel_size+c.stride-1)/c.stride+1}
+  value+=c.context-1
+  i+=1}
+ i=0
+ loop{if i==c.depth{break}
+  value=(value-1)*c.stride+c.kernel_size
+  i+=1}
+ result.ok(if c.resample{(value+1)/2}else{value})
+}

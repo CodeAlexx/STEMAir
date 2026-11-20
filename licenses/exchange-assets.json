@@ -1,0 +1,10 @@
+{
+  "model": "exchange-v1",
+  "filename": "exchange-v1.onnx",
+  "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR_MDXNET_Main.onnx",
+  "bytes": 66759214,
+  "sha256": "8289784cda38543ff431add4070662813311a8cccfc0112ca82f76d9dba2b4ca",
+  "reference_metadata_tail_md5": "53c4baf4d12c3e6c3831bb8f5b532b93",
+  "configuration": "configs/exchange-v1.json",
+  "credit": "UVR developers Anjok07 and aufr33; original MDX-Net architecture credited to Kuielab and Woosung Choi"
+}

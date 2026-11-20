@@ -1,0 +1,100 @@
+module stemair.recording_gpu
+import "engine.ai" as engine
+import "recording_inference.ai" as inference
+import "recording_shifts.ai" as shifts
+import "audio_result.ai" as audio
+import "waveform/config.ai" as early_config
+import "waveform/device.ai" as waveform_device
+import "waveform/session.ai" as waveform
+import "temporal/device.ai" as temporal_device
+import "temporal/session.ai" as temporal
+import "residual_waveform/config.ai" as residual_config
+import "residual_waveform/session.ai" as residual
+import "hybrid/config.ai" as hybrid_config
+import "hybrid/recording.ai" as hybrid
+import "hybrid/frontend.ai" as hybrid_frontend
+import "attention/config.ai" as attention_config
+import "attention/recording.ai" as attention
+import "device_ops.ai" as device_ops
+import std.mkl_vml as window_math
+import std.codec as codec
+import std.gpu as devicegpu
+import std.tensor as tensor
+pub type Limits=struct{max_frontends:u64,transform_bytes:u64=1073741824,device_index:u32=0}
+pub type Output=struct{samples:audio.Samples,observation:inference.Observation}
+pub fn supported(kind:str)->bool effects {} {kind=="waveform" or kind=="temporal" or kind=="residual-waveform" or kind=="hybrid" or kind=="attention"}
+fn error(e:gpu.error)->string effects {alloc}{string.copy(e.message)}
+fn finish(s:ref<engine.Loaded>,stream:ref<inference.Stream>,schedule:ref<shifts.Schedule>,options:ref<inference.Options>,outcome:result<array<f32>,string> own)->result<Output,string> effects {alloc}{
+ let observation:inference.Observation=inference.finish(stream,schedule,options)
+ match outcome{err(problem)=>result.err(problem),ok(values)=>{
+  s.requests+=1
+  result.ok(Output{samples:audio.from_single(values),observation:observation})}}
+}
+// Startup checkpoint ownership remains in Loaded. Per-request tensors and work
+// use the caller's device context and are released before its scope closes.
+pub fn separate(s:ref<engine.Loaded>,input:view<f32>,cancel:str,progress:str,options:ref<inference.Options>,request_stream:ref<inference.Stream>,work_limits:shifts.Limits,limits:ref<Limits>)->result<Output,string> effects {alloc,env,ffi,gpu,fs.meta,fs.write}{
+ let _=try inference.validate(options)
+ if view.len(input)<4 or view.len(input)%2!=0{return result.err("Recording controls require complete stereo frames")}
+ if not supported(s.profile.kind){return result.err("Recording GPU controls require a qualified recording model family")}
+ var context:GpuContext=try devicegpu.open(limits.device_index) map_err error
+ var stream:GpuStream=try devicegpu.compute_stream(context) map_err error
+ if s.profile.kind=="waveform" or s.profile.kind=="temporal"{
+  var c:early_config.Config=try early_config.Config_decode(s.profile.identity) map_err codec.describe
+  c.split=options.split
+  c.overlap=if c.generation==1{0.25}else{options.overlap}
+  let _=try early_config.validate(c)
+  let family:shifts.Family=if c.generation==1{shifts.Family.First}else{shifts.Family.Second}
+  if s.profile.kind=="waveform"{match s.waveform{none=>{return result.err("Waveform model session unavailable")},some(value)=>{
+   var parameters:array<tensor.Tensor>=try waveform.upload(context,stream,value)
+   var schedule:shifts.Schedule=try inference.begin(request_stream,options,family,view.len(input)/2,early_config.segment_length(c),work_limits)
+   let recurrent_limits:waveform.GpuLimits=waveform.gpu_limits()
+   let outcome:result<array<f32>,string>=waveform.separate_scheduled_state(context,stream,parameters,value,c,schedule,input,cancel,progress,recurrent_limits)
+   return finish(s,request_stream,schedule,options,outcome)}}
+  }else{match s.temporal{none=>{return result.err("Temporal model session unavailable")},some(value)=>{
+   var parameters:array<tensor.Tensor>=try temporal_device.upload(context,stream,struct.borrow(value,field=network))
+   var schedule:shifts.Schedule=try inference.begin(request_stream,options,family,view.len(input)/2,early_config.segment_length(c),work_limits)
+   let outcome:result<array<f32>,string>=temporal.separate_scheduled(context,stream,parameters,struct.borrow(value,field=network),c,schedule,input,cancel,progress)
+   return finish(s,request_stream,schedule,options,outcome)}}}
+ }
+ if s.profile.kind=="residual-waveform"{
+  var c:residual_config.Config=try residual_config.Config_decode(s.profile.identity) map_err codec.describe
+  c.split=options.split
+  c.overlap=options.overlap
+  let _=try residual_config.validate(c)
+  match s.residual{none=>{return result.err("Residual waveform session unavailable")},some(value)=>{
+   var parameters:array<tensor.Tensor>=try device_ops.upload(context,stream,struct.borrow(struct.borrow(value,field=network),field=weights))
+   let size:u64=residual.segment(value,c)
+   var schedule:shifts.Schedule=try inference.begin(request_stream,options,shifts.Family.Outer,view.len(input)/2,size,work_limits)
+   var math:window_math.Vml=try window_math.open_default()
+   let _=try residual.prepare_gpu(context,stream,value,math)
+   let outcome:result<array<f32>,string>=residual.separate_scheduled(context,stream,parameters,value,c,schedule,input,cancel,progress)
+   value.gpu=[]
+   return finish(s,request_stream,schedule,options,outcome)}}
+ }
+ if s.profile.kind=="hybrid"{
+  var c:hybrid_config.Config=try hybrid_config.Config_decode(s.profile.identity) map_err codec.describe
+  c.split=options.split
+  c.overlap=options.overlap
+  let _=try hybrid_config.validate(c)
+  if limits.max_frontends==0{return result.err("Hybrid recording controls require an explicit positive transform budget")}
+  match s.hybrid{none=>{return result.err("Hybrid model session unavailable")},some(value)=>{
+   var parameters:array<tensor.Tensor>=try device_ops.upload(context,stream,struct.borrow(struct.borrow(value,field=network),field=weights))
+   let size:u64=if c.segment_samples!=0{c.segment_samples}else{value.network.constructor.kwargs.segment*44100}
+   var schedule:shifts.Schedule=try inference.begin(request_stream,options,shifts.Family.Outer,view.len(input)/2,size,work_limits)
+   let geometries:hybrid.Limits=hybrid.Limits{max_frontends:limits.max_frontends}
+   let transform:hybrid_frontend.Limits=hybrid_frontend.Limits{workspace_bytes:67108864,clone_bytes:limits.transform_bytes,retained_bytes:limits.transform_bytes}
+   let outcome:result<array<f32>,string>=hybrid.separate_once_with_limits(context,stream,parameters,value,window_math.default_runtime(),c,schedule,input,cancel,progress,geometries,transform)
+   return finish(s,request_stream,schedule,options,outcome)}}
+ }
+ var c:attention_config.Config=try attention_config.Config_decode(s.profile.identity) map_err codec.describe
+ c.split=options.split
+ c.overlap=options.overlap
+ let _=try attention_config.validate(c)
+ let source_count:u64=array.len(s.profile.targets)
+ match s.attention{none=>result.err("Attention model session unavailable"),some(value)=>{
+  var parameters:array<tensor.Tensor>=try device_ops.upload(context,stream,struct.borrow(struct.borrow(value,field=network),field=weights))
+  let size:u64=if c.segment_samples!=0{c.segment_samples}else{value.network.training_length}
+  var schedule:shifts.Schedule=try inference.begin(request_stream,options,shifts.Family.Outer,view.len(input)/2,size,work_limits)
+  let outcome:result<array<f32>,string>=attention.separate_once(context,stream,parameters,value,window_math.default_runtime(),c,schedule,source_count,input,cancel,progress)
+  finish(s,request_stream,schedule,options,outcome)}}
+}

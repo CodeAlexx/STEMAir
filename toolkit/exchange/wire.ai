@@ -1,0 +1,68 @@
+module stemair.exchange.wire
+
+pub type Field=struct{number:u64,kind:u64,value:u64,start:u64,length:u64,next:u64}
+pub type Integer=struct{value:u64,next:u64}
+
+pub fn varint(data:view<byte>,position:u64,end:u64)->result<Integer,string> effects {alloc} {
+ if end>view.len(data) or position>=end{return result.err("Truncated interchange integer")}
+ var value:u64=0
+ var shift:u64=0
+ var cursor:u64=position
+ loop{
+  if cursor>=end or shift>=70{return result.err("Invalid interchange integer")}
+  let raw:u8=cast.bits(view.get(data,cursor))
+  let word:u64=cast.wrap(raw)
+  cursor+=1
+  if shift==63 and word>1{return result.err("Interchange integer overflow")}
+  value |= (word & 127) << shift
+  if word<128{break}
+  shift+=7}
+ result.ok(Integer{value:value,next:cursor})
+}
+pub fn little(data:view<byte>,position:u64,width:u64,end:u64)->result<u64,string> effects {alloc} {
+ if end>view.len(data) or position>end or width>end-position or width>8{return result.err("Truncated interchange fixed-width value")}
+ var out:u64=0
+ var i:u64=0
+ loop{if i>=width{break}
+  let raw:u8=cast.bits(view.get(data,position+i))
+  let word:u64=cast.wrap(raw)
+  out |= word << (8*i)
+  i+=1}
+ result.ok(out)
+}
+pub fn next(data:view<byte>,position:u64,end:u64)->result<Field,string> effects {alloc} {
+ let tag:Integer=try varint(data,position,end)
+ let number:u64=tag.value >> 3
+ let kind:u64=tag.value & 7
+ if number==0 or number>536870911{return result.err("Invalid interchange field number")}
+ if kind==0{
+  let value:Integer=try varint(data,tag.next,end)
+  return result.ok(Field{number:number,kind:kind,value:value.value,start:tag.next,length:value.next-tag.next,next:value.next})}
+ if kind==1 or kind==5{
+  let width:u64=if kind==1{8}else{4}
+  let value:u64=try little(data,tag.next,width,end)
+  return result.ok(Field{number:number,kind:kind,value:value,start:tag.next,length:width,next:tag.next+width})}
+ if kind==2{
+  let count:Integer=try varint(data,tag.next,end)
+  if count.next>end or count.value>end-count.next{return result.err("Interchange field extends past its container")}
+  return result.ok(Field{number:number,kind:kind,value:0,start:count.next,length:count.value,next:count.next+count.value})}
+ result.err("Unsupported interchange wire type")
+}
+pub fn text(data:view<byte>,field:Field)->result<string,string> effects {alloc} {
+ if field.kind!=2 or field.length>1048576{return result.err("Invalid interchange text field")}
+ match str.from_bytes(view.slice(data,field.start,field.start+field.length)){
+  some(value)=>result.ok(string.copy(value)),none=>result.err("Interchange text is not UTF-8"),}
+}
+pub fn integers(data:view<byte>,field:Field)->result<array<u64>,string> effects {alloc} {
+ if field.kind==0{return result.ok([field.value])}
+ if field.kind!=2{return result.err("Invalid packed interchange integers")}
+ var values:array<u64>=[]
+ var cursor:u64=field.start
+ let end:u64=field.start+field.length
+ loop{if cursor>=end{break}
+  if array.len(values)>=1048576{return result.err("Interchange integer list exceeds its bound")}
+  let value:Integer=try varint(data,cursor,end)
+  array.push(values,value.value)
+  cursor=value.next}
+ result.ok(values)
+}

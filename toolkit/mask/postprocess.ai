@@ -1,0 +1,65 @@
+module stemair.mask.postprocess
+import "config.ai" as config
+import "../artifact_cleanup.ai" as cleanup
+import "../control.ai" as control
+import std.float as fp
+import std.libm as libm
+import std.cabi as foreign
+
+// Explicit host ABI association for source-compatible saved spectra.
+// The existing scalar/default confidence law remains unchanged.
+pub fn confidence_host(c:ref<config.Config>,bin:u64,value:f32,library:ref<CAbiLibrary>)->result<f32,string> effects {alloc,ffi}{
+ if c.aggression==0.0{return result.ok(value)}
+ let split:u64=array.borrow(c.bands,0).crop_stop
+ let amount:f64=if c.primary_foreground{1.0-2.0*c.aggression}else{2.0*c.aggression}
+ let exponent:f32=cast.float(if bin<split{1.0+amount/3.0}else{1.0+amount})
+ result.ok(try libm.powf(library,value,exponent) map_err foreign.error_message)
+}
+
+// Same existing aggression expression; both masked outputs use this adjustment.
+pub fn confidence(c:ref<config.Config>,bin:u64,value:f32)->f32 effects {} {
+ if c.aggression==0.0{return value}
+ let split:u64=array.borrow(c.bands,0).crop_stop
+ let amount:f64=if c.primary_foreground{1.0-2.0*c.aggression}else{2.0*c.aggression}
+ let exponent:f32=cast.float(if bin<split{1.0+amount/3.0}else{1.0+amount})
+ fp.pow(value,exponent)
+}
+pub fn apply(mask:ref<array<f32>>,c:ref<config.Config>,bins:u64,frames:u64,settings:ref<cleanup.Settings>,cancel:str)->result<unit,string> effects {alloc,fs.meta} {
+ let _=try cleanup.validate(settings)
+ if not settings.enabled{return result.ok(())}
+ var channel:u64=0
+ loop{if channel==2{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var bin:u64=0
+  loop{if bin==bins{break}
+   var t:u64=0
+   loop{if t==frames{break}
+    let at:u64=(channel*bins+bin)*frames+t
+    array.set(mask,at,confidence(c,bin,array.get(mask,at)))
+    t+=1}
+   bin+=1}
+  channel+=1}
+ let policy:cleanup.Settings=cleanup.Settings{enabled:true,threshold:settings.threshold}
+ let _=try cleanup.apply(mask,2,bins,frames,policy,cancel)
+ result.ok(())
+}
+
+pub fn apply_host(mask:ref<array<f32>>,c:ref<config.Config>,bins:u64,frames:u64,settings:ref<cleanup.Settings>,cancel:str,library:ref<CAbiLibrary>)->result<unit,string> effects {alloc,ffi,fs.meta}{
+ let _=try cleanup.validate(settings)
+ if not settings.enabled{return result.ok(())}
+ var channel:u64=0
+ loop{if channel==2{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var bin:u64=0
+  loop{if bin==bins{break}
+   var t:u64=0
+   loop{if t==frames{break}
+    let at:u64=(channel*bins+bin)*frames+t
+    array.set(mask,at,try confidence_host(c,bin,array.get(mask,at),library))
+    t+=1}
+   bin+=1}
+  channel+=1}
+ let policy:cleanup.Settings=cleanup.Settings{enabled:true,threshold:settings.threshold}
+ let _=try cleanup.apply(mask,2,bins,frames,policy,cancel)
+ result.ok(())
+}

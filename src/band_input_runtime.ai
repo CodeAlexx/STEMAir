@@ -1,0 +1,64 @@
+module stemair.band_input_runtime
+import "source_input_runtime.ai" as source
+import "sound_file_runtime.ai" as identities
+import "../toolkit/band_recording_input.ai" as recording
+import "../toolkit/band_input_rule.ai" as rules
+import "../toolkit/rate_filter.ai" as filter
+import std.audio_rate as rate
+import std.files as files
+import std.path as path
+import std.codec as codec
+import std.json as json
+import std.system as system
+import std.sndfile as sound
+pub type Selected=struct{session:option<recording.Session>,rules:rules.Rules}
+fn error(e:fs.error)->string effects {alloc}{string.copy(fs.error.message(e))}
+fn base(root:str)->result<string,string> effects {alloc,fs.meta}{
+ let installed:string=path.join(root,"runtime/audio-rate")
+ match files.symlink_metadata(installed){ok(info)=>{
+  if not info.is_dir or info.is_symlink{return result.err("The installed audio rate runtime directory must be ordinary")}
+  result.ok(installed)},err(e)=>{if e.code!=1{return result.err("Cannot inspect audio rate runtime directory")}
+  result.ok(path.join(root,"build/runtime/audio-rate"))}}
+}
+pub fn open(root:str,library:str)->result<Selected,string> effects {alloc,env,ffi,fs.read,fs.meta}{
+ let raw:bytes=match files.read_limited(path.join(root,"licenses/band-input-runtime.json"),16384){ok(value)=>value,err(_)=>{return result.err("Band recording runtime identity is unavailable")}}
+ let raw_text:str=match str.from_bytes(bytes.view(raw)){some(value)=>value,none=>{return result.err("Band recording runtime identity must be UTF-8")}}
+ var doc:json.Document=try json.parse(raw_text) map_err json.message
+ let policy:codec.Policy=codec.Policy{reject_unknown:false,reject_duplicates:true}
+ var data:codec.Reader=codec.root_reader(policy)
+ if (try codec.u32_field(doc,data,"version") map_err codec.describe)!=1{return result.err("Unsupported band recording runtime identity")}
+ var asset:codec.Reader=try codec.object_field(doc,data,"rules_asset",policy) map_err codec.describe
+ let rule_path:string=try codec.text_field(doc,asset,"file") map_err codec.describe
+ let rule_sha:string=try codec.text_field(doc,asset,"sha256") map_err codec.describe
+ let rule_bytes:u64=try codec.u64_field(doc,asset,"bytes") map_err codec.describe
+ let _=try codec.reader_finish(doc,asset) map_err codec.describe
+ if rule_path!="assets/mask-input-rules-v1.json" or rule_bytes==0 or rule_bytes>262144 or str.len(rule_sha)!=64{return result.err("Invalid accepted band-reader parameter identity")}
+ let contents:bytes=match files.read_limited(path.join(root,rule_path),262144){ok(value)=>value,err(_)=>{return result.err("Band recording parameter rules are unavailable")}}
+ if view.len(bytes.view(contents))!=rule_bytes or bytes.hex(hash.sha256(bytes.view(contents)))!=rule_sha{return result.err("Band recording parameter rules differ from their identity")}
+ let rule_text:str=match str.from_bytes(bytes.view(contents)){some(value)=>value,none=>{return result.err("Band recording parameter rules must be UTF-8")}}
+ let selected_rules:rules.Rules=try rules.Rules_decode(rule_text) map_err codec.describe
+ var fast:codec.Reader=try codec.object_field(doc,data,"fast_filter",policy) map_err codec.describe
+ let fast_path:string=try codec.text_field(doc,fast,"path") map_err codec.describe
+ let fast_sha:string=try codec.text_field(doc,fast,"sha256") map_err codec.describe
+ let fast_bytes:u64=try codec.u64_field(doc,fast,"bytes") map_err codec.describe
+ let _=try codec.reader_finish(doc,fast) map_err codec.describe
+ if fast_path!="assets/rate-filter-fast-v1.npz" or fast_bytes==0 or fast_bytes>4194304 or str.len(fast_sha)!=64{return result.err("Invalid fast band-rate filter identity")}
+ let fast_asset:filter.Asset=filter.Asset{path:path.join(root,fast_path),sha256:fast_sha,max_archive_bytes:4194304,max_values:500000,max_header_bytes:1024}
+ var platform:codec.Reader=try codec.object_field(doc,data,if system.platform()=="windows"{"windows"}else{"linux"},policy) map_err codec.describe
+ let directory:string=try base(root)
+ let adapter_name:string=try codec.text_field(doc,platform,"adapter") map_err codec.describe
+ let library_name:string=try codec.text_field(doc,platform,"library") map_err codec.describe
+ let expected_adapter:str=if system.platform()=="windows"{"air_audio_rate.dll"}else{"libair_audio_rate.so"}
+ let expected_library:str=if system.platform()=="windows"{"libsamplerate-64bit.dll"}else{"libsamplerate.so.0"}
+ if adapter_name!=expected_adapter or library_name!=expected_library{return result.err("Unsupported analysis-band rate runtime filenames")}
+ let native:rate.Runtime=rate.Runtime{adapter:path.join(directory,adapter_name),adapter_sha256:try codec.text_field(doc,platform,"adapter_sha256") map_err codec.describe,library:path.join(directory,library_name),library_sha256:try codec.text_field(doc,platform,"library_sha256") map_err codec.describe,version:try codec.text_field(doc,platform,"version_string") map_err codec.describe}
+ let _=try codec.reader_finish(doc,platform) map_err codec.describe
+ let _=try codec.reader_finish(doc,data) map_err codec.describe
+ var sound_tool:sound.Tool=try source.tool(root,library)
+ let session:recording.Session=try recording.open(sound_tool,try identities.rate_filter(root),fast_asset,option.some(native))
+ result.ok(Selected{session:option.some(session),rules:selected_rules})
+}
+pub fn close(selected:Selected own)->result<unit,string> effects {alloc,ffi}{
+ var owned:Selected=selected
+ match struct.replace(owned,option.none(),field=session){none=>result.ok(()),some(session)=>recording.close(session)}
+}

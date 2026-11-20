@@ -1,0 +1,227 @@
+module stemair.hybrid.host
+import "network.ai" as network
+import "host_prepared.ai" as prepared
+import "host_ops.ai" as host
+import "host_residual.ai" as residual
+import "device.ai" as normalization
+import "spectral.ai" as spectral
+import "../ops.ai" as rows
+import "../numeric.ai" as num
+import "../control.ai" as control
+import "magnitude.ai" as magnitude
+import "host_transform.ai" as transform
+import "multi_layout.ai" as multi
+import "multi_host.ai" as bands
+import "multi_capacity.ai" as capacity
+import "magnitude_capacity.ai" as magnitude_capacity
+
+fn branch(n:ref<network.Network>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,input:host.Tensor own,index:u64,frequency:bool,cancel:str)->result<host.Tensor,string> effects {alloc,ffi,fs.meta} {
+ var x:host.Tensor=input
+ let batches:u64=x.n
+ let frequencies:u64=x.h
+ if frequency{x=try host.fold(x)}
+ x=try residual.forward(n,p,library,index,x,cancel)
+ if frequency{x=try host.unfold(x,batches,frequencies)}
+ result.ok(x)
+}
+pub fn encode(n:ref<network.Network>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,block:network.Encoder,input:host.Tensor own,inject:option<host.Tensor> own,cancel:str)->result<host.Tensor,string> effects {alloc,ffi,fs.meta} {
+ var x:host.Tensor=input
+ if not block.frequency{x=try host.pad_right(x,block.stride)}
+ var y:host.Tensor=try prepared.convolve(n,p,library,x,block.conv)
+ host.release(x)
+ if block.empty{return result.ok(y)}
+ match inject{some(v)=>{var held:host.Tensor=v
+  y=try host.add(y,held)},none=>{}}
+ y=try host.normalize(struct.borrow(n,field=weights),y,block.norm1)
+ y=host.gelu(y)
+ match block.residual{some(i)=>{y=try branch(n,p,library,y,i,block.frequency,cancel)},none=>{}}
+ var z:host.Tensor=try prepared.convolve(n,p,library,y,block.rewrite)
+ host.release(y)
+ z=try host.normalize(struct.borrow(n,field=weights),z,block.norm2)
+ host.glu(z)
+}
+pub type Decoded=struct{output:host.Tensor,pre:host.Tensor}
+pub fn decode(n:ref<network.Network>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,block:network.Decoder,input:host.Tensor own,skip:ref<host.Tensor>,length:u64,cancel:str)->result<Decoded,string> effects {alloc,ffi,fs.meta} {
+ var y:host.Tensor=input
+ if not block.empty{
+  y=try host.add(y,skip)
+  var rewrite:host.Tensor=try prepared.convolve(n,p,library,y,block.rewrite)
+  host.release(y)
+  rewrite=try host.normalize(struct.borrow(n,field=weights),rewrite,block.norm1)
+  y=try host.glu(rewrite)
+  match block.residual{some(i)=>{y=try branch(n,p,library,y,i,block.frequency,cancel)},none=>{}}}
+ var z:host.Tensor=try prepared.convolve(n,p,library,y,block.conv)
+ z=try host.normalize(struct.borrow(n,field=weights),z,block.norm2)
+ if block.frequency{
+  if block.pad!=0{
+   if z.h<=2*block.pad{return result.err("CPU hybrid frequency crop is empty")}
+   let count:u64=z.h-2*block.pad
+   z=try host.crop(z,2,block.pad,count)}
+ }else{z=try host.crop(z,3,block.pad,length)}
+ if not block.last{z=host.gelu(z)}
+ result.ok(Decoded{output:z,pre:y})
+}
+pub fn encode_bands(n:ref<network.Network>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,level:u64,input:host.Tensor own,inject:option<host.Tensor> own,cancel:str)->result<host.Tensor,string> effects {alloc,ffi,fs.meta}{
+ var x:host.Tensor=input
+ if array.len(array.borrow(n.encoder_bands,level).layers)==0{return encode(n,p,library,array.get(n.encoder,level),x,inject,cancel)}
+ if option.is_some(inject){return result.err("Frequency band encoder cannot accept an injection")}
+ let ratios:view<f64>=array.view(n.constructor.kwargs.multi_freqs)
+ var geometry:array<multi.Band>=try multi.encoder(x.h,ratios,8,4)
+ if array.len(geometry)!=array.len(array.borrow(n.encoder_bands,level).layers){return result.err("Frequency band encoder inventory differs")}
+ var outputs:array<host.Tensor>=[]
+ var i:u64=0
+ loop{if i==array.len(geometry){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let span:multi.Band=array.get(geometry,i)
+  var part:host.Tensor=try bands.span(x,span.start,span.count,span.left,span.right)
+  array.push(outputs,try encode(n,p,library,array.get(array.borrow(n.encoder_bands,level).layers,i),part,option.none(),cancel))
+  i+=1}
+ bands.join(outputs)
+}
+pub fn decode_bands(n:ref<network.Network>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,level:u64,input:host.Tensor own,skip:ref<host.Tensor>,length:u64,cancel:str)->result<Decoded,string> effects {alloc,ffi,fs.meta}{
+ var x:host.Tensor=input
+ if array.len(array.borrow(n.decoder_bands,level).layers)==0{return decode(n,p,library,array.get(n.decoder,level),x,skip,length,cancel)}
+ if x.h!=skip.h{return result.err("Frequency band decoder skip differs")}
+ var geometry:array<multi.Band>=try multi.decoder(x.h,array.view(n.constructor.kwargs.multi_freqs))
+ if array.len(geometry)!=array.len(array.borrow(n.decoder_bands,level).layers){return result.err("Frequency band decoder inventory differs")}
+ var outputs:array<host.Tensor>=[]
+ var i:u64=0
+ loop{if i==array.len(geometry){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let span:multi.Band=array.get(geometry,i)
+  var part:host.Tensor=try bands.span(x,span.start,span.count,0,0)
+  var held:host.Tensor=try bands.span(skip,span.start,span.count,0,0)
+  var block:network.Decoder=array.get(array.borrow(n.decoder_bands,level).layers,i)
+  block.last=true
+  var decoded:Decoded=try decode(n,p,library,block,part,held,0,cancel)
+  var out:host.Tensor=struct.replace(decoded,host.Tensor{n:1,c:1,h:1,w:1,data:[]},field=output)
+  let stride:u64=block.conv.stride_h
+  if i!=0{
+   let bias:view<f32>=array.view(array.borrow(n.weights.parameters.values,block.conv.bias).values)
+   let _=try bands.overlap(array.borrow(outputs,i-1),out,bias,stride)
+   let kept:u64=out.h-stride
+   out=try host.crop(out,2,stride,kept)}
+  if i+1==array.len(geometry){let kept:u64=out.h-stride/2
+   out=try host.crop(out,2,0,kept)}
+  if i==0{let kept:u64=out.h-stride/2
+   out=try host.crop(out,2,stride/2,kept)}
+  array.push(outputs,out)
+  i+=1}
+ var joined:host.Tensor=try bands.join(outputs)
+ if not array.get(n.decoder,level).last{joined=host.gelu(joined)}
+ result.ok(Decoded{output:joined,pre:host.Tensor{n:1,c:1,h:1,w:1,data:[]}})
+}
+fn embedding(n:ref<network.Network>,input:host.Tensor own)->result<host.Tensor,string> effects {alloc} {
+ var x:host.Tensor=input
+ let values:ref<array<f32>>=struct.borrow(array.borrow(n.weights.parameters.values,n.embedding),field=values)
+ if x.n!=1 or x.c!=48 or x.h!=512{return result.err("CPU hybrid embedding geometry differs")}
+ var c:u64=0
+ loop{if c==x.c{break}
+  var f:u64=0
+  loop{if f==x.h{break}
+   let scaled:f32=array.get(values,f*x.c+c)*10.0
+   let value:f32=scaled*0.2
+   var t:u64=0
+   loop{if t==x.w{break}
+    let i:u64=(c*x.h+f)*x.w+t
+    array.set(x.data,i,array.get(x.data,i)+value)
+    t+=1}
+   f+=1}
+  c+=1}
+ result.ok(x)
+}
+pub fn forward(n:ref<network.Network>,p:ref<prepared.Backend>,library:ref<CAbiLibrary>,input:ref<rows.Tensor>,cancel:str)->result<rows.Tensor,string> effects {alloc,ffi,fs.meta} {
+ let cac:bool=n.constructor.kwargs.cac
+ let sources:u64=array.len(n.constructor.kwargs.sources)
+ let output_channels:u64=2*sources
+ let complex_channels:u64=4*sources
+ let frequency_channels:u64=if cac{4}else{2}
+ let estimated_channels:u64=frequency_channels*sources
+ if input.c!=2 or input.h!=1 or input.w==0 or input.w>16711680 or array.len(input.data)!=2*input.w or not num.finite(array.view(input.data)) or array.len(p.slots)!=array.len(n.weights.parameters.values){return result.err("Invalid or unprepared CPU hybrid waveform")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ let length:u64=input.w
+ if array.len(n.constructor.kwargs.multi_freqs)!=0{
+  let plan:capacity.Plan=try capacity.plan(length)
+  if plan.peak_words>p.max_tensor_elements or plan.peak_words>p.max_convolution_elements or plan.complex_words>p.max_transpose_elements or
+   plan.transpose_matrix_words>p.max_transpose_matrix_elements or plan.matrix_input_bytes>p.max_matrix_input_bytes or plan.local_words>p.max_local_elements{
+   return result.err("Frequency-band recording exceeds retained CPU capacities")}
+  let _=try capacity.require_memory(plan,p.max_activation_bytes)}
+ if not cac and p.max_activation_bytes!=0{let planned:magnitude_capacity.Plan=try magnitude_capacity.plan(length)
+  let _=try magnitude_capacity.require_memory(planned,p.max_activation_bytes)}
+ var interleaved:array<f32>=[]
+ array.reserve(interleaved,array.len(input.data))
+ var i:u64=0
+ loop{if i==length{break}
+  array.push(interleaved,array.get(input.data,i))
+  array.push(interleaved,array.get(input.data,length+i))
+  i+=1}
+ var spectrum:rows.Tensor=if array.len(p.transforms)==0{try spectral.analyze(struct.borrow(n,field=spectral),array.view(interleaved),2)}else{match prepared.transform_index(p,length){none=>{return result.err("CPU hybrid transform extent was not prepared")},some(index)=>{try transform.analyze(array.borrow(p.transforms,index),array.view(interleaved))}}}
+ var frequency_norm:normalization.Normalized=if cac{try normalization.normalized(array.view(spectrum.data))}else{
+  var values:rows.Tensor=try magnitude.input(spectrum)
+  try normalization.normalized(array.view(values.data))}
+ var time_norm:normalization.Normalized=try normalization.normalized(array.view(input.data))
+ var x:host.Tensor=try host.make_limited(1,frequency_channels,spectrum.h,spectrum.w,struct.replace(frequency_norm,[],field=values),p.max_tensor_elements)
+ var xt:host.Tensor=try host.make_limited(1,2,1,length,struct.replace(time_norm,[],field=values),p.max_tensor_elements)
+ if cac{spectrum.data=[]}
+ interleaved=[]
+ var saved:array<host.Tensor>=[]
+ var saved_time:array<host.Tensor>=[]
+ var lengths:array<u64>=[]
+ var time_lengths:array<u64>=[]
+ i=0
+ loop{if i==6{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  array.push(lengths,x.w)
+  var inject:option<host.Tensor>=option.none()
+  if i<5{
+   array.push(time_lengths,xt.w)
+   let b:network.Encoder=array.get(n.tencoder,i)
+   xt=try encode(n,p,library,b,xt,option.none(),cancel)
+   if b.empty{inject=option.some(host.copy(xt))}else{array.push(saved_time,host.copy(xt))}}
+  x=try encode_bands(n,p,library,i,x,inject,cancel)
+  if i==0{x=try embedding(n,x)}
+  array.push(saved,host.copy(x))
+  i+=1}
+ x=host.zeros(x)
+ i=6
+ loop{if i==0{break}
+  i-=1
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var skip:host.Tensor=match array.pop(saved){some(v)=>v,none=>{return result.err("Missing CPU hybrid skip")}}
+  let given:u64=match array.pop(lengths){some(v)=>v,none=>{return result.err("Missing CPU hybrid extent")}}
+  var decoded:Decoded=try decode_bands(n,p,library,i,x,skip,given,cancel)
+  host.release(skip)
+  x=struct.replace(decoded,host.Tensor{n:1,c:1,h:1,w:1,data:[]},field=output)
+  if i<5{
+   let b:network.Decoder=array.get(n.tdecoder,i)
+   let time_length:u64=match array.pop(time_lengths){some(v)=>v,none=>{return result.err("Missing CPU hybrid time extent")}}
+   if b.empty{
+    var pre:host.Tensor=struct.replace(decoded,host.Tensor{n:1,c:1,h:1,w:1,data:[]},field=pre)
+    var unused:host.Tensor=host.Tensor{n:1,c:1,h:1,w:1,data:[]}
+    var time_decoded:Decoded=try decode(n,p,library,b,pre,unused,time_length,cancel)
+    xt=struct.replace(time_decoded,host.Tensor{n:1,c:1,h:1,w:1,data:[]},field=output)
+   }else{
+    var time_skip:host.Tensor=match array.pop(saved_time){some(v)=>v,none=>{return result.err("Missing CPU hybrid time skip")}}
+    var time_decoded:Decoded=try decode(n,p,library,b,xt,time_skip,time_length,cancel)
+    xt=struct.replace(time_decoded,host.Tensor{n:1,c:1,h:1,w:1,data:[]},field=output)}}}
+ if x.n!=1 or x.c!=estimated_channels or x.h!=2048 or x.w!=(length+1023)/1024 or xt.n!=1 or xt.c!=output_channels or xt.h!=1 or xt.w!=length{return result.err("CPU hybrid complete graph extents differ")}
+ var estimates:rows.Tensor=rows.tensor(estimated_channels,x.h,x.w,struct.replace(x,[],field=data))
+ i=0
+ loop{if i==array.len(estimates.data){break}
+  array.set(estimates.data,i,array.get(estimates.data,i)*frequency_norm.deviation+frequency_norm.mean)
+  i+=1}
+ var complex:rows.Tensor=if cac{estimates}else{try magnitude.reconstruct(spectrum,estimates,sources)}
+ spectrum.data=[]
+ let inverse:array<f32>=try spectral.synthesize(struct.borrow(n,field=spectral),complex,length)
+ var out:array<f32>=num.zeros(output_channels*length)
+ var c:u64=0
+ loop{if c==output_channels{break}
+  i=0
+  loop{if i==length{break}
+   let wave:f32=array.get(xt.data,c*length+i)*time_norm.deviation+time_norm.mean
+   array.set(out,c*length+i,wave+array.get(inverse,i*output_channels+c))
+   i+=1}
+  c+=1}
+ if not num.finite(array.view(out)){return result.err("CPU hybrid output is non-finite")}
+ result.ok(rows.tensor(output_channels,1,length,out))
+}

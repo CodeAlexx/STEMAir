@@ -1,0 +1,119 @@
+module stemair.temporal.host
+import "network.ai" as network
+import "../weights.ai" as weights
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+import "../channel_statistics.ai" as stats
+import "../control.ai" as control
+import std.cpu_conv2d as convolution
+import std.cpu_matmul as matrix
+
+// Startup-only immutable packs; the caller retains the original checkpoint too.
+pub type Backend=struct{convolutions:array<option<convolution.Prepared>>,basis:matrix.Matrix,packs:u64,bytes:u64}
+pub fn prepare(n:ref<network.Network>)->result<Backend,string> effects {alloc} {
+ let c:network.Options=n.options
+ if (c.generation!=1 and c.generation!=2) or c.features!=256 or c.window!=20 or c.bottleneck!=256 or c.hidden!=512 or c.kernel!=3 or c.blocks!=10 or c.repeats!=4 or c.sources!=4 or c.channels!=2 or c.rate!=44100 or c.norm!=network.NormKind.Global or c.causal or c.mask!=network.MaskKind.Relu or n.original_parameters!=366{return result.err("CPU temporal architecture has not been qualified")}
+ var convs:array<option<convolution.Prepared>>=[]
+ var packs:u64=0
+ var total:u64=0
+ var i:u64=0
+ loop{if i==array.len(n.weights.parameters.values){break}
+  let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,i)
+  if array.len(p.shape)==3 and array.get(p.shape,0)!=1{
+   let shape:array<u64>=[array.get(p.shape,0),array.get(p.shape,1),1,array.get(p.shape,2)]
+   let packed:convolution.Prepared=try convolution.prepare(array.view(p.values),array.view(shape))
+   total+=view.len(bytes.view(packed.values))
+   array.push(convs,option.some(packed))
+   packs+=1
+  }else{array.push(convs,option.none())}
+  i+=1}
+ let p:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,n.basis)
+ let basis:matrix.Matrix=try matrix.prepare(array.view(p.values),40,256,matrix.Limits{})
+ total+=view.len(bytes.view(basis.data))
+ if packs!=123{return result.err("CPU temporal convolution inventory differs")}
+ result.ok(Backend{convolutions:convs,basis:basis,packs:packs+1,bytes:total})
+}
+pub fn convolve(n:ref<network.Network>,p:ref<Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,id:u64,stride:u64,padding:u64,dilation:u64,groups:u64)->result<ops.Tensor,string> effects {alloc,ffi} {
+ if input.h!=1{return result.err("CPU temporal signal must be one-dimensional")}
+ let packed:ref<convolution.Prepared>=match array.borrow(p.convolutions,id){some(v)=>v,none=>{return result.err("Temporal weight was not prepared")}}
+ let shape:array<u64>=[1,input.c,1,input.w]
+ let empty:array<f32>=[]
+ let options:convolution.Options=convolution.Options{groups:groups,stride_width:stride,padding_width:padding,dilation_width:dilation}
+ let geometry:convolution.Geometry=try convolution.geometry(array.view(shape),array.view(packed.shape),options)
+ let values:array<f32>=try convolution.convolve_blas(library,array.view(input.data),array.view(shape),packed,array.view(empty),options,8388608)
+ result.ok(ops.tensor(geometry.output_channels,1,geometry.output_width,values))
+}
+fn normalize(n:ref<network.Network>,input:ops.Tensor own,form:network.Normalization,slope:option<u64>)->result<ops.Tensor,string> effects {alloc} {
+ var x:ops.Tensor=input
+ match slope{some(id)=>{x=try stats.prelu(x,array.get(array.borrow(n.weights.parameters.values,id).values,0))},none=>{},}
+ let gamma:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,form.gamma)
+ let beta:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,form.beta)
+ stats.normalize(x,array.view(gamma.values),array.view(beta.values),if form.kind==network.NormKind.Channel{stats.Kind.Channel}else{stats.Kind.Global},0.00000001)
+}
+fn relu(input:ops.Tensor own)->ops.Tensor effects {alloc} {
+ var x:ops.Tensor=input
+ var i:u64=0
+ loop{if i==array.len(x.data){break}
+  if array.get(x.data,i)<0.0{array.set(x.data,i,0.0)}
+  i+=1}
+ x
+}
+pub fn forward(n:ref<network.Network>,p:ref<Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ let length:u64=try network.valid_length(n,input.w)
+ if input.c!=2 or input.h!=1 or array.len(input.data)!=2*length or p.packs!=124 or array.len(p.convolutions)!=n.original_parameters or not num.finite(array.view(input.data)){return result.err("Invalid or unprepared CPU temporal input")}
+ if control.cancelled(cancel){return result.err("Separation cancelled")}
+ var encoded:ops.Tensor=relu(try convolve(n,p,library,input,n.encoder,10,0,1,1))
+ var normalized:ops.Tensor=try normalize(n,ops.tensor(encoded.c,1,encoded.w,num.copy(array.view(encoded.data))),n.input_norm,option.none())
+ var x:ops.Tensor=try convolve(n,p,library,normalized,n.bottleneck,1,0,1,1)
+ normalized.data=[]
+ var index:u64=0
+ loop{if index==array.len(n.blocks){break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let b:network.Block=array.get(n.blocks,index)
+  var expanded:ops.Tensor=try convolve(n,p,library,x,b.expand,1,0,1,1)
+  expanded=try normalize(n,expanded,b.norm1,option.some(b.slope1))
+  var depth:ops.Tensor=try convolve(n,p,library,expanded,b.depthwise,1,b.padding,b.dilation,512)
+  expanded.data=[]
+  depth=try normalize(n,depth,b.norm2,option.some(b.slope2))
+  var projected:ops.Tensor=try convolve(n,p,library,depth,b.project,1,0,1,1)
+  depth.data=[]
+  if projected.c!=x.c or projected.w!=x.w{return result.err("Temporal residual geometry differs")}
+  var at:u64=0
+  loop{if at==array.len(x.data){break}
+   array.set(x.data,at,array.get(projected.data,at)+array.get(x.data,at))
+   at+=1}
+  index+=1}
+ var score:ops.Tensor=relu(try convolve(n,p,library,x,n.mask,1,0,1,1))
+ x.data=[]
+ let time:u64=score.w
+ var output:array<f32>=num.zeros(8*length)
+ var source:u64=0
+ loop{if source==4{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var values:array<f32>=[]
+  array.reserve(values,time*256)
+  var frame:u64=0
+  loop{if frame==time{break}
+   var feature:u64=0
+   loop{if feature==256{break}
+    array.push(values,array.get(encoded.data,feature*time+frame)*array.get(score.data,(source*256+feature)*time+frame))
+    feature+=1}
+   frame+=1}
+  var rows:matrix.Matrix=try matrix.prepare(array.view(values),time,256,matrix.Limits{})
+  values=[]
+  let frames:array<f32>=try matrix.multiply(library,rows,matrix.Operation.Identity,struct.borrow(p,field=basis),matrix.Operation.Transpose,matrix.Limits{})
+  frame=0
+  loop{if frame==time{break}
+   var channel:u64=0
+   loop{if channel==2{break}
+    var at:u64=0
+    loop{if at==20{break}
+     let target:u64=(source*2+channel)*length+frame*10+at
+     array.set(output,target,array.get(output,target)+array.get(frames,frame*40+channel*20+at))
+     at+=1}
+    channel+=1}
+   frame+=1}
+  source+=1}
+ if not num.finite(array.view(output)){return result.err("Non-finite temporal decoder output")}
+ result.ok(ops.tensor(8,1,length,output))
+}

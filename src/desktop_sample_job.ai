@@ -1,0 +1,26 @@
+module stemair.desktop_sample_job
+import "recording_sample_job.ai" as sample_job
+import "recording_sample_application.ai" as application
+import "recording_sample_panel.ai" as panel
+import "job.ai" as job
+import "../toolkit/model_cache.ai" as cache
+import std.codec as codec
+import std.path as path
+
+pub fn run(work:sample_job.Work own)->job.Completed effects {alloc,fs.read,fs.write,fs.meta,process,time,ffi} {
+ var outcome:sample_job.Outcome=sample_job.run(work)
+ let retained:option<cache.Cache>=struct.replace(outcome,option.none(),field=retained)
+ let envelope:ref<application.Envelope>=struct.borrow(outcome,field=envelope)
+ let encoded:string=match application.Envelope_encode(envelope){ok(value)=>value,err(error)=>{
+  return job.Completed{retained:retained,ok:false,message:codec.describe(error),queue_report:option.none()}}}
+ let report:ref<application.Report>=struct.borrow(envelope,field=report)
+ var directory:string=""
+ var i:u64=0
+ loop{if i==array.len(report.rows){break}
+  let row:ref<application.Row>=array.borrow(report.rows,i)
+  if row.success{directory=path.dirname(row.path)
+   break}
+  i+=1}
+ job.Completed{retained:retained,ok:report.completed and report.total>0 and panel.successes(report)==report.total,
+  message:panel.summary(report),queue_report:option.none(),directory:directory,sample_report:encoded}
+}

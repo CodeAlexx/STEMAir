@@ -1,0 +1,76 @@
+// Optional retained published CPU real-FFT route. Caller selects its exact
+// runtime and closes the plan. The portable framing/default remains separate.
+module stemair.hybrid.host_transform
+import std.mkl_fft as fft
+import std.mkl_vml as vml
+import std.float as fp
+import "../ops.ai" as ops
+import "../numeric.ai" as num
+pub type Plan=struct{transform:option<fft.Plan>,window:array<f32>,n:u64,hop:u64,length:u64,frames:u64,old:bool,scale:f32}
+pub fn create(runtime:str,n:u64,length:u64,old:bool)->result<Plan,string> effects {alloc,ffi}{
+ create_with_limit(runtime,n,length,old,268435456)
+}
+pub fn create_with_limit(runtime:str,n:u64,length:u64,old:bool,staging_limit:u64)->result<Plan,string> effects {alloc,ffi}{
+ if n<8 or n>65536 or n%8!=0 or length<=n or length>16711680{return result.err("Invalid retained CPU hybrid transform geometry")}
+ let hop:u64=n/4
+ let frames:u64=(length+hop-1)/hop+4
+ var library:vml.Vml=try vml.open(runtime)
+ let window:array<f32>=try vml.hann_f32(library,n,true)
+ let transform:fft.Plan=try fft.plan(runtime,n,2*frames,fft.Precision.F32,staging_limit)
+ let count:f32=cast.float(n)
+ result.ok(Plan{transform:option.some(transform),window:window,n:n,hop:hop,length:length,frames:frames,old:old,scale:fp.sqrt(count)})
+}
+pub fn close(value:Plan own)->result<unit,string> effects {alloc,ffi}{
+ var p:Plan=value
+ let held:option<fft.Plan>=struct.replace(p,option.none(),field=transform)
+ match held{none=>result.ok(()),some(plan)=>fft.close(plan)}
+}
+pub fn analyze(p:ref<Plan>,input:view<f32>)->result<ops.Tensor,string> effects {alloc,ffi}{
+ if view.len(input)!=2*p.length or not num.finite(input){return result.err("Retained CPU transform input differs from its prepared length")}
+ let left:u64=p.hop/2*3
+ let padded:u64=(p.frames-4)*p.hop+2*left
+ var windowed:array<f32>=[]
+ array.reserve(windowed,2*p.frames*p.n)
+ var c:u64=0
+ loop{if c==2{break}
+  var t:u64=0
+  loop{if t==p.frames{break}
+   var i:u64=0
+   loop{if i==p.n{break}
+    let at:i64=cast.sat(t*p.hop+i)-cast.sat(p.n/2)
+    let center:i64=if at<0{-at}else{if at>=cast.sat(padded){cast.sat(2*padded)-2-at}else{at}}
+    let original:i64=center-cast.sat(left)
+    var value:f32=0.0
+    if p.old{if original>=0 and original<cast.sat(p.length){value=view.get(input,2*cast.sat(original)+c)}}else{
+     let reflected:i64=if original<0{-original}else{if original>=cast.sat(p.length){cast.sat(2*p.length)-2-original}else{original}}
+     value=view.get(input,2*cast.sat(reflected)+c)}
+    array.push(windowed,value*array.get(p.window,i))
+    i+=1}
+   t+=1}
+  c+=1}
+ let transformed:array<f32>=match p.transform{none=>{return result.err("Retained CPU transform is closed")},some(plan)=>{try fft.forward_f32(plan,array.view(windowed))}}
+ let frames:u64=p.frames-4
+ let bins:u64=p.n/2
+ var out:array<f32>=num.zeros(4*bins*frames)
+ c=0
+ loop{if c==2{break}
+  var f:u64=0
+  loop{if f==bins{break}
+   var t:u64=0
+   loop{if t==frames{break}
+    let source:u64=2*((c*p.frames+t+2)*(bins+1)+f)
+    array.set(out,(2*c*bins+f)*frames+t,array.get(transformed,source)/p.scale)
+    array.set(out,((2*c+1)*bins+f)*frames+t,array.get(transformed,source+1)/p.scale)
+    t+=1}
+   f+=1}
+  c+=1}
+ result.ok(ops.tensor(4,bins,frames,out))
+}
+pub fn staging_bytes(n:u64,length:u64)->result<u64,string> effects {alloc}{
+ if n<8 or n>65536 or n%8!=0 or length<=n or length>16711680{return result.err("Invalid explicit CPU transform geometry")}
+ let frames:u64=(length+n/4-1)/(n/4)+4
+ result.ok(2*(2*frames)*(n/2+1)*2*4)
+}
+pub fn statistics(p:ref<Plan>)->result<fft.Statistics,string> effects {alloc,ffi}{
+ match p.transform{none=>{return result.err("CPU transform is closed")},some(held)=>fft.statistics(held)}
+}

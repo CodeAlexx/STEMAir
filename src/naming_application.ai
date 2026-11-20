@@ -1,0 +1,76 @@
+module stemair.naming_application
+import "output_naming.ai" as naming
+import "model_defaults.ai" as defaults
+import "../toolkit/output_names.ai" as names
+import "../toolkit/engine.ai" as engine
+import "../toolkit/secondary_config.ai" as secondary
+import "../toolkit/model_ensemble_config.ai" as ensemble_config
+import std.codec as codec
+import std.path as path
+
+// Current controls are copied into an accepted job or queue snapshot. They do
+// not mutate that snapshot when the user later edits the current controls.
+pub type Choices=struct{append_model:bool=false,model_folder:bool=false,testing:bool=false,
+ append_ensemble:bool=false,ensemble_label:string=""} derive codec(strict)
+pub fn validate(choices:ref<Choices>)->result<unit,string> effects {alloc} {
+ if choices.append_ensemble and str.len(choices.ensemble_label)>0 and not names.component(choices.ensemble_label){
+  return result.err("Choose an ensemble label without path separators")}
+ result.ok(())
+}
+pub fn model(profile:ref<engine.Profile>,checkpoint:str,definition:str,choices:ref<Choices>,ordinal:u64,timestamp:u64)->result<naming.Context,string>
+ effects {alloc,fs.read,fs.meta} {
+ if ordinal==0{return result.err("Recording numbers begin at one")}
+ // The filename is sufficient. A retained checkpoint may already be offline.
+ let label:string=try names.recording_stem(path.basename(checkpoint))
+ if not names.component(label){return result.err("Choose a complete model filename")}
+ var labels:array<naming.Label>=[]
+ if str.len(definition)>0{
+  let accepted:defaults.LoadedRecord=try defaults.inspect_published(definition)
+  if str.view(accepted.record.configuration)!=str.view(profile.identity){return result.err("Model labels differ from the accepted configuration")}
+  if array.len(accepted.record.labels)!=array.len(profile.targets){return result.err("Model labels differ from the accepted target order")}
+  var index:u64=0
+  loop{if index==array.len(profile.targets){break}
+   array.push(labels,naming.Label{target:string.copy(array.get(profile.targets,index)),label:string.copy(array.get(accepted.record.labels,index))})
+   index+=1}
+ }
+ result.ok(naming.Context{model:label,labels:labels,ordinal:ordinal,timestamp:timestamp,testing:choices.testing,
+  append_model:choices.append_model,model_folder:choices.model_folder})
+}
+pub fn read_model(configuration:str,checkpoint:str,definition:str,choices:ref<Choices>,ordinal:u64,timestamp:u64)->result<naming.Context,string>
+ effects {alloc,fs.read,fs.meta} {
+ let profile:engine.Profile=try engine.read(configuration)
+ model(profile,checkpoint,definition,choices,ordinal,timestamp)
+}
+pub fn chain(recipe:ref<secondary.Recipe>,primary_definition:str,choices:ref<Choices>,ordinal:u64,timestamp:u64)->result<naming.Chain,string>
+ effects {alloc,fs.read,fs.meta} {
+ if array.len(recipe.models)==0{return result.err("Choose a primary model before naming its outputs")}
+ var models:array<naming.Context>=[]
+ var index:u64=0
+ loop{if index==array.len(recipe.models){break}
+  let selected:ref<secondary.Model>=array.borrow(recipe.models,index)
+  let definition:string=if str.len(selected.definition)>0{string.copy(selected.definition)}else{if index==0{string.copy(primary_definition)}else{""}}
+  array.push(models,try read_model(selected.config,selected.checkpoint,definition,choices,ordinal,timestamp))
+  index+=1}
+ let main:naming.Context=try naming.copy(array.borrow(models,0))
+ result.ok(naming.Chain{main:main,models:models})
+}
+pub fn ensemble(recipe:ref<ensemble_config.Recipe>,choices:ref<Choices>,ordinal:u64,timestamp:u64)->result<naming.Ensemble,string>
+ effects {alloc,fs.read,fs.meta} {
+ let _=try validate(choices)
+ if array.len(recipe.models)<2{return result.err("Choose at least two ensemble models")}
+ var members:array<naming.Chain>=[]
+ var index:u64=0
+ loop{if index==array.len(recipe.models){break}
+  let selected:ref<ensemble_config.Model>=array.borrow(recipe.models,index)
+  var main:naming.Context=try read_model(selected.config,selected.checkpoint,selected.definition,choices,ordinal,timestamp)
+  var member:naming.Chain=if str.len(selected.processing)>0{
+   let processing:secondary.Recipe=try secondary.Recipe_decode(selected.processing) map_err codec.describe
+   try chain(processing,selected.definition,choices,ordinal,timestamp)
+  }else{naming.Chain{main:try naming.copy(main),models:[try naming.copy(main)]}}
+  member.main=main
+  array.push(members,member)
+  index+=1}
+ let main:naming.Context=try naming.copy(struct.borrow(array.borrow(members,0),field=main))
+ result.ok(naming.Ensemble{main:main,members:members,label:string.copy(choices.ensemble_label),
+  default_label:str.len(choices.ensemble_label)==0,append_label:choices.append_ensemble})
+}

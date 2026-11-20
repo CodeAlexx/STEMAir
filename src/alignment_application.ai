@@ -1,0 +1,193 @@
+module stemair.alignment_application
+import "wav_export.ai" as wav
+import "checked_input.ai" as checked_input
+import "container_export.ai" as container
+import "../toolkit/coarse_alignment.ai" as alignment
+import "../toolkit/control.ai" as control
+import "../toolkit/initial_polarity.ai" as polarity
+import std.audio as audio
+import std.codec as codec
+import std.files as files
+import std.path as path
+import std.cpu_dot as dot
+import std.float as fp
+
+pub type Settings=struct{runtime:string,runtime_sha256:string,invert:bool=false,save_aligned:bool=true,auto_polarity:bool=false} derive codec(strict)
+type Manifest=struct{operation:string,first:string,second:string,invert:bool,save_aligned:bool,
+ auto_polarity:bool,polarity_inverted:bool,polarity_coefficient:option<f64>,polarity_frames:u64,
+ frames:u64,channels:u64,sample_rate:u32,lag_samples:i64,probe_frames:u64,lag_score:f64,dot_configuration:string,dot_core:string,runtime_sha256:string,
+ residual:string,aligned:string,backend:string,checkpoint_loads:u64} derive codec(strict)
+pub fn read(file:str)->result<Settings,string> effects {alloc,fs.read} {
+ let raw:bytes=match files.read_limited(file,16384){ok(v)=>v,err(_)=>{return result.err("Cannot read a bounded alignment recipe")}}
+ let source:str=match str.from_bytes(bytes.view(raw)){some(v)=>v,none=>{return result.err("Alignment recipe must be UTF-8")}}
+ let settings:Settings=try Settings_decode(source) map_err codec.describe
+ let _=try validate(settings)
+ result.ok(settings)
+}
+pub fn validate(settings:ref<Settings>)->result<unit,string> effects {alloc} {
+ if settings.auto_polarity and settings.invert{return result.err("Choose automatic polarity or fixed inversion, not both")}
+ result.ok(())
+}
+pub fn preflight(directory:str,save_aligned:bool)->result<unit,string> effects {alloc,fs.meta} {
+ if not match files.is_dir(directory){ok(v)=>v,err(_)=>false}{return result.err("Output directory must already exist")}
+ let names:array<string>=["alignment.json","residual.wav","aligned.wav"]
+ var i:u64=0
+ loop{if i==if save_aligned{3}else{2}{break}
+  match files.symlink_metadata(path.join(directory,array.get(names,i))){ok(_)=>{return result.err("An alignment output already exists; choose an empty directory")},err(error)=>{
+   if error.code!=1{return result.err("Cannot inspect alignment output directory")}}}
+  i+=1}
+ result.ok(())
+}
+pub fn load(file:str)->result<audio.AudioBuffer,string> effects {alloc,fs.read} {
+ let raw:bytes=match files.read_limited(file,67112960){ok(v)=>v,err(_)=>{return result.err("Cannot read a bounded alignment WAV")}}
+ let buffer:audio.AudioBuffer=try audio.decode_wav(bytes.view(raw)) map_err audio.message
+ if buffer.rate!=44100 or (buffer.channels!=1 and buffer.channels!=2){return result.err("Coarse alignment requires native 44100-Hz mono or stereo WAV inputs")}
+ result.ok(buffer)
+}
+pub fn planar(buffer:ref<audio.AudioBuffer>)->array<f32> effects {alloc} {
+ let frames:u64=audio.num_frames(buffer)
+ let channels:u64=cast.wrap(buffer.channels)
+ var out:array<f32>=[]
+ array.reserve(out,frames*channels)
+ var channel:u64=0
+ loop{if channel==channels{break}
+  var frame:u64=0
+  loop{if frame==frames{break}
+   array.push(out,array.get(buffer.samples,frame*channels+channel))
+   frame+=1}
+  channel+=1}
+ out
+}
+pub fn encode(values:view<f32>,frames:u64,channels:u64)->result<bytes,string> effects {alloc} {
+ let interleaved:array<f32>=wav.interleave(values,frames,channels)
+ var buffer:audio.AudioBuffer=audio.AudioBuffer{samples:interleaved,rate:44100,channels:cast.wrap(channels)}
+ result.ok(try audio.encode_wav(buffer,32) map_err audio.message)
+}
+type Computed=struct{output:alignment.Output,selected:polarity.Decision,configuration:string,core:string}
+fn compute(settings:ref<Settings>,first:str,second:str,cancel:str,progress:str,input_options:ref<option<checked_input.Options>>)->result<Computed,string> effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ if str.len(settings.runtime)==0 or str.len(settings.runtime_sha256)!=64{return result.err("Alignment requires an explicit pinned native CPU dot runtime")}
+ let runtime_identity:string=match files.sha256(settings.runtime){ok(v)=>v,err(_)=>{return result.err("Cannot read the configured CPU dot runtime identity")}}
+ if runtime_identity!=settings.runtime_sha256{return result.err("CPU dot runtime SHA256 differs from its explicit pinned identity")}
+ var engine:dot.Engine=try dot.open(settings.runtime,"0.3.20","Zen")
+ let first_buffer:audio.AudioBuffer=try match input_options{none=>load(first),some(options)=>checked_input.buffer(first,44100,checked_input.queue_item(options,0,cancel))}
+ if control.cancelled(cancel){return result.err("Alignment cancelled")}
+ let second_buffer:audio.AudioBuffer=try match input_options{none=>load(second),some(options)=>checked_input.buffer(second,44100,checked_input.queue_item(options,1,cancel))}
+ let first_channels:u64=cast.wrap(first_buffer.channels)
+ let second_channels:u64=cast.wrap(second_buffer.channels)
+ let first_samples:array<f32>=planar(first_buffer)
+ let second_samples:array<f32>=planar(second_buffer)
+ let selected:polarity.Decision=if settings.auto_polarity{
+  try polarity.detect(engine,array.view(first_samples),array.view(second_samples),first_channels,second_channels)
+ }else{polarity.Decision{inverted:settings.invert,coefficient:0.0,frames:0}}
+ var output:alignment.Output=try alignment.process(engine,array.view(first_samples),array.view(second_samples),first_channels,second_channels,selected.inverted,cancel,progress)
+ result.ok(Computed{output:output,selected:selected,configuration:string.copy(engine.configuration),core:string.copy(engine.core)})
+}
+fn run_impl(settings:ref<Settings>,first:str,second:str,directory:str,cancel:str,progress:str,encoding:option<audio.WavSubtype>)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ if control.cancelled(cancel){return result.err("Alignment cancelled")}
+ let _=try validate(settings)
+ match encoding{some(kind)=>{let _=try preflight_as(directory,settings.save_aligned,kind)},none=>{let _=try preflight(directory,settings.save_aligned)}}
+ var input_options:option<checked_input.Options>=option.none()
+ var computed:Computed=try compute(settings,first,second,cancel,progress,input_options)
+ let selected:polarity.Decision=computed.selected
+ let output:ref<alignment.Output>=struct.borrow(computed,field=output)
+ let residual:bytes=if option.is_some(encoding){bytes.copy(b"")}else{try encode(array.view(output.residual),output.frames,output.channels)}
+ let aligned:bytes=if settings.save_aligned and not option.is_some(encoding){try encode(array.view(output.aligned),output.frames,output.channels)}else{bytes.copy(b"")}
+ if control.cancelled(cancel){return result.err("Alignment cancelled before export")}
+ match encoding{some(kind)=>{
+  let residual_buffer:audio.AudioBuffer=try wav.buffer_planar(array.view(output.residual),44100,output.frames,output.channels)
+  let _=try wav.write_buffer_controlled(path.join(directory,"residual.wav"),residual_buffer,kind,cancel,progress)
+  if settings.save_aligned{
+   let aligned_buffer:audio.AudioBuffer=try wav.buffer_planar(array.view(output.aligned),44100,output.frames,output.channels)
+   let _=try wav.write_buffer_controlled(path.join(directory,"aligned.wav"),aligned_buffer,kind,cancel,progress)}
+ },none=>{
+ let _=match files.write_new_bytes(path.join(directory,"residual.wav"),bytes.view(residual)){ok(_)=>(),err(_)=>{
+  return result.err("Cannot create residual WAV; existing outputs are preserved; an owned partial file may remain")}}
+ if settings.save_aligned{
+  let _=match files.write_new_bytes(path.join(directory,"aligned.wav"),bytes.view(aligned)){ok(_)=>(),err(_)=>{
+   return result.err("Cannot create aligned WAV; residual remains available and an owned partial file may remain")}}}
+ }}
+ var manifest:Manifest=Manifest{operation:"coarse-alignment-default-intro-volume-none",first:string.copy(first),second:string.copy(second),
+  invert:settings.invert,save_aligned:settings.save_aligned,frames:output.frames,channels:output.channels,sample_rate:44100,
+  auto_polarity:settings.auto_polarity,polarity_inverted:selected.inverted,
+  polarity_coefficient:if settings.auto_polarity and fp.is_finite(selected.coefficient){option.some(selected.coefficient)}else{option.none()},polarity_frames:selected.frames,
+  lag_samples:output.lag.samples,probe_frames:output.lag.probe_frames,lag_score:output.lag.score,dot_configuration:string.copy(computed.configuration),dot_core:string.copy(computed.core),runtime_sha256:string.copy(settings.runtime_sha256),
+  residual:"residual.wav",aligned:if settings.save_aligned{"aligned.wav"}else{""},backend:"native-air-cpu",checkpoint_loads:0}
+ let text:string=try Manifest_encode(manifest) map_err codec.describe
+ match encoding{some(kind)=>wav.write_metadata(path.join(directory,"alignment.json"),text,kind),none=>{
+ match files.write_new_text(path.join(directory,"alignment.json"),text){ok(_)=>result.ok(()),err(_)=>{
+  result.err("Cannot create alignment manifest; exported WAVs remain available")}}
+ }}
+}
+pub fn run(settings:ref<Settings>,first:str,second:str,directory:str,cancel:str,progress:str)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ run_impl(settings,first,second,directory,cancel,progress,option.none())
+}
+pub fn run_as(settings:ref<Settings>,first:str,second:str,directory:str,cancel:str,progress:str,kind:audio.WavSubtype)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ run_impl(settings,first,second,directory,cancel,progress,option.some(kind))
+}
+
+
+pub fn preflight_as(directory:str,save_aligned:bool,kind:audio.WavSubtype)->result<unit,string> effects {alloc,fs.meta} {
+ let _=try preflight(directory,save_aligned)
+ let names:array<string>=["residual.wav","alignment.json"]
+ var i:u64=0
+ loop{if i==array.len(names){break}
+  let _=try wav.preflight_file(path.join(directory,array.get(names,i)))
+  i+=1}
+ if save_aligned{let _=try wav.preflight_file(path.join(directory,"aligned.wav"))}
+ result.ok(())
+}
+
+
+pub fn preflight_to(directory:str,save_aligned:bool,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string> effects {alloc,fs.read,fs.meta} {
+ let _=try container.verify(plan)
+ let _=try container.require_directory(directory)
+ let _=try container.preflight_tracked(container.target(directory,"residual",plan),plan,log)
+ if save_aligned{let _=try container.preflight_tracked(container.target(directory,"aligned",plan),plan,log)}
+ container.preflight_metadata_tracked(path.join(directory,"alignment.json"),log)
+}
+
+fn run_to_impl(settings:ref<Settings>,first:str,second:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>,input_options:ref<option<checked_input.Options>>)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ if control.cancelled(cancel){return result.err("Alignment cancelled")}
+ let _=try validate(settings)
+ let start:u64=array.len(log.artifacts)
+ let _=try preflight_to(directory,settings.save_aligned,plan,log)
+ var computed:Computed=try compute(settings,first,second,cancel,progress,input_options)
+ let selected:polarity.Decision=computed.selected
+ let output:ref<alignment.Output>=struct.borrow(computed,field=output)
+ if control.cancelled(cancel){return result.err("Alignment cancelled before export")}
+ let residual_buffer:audio.AudioBuffer=try wav.buffer_planar(array.view(output.residual),44100,output.frames,output.channels)
+ let _=try container.write_buffer(container.target(directory,"residual",plan),residual_buffer,plan,log,cancel,progress)
+ if settings.save_aligned{
+  let aligned_buffer:audio.AudioBuffer=try wav.buffer_planar(array.view(output.aligned),44100,output.frames,output.channels)
+  let _=try container.write_buffer(container.target(directory,"aligned",plan),aligned_buffer,plan,log,cancel,progress)}
+ var manifest:Manifest=Manifest{operation:"coarse-alignment-default-intro-volume-none",first:string.copy(first),second:string.copy(second),
+  invert:settings.invert,save_aligned:settings.save_aligned,frames:output.frames,channels:output.channels,sample_rate:44100,
+  auto_polarity:settings.auto_polarity,polarity_inverted:selected.inverted,
+  polarity_coefficient:if settings.auto_polarity and fp.is_finite(selected.coefficient){option.some(selected.coefficient)}else{option.none()},polarity_frames:selected.frames,
+  lag_samples:output.lag.samples,probe_frames:output.lag.probe_frames,lag_score:output.lag.score,dot_configuration:string.copy(computed.configuration),dot_core:string.copy(computed.core),runtime_sha256:string.copy(settings.runtime_sha256),
+  residual:container.filename("residual",plan),aligned:if settings.save_aligned{container.filename("aligned",plan)}else{""},backend:"native-air-cpu",checkpoint_loads:0}
+ let text:string=try Manifest_encode(manifest) map_err codec.describe
+ container.write_metadata(path.join(directory,"alignment.json"),text,plan,log,start)
+}
+pub fn run_to(settings:ref<Settings>,first:str,second:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ log.attempted=""
+ log.failure=""
+ var input_options:option<checked_input.Options>=option.none()
+ let outcome:result<unit,string>=run_to_impl(settings,first,second,directory,cancel,progress,plan,log,input_options)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}
+
+pub fn run_with_input_to(settings:ref<Settings>,first:str,second:str,directory:str,cancel:str,progress:str,plan:ref<container.Plan>,log:ref<container.Journal>,input_options:ref<option<checked_input.Options>>)->result<unit,string>
+ effects {alloc,fs.read,fs.write,fs.meta,ffi,process,time} {
+ log.attempted=""
+ log.failure=""
+ let outcome:result<unit,string>=run_to_impl(settings,first,second,directory,cancel,progress,plan,log,input_options)
+ match outcome{ok(value)=>result.ok(value),err(problem)=>{if str.len(log.failure)==0{container.record_failure(log,"",problem)}
+  result.err(problem)}}
+}

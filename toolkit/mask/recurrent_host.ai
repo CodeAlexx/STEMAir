@@ -1,0 +1,141 @@
+module stemair.mask.recurrent_host
+import "recurrent_network.ai" as network
+import "network.ai" as layout
+import "host.ai" as common
+import "../weights.ai" as weights
+import "../recurrent.ai" as recurrent
+import "../ops.ai" as ops
+import "../spatial.ai" as spatial
+import "../numeric.ai" as num
+import "../control.ai" as control
+import std.cpu_matmul as matrix
+import std.float as fp
+
+pub type Projection=struct{parameter:u64,values:matrix.Matrix}
+pub type Backend=struct{convolution:common.Backend,projections:array<Projection>,projection_bytes:u64,projection_count:u64}
+pub fn prepare(n:ref<network.Network>)->result<Backend,string> effects {alloc,fs.read} {
+ let convolution:common.Backend=try common.prepare(struct.borrow(n,field=weights))
+ let indices:array<u64>=[n.low1.recurrent.projection,n.high1.recurrent.projection,n.low2.recurrent.projection,n.high2.recurrent.projection,n.full.recurrent.projection]
+ var projections:array<Projection>=[]
+ var bytes:u64=0
+ var i:u64=0
+ loop{if i==array.len(indices){break}
+  let id:u64=array.get(indices,i)
+  let w:ref<weights.Parameter>=array.borrow(n.weights.parameters.values,id)
+  if array.len(w.shape)!=2{return result.err("Recurrent projection requires rank-two original weights")}
+  let prepared:matrix.Matrix=try matrix.prepare(array.view(w.values),array.get(w.shape,0),array.get(w.shape,1),matrix.Limits{})
+  bytes+=view.len(bytes.view(prepared.data))
+  array.push(projections,Projection{parameter:id,values:prepared})
+  i+=1}
+ result.ok(Backend{convolution:convolution,projections:projections,projection_bytes:bytes,projection_count:array.len(indices)})
+}
+fn copy_tensor(x:ref<ops.Tensor>)->ops.Tensor effects {alloc} {ops.tensor(x.c,x.h,x.w,num.copy(array.view(x.data)))}
+fn join(a:ref<ops.Tensor>,b:ref<ops.Tensor>)->result<ops.Tensor,string> effects {alloc} {
+ if a.h!=b.h or a.w!=b.w{return result.err("Recurrent channel concatenation shape differs")}
+ result.ok(ops.concat(a,b))
+}
+fn convolve(w:ref<weights.Model>,p:ref<Backend>,library:ref<CAbiLibrary>,x:ref<ops.Tensor>,c:layout.Convolution)->result<ops.Tensor,string> effects {alloc,ffi} {
+ common.convolve_with_workspace(w,struct.borrow(p,field=convolution),library,x,c,8388608)
+}
+fn parameter(w:ref<weights.Model>,id:u64,index:u64)->f32 effects {} {array.get(array.borrow(w.parameters.values,id).values,index)}
+// Row input is [1,time,2*hidden]; bias, normalization and activation preserve order.
+pub fn project_rows(w:ref<weights.Model>,p:ref<Backend>,library:ref<CAbiLibrary>,r:network.Recurrent,x:ref<ops.Tensor>)->result<ops.Tensor,string> effects {alloc,ffi} {
+ if x.c!=1 or x.w!=2*r.layer.hidden_features{return result.err("Recurrent projection row geometry differs")}
+ var i:u64=0
+ loop{if i==array.len(p.projections){break}
+  let projection:ref<Projection>=array.borrow(p.projections,i)
+  if projection.parameter==r.projection{
+   var activation:matrix.Matrix=try matrix.prepare(array.view(x.data),x.h,x.w,matrix.Limits{})
+   let projected:array<f32>=try matrix.multiply(library,activation,matrix.Operation.Identity,struct.borrow(projection,field=values),matrix.Operation.Transpose,matrix.Limits{})
+   var output:ops.Tensor=ops.tensor(1,x.h,r.features,projected)
+   var at:u64=0
+   loop{if at==array.len(output.data){break}
+    let feature:u64=at%r.features
+    let biased:f32=array.get(output.data,at)+parameter(w,r.projection_bias,feature)
+    let normalized:f32=biased*parameter(w,r.scale,feature)+parameter(w,r.bias,feature)
+    array.set(output.data,at,if normalized>0.0{normalized}else{0.0})
+    at+=1}
+   return result.ok(output)}
+  i+=1}
+ result.err("Recurrent projection weights were not prepared at session open")
+}
+fn feature(w:ref<weights.Model>,p:ref<Backend>,library:ref<CAbiLibrary>,r:network.Recurrent,x:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ var columns:ops.Tensor=try convolve(w,p,library,x,r.convolution)
+ var rows:ops.Tensor=ops.transpose(columns)
+ var hidden:ops.Tensor=try recurrent.forward(w,r.layer,rows,cancel)
+ var projected:ops.Tensor=try project_rows(w,p,library,r,hidden)
+ result.ok(ops.transpose(projected))
+}
+fn base(w:ref<weights.Model>,p:ref<Backend>,library:ref<CAbiLibrary>,n:ref<network.Base>,input:ops.Tensor own,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ var given:ops.Tensor=input
+ var x:ops.Tensor=try convolve(w,p,library,given,n.initial)
+ var skips:array<ops.Tensor>=[]
+ array.push(skips,copy_tensor(x))
+ var i:u64=0
+ loop{if i==4{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  let pair:layout.Pair=array.get(n.encoder,i)
+  var first:ops.Tensor=try convolve(w,p,library,x,pair.first)
+  x=try convolve(w,p,library,first,pair.second)
+  if i<3{array.push(skips,copy_tensor(x))}
+  i+=1}
+ var averaged:ops.Tensor=spatial.mean_height(x)
+ var first:ops.Tensor=try convolve(w,p,library,averaged,array.get(n.branches,0))
+ var joined:ops.Tensor=try spatial.resize_corners(first,x.h,x.w)
+ i=1
+ loop{if i==5{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var part:ops.Tensor=try convolve(w,p,library,x,array.get(n.branches,i))
+  joined=try join(joined,part)
+  i+=1}
+ x=try convolve(w,p,library,joined,n.bottleneck)
+ i=0
+ loop{if i==3{break}
+  if control.cancelled(cancel){return result.err("Separation cancelled")}
+  var expanded:ops.Tensor=try spatial.resize_corners(x,2*x.h,2*x.w)
+  var skip:ops.Tensor=match array.pop(skips){some(v)=>v,none=>{return result.err("Missing recurrent CPU decoder skip")}}
+  if skip.h!=expanded.h or skip.w<expanded.w{return result.err("Recurrent CPU decoder exceeds its skip extent")}
+  if skip.w!=expanded.w{skip=try spatial.slice(skip,0,skip.h,(skip.w-expanded.w)/2,expanded.w)}
+  joined=try join(expanded,skip)
+  x=try convolve(w,p,library,joined,array.get(n.decoder,i))
+  i+=1}
+ var recurrent_feature:ops.Tensor=try feature(w,p,library,n.recurrent,x,cancel)
+ joined=try join(x,recurrent_feature)
+ var expanded:ops.Tensor=try spatial.resize_corners(joined,2*joined.h,2*joined.w)
+ var initial:ops.Tensor=match array.pop(skips){some(v)=>v,none=>{return result.err("Missing recurrent CPU initial skip")}}
+ if initial.h!=expanded.h or initial.w<expanded.w{return result.err("Recurrent CPU final decoder exceeds its initial skip")}
+ if initial.w!=expanded.w{initial=try spatial.slice(initial,0,initial.h,(initial.w-expanded.w)/2,expanded.w)}
+ joined=try join(expanded,initial)
+ convolve(w,p,library,joined,n.final)
+}
+pub fn predict(n:ref<network.Network>,p:ref<Backend>,library:ref<CAbiLibrary>,input:ref<ops.Tensor>,cancel:str)->result<ops.Tensor,string> effects {alloc,ffi,fs.meta} {
+ let bins:u64=n.bins
+ if input.c!=2 or input.h!=bins+1 or input.w<=2*n.offset or input.w>4096 or input.w%32!=0{return result.err("Invalid recurrent CPU input geometry")}
+ if p.projection_count!=5 or array.len(p.projections)!=5{return result.err("Recurrent CPU weights were not prepared at session open")}
+ let w:ref<weights.Model>=struct.borrow(n,field=weights)
+ var x:ops.Tensor=try spatial.slice(input,0,bins,0,input.w)
+ var low:ops.Tensor=try spatial.slice(x,0,bins/2,0,x.w)
+ var high:ops.Tensor=try spatial.slice(x,bins/2,bins/2,0,x.w)
+ var low1:ops.Tensor=try base(w,p,library,struct.borrow(n,field=low1),copy_tensor(low),cancel)
+ low1=try convolve(w,p,library,low1,n.low1_tail)
+ var high1:ops.Tensor=try base(w,p,library,struct.borrow(n,field=high1),copy_tensor(high),cancel)
+ var aux1:ops.Tensor=try spatial.concatenate_height(low1,high1)
+ var low2_input:ops.Tensor=try join(low,low1)
+ var high2_input:ops.Tensor=try join(high,high1)
+ var low2:ops.Tensor=try base(w,p,library,struct.borrow(n,field=low2),low2_input,cancel)
+ low2=try convolve(w,p,library,low2,n.low2_tail)
+ var high2:ops.Tensor=try base(w,p,library,struct.borrow(n,field=high2),high2_input,cancel)
+ var aux2:ops.Tensor=try spatial.concatenate_height(low2,high2)
+ var joined:ops.Tensor=try join(x,aux1)
+ joined=try join(joined,aux2)
+ var full:ops.Tensor=try base(w,p,library,struct.borrow(n,field=full),joined,cancel)
+ var mask:ops.Tensor=try convolve(w,p,library,full,n.output)
+ var i:u64=0
+ loop{if i==array.len(mask.data){break}
+  let value:f32=array.get(mask.data,i)
+  array.set(mask.data,i,1.0/(1.0+fp.exp(-value)))
+  i+=1}
+ var edge:ops.Tensor=try spatial.slice(mask,bins-1,1,0,mask.w)
+ var extended:ops.Tensor=try spatial.concatenate_height(mask,edge)
+ spatial.slice(extended,0,bins+1,n.offset,extended.w-2*n.offset)
+}
